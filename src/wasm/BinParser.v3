@@ -1,0 +1,244 @@
+// Copyright 2019 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Parses the binary format of WebAssembly and produces an in-memory module
+// representation. The parser uses a "push" model which allows the creator
+// to input segments of data into the parser incrementally, e.g. if streaming
+// it over a network.
+class BinParser(filename: string) {
+	private def module = Module.new();
+        private var state = BpState.HEADER;
+        private var cur_function: int;
+        private var decoder = Decoder.new([]);
+        private var size_estimate: int;
+        private var declared_code_size: int;
+        private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
+        private var total_module_size: int;
+
+	// Checks whether any error has occured yet and returns {true} if not.
+	def ok() -> bool { return decoder.ok() || decoder.eof(); }
+	// Checks whether any error has occurred yet and returns {true} if so.
+        def error() -> bool { return decoder.error() && !decoder.eof(); }
+
+	// Push new data into the parser from the specified range. The given array is
+        // not modified or retained by this call; internal copies of data are made
+        // if necessary. However, do not pass an array that could be concurrently modified.
+	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
+        	if (decoder.error() && !decoder.eof()) return;  // Already hit a non-EOF error.
+
+		total_module_size += xlength;
+		if (total_module_size > Limits.max_module_size) {
+                	// Enforce maximum module size.
+                        decoder.fail("maximum module size exceeded"); // TODO error position
+                	return;
+                }
+        	if (decoder.available() > 0) {
+                	// If there is a remainder, append the new data into it.
+                        decoder = decoder.append(size_estimate, x, xpos, xlength);
+                } else {
+                	// No remainder from previous decoding, decode in-place from caller's buffer.
+                        var skipped = decoder.skipped;
+                        decoder = Decoder.new(x);
+                        decoder.pos = xpos;
+                        decoder.limit = xpos + xlength;
+                        decoder.skipped = skipped - xpos;
+                }
+
+		// Run the decode loop.
+        	var prev = decoder.pos;
+        	while (decoder.more()) {
+	        	match (state) {
+        	        	HEADER => readHeader();
+                	        SECTIONS => readSection();
+                        	FUNCTIONS => readFunctionBody();
+	                }
+                        if (decoder.eof()) break;
+                }
+
+		if (decoder.data == x) {
+			// If this was an in-place decoding, copy out the remainder into a buffer.
+                        decoder = decoder.extract(size_estimate);
+                }
+        }
+
+	// Finish the decoding of the pushed bytes, returning a valid module
+	def finish() -> Decoded<Module> {
+        	match (state) {
+                	HEADER => decoder.fail("incomplete header");
+                        FUNCTIONS => decoder.fail("incomplete code section");
+                        SECTIONS => {
+		        	if (decoder.more()) {
+                                	decoder.fail("incomplete section");
+		                } else {
+                                	checkSectionConstraints();
+                                }
+                        }
+                }
+		return Decoded<Module>.new(filename, 0, total_module_size, module, "");
+        }
+
+	private def readHeader() {
+        	var p1 = decoder.pos, magic = decoder.read_u32();
+		if (decoder.eof()) return rewind(p1, 4);                
+                if (magic != WASM_MAGIC) {
+                	decoder.fail_at(p1, "incorrect Wasm magic word"); // TODO: expectation in msg
+                        return;
+                }
+                var p2 = decoder.pos, version = decoder.read_u32();
+		if (decoder.eof()) return rewind(p2, 4);                
+                if (version != WASM_VERSION) {
+                	decoder.fail_at(p2, "incorrect Wasm version");  // TODO: expectation in msg
+                        return;
+                }
+                if (decoder.ok()) state = BpState.SECTIONS;
+        }
+
+	private def rewind(pos: int, expect: int) {
+        	decoder.at(pos);
+               	size_estimate = if (expect > 0, if (expect < MAX_SIZE_ESTIMATE, expect, MAX_SIZE_ESTIMATE));
+        }
+
+	private def readSection() {
+        	var start = decoder.pos;
+        	var code = decoder.read_u8();
+                var size = decoder.read_u32leb().1;
+                if (decoder.eof()) return rewind(start, 5);  // size not available yet
+		start = decoder.pos;
+
+		// Check for duplicate sections
+                if (code != 0 && code < seen_sections.length && seen_sections[code]) {
+                	decoder.fail_at(start, "duplicate section");
+                }
+
+                // The code section has a special state; function bodies are handled individually.
+                if (code == BpSection.Code.code) {
+                	// Transition into reading code section
+	        	var num_functions = decoder.read_u32leb();
+                        if (decoder.eof()) return rewind(start, 0);
+        	        if (num_functions.0 != module.functions.declared.size()) {
+                		decoder.fail_at(start, "number of function bodies != function declarations");
+                        	return;
+	                }
+        	        state = BpState.FUNCTIONS;
+                        seen_sections[code] = true;
+                        declared_code_size = int.!(size);
+			return;
+                }
+                
+                // For all other sections, rewind if they are not complete.
+                if (!decoder.check_bytes(int.!(size))) return rewind(start, int.!(size));
+
+		// For valid sections, record that the section has now been seen.
+                if (code >= 0 && code < seen_sections.length) {
+	                seen_sections[code] = true;
+                }
+                
+                match (code) {
+                        0 => readCustomSection(size);
+			BpSection.Type.code => readTypeSection();
+			BpSection.Import.code => readImportSection();
+			BpSection.Function.code => readFunctionSection();
+			BpSection.Table.code => readTableSection();
+			BpSection.Memory.code => readMemorySection();
+			BpSection.Global.code => readGlobalSection();
+			BpSection.Export.code => readExportSection();
+			BpSection.Start.code => readStartSection();
+			BpSection.Element.code => readElementSection();
+			BpSection.Data.code => readDataSection();
+                        _ => decoder.fail_at(start, "unknown section code");  // TODO: value in msg
+               }
+
+		// Check that the size of bytes read equals the section's declared size
+                var read = decoder.pos - start;
+                if (read < size) {
+                	decoder.fail("section is shorter than declared size");
+                } else if (read > size) {
+                	decoder.fail("section is longer than declared size");
+                }
+        }
+
+	private def readCustomSection(size: u32) {
+        	var start = decoder.pos;
+        	var name_len = decoder.read_u32leb().1;
+                var name = decoder.read_bytes(int.!(name_len));
+                var payload_len = int.!(size) - (decoder.pos - start);
+                var payload = decoder.read_bytes(payload_len);
+                module.custom_sections.add(CustomSection.new(name, payload));
+        }
+	private def readTypeSection() { } // TODO:
+	private def readImportSection() { } // TODO:
+	private def readFunctionSection() { } // TODO:
+	private def readTableSection() { } // TODO:
+	private def readMemorySection() { } // TODO:
+	private def readGlobalSection() { } // TODO:
+	private def readExportSection() { } // TODO:
+	private def readStartSection() { } // TODO:
+	private def readElementSection() { } // TODO:
+	private def readDataSection() { } // TODO:
+
+	private def readFunctionBody() {
+        	var start = decoder.pos;
+        	var size = decoder.read_u32leb().1;
+                if (decoder.eof()) return rewind(start, 5);
+                if (size > Limits.max_func_size) {
+                	decoder.fail("function too large");  // TODO: size in msg
+                        return;
+                }
+		var body = decoder.read_bytes(int.!(size));
+		if (decoder.eof()) return rewind(start, int.!(size));
+                var f = module.functions.declared[cur_function++];
+                f.body = body;
+                if (cur_function == module.functions.declared.size()) {
+                	state = BpState.SECTIONS;
+                        // TODO: check size of code section against declared size
+                }
+        }
+
+	private def checkSectionConstraints() {
+        }
+}
+// Internal constants.
+def MAX_SIZE_ESTIMATE = 16 * 1024 * 1024;
+// Header constants.
+def WASM_MAGIC = 0x6d736100u;
+def WASM_VERSION = 0x01u;
+// Used internally in the binary parser.
+enum BpState {
+	HEADER,
+        SECTIONS,
+        FUNCTIONS
+}
+// Section codes.
+enum BpSection(code: byte) {
+	Unknown(0),
+	Type(1),
+	Import(2),
+	Function(3),
+	Table(4),
+	Memory(5),
+	Global(6),
+	Export(7),
+	Start(8),
+	Element(9),
+	Code(10),
+	Data(11),
+}
+// Import/export kind codes.
+enum BpImportExportKind(code: byte) {
+	Function(0),
+	Table(1),
+	Memory(2),
+	Global(3)
+}
+// Type constructor codes.
+enum BpTypecon(code: byte) {
+	I32(0x7F),
+        I64(0x7E),
+        F32(0x7D),
+        F64(0x7C),
+        SIMD128(0x7B), // ext:simd
+	AnyFunc(0x70),
+        AnyRef(0x6F), // ext:reference-types
+	Function(0x60),
+	EmptyBlock(0x40)
+}
