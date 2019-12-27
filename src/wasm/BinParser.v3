@@ -135,16 +135,16 @@ class BinParser(filename: string) {
                 
                 match (code) {
                         0 => readCustomSection(size);
-			BpSection.Type.code => readTypeSection();
-			BpSection.Import.code => readImportSection();
-			BpSection.Function.code => readFunctionSection();
-			BpSection.Table.code => readTableSection();
-			BpSection.Memory.code => readMemorySection();
-			BpSection.Global.code => readGlobalSection();
-			BpSection.Export.code => readExportSection();
+			BpSection.Type.code => readMultiple("types", Limits.max_num_types, module.types, readTypeDecl);
+			BpSection.Import.code => readMultiple("imports", Limits.max_num_imports, module.imports, readImportDecl);
+			BpSection.Function.code => readMultiple("functions", Limits.max_num_functions, module.functions.declared, readFunctionDecl);
+			BpSection.Table.code => readMultiple("tables", Limits.max_num_tables, module.tables.declared, readTableDecl);
+			BpSection.Memory.code => readMultiple("memories", Limits.max_num_memories, module.memories.declared, readMemoryDecl);
+			BpSection.Global.code => readMultiple("globals", Limits.max_num_globals, module.globals.declared, readGlobalDecl);
+			BpSection.Export.code => readMultiple("exports", Limits.max_num_exports, module.exports, readExportDecl);
 			BpSection.Start.code => readStartSection();
-			BpSection.Element.code => readElementSection();
-			BpSection.Data.code => readDataSection();
+			BpSection.Element.code => readMultiple("elements", Limits.max_num_table_entries, module.elems, readElemDecl);
+			BpSection.Data.code => readMultiple("data", Limits.max_num_data_segments, module.data, readDataDecl);
                         _ => decoder.fail_at(start, "unknown section code");  // TODO: value in msg
                }
 
@@ -165,16 +165,247 @@ class BinParser(filename: string) {
                 var payload = decoder.read_bytes(payload_len);
                 module.custom_sections.add(CustomSection.new(name, payload));
         }
-	private def readTypeSection() { } // TODO:
-	private def readImportSection() { } // TODO:
-	private def readFunctionSection() { } // TODO:
-	private def readTableSection() { } // TODO:
-	private def readMemorySection() { } // TODO:
-	private def readGlobalSection() { } // TODO:
-	private def readExportSection() { } // TODO:
-	private def readStartSection() { } // TODO:
-	private def readElementSection() { } // TODO:
-	private def readDataSection() { } // TODO:
+	private def readMultiple<T>(thing_name: string, max: u32, vec: Vector<T>, read: int -> T) {
+		var count = readU32(thing_name, 0, max);
+		if (!decoder.ok()) return;
+		if (count < MAX_GROW_SIZE) vec.grow(int.!(count));
+		for (index < int.!(count)) {
+			var thing = read(index);
+			vec.set(index, thing);
+		}
+	}
+	private def readTypeDecl(index: int) -> TypeDecl {
+		var pt = decoder.pos, invalid: TypeDecl;
+		var form = decoder.read_u8();
+		if (form != BpTypecon.Function.code) {
+			decoder.fail_at(pt, "invalid type, expected function");
+			return invalid;
+		}
+		pt = decoder.pos;
+		var param_count = readU32("param count", 0, Limits.max_num_func_params);
+		if (!decoder.ok()) return invalid;
+		var ptypes = Array<ValueType>.new(int.!(param_count));
+		for (j < param_count) {
+			ptypes[int.!(j)] = readValueType();
+		}
+		var ret_count = readU32("result count", 0, Limits.max_num_func_results);
+		if (!decoder.ok()) return invalid;
+		var rtypes = Array<ValueType>.new(int.!(ret_count));
+		for (j < ret_count) {
+			rtypes[int.!(j)] = readValueType();
+		}
+		return TypeDecl.Function(ptypes, rtypes);
+	}
+	private def readValueType() -> ValueType {
+		var pt = decoder.pos, b = decoder.read_u8();
+		match (b) {
+			BpTypecon.I32.code => return ValueType.I32;
+			BpTypecon.I64.code => return ValueType.I64;
+			BpTypecon.F32.code => return ValueType.F32;
+			BpTypecon.F64.code => return ValueType.F64;
+			BpTypecon.VEC128.code => return ValueType.VEC128;
+			BpTypecon.AnyRef.code => return ValueType.ANYREF;
+		}
+		decoder.fail_at(pt, "invalid value type");
+		return ValueType.I32;
+	}
+	private def readImportDecl(index: int) -> ImportDecl {
+		var module_name = readString("import module name");
+		var field_name = readString("import field name");
+		var pt = decoder.pos;
+		var kind = decoder.read_u8();
+		var result: ImportDecl;
+		var details: ImportDetails;
+		match (kind) {
+			BpImportExportKind.Function.code => {
+				var sig = readSigIndex();
+				var decl = FunctionDecl.new(true, sig.0, sig.1);
+				module.functions.imported.add(decl);
+				details = ImportDetails.Function(decl);
+			}
+			BpImportExportKind.Table.code => {
+				var et = readElemType();
+				var l = readLimits("table", Limits.max_table_size);
+				var decl = TableDecl.new(true, et, l.0, l.1);
+				module.tables.imported.add(decl);
+				details = ImportDetails.Table(decl);
+			}
+			BpImportExportKind.Memory.code => {
+				var l = readLimits("memory", Limits.max_memory_pages); // TODO: shared flag
+				var decl = MemoryDecl.new(true, l.0, l.1, false);
+				module.memories.imported.add(decl);
+				details = ImportDetails.Memory(decl);
+			}
+			BpImportExportKind.Global.code => {
+				var t = readValueType();
+				var mut = decoder.read_u8() != 0;
+				var decl = GlobalDecl.new(true, t, mut, InitExpr.I32(0));
+				module.globals.imported.add(decl);
+				details = ImportDetails.Global(decl);
+			}
+			_ => decoder.fail_at(pt, "invalid import kind");
+		}
+		return ImportDecl.new(module_name, field_name, details);
+	}
+	private def readFunctionDecl(index: int) -> FunctionDecl {
+		var pt = decoder.pos;
+		var sig = readSigIndex();
+		return FunctionDecl.new(false, sig.0, sig.1);
+	}
+	private def readTableDecl(index: int) -> TableDecl {
+		var et = readElemType();
+		var l = readLimits("table", Limits.max_table_size);
+		return TableDecl.new(false, et, l.0, l.1);
+	}
+	private def readMemoryDecl(index: int) -> MemoryDecl {
+		var l = readLimits("memory", Limits.max_memory_pages); // TODO: shared flag
+		return MemoryDecl.new(false, l.0, l.1, false);
+	}
+	private def readGlobalDecl(index: int) -> GlobalDecl {
+		var vt = readValueType();
+		var mut = decoder.read_u8() != 0;
+		var init = readInitExpr("global initializer");
+		return GlobalDecl.new(false, vt, mut, init);
+	}
+	private def readExportDecl(index: int) -> ExportDecl {
+		var name = readString("export name");
+		var pt = decoder.pos;
+		var k = decoder.read_u8();
+		var details: ExportDetails;
+		match (k) {
+			BpImportExportKind.Function.code => {
+				var index = readFuncIndex();
+				details = ExportDetails.Function(index);
+			}
+			BpImportExportKind.Table.code => {
+				var index = readTableIndex();
+				details = ExportDetails.Table(index);
+			}
+			BpImportExportKind.Memory.code => {
+				var index = readMemoryIndex();
+				details = ExportDetails.Memory(index);
+			}
+			BpImportExportKind.Global.code => {
+				var index = readGlobalIndex();
+				details = ExportDetails.Global(index);
+			}
+			_ => decoder.fail_at(pt, "invalid export kind");
+		}
+		return ExportDecl.new(name, details);
+	}
+	private def readElemDecl(index: int) -> ElemDecl {
+		var table_index = readTableIndex();
+		var offset = readI32Expr("elements offset");
+		var count = readU32("element count", 0, Limits.max_num_table_entries);
+		var array = Array<int>.new(int.!(count));
+		for (i < int.!(count)) {
+			array[i] = readFuncIndex(); // TODO: support init expressions
+		}
+		var details = ElemDetails.FuncRefs(array);
+		var active = true; // TODO(bulk-memory)
+		return ElemDecl.new(table_index, offset, details, active);
+	}
+	private def readDataDecl(index: int) -> DataDecl {
+		var mem_index = readMemoryIndex();
+		var offset = readI32Expr("data element offset");
+		var len = readU32("data segment size", 0, Limits.max_data_segment_size);
+		var data = decoder.read_bytes(int.!(len));
+		var active = true; // TODO(bulk-memory)
+		return DataDecl.new(mem_index, offset, data, active);
+	}
+	private def readStartSection() {
+		module.start_function = readFuncIndex();
+	}
+
+	def readU32(quantity: string, min: u32, max: u32) -> u32 {
+		var pt = decoder.pos;
+		var val = decoder.read_u32leb();
+		if (decoder.eof()) return 0;
+		if (val < min || val > max) decoder.fail_at(pt, "exceeded maximum"); // TODO msg
+		return val;
+	}
+	def readString(name: string) -> string {
+		var len = decoder.read_u32leb();
+		var str = decoder.read_bytes(int.!(len));
+		return str;
+	}
+	def readLimits(name: string, limit: u32) -> (int, int) { // TODO: return (u32, bool, u32)
+		var flags = decoder.read_u8();
+		var min = decoder.read_u32leb();
+		var has_max = (flags & 1) != 0;
+		var max = -1;
+		if (has_max) {
+			var pt = decoder.pos;
+			var m = decoder.read_u32leb();
+			if (m > limit) decoder.fail_at(pt, "maximum too large"); // TODO: msg
+			max = int.!(max);
+		}
+		return (int.!(min), max);
+	}
+	def readTableIndex() -> int {
+		var pt = decoder.pos;
+		var index = decoder.read_u32leb();
+		if (index >= module.tables.size()) decoder.fail_at(pt, "invalid table index");
+		return int.!(index);
+	}
+	def readSigIndex() -> (int, TypeDecl.Function) {
+		var pt = decoder.pos;
+		var index = decoder.read_u32leb(), ft: TypeDecl.Function;
+		if (index >= module.types.size()) {
+			decoder.fail_at(pt, "invalid signature index");
+		} else {
+			var t = module.types[int.!(index)];
+			if (!TypeDecl.Function.?(t)) decoder.fail_at(pt, "expected function type signature");
+			else ft = TypeDecl.Function.!(t);
+			
+		}
+		return (int.!(index), ft);
+	}
+	def readFuncIndex() -> int {
+		var pt = decoder.pos;
+		var index = decoder.read_u32leb();
+		if (index >= module.functions.size()) decoder.fail_at(pt, "invalid function index");
+		return int.!(index);
+	}
+	def readMemoryIndex() -> int {
+		var pt = decoder.pos;
+		var index = decoder.read_u32leb();
+		if (index >= module.memories.size()) decoder.fail_at(pt, "invalid memory index");
+		return int.!(index);
+	}
+	def readGlobalIndex() -> int {
+		var pt = decoder.pos;
+		var index = decoder.read_u32leb();
+		if (index >= module.globals.size()) decoder.fail_at(pt, "invalid global index");
+		return int.!(index);
+	}
+	def readElemType() -> ElemType {
+		var pt = decoder.pos;
+		var b = decoder.read_u8();
+		var et: ElemType;
+		match (b) {
+			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
+			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
+			_ => decoder.fail_at(pt, "invalid table element type");
+		}
+		return et;
+	}
+	def readI32Expr(quantity: string) -> InitExpr {
+		var pt = decoder.pos;
+		var init = readInitExpr(quantity);
+		match (init) {
+			I32(val) => ;
+			Global(global_index) => {
+				var g = module.globals[global_index];
+				if (g == null || g.valtype != ValueType.I32) {
+					decoder.fail_at(pt, "expected i32 init expr");
+				}
+			}
+			_ => decoder.fail_at(pt, "expected i32 init expr");
+		}
+		return init;
+	}
+	def readInitExpr(quantity: string) -> InitExpr; // TODO
 
 	private def readFunctionBody() {
         	var start = decoder.pos;
@@ -199,9 +430,16 @@ class BinParser(filename: string) {
 }
 // Internal constants.
 def MAX_SIZE_ESTIMATE = 16 * 1024 * 1024;
+def MAX_GROW_SIZE = 1000000;
 // Header constants.
 def WASM_MAGIC = 0x6d736100u;
 def WASM_VERSION = 0x01u;
+// Selects the amount of tracing output printed by the decoder.
+enum Verbosity {
+	SILENT,     // no output
+	DIAGNOSTIC, // summarizes sections prior to error, verbose near error
+	VERBOSE	    // details for everything printed
+}
 // Used internally in the binary parser.
 enum BpState {
 	HEADER,
@@ -236,7 +474,7 @@ enum BpTypecon(code: byte) {
         I64(0x7E),
         F32(0x7D),
         F64(0x7C),
-        SIMD128(0x7B), // ext:simd
+        VEC128(0x7B), // ext:simd
 	AnyFunc(0x70),
         AnyRef(0x6F), // ext:reference-types
 	Function(0x60),
