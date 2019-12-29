@@ -5,7 +5,7 @@
 // representation. The parser uses a "push" model which allows the creator
 // to input segments of data into the parser incrementally, e.g. if streaming
 // it over a network.
-class BinParser(filename: string) {
+class BinParser(verbose: Verbosity, filename: string) {
 	private def module = Module.new();
         private var state = BpState.HEADER;
         private var cur_function: int;
@@ -14,17 +14,18 @@ class BinParser(filename: string) {
         private var declared_code_size: int;
         private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
         private var total_module_size: int;
+	private def V = verbose.tag > Verbosity.SILENT.tag;
 
 	// Checks whether any error has occured yet and returns {true} if not.
-	def ok() -> bool { return decoder.ok() || decoder.eof(); }
+	def ok() -> bool { return decoder.ok() || decoder.eof; }
 	// Checks whether any error has occurred yet and returns {true} if so.
-        def error() -> bool { return decoder.error() && !decoder.eof(); }
+        def error() -> bool { return decoder.error() && !decoder.eof; }
 
 	// Push new data into the parser from the specified range. The given array is
         // not modified or retained by this call; internal copies of data are made
         // if necessary. However, do not pass an array that could be concurrently modified.
 	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
-        	if (decoder.error() && !decoder.eof()) return;  // Already hit a non-EOF error.
+        	if (decoder.error() && !decoder.eof) return;  // Already hit a non-EOF error.
 
 		total_module_size += xlength;
 		if (total_module_size > Limits.max_module_size) {
@@ -47,12 +48,13 @@ class BinParser(filename: string) {
 		// Run the decode loop.
         	var prev = decoder.pos;
         	while (decoder.more()) {
+			traceStatus();
 	        	match (state) {
         	        	HEADER => readHeader();
                 	        SECTIONS => readSection();
                         	FUNCTIONS => readFunctionBody();
 	                }
-                        if (decoder.eof()) break;
+                        if (decoder.eof) break;
                 }
 
 		if (decoder.data == x) {
@@ -63,6 +65,11 @@ class BinParser(filename: string) {
 
 	// Finish the decoding of the pushed bytes, returning a valid module
 	def finish() -> Decoded<Module> {
+		traceStatus();
+		if (!decoder.ok() && !decoder.eof) {
+			return Decoded<Module>.new(filename, decoder.error_pos, 0, null,
+							decoder.error_msg);
+		}
         	match (state) {
                 	HEADER => decoder.fail("incomplete header");
                         FUNCTIONS => decoder.fail("incomplete code section");
@@ -74,18 +81,18 @@ class BinParser(filename: string) {
                                 }
                         }
                 }
-		return Decoded<Module>.new(filename, 0, total_module_size, module, "");
+		return Decoded<Module>.new(filename, int.max, total_module_size, module, null);
         }
 
 	private def readHeader() {
         	var p1 = decoder.pos, magic = decoder.read_u32();
-		if (decoder.eof()) return rewind(p1, 4);                
+		if (decoder.eof) return rewind(p1, 4);                
                 if (magic != WASM_MAGIC) {
                 	decoder.fail_at(p1, "incorrect Wasm magic word"); // TODO: expectation in msg
                         return;
                 }
                 var p2 = decoder.pos, version = decoder.read_u32();
-		if (decoder.eof()) return rewind(p2, 4);                
+		if (decoder.eof) return rewind(p2, 4);                
                 if (version != WASM_VERSION) {
                 	decoder.fail_at(p2, "incorrect Wasm version");  // TODO: expectation in msg
                         return;
@@ -100,11 +107,18 @@ class BinParser(filename: string) {
 
 	private def readSection() {
         	var start = decoder.pos;
-        	var code = decoder.read_u8();
-                var size = decoder.read_u32leb();
-                if (decoder.eof()) return rewind(start, 5);  // size not available yet
-		start = decoder.pos;
+        	var code = readByte("section code");
+		var size = readU32("section size", 0, Limits.max_module_size);
+		if (V) {
+			System.puts("section code=");
+			System.puti(code);
+			System.puts(", size=");
+			System.puti(int.!(size));
+			System.ln();
+		}
+                if (decoder.eof) return rewind(start, 5);  // size not available yet
 
+		var body = decoder.pos;
 		// Check for duplicate sections
                 if (code != 0 && code < seen_sections.length && seen_sections[code]) {
                 	decoder.fail_at(start, "duplicate section");
@@ -113,8 +127,9 @@ class BinParser(filename: string) {
                 // The code section has a special state; function bodies are handled individually.
                 if (code == BpSection.Code.code) {
                 	// Transition into reading code section
-	        	var num_functions = decoder.read_u32leb();
-                        if (decoder.eof()) return rewind(start, 0);
+			start = decoder.pos;
+	        	var num_functions = readU32("function body count", 0, Limits.max_num_functions);
+                        if (decoder.eof) return rewind(start, 0);
         	        if (num_functions != module.functions.declared.size()) {
                 		decoder.fail_at(start, "number of function bodies != function declarations");
                         	return;
@@ -135,21 +150,38 @@ class BinParser(filename: string) {
                 
                 match (code) {
                         0 => readCustomSection(size);
-			BpSection.Type.code => readMultiple("types", Limits.max_num_types, module.types, readTypeDecl);
-			BpSection.Import.code => readMultiple("imports", Limits.max_num_imports, module.imports, readImportDecl);
-			BpSection.Function.code => readMultiple("functions", Limits.max_num_functions, module.functions.declared, readFunctionDecl);
-			BpSection.Table.code => readMultiple("tables", Limits.max_num_tables, module.tables.declared, readTableDecl);
-			BpSection.Memory.code => readMultiple("memories", Limits.max_num_memories, module.memories.declared, readMemoryDecl);
-			BpSection.Global.code => readMultiple("globals", Limits.max_num_globals, module.globals.declared, readGlobalDecl);
-			BpSection.Export.code => readMultiple("exports", Limits.max_num_exports, module.exports, readExportDecl);
+			BpSection.Type.code => readMultiple("types", Limits.max_num_types,
+							module.types.declared, readTypeDecl);
+			BpSection.Import.code => readMultiple("imports", Limits.max_num_imports,
+							module.imports, readImportDecl);
+			BpSection.Function.code => readMultiple("functions", Limits.max_num_functions,
+							module.functions.declared, readFunctionDecl);
+			BpSection.Table.code => readMultiple("tables", Limits.max_num_tables,
+							module.tables.declared, readTableDecl);
+			BpSection.Memory.code => readMultiple("memories", Limits.max_num_memories,
+							module.memories.declared, readMemoryDecl);
+			BpSection.Global.code => readMultiple("globals", Limits.max_num_globals,
+							module.globals.declared, readGlobalDecl);
+			BpSection.Export.code => readMultiple("exports", Limits.max_num_exports,
+							module.exports, readExportDecl);
 			BpSection.Start.code => readStartSection();
-			BpSection.Element.code => readMultiple("elements", Limits.max_num_table_entries, module.elems, readElemDecl);
-			BpSection.Data.code => readMultiple("data", Limits.max_num_data_segments, module.data, readDataDecl);
+			BpSection.Element.code => readMultiple("elements", Limits.max_num_table_entries,
+							module.elems, readElemDecl);
+			BpSection.Data.code => readMultiple("data", Limits.max_num_data_segments,
+							module.data, readDataDecl);
                         _ => decoder.fail_at(start, "unknown section code");  // TODO: value in msg
                }
 
 		// Check that the size of bytes read equals the section's declared size
-                var read = decoder.pos - start;
+                var read = decoder.pos - body;
+		traceStatus();
+		if (V) {
+			System.puts("read ");
+			System.puti(read);
+			System.puts(" bytes of ");
+			System.puti(int.!(size));
+			System.puts(" expected\n");
+		}
                 if (read < size) {
                 	decoder.fail("section is shorter than declared size");
                 } else if (read > size) {
@@ -159,7 +191,7 @@ class BinParser(filename: string) {
 
 	private def readCustomSection(size: u32) {
         	var start = decoder.pos;
-        	var name_len = decoder.read_u32leb();
+        	var name_len = readU32("name length", 0, Limits.max_module_size);
                 var name = decoder.read_bytes(int.!(name_len));
                 var payload_len = int.!(size) - (decoder.pos - start);
                 var payload = decoder.read_bytes(payload_len);
@@ -176,7 +208,7 @@ class BinParser(filename: string) {
 	}
 	private def readTypeDecl(index: int) -> TypeDecl {
 		var pt = decoder.pos, invalid: TypeDecl;
-		var form = decoder.read_u8();
+		var form = readByte("type constructor");
 		if (form != BpTypecon.Function.code) {
 			decoder.fail_at(pt, "invalid type, expected function");
 			return invalid;
@@ -197,7 +229,7 @@ class BinParser(filename: string) {
 		return TypeDecl.Function(ptypes, rtypes);
 	}
 	private def readValueType() -> ValueType {
-		var pt = decoder.pos, b = decoder.read_u8();
+		var pt = decoder.pos, b = readByte("type constructor");
 		match (b) {
 			BpTypecon.I32.code => return ValueType.I32;
 			BpTypecon.I64.code => return ValueType.I64;
@@ -213,7 +245,7 @@ class BinParser(filename: string) {
 		var module_name = readString("import module name");
 		var field_name = readString("import field name");
 		var pt = decoder.pos;
-		var kind = decoder.read_u8();
+		var kind = readByte("import kind");
 		var result: ImportDecl;
 		var details: ImportDetails;
 		match (kind) {
@@ -238,7 +270,7 @@ class BinParser(filename: string) {
 			}
 			BpImportExportKind.Global.code => {
 				var t = readValueType();
-				var mut = decoder.read_u8() != 0;
+				var mut = readByte("flags") != 0;
 				var decl = GlobalDecl.new(true, t, mut, InitExpr.I32(0));
 				module.globals.imported.add(decl);
 				details = ImportDetails.Global(decl);
@@ -263,14 +295,14 @@ class BinParser(filename: string) {
 	}
 	private def readGlobalDecl(index: int) -> GlobalDecl {
 		var vt = readValueType();
-		var mut = decoder.read_u8() != 0;
+		var mut = readByte("flags") != 0;
 		var init = readInitExpr("global initializer");
 		return GlobalDecl.new(false, vt, mut, init);
 	}
 	private def readExportDecl(index: int) -> ExportDecl {
 		var name = readString("export name");
 		var pt = decoder.pos;
-		var k = decoder.read_u8();
+		var k = readByte("export kind");
 		var details: ExportDetails;
 		match (k) {
 			BpImportExportKind.Function.code => {
@@ -320,68 +352,59 @@ class BinParser(filename: string) {
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
 		var pt = decoder.pos;
 		var val = decoder.read_u32leb();
-		if (decoder.eof()) return 0;
-		if (val < min || val > max) decoder.fail_at(pt, "exceeded maximum"); // TODO msg
+		if (decoder.eof) return 0;
+		if (val < min) decoder.fail_at(pt, "exceeded minimum"); // TODO msg
+		if (val > max) decoder.fail_at(pt, "exceeded maximum"); // TODO msg
+		if (V) {
+			outbytes(pt, quantity);
+			System.puti(int.!(val));
+			System.ln();
+		}
 		return val;
 	}
-	def readString(name: string) -> string {
-		var len = decoder.read_u32leb();
+	def readString(quantity: string) -> string {
+		var len = readU32("string length", 0, Limits.max_module_size);
 		var str = decoder.read_bytes(int.!(len));
 		return str;
 	}
-	def readLimits(name: string, limit: u32) -> (int, int) { // TODO: return (u32, bool, u32)
-		var flags = decoder.read_u8();
-		var min = decoder.read_u32leb();
+	def readLimits(quantity: string, limit: u32) -> (int, int) { // TODO: return (u32, bool, u32)
+		var flags = readByte("flags");
+		var min = readU32("minimum", 0, limit);
 		var has_max = (flags & 1) != 0;
 		var max = -1;
 		if (has_max) {
 			var pt = decoder.pos;
-			var m = decoder.read_u32leb();
-			if (m > limit) decoder.fail_at(pt, "maximum too large"); // TODO: msg
+			var m = readU32("maximum", min, limit);
 			max = int.!(max);
 		}
 		return (int.!(min), max);
 	}
 	def readTableIndex() -> int {
-		var pt = decoder.pos;
-		var index = decoder.read_u32leb();
-		if (index >= module.tables.size()) decoder.fail_at(pt, "invalid table index");
-		return int.!(index);
+		return readIndex("table index", module.tables).0;
 	}
 	def readSigIndex() -> (int, TypeDecl.Function) {
-		var pt = decoder.pos;
-		var index = decoder.read_u32leb(), ft: TypeDecl.Function;
-		if (index >= module.types.size()) {
-			decoder.fail_at(pt, "invalid signature index");
-		} else {
-			var t = module.types[int.!(index)];
-			if (!TypeDecl.Function.?(t)) decoder.fail_at(pt, "expected function type signature");
-			else ft = TypeDecl.Function.!(t);
-			
-		}
-		return (int.!(index), ft);
+		var r = readIndex("signature index", module.types);
+		var t = if(TypeDecl.Function.?(r.1), TypeDecl.Function.!(r.1));
+		return (r.0, t);
 	}
 	def readFuncIndex() -> int {
-		var pt = decoder.pos;
-		var index = decoder.read_u32leb();
-		if (index >= module.functions.size()) decoder.fail_at(pt, "invalid function index");
-		return int.!(index);
+		return readIndex("function index", module.functions).0;
 	}
 	def readMemoryIndex() -> int {
-		var pt = decoder.pos;
-		var index = decoder.read_u32leb();
-		if (index >= module.memories.size()) decoder.fail_at(pt, "invalid memory index");
-		return int.!(index);
+		return readIndex("memory index", module.memories).0;
 	}
 	def readGlobalIndex() -> int {
+		return readIndex("global index", module.globals).0;
+	}
+	def readIndex<T>(quantity: string, space: IndexSpace<T>) -> (int, T) {
 		var pt = decoder.pos;
-		var index = decoder.read_u32leb();
-		if (index >= module.globals.size()) decoder.fail_at(pt, "invalid global index");
-		return int.!(index);
+		var index = readU32(quantity, 0, u32.!(space.size()));
+		var t = if(index < space.size(), space[int.!(index)]);
+		return (int.!(index), t);
 	}
 	def readElemType() -> ElemType {
 		var pt = decoder.pos;
-		var b = decoder.read_u8();
+		var b = readByte("element type");
 		var et: ElemType;
 		match (b) {
 			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
@@ -406,17 +429,35 @@ class BinParser(filename: string) {
 		return init;
 	}
 	def readInitExpr(quantity: string) -> InitExpr; // TODO
+	def readByte(quantity: string) -> byte {
+		var pt = decoder.pos;
+		var r = decoder.read_u8();
+		if (V) {
+			outbytes(pt, quantity);
+			System.puti(r);
+			System.ln();
+		}
+		return r;
+	}
+
+	def outbytes(pt: int, quantity: string) {
+		if (quantity == null) return;
+		System.puts("+");
+		System.puti(pt + decoder.skipped);
+		System.puts("[");
+		System.puti(decoder.pos -pt);
+		System.puts("B] ");
+		System.puts(quantity);
+		System.puts("=");
+		// TODO: print bytes
+	}
 
 	private def readFunctionBody() {
         	var start = decoder.pos;
-        	var size = decoder.read_u32leb();
-                if (decoder.eof()) return rewind(start, 5);
-                if (size > Limits.max_func_size) {
-                	decoder.fail("function too large");  // TODO: size in msg
-                        return;
-                }
+        	var size = readU32("function size", 0, Limits.max_func_size);
+                if (decoder.eof) return rewind(start, 5);
 		var body = decoder.read_bytes(int.!(size));
-		if (decoder.eof()) return rewind(start, int.!(size));
+		if (decoder.eof) return rewind(start, int.!(size));
                 var f = module.functions.declared[cur_function++];
                 f.body = body;
                 if (cur_function == module.functions.declared.size()) {
@@ -427,6 +468,24 @@ class BinParser(filename: string) {
 
 	private def checkSectionConstraints() {
         }
+	private def traceStatus() {
+		System.puts("@+");
+		System.puti(decoder.pos);
+		System.puts(" limit=");
+		System.puti(decoder.limit);
+		if (decoder.eof) System.puts(" [eof] ");
+		if (decoder.error_pos < int.max) {
+			System.puts(" err@+");
+			System.puti(decoder.error_pos);
+			System.puts(" ");
+		}
+		if (decoder.error_msg != null) {
+			System.puts(" msg=\"");
+			System.puts(decoder.error_msg);
+			System.puts("\"");
+		}
+		System.ln();
+	}
 }
 // Internal constants.
 def MAX_SIZE_ESTIMATE = 16 * 1024 * 1024;
