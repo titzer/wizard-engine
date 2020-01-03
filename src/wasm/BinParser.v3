@@ -7,13 +7,14 @@
 // it over a network.
 class BinParser(verbose: Verbosity, filename: string) {
 	private def module = Module.new();
-        private var state = BpState.HEADER;
-        private var cur_function: int;
-        private var decoder = Decoder.new([]);
-        private var size_estimate: int;
-        private var declared_code_size: int;
-        private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
-        private var total_module_size: int;
+	private var state = BpState.HEADER;
+	private var cur_function: int;
+	private var decoder = Decoder.new([]);
+	private var size_estimate: int;
+	private var expected_code_size: int;
+	private var code_start: int;
+	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
+	private var total_module_size: int;
 	private var current_section: byte;
 	private def V = verbose.tag > Verbosity.SILENT.tag;
 	private def buf = StringBuffer.new();
@@ -21,49 +22,50 @@ class BinParser(verbose: Verbosity, filename: string) {
 	// Checks whether any error has occured yet and returns {true} if not.
 	def ok() -> bool { return decoder.ok() || decoder.eof; }
 	// Checks whether any error has occurred yet and returns {true} if so.
-        def error() -> bool { return decoder.error() && !decoder.eof; }
+	def error() -> bool { return decoder.error() && !decoder.eof; }
 
 	// Push new data into the parser from the specified range. The given array is
-        // not modified or retained by this call; internal copies of data are made
-        // if necessary. However, do not pass an array that could be concurrently modified.
+	// not modified or retained by this call; internal copies of data are made
+	// if necessary. However, do not pass an array that could be concurrently modified.
 	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
-        	if (decoder.error() && !decoder.eof) return;  // Already hit a non-EOF error.
+		if (decoder.error() && !decoder.eof) return;  // Already hit a non-EOF error.
 
 		total_module_size += xlength;
 		if (total_module_size > Limits.max_module_size) {
-                	// Enforce maximum module size.
-                        FAIL1(decoder.pos, "maximum module size of %d exceeded", Limits.max_module_size);
-                	return;
-                }
-        	if (decoder.available() > 0) {
-                	// If there is a remainder, append the new data into it.
-                        decoder = decoder.append(size_estimate, x, xpos, xlength);
-                } else {
-                	// No remainder from previous decoding, decode in-place from caller's buffer.
-                        var skipped = decoder.skipped;
-                        decoder = Decoder.new(x);
-                        decoder.pos = xpos;
-                        decoder.limit = xpos + xlength;
-                        decoder.skipped = skipped - xpos;
-                }
+			// Enforce maximum module size.
+			FAIL1(decoder.pos, "maximum module size of %d exceeded",
+				Limits.max_module_size);
+			return;
+		}
+		if (decoder.available() > 0) {
+			// If there is a remainder, append the new data into it.
+			decoder = decoder.append(size_estimate, x, xpos, xlength);
+		} else {
+			// No remainder from previous decoding, decode in-place from caller's buffer.
+			var skipped = decoder.skipped;
+			decoder = Decoder.new(x);
+			decoder.pos = xpos;
+			decoder.limit = xpos + xlength;
+			decoder.skipped = skipped - xpos;
+		}
 
 		// Run the decode loop.
-        	var prev = decoder.pos;
-        	while (decoder.more()) {
+		var prev = decoder.pos;
+		while (decoder.more()) {
 			traceBuffer();
-	        	match (state) {
-        	        	HEADER => readHeader();
-                	        SECTIONS => readSection();
-                        	FUNCTIONS => readFunctionBody();
-	                }
-                        if (decoder.eof) break;
-                }
+			match (state) {
+				HEADER => readHeader();
+				SECTIONS => readSection();
+				FUNCTIONS => readFunctionBody();
+			}
+			if (decoder.eof) break;
+		}
 
 		if (decoder.data == x) {
 			// If this was an in-place decoding, copy out the remainder into a buffer.
-                        decoder = decoder.extract(size_estimate);
-                }
-        }
+			decoder = decoder.extract(size_estimate);
+		}
+	}
 
 	// Finish the decoding of the pushed bytes, returning a valid module
 	def finish() -> Decoded<Module> {
@@ -72,90 +74,92 @@ class BinParser(verbose: Verbosity, filename: string) {
 			return Decoded<Module>.new(filename, decoder.error_pos, 0, null,
 							decoder.error_msg);
 		}
-        	match (state) {
-                	HEADER => FAIL1(decoder.pos, "incomplete header", ());
-                        FUNCTIONS => FAIL1(decoder.pos, "incomplete code section", ());
-                        SECTIONS => {
-		        	if (decoder.more()) {
-                                	FAIL1(decoder.pos, "incomplete %q section", renderSectionName(_, current_section));
-		                } else {
-                                	checkSectionConstraints();
-                                }
-                        }
-                }
+		match (state) {
+			HEADER => FAIL1(decoder.pos, "incomplete header", ());
+			FUNCTIONS => FAIL1(decoder.pos, "incomplete code section", ());
+			SECTIONS => {
+				if (decoder.more()) {
+					FAIL1(decoder.pos, "incomplete %q section",
+						renderSectionName(_, current_section));
+				} else {
+					checkSectionConstraints();
+				}
+			}
+		}
 		return Decoded<Module>.new(filename, int.max, total_module_size, module, null);
-        }
+	}
 
 	private def readHeader() {
-        	var p1 = decoder.pos, magic = decoder.read_u32();
-		if (decoder.eof) return rewind(p1, 4);                
-                if (magic != WASM_MAGIC) {
-                	FAIL2(p1, "incorrect Wasm magic word %x, expected %x", magic, WASM_MAGIC);
-                        return;
-                }
-                var p2 = decoder.pos, version = decoder.read_u32();
-		if (decoder.eof) return rewind(p2, 4);                
-                if (version != WASM_VERSION) {
-                	FAIL2(p2, "incorrect Wasm version %d, expected %d", version, magic);
-                        return;
-                }
-                if (decoder.ok()) state = BpState.SECTIONS;
-        }
+		var p1 = decoder.pos, magic = decoder.read_u32();
+		if (decoder.eof) return rewind(p1, 4);
+		if (magic != WASM_MAGIC) {
+			FAIL2(p1, "incorrect Wasm magic word %x, expected %x", magic, WASM_MAGIC);
+			return;
+		}
+		var p2 = decoder.pos, version = decoder.read_u32();
+		if (decoder.eof) return rewind(p2, 4);
+		if (version != WASM_VERSION) {
+			FAIL2(p2, "incorrect Wasm version %d, expected %d", version, magic);
+			return;
+		}
+		if (decoder.ok()) state = BpState.SECTIONS;
+	}
 
 	private def rewind(pos: int, expect: int) {
 		if (V) {
 			buf.put2("[rewind to +%d, expecting %d]\n", pos, expect);
 			flush();
 		}
-        	decoder.at(pos);
-               	size_estimate = if (expect > 0, if (expect < MAX_SIZE_ESTIMATE, expect, MAX_SIZE_ESTIMATE));
-        }
+		decoder.at(pos);
+		size_estimate = if (expect > 0,
+			if (expect < MAX_SIZE_ESTIMATE, expect, MAX_SIZE_ESTIMATE));
+	}
 
 	private def readSection() {
-        	var start = decoder.pos;
-        	var code = readByte("section code", renderSectionName);
+		var start = decoder.pos;
+		var code = readByte("section code", renderSectionName);
 		var size = readU32("section size", 0, Limits.max_module_size);
 		if (V) {
 			buf.put3("=>section code=%d (%q), size=%d\n",
 				code, renderSectionName(_, code), size);
 			flush();
 		}
-                if (decoder.eof) return rewind(start, 5);  // size not available yet
+		if (decoder.eof) return rewind(start, 5);  // size not available yet
 
 		current_section = code;
 		var body = decoder.pos;
 		// Check for duplicate sections
-                if (code != 0 && code < seen_sections.length && seen_sections[code]) {
-                	FAIL1(start, "duplicate %s section", renderSectionName(_, code));
-                }
+		if (code != 0 && code < seen_sections.length && seen_sections[code]) {
+			FAIL1(start, "duplicate %s section", renderSectionName(_, code));
+		}
 
-                // The code section has a special state; function bodies are handled individually.
-                if (code == BpSection.Code.code) {
-                	// Transition into reading code section
-			start = decoder.pos;
-	        	var num_functions = readU32("function body count", 0, Limits.max_num_functions);
-                        if (decoder.eof) return rewind(start, 0);
-        	        if (num_functions != module.functions.declared.size()) {
-                		FAIL2(start, "number of function bodies (%d) != function declarations (%d)",
+		// The code section has a special state; function bodies are handled individually.
+		if (code == BpSection.Code.code) {
+			// Transition into reading code section
+			var num_functions = readU32("function body count", 0, Limits.max_num_functions);
+			if (decoder.eof) return rewind(start, 0);
+			if (num_functions != module.functions.declared.size()) {
+				FAIL2(body, "number of function bodies (%d) != function declarations (%d)",
 						num_functions, module.functions.declared.size());
-                        	return;
-	                }
-        	        state = BpState.FUNCTIONS;
-                        seen_sections[code] = true;
-                        declared_code_size = int.!(size);
+				return;
+			}
+			state = BpState.FUNCTIONS;
+			seen_sections[code] = true;
+			expected_code_size = int.!(size);
+			code_start = body + decoder.skipped;
 			return;
-                }
-                
-                // For all other sections, rewind if they are not complete.
-                if (!decoder.check_bytes(int.!(size))) return rewind(start, int.!(size));
+		}
+
+		// For all other sections, rewind if they are not complete.
+		if (!decoder.check_bytes(int.!(size))) return rewind(start, int.!(size));
 
 		// For valid sections, record that the section has now been seen.
-                if (code >= 0 && code < seen_sections.length) {
-	                seen_sections[code] = true;
-                }
-                
-                match (code) {
-                        0 => readCustomSection(size);
+		if (code >= 0 && code < seen_sections.length) {
+			seen_sections[code] = true;
+		}
+
+		match (code) {
+			0 => readCustomSection(size);
 			BpSection.Type.code => readMultiple("types", Limits.max_num_types,
 							module.types.declared, readTypeDecl);
 			BpSection.Import.code => readMultiple("imports", Limits.max_num_imports,
@@ -175,27 +179,25 @@ class BinParser(verbose: Verbosity, filename: string) {
 							module.elems, readElemDecl);
 			BpSection.Data.code => readMultiple("data", Limits.max_num_data_segments,
 							module.data, readDataDecl);
-                        _ => FAIL1(start, "unknown section code %x", code);
-               }
+			_ => FAIL1(start, "unknown section code %x", code);
+	       }
 
 		// Check that the size of bytes read equals the section's declared size
-                var read = decoder.pos - body;
+		var read = decoder.pos - body;
 		traceBuffer();
-                if (read < size) {
-                	FAIL2(decoder.pos, "section is shorter (%d bytes) than declared size of %d bytes", read, size);
-                } else if (read > size) {
-                	FAIL2(decoder.pos, "section is longer (%d bytes) than declared size of %d bytes", read, size);
-                }
-        }
+		if (read != size) {
+			FAIL2(decoder.pos, "expected section size of %d, read %d bytes", size, read);
+		}
+	}
 
 	private def readCustomSection(size: u32) {
-        	var start = decoder.pos;
-        	var name_len = readU32("name length", 0, Limits.max_module_size);
-                var name = decoder.read_bytes(int.!(name_len));
-                var payload_len = int.!(size) - (decoder.pos - start);
-                var payload = decoder.read_bytes(payload_len);
-                module.custom_sections.add(CustomSection.new(name, payload));
-        }
+		var start = decoder.pos;
+		var name_len = readU32("name length", 0, Limits.max_module_size);
+		var name = decoder.read_bytes(int.!(name_len));
+		var payload_len = int.!(size) - (decoder.pos - start);
+		var payload = decoder.read_bytes(payload_len);
+		module.custom_sections.add(CustomSection.new(name, payload));
+	}
 	private def readMultiple<T>(thing_name: string, max: u32, vec: Vector<T>, read: int -> T) {
 		var count = readU32(thing_name, 0, max);
 		if (!decoder.ok()) return;
@@ -266,8 +268,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 				details = ImportDetails.Table(decl);
 			}
 			BpImportExportKind.Memory.code => {
-				var l = readLimits("memory", Limits.max_memory_pages); // TODO: shared flag
-				var decl = MemoryDecl.new(true, l.0, l.1, false);
+				var l = readMemoryLimits("memory", Limits.max_memory_pages);
+				var decl = MemoryDecl.new(true, l.0, l.1, l.2);
 				module.memories.imported.add(decl);
 				details = ImportDetails.Memory(decl);
 			}
@@ -293,8 +295,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 		return TableDecl.new(false, et, l.0, l.1);
 	}
 	private def readMemoryDecl(index: int) -> MemoryDecl {
-		var l = readLimits("memory", Limits.max_memory_pages); // TODO: shared flag
-		return MemoryDecl.new(false, l.0, l.1, false);
+		var l = readMemoryLimits("memory", Limits.max_memory_pages);
+		return MemoryDecl.new(false, l.0, l.1, l.2);
 	}
 	private def readGlobalDecl(index: int) -> GlobalDecl {
 		var vt = readValueType();
@@ -329,23 +331,49 @@ class BinParser(verbose: Verbosity, filename: string) {
 		return ExportDecl.new(name, details);
 	}
 	private def readElemDecl(index: int) -> ElemDecl {
-		var table_index = readTableIndex();
+		var pt = decoder.pos;
+		var flags = readByte("data flags", renderNone);
+		var active = true, table_index = 0, init_exprs = false;
+		if (Extensions.bulk_memory) {
+			if ((flags & 1) == 1) active = false;
+			if ((flags & 2) == 2) table_index = readTableIndex();
+			if ((flags & 4) == 4) init_exprs = true;
+		} else if (flags != 0) {
+			FAIL1(pt, "expected zero byte for elements, got %x", flags);
+		}
 		var offset = readI32Expr("elements offset");
 		var count = readU32("element count", 0, Limits.max_num_table_entries);
-		var array = Array<int>.new(int.!(count));
-		for (i < int.!(count)) {
-			array[i] = readFuncIndex(); // TODO: support init expressions
+		var details: ElemDetails;
+		if (init_exprs) { // init expressions
+			var array = Array<InitExpr>.new(int.!(count));
+			for (i < int.!(count)) {
+				array[i] = readInitExpr("element");
+			}
+			details = ElemDetails.Exprs(array);
+		} else {  // function indices
+			var array = Array<int>.new(int.!(count));
+			for (i < int.!(count)) {
+				array[i] = readFuncIndex();
+			}
+			details = ElemDetails.FuncRefs(array);
 		}
-		var details = ElemDetails.FuncRefs(array);
-		var active = true; // TODO(bulk-memory)
 		return ElemDecl.new(table_index, offset, details, active);
 	}
 	private def readDataDecl(index: int) -> DataDecl {
-		var mem_index = readMemoryIndex();
+		var pt = decoder.pos;
+		var flags = readByte("data flags", renderNone);
+		var active = true, mem_index = 0;
+		if (Extensions.bulk_memory) {
+			if ((flags & 1) == 1) {
+				active = false;
+				mem_index = readMemoryIndex();
+			}
+		} else if (flags != 0) {
+			FAIL1(pt, "expected zero byte for data segment, got %x", flags);
+		}
 		var offset = readI32Expr("data element offset");
 		var len = readU32("data segment size", 0, Limits.max_data_segment_size);
 		var data = decoder.read_bytes(int.!(len));
-		var active = true; // TODO(bulk-memory)
 		return DataDecl.new(mem_index, offset, data, active);
 	}
 	private def readStartSection() {
@@ -378,13 +406,25 @@ class BinParser(verbose: Verbosity, filename: string) {
 	}
 	def readString(quantity: string) -> string {
 		var len = readU32("string length", 0, Limits.max_module_size);
+		var pt = decoder.pos;
 		var str = decoder.read_bytes(int.!(len));
+		if (V) {
+			outbytes(pt, quantity);
+			buf.puts("\"");
+			var max = 24;
+			var count = decoder.pos - pt;
+			for (i = 0; i < count && i < max; i++) {
+				buf.put1("%c", toPrintableChar(decoder.data[pt + i]));
+			}
+			buf.puts("\"\n");
+			flush();
+		}
 		return str;
 	}
-	def readLimits(quantity: string, limit: u32) -> (int, int) { // TODO: return (u32, bool, u32)
+	def readLimits(quantity: string, limit: u32) -> (int, int) {
 		var flags = readByte("flags", renderLimitFlags);
 		var min = readU32("minimum", 0, limit);
-		var has_max = (flags & 1) != 0;
+		var has_max = (flags & 1) == 1;
 		var max = -1;
 		if (has_max) {
 			var pt = decoder.pos;
@@ -392,6 +432,23 @@ class BinParser(verbose: Verbosity, filename: string) {
 			max = int.!(max);
 		}
 		return (int.!(min), max);
+	}
+	def readMemoryLimits(quantity: string, limit: u32) -> (int, int, bool) {
+		var pt = decoder.pos;
+		var flags = readByte("flags", renderLimitFlags);
+		var min = readU32("minimum", 0, limit);
+		var has_max = (flags & 1) == 1;
+		var max = -1, shared = false;
+		if (has_max) {
+			var pt = decoder.pos;
+			var m = readU32("maximum", min, limit);
+			max = int.!(max);
+		}
+		if (Extensions.threads) {
+			shared = (flags & 2) == 2;
+			if (shared && !has_max) FAIL1(pt, "shared memory must have maximum", ());
+		}
+		return (int.!(min), max, shared);
 	}
 	def readTableIndex() -> int {
 		return readIndex("table index", module.tables).0;
@@ -494,8 +551,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 		var count = decoder.pos - pt;
 		buf.put1("%x: ", pt + decoder.skipped);
 		for (i < count) {
-			if (i > 0 && (i % 8) == 0) buf.puts("\n         ");
-			buf.put1("%x ", decoder.data[pt + i]); 
+			if (i > 0 && (i % 8) == 0) buf.puts("\n          ");
+			buf.put1("%x ", decoder.data[pt + i]);
 		}
 		var rounded = ((count + 7) / 8) * 8;
 		for (i < rounded - count) buf.puts("   ");
@@ -504,22 +561,27 @@ class BinParser(verbose: Verbosity, filename: string) {
 	}
 
 	private def readFunctionBody() {
-        	var start = decoder.pos;
-        	var size = readU32("function size", 0, Limits.max_func_size);
-                if (decoder.eof) return rewind(start, 5);
+		var start = decoder.pos;
+		var size = readU32("function size", 0, Limits.max_func_size);
+		if (decoder.eof) return rewind(start, 5);
 		var body = decoder.read_bytes(int.!(size));
 		if (decoder.eof) return rewind(start, int.!(size));
-                var f = module.functions.declared[cur_function++];
-                f.body = body;
-                if (cur_function == module.functions.declared.size()) {
-                	state = BpState.SECTIONS;
-                        // TODO: check size of code section against declared size
-                }
-        }
+		var f = module.functions.declared[cur_function++];
+		f.body = body;
+		if (cur_function == module.functions.declared.size()) {
+			state = BpState.SECTIONS;
+			var size = expected_code_size;
+			var read = decoder.pos + decoder.skipped - code_start;
+			if (size != read) {
+				FAIL2(decoder.pos,
+				"expected code section size of %d, read %d bytes", size, read);
+			}
+		}
+	}
 
 	private def checkSectionConstraints() {
 		// TODO
-        }
+	}
 	private def traceBuffer() {
 		if (!V) return;
 		buf.put2("[buf@+%d limit=%d", decoder.pos, decoder.limit);
@@ -544,6 +606,10 @@ class BinParser(verbose: Verbosity, filename: string) {
 		var msg = Strings.format3(fmt, arg1, arg2, arg3);
 		decoder.fail_at(pt, msg, ());
 	}
+	def toPrintableChar(b: byte) -> byte {
+		if (b < ' ' || b > 127) b = '.';
+		return b;
+	}
 	def flush() {
 		System.puts(buf.extract());
 	}
@@ -556,15 +622,15 @@ def WASM_MAGIC = 0x6d736100u;
 def WASM_VERSION = 0x01u;
 // Selects the amount of tracing output printed by the decoder.
 enum Verbosity {
-	SILENT,     // no output
+	SILENT,	    // no output
 	DIAGNOSTIC, // summarizes sections prior to error, verbose near error
 	VERBOSE	    // details for everything printed
 }
 // Used internally in the binary parser.
 enum BpState {
 	HEADER,
-        SECTIONS,
-        FUNCTIONS
+	SECTIONS,
+	FUNCTIONS
 }
 // Section codes.
 enum BpSection(code: byte) {
@@ -618,12 +684,12 @@ def renderImportKind(buf: StringBuffer, b: byte) -> StringBuffer {
 // Type constructor codes.
 enum BpTypecon(code: byte) {
 	I32(0x7F),
-        I64(0x7E),
-        F32(0x7D),
-        F64(0x7C),
-        VEC128(0x7B), // ext:simd
+	I64(0x7E),
+	F32(0x7D),
+	F64(0x7C),
+	VEC128(0x7B), // ext:simd
 	AnyFunc(0x70),
-        AnyRef(0x6F), // ext:reference-types
+	AnyRef(0x6F), // ext:reference-types
 	Function(0x60),
 	EmptyBlock(0x40)
 }
@@ -645,8 +711,12 @@ def renderTypecon(buf: StringBuffer, b: byte) -> StringBuffer {
 def renderNone(buf: StringBuffer, b: byte) -> StringBuffer {
 	return buf;
 }
-def renderGlobalFlags = renderNone; // TODO
+def renderGlobalFlags(buf: StringBuffer, b: byte) -> StringBuffer {
+	if ((b & 1) == 1) buf.puts("mutable");
+	return buf;
+}
 def renderLimitFlags(buf: StringBuffer, b: byte) -> StringBuffer {
 	if ((b & 1) == 1) buf.puts("has_max");
+	if ((b & 2) == 2) buf.puts(" shared");
 	return buf;
 }
