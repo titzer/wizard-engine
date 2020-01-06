@@ -5,19 +5,19 @@
 // representation. The parser uses a "push" model which allows the creator
 // to input segments of data into the parser incrementally, e.g. if streaming
 // it over a network.
-class BinParser(verbose: Verbosity, filename: string) {
-	private def module = Module.new();
+class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
+	new() super(Module.new()) {
+		verbose = vb.tag > Verbosity.SILENT.tag;
+	}
+
 	private var state = BpState.HEADER;
 	private var cur_function: int;
-	private var decoder = Decoder.new([]);
 	private var size_estimate: int;
 	private var expected_code_size: int;
 	private var code_start: int;
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var total_module_size: int;
 	private var current_section: byte;
-	private def V = verbose.tag > Verbosity.SILENT.tag;
-	private def buf = StringBuffer.new();
 
 	// Checks whether any error has occured yet and returns {true} if not.
 	def ok() -> bool { return decoder.ok() || decoder.eof; }
@@ -106,8 +106,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 	}
 
 	private def rewind(pos: int, expect: int) {
-		if (V) {
-			buf.put2("[rewind to +%d, expecting %d]\n", pos, expect);
+		if (verbose) {
+			trace.put2("[rewind to +%d, expecting %d]\n", pos, expect);
 			flush();
 		}
 		decoder.at(pos);
@@ -119,8 +119,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 		var start = decoder.pos;
 		var code = readByte("section code", renderSectionName);
 		var size = readU32("section size", 0, Limits.max_module_size);
-		if (V) {
-			buf.put3("=>section code=%d (%q), size=%d\n",
+		if (verbose) {
+			trace.put3("=>section code=%d (%q), size=%d\n",
 				code, renderSectionName(_, code), size);
 			flush();
 		}
@@ -203,8 +203,8 @@ class BinParser(verbose: Verbosity, filename: string) {
 		if (!decoder.ok()) return;
 		if (count < MAX_GROW_SIZE) vec.grow(int.!(count));
 		for (index < int.!(count)) {
-			if (V) {
-				buf.put2("==>%s #%d\n", thing_name, index);
+			if (verbose) {
+				trace.put2("==>%s #%d\n", thing_name, index);
 				flush();
 			}
 			var thing = read(index);
@@ -232,19 +232,6 @@ class BinParser(verbose: Verbosity, filename: string) {
 			rtypes[int.!(j)] = readValueType();
 		}
 		return TypeDecl.Function(ptypes, rtypes);
-	}
-	private def readValueType() -> ValueType {
-		var pt = decoder.pos, b = readByte("type constructor", renderTypecon);
-		match (b) {
-			BpTypecon.I32.code => return ValueType.I32;
-			BpTypecon.I64.code => return ValueType.I64;
-			BpTypecon.F32.code => return ValueType.F32;
-			BpTypecon.F64.code => return ValueType.F64;
-			BpTypecon.VEC128.code => return ValueType.VEC128;
-			BpTypecon.AnyRef.code => return ValueType.ANYREF;
-		}
-		FAIL1(pt, "invalid value type %x", b);
-		return ValueType.I32;
 	}
 	private def readImportDecl(index: int) -> ImportDecl {
 		var module_name = readString("import module name");
@@ -311,7 +298,7 @@ class BinParser(verbose: Verbosity, filename: string) {
 		var details: ExportDetails;
 		match (kind) {
 			BpImportExportKind.Function.code => {
-				var index = readFuncIndex();
+				var index = readFunc().0;
 				details = ExportDetails.Function(index);
 			}
 			BpImportExportKind.Table.code => {
@@ -323,7 +310,7 @@ class BinParser(verbose: Verbosity, filename: string) {
 				details = ExportDetails.Memory(index);
 			}
 			BpImportExportKind.Global.code => {
-				var index = readGlobalIndex();
+				var index = readGlobal().0;
 				details = ExportDetails.Global(index);
 			}
 			_ => FAIL1(pt, "invalid export kind %x", kind);
@@ -353,7 +340,7 @@ class BinParser(verbose: Verbosity, filename: string) {
 		} else {  // function indices
 			var array = Array<int>.new(int.!(count));
 			for (i < int.!(count)) {
-				array[i] = readFuncIndex();
+				array[i] = readFunc().0;
 			}
 			details = ElemDetails.FuncRefs(array);
 		}
@@ -377,50 +364,9 @@ class BinParser(verbose: Verbosity, filename: string) {
 		return DataDecl.new(mem_index, offset, data, active);
 	}
 	private def readStartSection() {
-		module.start_function = readFuncIndex();
+		module.start_function = readFunc().0;
 	}
 
-	def readU32(quantity: string, min: u32, max: u32) -> u32 {
-		var pt = decoder.pos;
-		var val = decoder.read_u32leb();
-		if (decoder.eof) return 0;
-		if (val < min) FAIL3(pt, "%s %d exceeds minimum %d", quantity, val, min);
-		if (val > max) FAIL3(pt, "%s %d exceeds maximum %d", quantity, val, max);
-		if (V) {
-			outbytes(pt, quantity);
-			buf.putd(val).ln();
-			flush();
-		}
-		return val;
-	}
-	def readU64(quantity: string) -> u64 {
-		var pt = decoder.pos;
-		var val = decoder.read_u64leb();
-		if (decoder.eof) return 0;
-		if (V) {
-			outbytes(pt, quantity);
-			buf.putd(val).ln();
-			flush();
-		}
-		return val;
-	}
-	def readString(quantity: string) -> string {
-		var len = readU32("string length", 0, Limits.max_module_size);
-		var pt = decoder.pos;
-		var str = decoder.read_bytes(int.!(len));
-		if (V) {
-			outbytes(pt, quantity);
-			buf.puts("\"");
-			var max = 24;
-			var count = decoder.pos - pt;
-			for (i = 0; i < count && i < max; i++) {
-				buf.put1("%c", toPrintableChar(decoder.data[pt + i]));
-			}
-			buf.puts("\"\n");
-			flush();
-		}
-		return str;
-	}
 	def readLimits(quantity: string, limit: u32) -> (int, int) {
 		var flags = readByte("flags", renderLimitFlags);
 		var min = readU32("minimum", 0, limit);
@@ -449,29 +395,6 @@ class BinParser(verbose: Verbosity, filename: string) {
 			if (shared && !has_max) FAIL1(pt, "shared memory must have maximum", ());
 		}
 		return (int.!(min), max, shared);
-	}
-	def readTableIndex() -> int {
-		return readIndex("table index", module.tables).0;
-	}
-	def readSigIndex() -> (int, TypeDecl.Function) {
-		var r = readIndex("signature index", module.types);
-		var t = if(TypeDecl.Function.?(r.1), TypeDecl.Function.!(r.1));
-		return (r.0, t);
-	}
-	def readFuncIndex() -> int {
-		return readIndex("function index", module.functions).0;
-	}
-	def readMemoryIndex() -> int {
-		return readIndex("memory index", module.memories).0;
-	}
-	def readGlobalIndex() -> int {
-		return readIndex("global index", module.globals).0;
-	}
-	def readIndex<T>(quantity: string, space: IndexSpace<T>) -> (int, T) {
-		var pt = decoder.pos;
-		var index = readU32(quantity, 0, u32.!(space.size()));
-		var t = if(index < space.size(), space[int.!(index)]);
-		return (int.!(index), t);
 	}
 	def readElemType() -> ElemType {
 		var pt = decoder.pos;
@@ -520,7 +443,7 @@ class BinParser(verbose: Verbosity, filename: string) {
 				expr = InitExpr.F64(val);
 			}
 			WasmOpcode.GLOBAL_GET.code => {
-				var val = readGlobalIndex();
+				var val = readGlobal().0;
 				expr = InitExpr.Global(val);
 			}
 			_ => {
@@ -535,31 +458,6 @@ class BinParser(verbose: Verbosity, filename: string) {
 		}
 		return expr;
 	}
-	def readByte(quantity: string, render: (StringBuffer, byte) -> StringBuffer) -> byte {
-		var pt = decoder.pos;
-		var r = decoder.read_u8();
-		if (V) {
-			outbytes(pt, quantity);
-			buf.put2("%d (%q)\n", r, render(_, r));
-			flush();
-		}
-		return r;
-	}
-
-	def outbytes(pt: int, quantity: string) -> StringBuffer {
-		if (quantity == null) return buf;
-		var count = decoder.pos - pt;
-		buf.put1("%x: ", pt + decoder.skipped);
-		for (i < count) {
-			if (i > 0 && (i % 8) == 0) buf.puts("\n          ");
-			buf.put1("%x ", decoder.data[pt + i]);
-		}
-		var rounded = ((count + 7) / 8) * 8;
-		for (i < rounded - count) buf.puts("   ");
-		buf.put1(" %s = ", quantity);
-		return buf;
-	}
-
 	private def readFunctionBody() {
 		var start = decoder.pos;
 		var size = readU32("function size", 0, Limits.max_func_size);
@@ -581,37 +479,6 @@ class BinParser(verbose: Verbosity, filename: string) {
 
 	private def checkSectionConstraints() {
 		// TODO
-	}
-	private def traceBuffer() {
-		if (!V) return;
-		buf.put2("[buf@+%d limit=%d", decoder.pos, decoder.limit);
-		if (decoder.eof) buf.puts("eof ");
-		if (decoder.error_pos < int.max) {
-			buf.put1(" err@+%d", decoder.error_pos);
-		}
-		if (decoder.error_msg != null) {
-			buf.put1(" msg=\"%s\"", decoder.error_msg);
-		}
-		buf.putc(']').ln();
-		flush();
-	}
-	def FAIL1<T>(pt: int, fmt: string, arg: T) {
-		decoder.fail_at(pt, fmt, arg);
-	}
-	def FAIL2<T, U>(pt: int, fmt: string, arg1: T, arg2: U) {
-		var msg = Strings.format2(fmt, arg1, arg2);
-		decoder.fail_at(pt, msg, ());
-	}
-	def FAIL3<T, U, V>(pt: int, fmt: string, arg1: T, arg2: U, arg3: V) {
-		var msg = Strings.format3(fmt, arg1, arg2, arg3);
-		decoder.fail_at(pt, msg, ());
-	}
-	def toPrintableChar(b: byte) -> byte {
-		if (b < ' ' || b > 127) b = '.';
-		return b;
-	}
-	def flush() {
-		System.puts(buf.extract());
 	}
 }
 // Internal constants.
@@ -719,4 +586,259 @@ def renderLimitFlags(buf: StringBuffer, b: byte) -> StringBuffer {
 	if ((b & 1) == 1) buf.puts("has_max");
 	if ((b & 2) == 2) buf.puts(" shared");
 	return buf;
+}
+def EMPTY: Array<ValueType> = [];
+def FUNC_EMPTY = TypeDecl.Function(EMPTY, EMPTY);
+def FUNC_I32 = TypeDecl.Function(EMPTY, [ValueType.I32]);
+def FUNC_I64 = TypeDecl.Function(EMPTY, [ValueType.I64]);
+def FUNC_F32 = TypeDecl.Function(EMPTY, [ValueType.F32]);
+def FUNC_F64 = TypeDecl.Function(EMPTY, [ValueType.F64]);
+def FUNC_VEC128 = TypeDecl.Function(EMPTY, [ValueType.VEC128]);
+def FUNC_ANYREF = TypeDecl.Function(EMPTY, [ValueType.ANYREF]);
+// A binary parser customized to immediates.
+class BinImmParser extends WasmParser {
+	new(module: Module, decoder: Decoder) super(module) {
+		this.decoder = decoder;
+	}
+	// skip an immediate of the given kind and return its size
+	def skipImm(kind: ImmKind) -> int {
+		var pt = decoder.pos;
+		match (kind) {
+			NONE => ;
+			BLOCK_TYPE => readBlockType();
+			LABEL => readLabel();
+			LABELS => readLabels();
+			FUNC_INDEX => readFunc();
+			SIG_INDEX => readSigIndex();
+			LOCAL_INDEX => readLocalIndex();
+			GLOBAL_INDEX => readGlobal();
+			MEMORY_INDEX => readMemoryIndex();
+			MEMARG => readMemoryArg();
+			I32 => readI32();
+			I64 => readI64();
+			F32 => readF32();
+			F64 => readF64();
+		}
+		return decoder.pos - pt;
+	}
+	def readBlockType() -> TypeDecl.Function {
+		var pt = decoder.pos, b = readByte("block type", renderTypecon);
+		match (b) {
+			0x40 => return FUNC_EMPTY;
+			BpTypecon.I32.code => return FUNC_I32;
+			BpTypecon.I64.code => return FUNC_I64;
+			BpTypecon.F32.code => return FUNC_F32;
+			BpTypecon.F64.code => return FUNC_F64;
+			BpTypecon.VEC128.code => return FUNC_VEC128;
+			BpTypecon.AnyRef.code => return FUNC_ANYREF;
+		}
+		decoder.at(pt); // backup and try again as full signed LEB
+		var index = decoder.read_i32leb(), r: TypeDecl.Function;
+		if (index < 0 || index > module.types.size()) {
+			FAIL1(pt, "invalid block type %d", index);
+			return r;
+		}
+		var t = module.types[index];
+		if (TypeDecl.Function.?(t)) {
+			return TypeDecl.Function.!(t);
+		} else {
+			var d: TypeDecl.Function;
+			FAIL1(pt, "expected type index %d to be a function", index);
+			return r;
+		}
+	}
+	def readLabel() -> u32 {
+		var depth = decoder.read_u32leb();
+		return depth;
+	}
+	def readLabels() -> Array<u32> {
+		var pt = decoder.pos;
+		var count = decoder.read_u32leb(), max = Limits.max_func_size;
+		if (count > max) {
+			FAIL2(pt, "target count %d exceeds maximum %d", count, max);
+			return null;
+		}
+		var length = int.!(count + 1);
+		var result = Array<u32>.new(length);
+		for (i < length) result[i] = decoder.read_u32leb();
+		return result;
+	}
+	def readLocalIndex() -> u32 {
+		var index = decoder.read_u32leb();
+		return index;
+	}
+	def readMemoryArg() -> (u32, u32) {
+		var flags = readU32("memarg flags", 0, u32.max); // TODO render
+		var offset = readU32("memarg offset", 0, u32.max);
+		return (flags, offset);
+	}
+	def readI32() -> u32 {
+		var val = decoder.read_u32leb();
+		return val;
+	}
+	def readI64() -> u64 {
+		var val = decoder.read_u64leb();
+		return val;
+	}
+	def readF32() -> u32 {
+		var val = decoder.read_u32();
+		return val;
+	}
+	def readF64() -> u64 {
+		var val = decoder.read_u64();
+		return val;
+	}
+}
+// Contains common routines for the module parser and function body parser.
+class WasmParser(module: Module) {
+	var decoder = Decoder.new([]);
+	var verbose = false;
+	def trace = StringBuffer.new();
+
+	def readTableIndex() -> int {
+		return readIndex("table index", module.tables).0;
+	}
+	def readSigIndex() -> (int, TypeDecl.Function) {
+		var pt = decoder.pos;
+		var r = readIndex("signature index", module.types);
+		if (TypeDecl.Function.?(r.1)) {
+			return (r.0, TypeDecl.Function.!(r.1));
+		} else {
+			var d: TypeDecl.Function;
+			FAIL1(pt, "expected type index %d to be a function", r.0);
+			return (r.0, d);
+		}
+	}
+	def readFunc() -> (int, FunctionDecl) {
+		return readIndex("function index", module.functions);
+	}
+	def readMemoryIndex() -> int {
+		return readIndex("memory index", module.memories).0;
+	}
+	def readGlobal() -> (int, GlobalDecl) {
+		return readIndex("global index", module.globals);
+	}
+	def readIndex<T>(quantity: string, space: IndexSpace<T>) -> (int, T) {
+		var pt = decoder.pos;
+		var max = space.size();
+		var index = int.!(readU32(quantity, 0, u32.!(max)));
+		var t: T;
+		if (index < space.size()) {
+			t = space[index];
+		} else {
+			FAIL3(pt, "%s %d exceeds maximum %d", quantity, index, max);
+		}
+		return (index, t);
+	}
+	def readValueType() -> ValueType {
+		var pt = decoder.pos, b = readByte("type constructor", renderTypecon);
+		match (b) {
+			BpTypecon.I32.code => return ValueType.I32;
+			BpTypecon.I64.code => return ValueType.I64;
+			BpTypecon.F32.code => return ValueType.F32;
+			BpTypecon.F64.code => return ValueType.F64;
+			BpTypecon.VEC128.code => return ValueType.VEC128;
+			BpTypecon.AnyRef.code => return ValueType.ANYREF;
+		}
+		FAIL1(pt, "invalid value type %x", b);
+		return ValueType.I32;
+	}
+	def readU32(quantity: string, min: u32, max: u32) -> u32 {
+		var pt = decoder.pos;
+		var val = decoder.read_u32leb();
+		if (decoder.eof) return 0;
+		if (val < min) FAIL3(pt, "%s %d exceeds minimum %d", quantity, val, min);
+		if (val > max) FAIL3(pt, "%s %d exceeds maximum %d", quantity, val, max);
+		if (verbose) {
+			traceBytes(pt, quantity);
+			trace.putd(val).ln();
+			flush();
+		}
+		return val;
+	}
+	def readU64(quantity: string) -> u64 {
+		var pt = decoder.pos;
+		var val = decoder.read_u64leb();
+		if (decoder.eof) return 0;
+		if (verbose) {
+			traceBytes(pt, quantity);
+			trace.putd(val).ln();
+			flush();
+		}
+		return val;
+	}
+	def readString(quantity: string) -> string {
+		var len = readU32("string length", 0, Limits.max_module_size);
+		var pt = decoder.pos;
+		var str = decoder.read_bytes(int.!(len));
+		if (verbose) {
+			traceBytes(pt, quantity);
+			trace.puts("\"");
+			var max = 24;
+			var count = decoder.pos - pt;
+			for (i = 0; i < count && i < max; i++) {
+				trace.put1("%c", toPrintableChar(decoder.data[pt + i]));
+			}
+			trace.puts("\"\n");
+			flush();
+		}
+		return str;
+	}
+	def readByte(quantity: string, render: (StringBuffer, byte) -> StringBuffer) -> byte {
+		var pt = decoder.pos;
+		var r = decoder.read_u8();
+		if (verbose) {
+			traceBytes(pt, quantity);
+			trace.put2("%d (%q)\n", r, render(_, r));
+			flush();
+		}
+		return r;
+	}
+
+	def traceBytes(pt: int, quantity: string) -> StringBuffer {
+		if (quantity == null) return trace;
+		var count = decoder.pos - pt;
+		trace.put1("%x: ", pt + decoder.skipped);
+		for (i < count) {
+			if (i > 0 && (i % 8) == 0) trace.puts("\n         ");
+			trace.put1("%x ", decoder.data[pt + i]);
+		}
+		var rounded = ((count + 7) / 8) * 8;
+		for (i < rounded - count) trace.puts("   ");
+		trace.put1(" %s = ", quantity);
+		return trace;
+	}
+
+	def traceBuffer() {
+		if (!verbose) return;
+		trace.put2("[buf@+%d limit=%d", decoder.pos, decoder.limit);
+		if (decoder.eof) trace.puts("eof ");
+		if (decoder.error_pos < int.max) {
+			trace.put1(" err@+%d", decoder.error_pos);
+		}
+		if (decoder.error_msg != null) {
+			trace.put1(" msg=\"%s\"", decoder.error_msg);
+		}
+		trace.putc(']').ln();
+		flush();
+	}
+
+	def FAIL1<T>(pt: int, fmt: string, arg: T) {
+		decoder.fail_at(pt, fmt, arg);
+	}
+	def FAIL2<T, U>(pt: int, fmt: string, arg1: T, arg2: U) {
+		var msg = Strings.format2(fmt, arg1, arg2);
+		decoder.fail_at(pt, msg, ());
+	}
+	def FAIL3<T, U, V>(pt: int, fmt: string, arg1: T, arg2: U, arg3: V) {
+		var msg = Strings.format3(fmt, arg1, arg2, arg3);
+		decoder.fail_at(pt, msg, ());
+	}
+	def toPrintableChar(b: byte) -> byte {
+		if (b < ' ' || b > 127) b = '.';
+		return b;
+	}
+	def flush() {
+		System.puts(trace.extract());
+	}
 }

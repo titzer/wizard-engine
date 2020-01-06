@@ -1,0 +1,356 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements that validation logic for the code of a function.
+class CodeValidator(module: Module) {
+	def parser = BinImmParser.new(module, null);
+	def locals = Vector<ValueType>.new();
+	def val_stack = Stack<ValueType>.new();
+	def ctl_stack = Stack<ControlEntry>.new();
+	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
+	var func: FunctionDecl;
+	var opcode_pt: int;
+
+	def validate(f: FunctionDecl) {
+		func = f;
+		parser.decoder = Decoder.new(f.body);  // TODO(fast): reuse Decoder
+		ctl_stack.clear();
+		val_stack.clear();
+		setupParams();
+		readLocalDecls();
+		opcode_pt = parser.decoder.pos;
+		pushControl(WasmOpcode.UNREACHABLE.code, f.functype);
+		validateCode();
+	}
+
+	def setupParams() {
+		var p = func.functype.params;
+		locals.resize(p.length);
+		for (i < p.length) locals[i] = p[i];
+	}
+	def readLocalDecls() {
+		var d = parser.readU32("local decl count", 0, Limits.max_num_locals);
+		for (i < d) {
+			var count = parser.readU32("local count", 0, Limits.max_num_locals);
+			var ltype = parser.readValueType();
+			for (i < count) locals.add(ltype); // TODO(fast): bulk append value type
+		}
+	}
+	def validateCode() {
+		var d = parser.decoder;
+		while (d.pos < d.limit) {
+			opcode_pt = parser.decoder.pos;
+			var opcode = parser.readByte("opcode", WasmOpcodes.render);
+			// FAST: Handle short operators (predictable direct branch)
+			if (WasmOpcodes.isShortOperator[opcode]) {
+				// TODO(fast): combine signature read with isOperator() check
+				var sig = WasmOpcodes.signatures[opcode];
+				var p = sig.params, r = sig.results;
+				if (p.length > 0) checkAndPopArgs(p);
+				if (r.length > 0) pushTypes(r);
+				continue;
+			}
+			// Handle all other operators in the switch (indirect branch)
+			match (opcode) {
+				WasmOpcode.UNREACHABLE.code => {
+					ctl_top.reachable = false;
+					val_stack.top = ctl_top.val_stack_top;
+				}
+				WasmOpcode.BLOCK.code => {
+					var sig = parser.readBlockType();
+					checkArgs(sig.params);
+					pushControl(opcode, sig);
+				}
+				WasmOpcode.LOOP.code => {
+					var sig = parser.readBlockType();
+					checkArgs(sig.params);
+					pushControl(opcode, sig);
+				}
+				WasmOpcode.IF.code => {
+					var sig = parser.readBlockType();
+					popE(ValueType.I32);
+					checkArgs(sig.params);
+					pushControl(opcode, sig);
+				}
+				WasmOpcode.ELSE.code => {
+					checkArgsAndTransfer(ctl_top.sig.results, ctl_top.val_stack_top);
+					if (ctl_top.start_opcode != WasmOpcode.IF.code) {
+						return parser.FAIL1(opcode_pt, "mismatched else", ());
+					}
+					ctl_top.start_opcode = opcode;
+					val_stack.top = ctl_top.val_stack_top;
+					pushTypes(ctl_top.sig.params);
+				}
+				WasmOpcode.END.code => {
+					checkArgsAndTransfer(ctl_top.sig.results, ctl_top.val_stack_top);
+					var ctl = popControl();
+					if (ctl == null) {
+						return parser.FAIL1(opcode_pt, "empty control stack", ());
+					}
+				}
+				WasmOpcode.BR.code => {
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					checkAndPopArgs(target.sig.results);
+					ctl_top.reachable = false;
+					val_stack.top = ctl_top.val_stack_top;
+				}
+				WasmOpcode.BR_IF.code => {
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					popE(ValueType.I32);
+					checkArgs(target.sig.results);
+				}
+				WasmOpcode.BR_TABLE.code => {
+					var labels = parser.readLabels();
+					popE(ValueType.I32);
+					for (depth in labels) {
+						var target = getControl(depth);
+						if (target == null) return;
+						checkArgs(target.sig.results);
+					}
+					ctl_top.reachable = false;
+					val_stack.top = ctl_top.val_stack_top;
+				}
+				WasmOpcode.RETURN.code => {
+					checkAndPopArgs(func.functype.results);
+					ctl_top.reachable = false;
+					val_stack.top = ctl_top.val_stack_top;
+				}
+				WasmOpcode.CALL.code => {
+					var t = parser.readFunc(), target = t.1;
+					checkAndPopArgs(target.functype.params);
+					pushTypes(target.functype.results);
+				}
+				WasmOpcode.CALL_INDIRECT.code => {
+					var t = parser.readSigIndex(), sig = t.1;
+					popE(ValueType.I32);
+					checkAndPopArgs(sig.params);
+					pushTypes(sig.results);
+				}
+				WasmOpcode.DROP.code => {
+					popAny();
+				}
+				WasmOpcode.SELECT.code => {
+					popE(ValueType.I32);
+					var t = popAny();
+					popE(t);
+					val_stack.push(t);
+				}
+				WasmOpcode.LOCAL_GET.code => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					val_stack.push(t);
+				}
+				WasmOpcode.LOCAL_SET.code => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					popE(t);
+				}
+				WasmOpcode.LOCAL_TEE.code => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					popE(t);
+					val_stack.push(t);  // TODO: unreachable concern?
+				}
+				WasmOpcode.GLOBAL_GET.code => {
+					var g = parser.readGlobal().1;
+					if (g == null) return;
+					val_stack.push(g.valtype);
+				}
+				WasmOpcode.GLOBAL_SET.code => {
+					var g = parser.readGlobal().1;
+					if (g == null) return;
+					popE(g.valtype);
+				}
+				WasmOpcode.I32_LOAD.code,
+				WasmOpcode.I64_LOAD.code,
+				WasmOpcode.F32_LOAD.code,
+				WasmOpcode.F64_LOAD.code,
+				WasmOpcode.I32_LOAD8_S.code,
+				WasmOpcode.I32_LOAD8_U.code,
+				WasmOpcode.I32_LOAD16_S.code,
+				WasmOpcode.I32_LOAD16_U.code,
+				WasmOpcode.I64_LOAD8_S.code,
+				WasmOpcode.I64_LOAD8_U.code,
+				WasmOpcode.I64_LOAD16_S.code,
+				WasmOpcode.I64_LOAD16_U.code,
+				WasmOpcode.I64_LOAD32_S.code,
+				WasmOpcode.I64_LOAD32_U.code,
+				WasmOpcode.I32_STORE.code,
+				WasmOpcode.I64_STORE.code,
+				WasmOpcode.F32_STORE.code,
+				WasmOpcode.F64_STORE.code,
+				WasmOpcode.I32_STORE8.code,
+				WasmOpcode.I32_STORE16.code,
+				WasmOpcode.I64_STORE8.code,
+				WasmOpcode.I64_STORE16.code,
+				WasmOpcode.I64_STORE32.code => {
+					var memarg = parser.readMemoryArg();
+					// TODO: check alignment
+					var sig = WasmOpcodes.signatures[opcode];
+					checkAndPopArgs(sig.params);
+					pushTypes(sig.results);
+				}
+
+				WasmOpcode.MEMORY_SIZE.code,
+				WasmOpcode.MEMORY_GROW.code => {
+					var index = parser.readMemoryIndex();
+					var sig = WasmOpcodes.signatures[opcode];
+					checkAndPopArgs(sig.params);
+					pushTypes(sig.results);
+				}
+				WasmOpcode.I32_CONST.code => {
+					parser.readI32();
+					val_stack.push(ValueType.I32);
+				}
+				WasmOpcode.I64_CONST.code => {
+					parser.readI64();
+					val_stack.push(ValueType.I64);
+				}
+				WasmOpcode.F32_CONST.code => {
+					parser.readF32();
+					val_stack.push(ValueType.F32);
+				}
+				WasmOpcode.F64_CONST.code => {
+					parser.readF64();
+					val_stack.push(ValueType.F64);
+				}
+				_ => ;
+			}
+		}
+	}
+
+	def checkArgs(p: Array<ValueType>) {
+		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
+		val_stack.pushA(p);  // TODO: unreachable concern?
+	}
+	def checkAndPopArgs(p: Array<ValueType>) {
+		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
+	}
+	def checkArgsAndTransfer(p: Array<ValueType>, top: int) {
+		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
+		val_stack.top = top;
+		val_stack.pushA(p);
+	}
+
+	def push(v: ValueType) {
+		val_stack.push(v);
+	}
+	def pop() -> ValueType {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) parser.FAIL1(opcode_pt, "empty value stack", ());
+			return ValueType.I32;
+		}
+		return val_stack.pop();
+	}
+	def popE(expected: ValueType) {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) {
+				parser.FAIL1(opcode_pt, "empty value stack, expected %q",
+						ValueTypes.render(_, expected));
+			}
+			return; // unreachable or already signalled an error
+		}
+		var t = val_stack.pop();
+		if (!ValueTypes.isAssignable(t, expected)) {
+			parser.FAIL2(opcode_pt, "expected type %q, got %q",
+				ValueTypes.render(_, expected), ValueTypes.render(_, t));
+		}
+	}
+	def popAny() -> ValueType {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) parser.FAIL1(opcode_pt, "empty value stack", ());
+		}
+		return val_stack.pop();
+	}
+	def pushTypes(r: Array<ValueType>) {
+		val_stack.pushA(r);
+	}
+	def pushControl(opcode: byte, sig: TypeDecl.Function) -> ControlEntry {
+		var ctl = ctl_stack.next();
+		if (ctl != null) { // FAST: reuse previous ControlEntry object
+			ctl_stack.top++;
+		} else { // allocate and cache new ControlEntry object
+			ctl = ControlEntry.new();
+			ctl_stack.push(ctl);
+		}
+		ctl_top = ctl;
+		ctl.start_pt = opcode_pt;
+		ctl.start_opcode = opcode;
+		ctl.sig = sig;
+		ctl.val_stack_top = val_stack.top;
+		ctl.reachable = true;
+		return ctl;
+	}
+	def popControl() -> ControlEntry {
+		var entry = ctl_stack.pop();
+		ctl_top = ctl_stack.peek();
+		return entry;
+	}
+	def getControl(depth: u32) -> ControlEntry {
+		if (depth >= ctl_stack.top) {
+			parser.FAIL2(opcode_pt, "label %d exceeds control depth %d", depth, ctl_stack.top);
+			return null;
+		}
+		return ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
+	}
+	def getLocalType(index: u32) -> ValueType {
+		if (index >= locals.size()) {
+			parser.FAIL2(opcode_pt, "local index %d exceeds local count %d", index, locals.size());
+			return ValueType.I32;
+		}
+		return locals[int.!(index)];
+	}
+}
+// An entry in the control stack, exposed guts.
+class ControlEntry {
+	var start_pt: int;
+	var start_opcode: byte;
+	var sig: TypeDecl.Function;
+	var reachable = true;
+	var val_stack_top: int;
+}
+// FAST: custom lightweight stack data structure, exposed guts.
+class Stack<T> {
+	var elems = Array<T>.new(10);
+	var top = 0;
+	// Push a single element.
+	def push(v: T) {
+		if (top == elems.length) {
+			var nelems = Array<T>.new(elems.length * 4);
+			for (i < top) nelems[i] = elems[i];
+			elems = nelems;
+		}
+		elems[top++] = v;
+	}
+	// Push all the given elements.
+	def pushA(v: Array<T>) {
+		var end = top + v.length;
+		if (end > elems.length) {
+			var nelems = Array<T>.new(end + elems.length * 3);
+			for (i < top) nelems[i] = elems[i];
+			elems = nelems;
+		}
+		for (i < v.length) elems[top + i] = v[i];
+		top = end;
+	}
+	// FAST: Peek at the storage just above the top.
+	def next() -> T {
+		return if(top < elems.length - 1, elems[top]);
+	}
+	// Read the top of the stack without popping.
+	def peek() -> T {
+		return if(top > 0, elems[top - 1]);
+	}
+	// Pop the top of the stack and return it.
+	def pop() -> T {
+		return if(top > 0, elems[--top]);
+	}
+	// Reset stack height to 0.
+	def clear() {
+		top = 0;
+	}
+}
