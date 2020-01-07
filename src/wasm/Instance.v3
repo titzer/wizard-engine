@@ -1,0 +1,260 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Superclass of all import/exportable objects.
+class Exportable {
+}
+// Abstract base class of host and wasm functions.
+class Function(sig: TypeDecl.Function) extends Exportable {
+}
+// For functions provided by the host.
+class Executor {
+	def trap(reason: TrapReason);
+}
+class HostFunction extends Function {
+	def invoke: (Executor, Array<Value>) -> Array<Value>;
+	new(sig: TypeDecl.Function, invoke) super(sig) { }
+}
+// A function from a wasm instance.
+class WasmFunction(instance: Instance, decl: FunctionDecl) extends Function {
+	new() super(decl.sig) { }
+}
+class Memory(decl: MemoryDecl) extends Exportable {
+	var oom = false;
+	def deallocate() { }  // explicitly deallocate any virtual memory
+	def grow(pages: int) -> int;
+}
+class Table(decl: TableDecl) extends Exportable {
+	var oom = false;
+	def grow(elems: int) -> int;
+	def size() -> int;
+}
+class FunctionTable extends Table {
+	var elems: Array<Function>;
+	new(decl: TableDecl) super(decl) { }
+	def size() -> int { return elems.length; }
+}
+class ValueTable extends Table {
+	var elems: Array<Value>;
+	new(decl: TableDecl) super(decl) { }
+	def size() -> int { return elems.length; }
+}
+class Global(decl: GlobalDecl) extends Exportable {
+	var value: Value;
+}
+
+// An instantiated module, including memories, tables, functions, etc.
+class Instance(module: Module, imports: Array<Exportable>) {
+	def memories = Array<Memory>.new(module.memories.size());
+	private def functions = Array<Function>.new(module.functions.size());  // lazily allocated
+	def globals = Array<Global>.new(module.globals.size());
+	def tables = Array<Table>.new(module.tables.size());
+	def exports = Array<Exportable>.new(module.exports.size());
+	def dropped_elems = Array<bool>.new(module.elems.size());
+	def dropped_data = Array<bool>.new(module.data.size());
+	var valid = true;
+	var error_msg: string;
+
+	// Creates a new instance and internal objects. May fail and end up {valid == false}
+	// if the supplied imports do not validate. Loads active element and data segments,
+	// but does *not* execute the start function.
+	new() {
+		if (imports.length != module.imports.size()) return fail("import count mismatch");
+
+		// 1. Organize imports
+		var func_index = 0;
+		var table_index = 0;
+		var memory_index = 0;
+		var global_index = 0;
+
+		for (i < imports.length) {
+			var imp = imports[i];
+			var decl = module.imports[i];
+			match (decl.details) {
+				Function(decl) =>
+					functions[func_index++] = checkFunction(decl, imp);
+				Table(decl) =>
+					tables[table_index++] = checkTable(decl, imp);
+				Memory(decl) =>
+					memories[memory_index++] = checkMemory(decl, imp);
+				Global(decl) =>
+					globals[global_index++] = checkGlobal(decl, imp);
+			}
+			if (!valid) return;
+		}
+
+		// 2. Instantiate memories, tables, globals, etc.
+		for (i < module.tables.declared.size()) {
+			var decl = module.tables.declared[i];
+			var t = if(decl.elemtype == ElemType.FuncRef,
+					FunctionTable.new(decl),
+					ValueTable.new(decl));
+			tables[table_index++] = t;
+			if (t.oom) return fail("out of memory allocating table");
+		}
+		for (i < module.memories.declared.size()) {
+			var m = Memory.new(module.memories.declared[i]);
+			memories[memory_index++] = m;
+			if (m.oom) return fail("out of memory allocating memory");
+		}
+		for (i < module.globals.declared.size()) {
+			var d = module.globals.declared[i];
+			var g = Global.new(d);
+			globals[global_index++] = g;
+			g.value = evalInitExpr(d.init);
+		}
+
+		// 3. Load element segments.
+		for (i < module.elems.size()) {
+			var e = module.elems[i];
+			if (!e.active) continue;
+			var offset = Value.I32.!(evalInitExpr(e.offset)).val;
+			loadElems(tables[e.table_index], offset, e.details);
+			dropped_elems[i] = true;
+		}
+
+		// 4. Load data segments.
+		for (i < module.data.size()) {
+			var d = module.data[i];
+			if (!d.active) continue;
+			var offset = Value.I32.!(evalInitExpr(d.offset)).val;
+			loadData(memories[d.mem_index], offset, d.data);
+			dropped_data[i] = true;
+		}
+
+		// 5. Organize exports
+		for (i < module.exports.size()) {
+			var exp = module.exports[i];
+			var v: Exportable;
+			match (exp.details) {
+				Function(index) => v = getFunction(index);
+				Table(index) => v = tables[index];
+				Memory(index) => v = memories[index];
+				Global(index) => v = globals[index];
+			}
+			exports[i] = v;
+		}
+	}
+	// Lazily allocates and caches functions for this instance.
+	def getFunction(index: int) -> Function {
+		var f = functions[index];
+		if (f == null) {
+			f = functions[index] = WasmFunction.new(this, module.functions[index]);
+		}
+		return f;
+	}
+	private def fail(msg: string) {
+		valid = false;
+		error_msg = msg;
+		clear();
+	}
+	private def checkFunction(decl: FunctionDecl, imp: Exportable) -> Function {
+		if (!Function.?(imp)) {
+			fail("expected function import");
+			return null;
+		}
+		var func = Function.!(imp);
+		if (!ValueTypes.isAssignableSig(decl.sig, func.sig)) fail("function sig mismatch");
+		return func;
+	}
+	private def checkTable(decl: TableDecl, imp: Exportable) -> Table {
+		if (!Table.?(imp)) {
+			fail("expected table import");
+			return null;
+		}
+		var table = Table.!(imp);
+		if (!checkLimits(table.decl.minimum, table.decl.maximum, decl.minimum, decl.maximum)) {
+			fail("table limits mismatch");
+		}
+		return table;
+	}
+	private def checkMemory(decl: MemoryDecl, imp: Exportable) -> Memory {
+		if (!Memory.?(imp)) {
+			fail("expected import");
+			return null;
+		}
+		var memory = Memory.!(imp);
+		if (!checkLimits(memory.decl.minimum, memory.decl.maximum, decl.minimum, decl.maximum)) {
+			fail("memory limits mismatch");
+		}
+		if (memory.decl.shared != decl.shared) {
+			fail("memory sharing mismatch");
+		}
+		return memory;
+	}
+	private def checkGlobal(decl: GlobalDecl, imp: Exportable) -> Global {
+		if (!Global.?(imp)) {
+			fail("expected global import");
+			return null;
+		}
+		var global = Global.!(imp);
+		if (decl.mutable != global.decl.mutable) {
+			fail("global immutability mismatch");
+		}
+		if (!ValueTypes.isAssignable(global.decl.valtype, decl.valtype)) {
+			fail("global type mismatch");
+		}
+		if (!decl.mutable &&!ValueTypes.isAssignable(global.decl.valtype, decl.valtype)) {
+			fail("global type mismatch");
+		}
+		return global;
+	}
+	private def evalInitExpr(init: InitExpr) -> Value {
+		match (init) {
+			I32(val) => return Value.I32(u32.!(val));
+			I64(val) => return Value.I64(u64.!(val));
+			F32(val) => return Value.F32(val);
+			F64(val) => return Value.F64(val);
+			Global(global_index) => {
+				return globals[global_index].value;
+			}
+		}
+	}
+	// Upon error, clear internal fields to prevent retaining garbage.
+	private def clear() {
+		for (i = module.memories.imported.size(); i < memories.length; i++) {
+			var m = memories[i];
+			if (m != null) m.deallocate();	// explicitly deallocate memory
+		}
+		for (i < memories.length) memories[i] = null;
+		for (i < functions.length) functions[i] = null;
+		for (i < globals.length) globals[i] = null;
+		for (i < tables.length) tables[i] = null;
+	}
+	private def checkLimits(fmin: int, fmax: int, tmin: int, tmax: int) -> bool {
+		if (fmin < tmin) return false;
+		if (tmax >= 0) {
+			if (fmax < 0) return false;
+			if (fmax > tmax) return false;
+			if (fmin > tmax) return false;
+		}
+		return true;
+	}
+	private def checkBounds(offset: u32, count: int, length: int) -> bool {
+		var end = offset + u32.!(count);
+		if (end < offset || end > length) {
+			fail("out of bounds in element initialization");
+			return false;
+		}
+		return true;
+	}
+	private def loadElems(table: Table, offset: u32, details: ElemDetails) {
+		match (details) {
+			FuncRefs(vals) => {
+				var ft = FunctionTable.!(table);
+				if (!checkBounds(offset, vals.length, ft.elems.length)) return;
+				for (i < vals.length) {
+					ft.elems[i + int.!(offset)] = getFunction(vals[i]);
+				}
+			}
+			Exprs(vals) => {
+				var vt = ValueTable.!(table);
+				if (!checkBounds(offset, vals.length, vt.elems.length)) return;
+				for (i < vals.length) {
+					vt.elems[i + int.!(offset)] = evalInitExpr(vals[i]);
+				}
+			}
+		}
+	}
+	private def loadData(memory: Memory, offset: u32, data: Array<byte>);
+}
