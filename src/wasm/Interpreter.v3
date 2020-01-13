@@ -5,11 +5,367 @@
 class Interpreter(instance: Instance) extends Executor {
 	def val_stack = Stack<Value>.new();
 	def call_stack = Stack<Frame>.new();
+	def codeptr = CodePtr.new();
+	var frame: Frame;	// cache of top-of-stack
+	var state: ExecState;
+	var trap_reason: TrapReason;
+	var error_msg: string;
+	var step_count: int;
+
+	def call(f: Function, args: Array<Value>) {
+	}
+
+	def pushFrame(f: WasmFunction) {
+		var nf = call_stack.next();
+		if (nf != null) {  // reuse cached Frame object if possible
+			call_stack.top++;
+		} else {
+			nf = Frame.new();
+			call_stack.push(nf);
+		}
+		var sp = val_stack.top;
+		nf.fp = sp - f.decl.sig.params.length;
+		val_stack.resize(sp + f.decl.code.num_locals);
+		nf.func = f;
+		nf.pc = f.decl.code.start_pc;
+		codeptr.reset(nf);
+		frame = nf;
+	}
+
+	def run(count: int) -> ExecState {
+		match (state) {
+			PAUSED,
+			RUNNING,
+			RESUME,
+			STOPPED => state = ExecState.RUNNING;
+			BREAKPOINT => state = ExecState.RESUME;
+			FINISHED,
+			TRAPPED => return state;
+		}
+		if (count <= 0) {
+			// Run until exhaustion.
+			while (true) {
+				var completed = step();
+				if (completed) step_count++;
+				if (state != ExecState.RUNNING) break;
+			}
+		} else {
+			// Run for a limited number of steps.
+			while (count-- > 0) {
+				var completed = step();
+				if (completed) step_count++;
+				if (state != ExecState.RUNNING) break;
+			}
+		}
+		return state;
+	}
+	// Execute a single instruction. Return {true} if the instruction was completed.
+	def step() -> bool {
+		var pc = codeptr.pos;
+		var opcode = codeptr.readopcode();
+		while (true) {
+			match (opcode) {
+				WasmOpcode.UNREACHABLE.code => {
+					trap(TrapReason.UNREACHABLE);
+				}
+				WasmOpcode.NOP.code => {
+					// do nothing
+				}
+				WasmOpcode.BLOCK.code,
+				WasmOpcode.LOOP.code => {
+					codeptr.readleb32(); // skip blocktype
+				}
+				WasmOpcode.IF.code => {
+					codeptr.readleb32(); // skip blocktype
+					var cond = popi32();
+					if (cond == 0) codeptr.pos = lookupBranch(pc);
+				}
+				WasmOpcode.ELSE.code => {
+					codeptr.pos = lookupBranch(pc);
+				}
+				WasmOpcode.END.code => {
+					if (codeptr.end()) doReturn();
+				}
+				WasmOpcode.BR.code => {
+					codeptr.pos = lookupBranchAndPop(pc);
+				}
+				WasmOpcode.BR_IF.code => {
+					var cond = popi32();
+					if (cond == 0) codeptr.readleb32();  // read and skip label
+					else codeptr.pos = lookupBranchAndPop(pc);
+				}
+				WasmOpcode.BR_TABLE.code => {
+					var key = popi32();
+					codeptr.pos = lookupSwitchAndPop(pc);
+				}
+				WasmOpcode.RETURN.code => {
+					doReturn();
+				}
+				WasmOpcode.CALL.code => {
+					var func_index = codeptr.readleb32();
+					doCall(func_index);
+				}
+				WasmOpcode.CALL_INDIRECT.code => {
+					var sig_index = codeptr.readleb32();
+					var table_index = codeptr.readleb32();
+					var func_index = popu32();
+					doCallIndirect(sig_index, table_index, func_index);
+				}
+				WasmOpcode.DROP.code => {
+					pop();
+				}
+				WasmOpcode.SELECT.code => {
+					var cond = popu32();
+					var a = pop();
+					var b = pop();
+					push(if(cond != 0, a, b));
+				}
+				WasmOpcode.LOCAL_GET.code => {
+					var index = codeptr.readleb32();
+					push(val_stack.elems[frame.fp + int.!(index)]);
+				}
+				WasmOpcode.LOCAL_SET.code => {
+					var index = codeptr.readleb32();
+					val_stack.elems[frame.fp + int.!(index)] = pop();
+				}
+				WasmOpcode.LOCAL_TEE.code => {
+					var index = codeptr.readleb32();
+					val_stack.elems[frame.fp + int.!(index)] = val_stack.peek();
+				}
+				WasmOpcode.GLOBAL_GET.code => {
+					var index = codeptr.readleb32();
+					push(instance.globals[int.!(index)].value);
+				}
+				WasmOpcode.GLOBAL_SET.code => {
+					var index = codeptr.readleb32();
+					instance.globals[int.!(index)].value = pop();
+				}
+				WasmOpcode.MEMORY_SIZE.code => {
+					var index = codeptr.readleb32();
+					var pages = instance.memories[int.!(index)].size();
+					pushu32(pages);
+				}
+				WasmOpcode.MEMORY_GROW.code => {
+					var index = codeptr.readleb32();
+					var result = instance.memories[int.!(index)].grow(popu32());
+					pushu32(u32.!(result));
+				}
+				WasmOpcode.I32_CONST.code => {
+					var val = codeptr.readleb32();
+					pushu32(val);
+				}
+				WasmOpcode.I64_CONST.code => {
+					var val = codeptr.readleb64();
+					pushu64(val);
+				}
+				WasmOpcode.F32_CONST.code => {
+					var val = codeptr.readu32();
+					push(Value.F32(val));
+				}
+				WasmOpcode.F64_CONST.code => {
+					var val = codeptr.readu64();
+					push(Value.F64(val));
+				}
+				WasmOpcode.I32_EQZ.code => pushbool(popu32() == 0);
+				WasmOpcode.I32_EQ.code => pushbool(popu32() == popu32());
+				WasmOpcode.I32_NE.code => pushbool(popu32() != popu32());
+				WasmOpcode.I32_LT_S.code => pushbool(popi32() < popi32());
+				WasmOpcode.I32_LT_U.code => pushbool(popu32() < popu32());
+				WasmOpcode.I32_GT_S.code => pushbool(popi32() > popi32());
+				WasmOpcode.I32_GT_U.code => pushbool(popu32() > popu32());
+				WasmOpcode.I32_LE_S.code => pushbool(popi32() <= popi32());
+				WasmOpcode.I32_LE_U.code => pushbool(popu32() <= popu32());
+				WasmOpcode.I32_GE_S.code => pushbool(popi32() >= popi32());
+				WasmOpcode.I32_GE_U.code => pushbool(popu32() >= popu32());
+
+				WasmOpcode.I32_ADD.code => pushu32(popu32() + popu32());
+				WasmOpcode.I32_SUB.code => pushu32(popu32() - popu32());
+				WasmOpcode.I32_MUL.code => pushu32(popu32() * popu32());
+
+				WasmOpcode.I64_EQZ.code => pushbool(popu64() == 0);
+				WasmOpcode.I64_EQ.code => pushbool(popu64() == popu64());
+				WasmOpcode.I64_NE.code => pushbool(popu64() != popu64());
+				WasmOpcode.I64_ADD.code => pushu64(popu64() + popu64());
+				WasmOpcode.I64_SUB.code => pushu64(popu64() - popu64());
+				WasmOpcode.I64_MUL.code => pushu64(popu64() * popu64());
+				WasmOpcode.I64_LT_S.code => pushbool(popi64() < popi64());
+				WasmOpcode.I64_LT_U.code => pushbool(popu64() < popu64());
+				WasmOpcode.I64_GT_S.code => pushbool(popi64() > popi64());
+				WasmOpcode.I64_GT_U.code => pushbool(popu64() > popu64());
+				WasmOpcode.I64_LE_S.code => pushbool(popi64() <= popi64());
+				WasmOpcode.I64_LE_U.code => pushbool(popu64() <= popu64());
+				WasmOpcode.I64_GE_S.code => pushbool(popi64() >= popi64());
+				WasmOpcode.I64_GE_U.code => pushbool(popu64() >= popu64());
+
+				InternalOpcode.BREAK.code => {
+					if (state == ExecState.RUNNING) {
+						state = ExecState.BREAKPOINT;
+						return false; // did not execute instruction
+					} else {
+						var orig_opcode = codeptr.orig[pc];
+						opcode = orig_opcode;
+						continue;  // re-execute switch with original opcode
+					}
+				}
+				InternalOpcode.PROBE.code => {
+					// TODO
+				}
+				_ => error("unknown opcode");
+			}
+			frame.pc = codeptr.pos;
+			break;
+		}
+		return true;
+	}
+	def lookupBranch(pc: int) -> int;
+	def lookupBranchAndPop(pc: int) -> int;
+	def lookupSwitchAndPop(pc: int) -> int;
+	def doReturn() {
+		var count = frame.func.decl.sig.results.length;
+		copyVals(count, frame.fp);
+		val_stack.resize(frame.fp + count);
+		call_stack.pop();
+		frame = call_stack.peek();
+		if (frame == null) {
+			state = ExecState.FINISHED;
+			codeptr.clear();
+		} else {
+			// Advance past caller's call instruction.
+			codeptr.reset(frame);
+			var opcode = codeptr.readopcode();
+			match (opcode) {
+				WasmOpcode.CALL.code => {
+					codeptr.readleb32();
+				}
+				WasmOpcode.CALL_INDIRECT.code => {
+					codeptr.readleb32();
+					codeptr.readleb32();
+				}
+			}
+			frame.pc = codeptr.pos;
+		}
+	}
+	def doCall(func_index: u32) {
+		var f = frame.func.instance.getFunction(int.!(func_index));
+		doCallFunction(f);
+	}
+	def doCallIndirect(sig_index: u32, table_index: u32, func_index: u32) {
+		if (func_index >= frame.func.instance.module.functions.size()) {
+			return trap(TrapReason.FUNC_INVALID);
+		}
+		var table = FunctionTable.!(frame.func.instance.tables[int.!(table_index)]);
+		var f = table.elems[int.!(func_index)];
+		var sig = TypeDecl.Function.!(frame.func.instance.module.types[int.!(sig_index)]);
+		if (!ValueTypes.isAssignableSig(f.sig, sig)) {
+			return trap(TrapReason.FUNC_SIG_MISMATCH);
+		}
+		doCallFunction(f);
+	}
+	def doCallFunction(f: Function) {
+		match (f) {
+			hf: HostFunction => {
+				var count = f.sig.params.length;
+				var args = Array<Value>.new(count);
+				var sp = val_stack.top - count;
+				for (i < count) args[i] = val_stack.elems[sp + i];
+				var results = hf.invoke(this, args);
+				count = f.sig.results.length;
+				val_stack.resize(sp + count);
+				for (i < count) val_stack.elems[sp + i] = results[i];
+			}
+			wf: WasmFunction => {
+				pushFrame(wf);
+			}
+		}
+	}
+	def trap(reason: TrapReason) {
+		state = ExecState.TRAPPED;
+		trap_reason = reason;
+	}
+	def pause();
+	def error(msg: string) {
+		state = ExecState.TRAPPED;
+		trap_reason = TrapReason.ERROR;
+		error_msg = msg;
+	}
+	def copyVals(count: int, dest: int) {
+		var sp = val_stack.top - count;
+		if (sp != dest) {
+			var e = val_stack.elems;
+			for (i < count) e[dest + i] = e[sp + i];
+		}
+	}
+	def pop() -> Value {
+		return val_stack.pop();
+	}
+	def popi32() -> i32 {
+		var val = val_stack.pop();
+		return i32.!(Value.I32.!(val).val);
+	}
+	def popu32() -> u32 {
+		var val = val_stack.pop();
+		return Value.I32.!(val).val;
+	}
+	def popi64() -> i64 {
+		var val = val_stack.pop();
+		return i64.!(Value.I64.!(val).val);
+	}
+	def popu64() -> u64 {
+		var val = val_stack.pop();
+		return Value.I64.!(val).val;
+	}
+	def push(val: Value) {
+		val_stack.push(val);
+	}
+	def pushbool(val: bool) {
+		val_stack.push(if(val, TRUE, FALSE));
+	}
+	def pushu32(val: u32) {
+		val_stack.push(Value.I32(val));
+	}
+	def pushu64(val: u64) {
+		val_stack.push(Value.I64(val));
+	}
+}
+enum ExecState {
+	STOPPED,	// execution has not yet begun
+	RUNNING,	// currently running
+	BREAKPOINT,	// stopped at (code) breakpoint
+	RESUME,		// continuing over current breakpoint
+	PAUSED,		// paused by probe
+	FINISHED,	// execution completed bottom-most function
+	TRAPPED		// execution encountered a trap
 }
 class Frame {
-	var instance: Instance;
-	var func: FunctionDecl;
-	var current_sp: int;
-	var current_pc: int;
-	var ret_pc: int;
+	var func: WasmFunction;
+	var fp: int;
+	var pc: int;
+}
+enum InternalOpcode(code: u8) {
+	BREAK(0x12),
+	PROBE(0x13)
+}
+def TRUE = Value.I32(1), FALSE = Value.I32(0);
+class CodePtr {
+	var code: Array<byte>;
+	var orig: Array<byte>;
+	var pos: int;
+	def readopcode() -> byte;
+	def readleb32() -> u32;
+	def readleb64() -> u64;
+	def readu32() -> u32;
+	def readu64() -> u64;
+	def readmemarg() -> (int, u32);
+	def reset(f: Frame) {
+		code = f.func.decl.code.code;
+		orig = f.func.decl.code.orig;
+		pos = f.pc;
+	}
+	def clear() {
+		code = orig = null;
+		pos = 0;
+	}
+	def end() -> bool {
+		return pos >= code.length;
+	}
 }
