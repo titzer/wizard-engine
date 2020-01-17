@@ -2,10 +2,11 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Interpreter for Wasm bytecode.
+def EMPTY: Array<byte> = [];
 class Interpreter extends Executor {
 	def val_stack = Stack<Value>.new();
 	def call_stack = Stack<Frame>.new();
-	def codeptr = CodePtr.new();
+	def codeptr = Decoder.new(EMPTY);
 	var frame: Frame;	// cache of top-of-stack
 	var state: ExecState;
 	var trap_reason: TrapReason;
@@ -33,7 +34,6 @@ class Interpreter extends Executor {
 	}
 
 	def pushFrame(f: WasmFunction) {
-		// TODO: initialize locals with properly-typed values
 		var nf = call_stack.next();
 		if (nf != null) {  // reuse cached Frame object if possible
 			call_stack.top++;
@@ -45,8 +45,25 @@ class Interpreter extends Executor {
 		nf.fp = sp - f.decl.sig.params.length;
 		val_stack.resize(sp + f.decl.code.num_locals);
 		nf.func = f;
-		nf.pc = f.decl.code.start_pc;
-		codeptr.reset(nf);
+		// Initialize locals
+		nf.pc = 0;
+		var code = f.decl.code.code;
+		codeptr.reset(code, 0, code.length);
+		var count = codeptr.read_u32leb();
+		for (i < count) {
+			var d = codeptr.read_u32leb();
+			var t = codeptr.read_u8();
+			var val: Value;
+			match (t) {
+				BpTypecon.I32.code => val = Values.I32_0;
+				BpTypecon.I64.code => val = Values.I64_0;
+				BpTypecon.F32.code => val = Values.F32_0;
+				BpTypecon.F64.code => val = Values.F64_0;
+				_ => error("invalid local value type");
+			}
+			for (i < d) val_stack.elems[sp++] = val;
+		}
+		nf.pc = codeptr.pos;
 		frame = nf;
 	}
 
@@ -80,7 +97,7 @@ class Interpreter extends Executor {
 	// Execute a single instruction. Return {true} if the instruction was completed.
 	def step() -> bool {
 		var pc = codeptr.pos;
-		var opcode = codeptr.readopcode();
+		var opcode = codeptr.read_u8();
 		if (traceSteps) traceStep(pc, opcode);
 		while (true) {
 			match (opcode) {
@@ -92,10 +109,10 @@ class Interpreter extends Executor {
 				}
 				WasmOpcode.BLOCK.code,
 				WasmOpcode.LOOP.code => {
-					codeptr.readleb32(); // skip blocktype
+					codeptr.read_u32leb(); // skip blocktype
 				}
 				WasmOpcode.IF.code => {
-					codeptr.readleb32(); // skip blocktype
+					codeptr.read_u32leb(); // skip blocktype
 					var cond = popi32();
 					if (cond == 0) codeptr.pos = doBranch(pc);
 				}
@@ -103,14 +120,14 @@ class Interpreter extends Executor {
 					codeptr.pos = doBranch(pc);
 				}
 				WasmOpcode.END.code => {
-					if (codeptr.end()) doReturn();
+					if (codeptr.available() == 0) doReturn();
 				}
 				WasmOpcode.BR.code => {
 					codeptr.pos = doBranch(pc);
 				}
 				WasmOpcode.BR_IF.code => {
 					var cond = popi32();
-					if (cond == 0) codeptr.readleb32();  // read and skip label
+					if (cond == 0) codeptr.read_u32leb();  // read and skip label
 					else codeptr.pos = doBranch(pc);
 				}
 				WasmOpcode.BR_TABLE.code => {
@@ -121,12 +138,12 @@ class Interpreter extends Executor {
 					doReturn();
 				}
 				WasmOpcode.CALL.code => {
-					var func_index = codeptr.readleb32();
+					var func_index = codeptr.read_u32leb();
 					doCall(func_index);
 				}
 				WasmOpcode.CALL_INDIRECT.code => {
-					var sig_index = codeptr.readleb32();
-					var table_index = codeptr.readleb32();
+					var sig_index = codeptr.read_u32leb();
+					var table_index = codeptr.read_u32leb();
 					var func_index = popu32();
 					doCallIndirect(sig_index, table_index, func_index);
 				}
@@ -140,52 +157,52 @@ class Interpreter extends Executor {
 					push(if(cond != 0, a, b));
 				}
 				WasmOpcode.LOCAL_GET.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					push(val_stack.elems[frame.fp + int.!(index)]);
 				}
 				WasmOpcode.LOCAL_SET.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					val_stack.elems[frame.fp + int.!(index)] = pop();
 				}
 				WasmOpcode.LOCAL_TEE.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					val_stack.elems[frame.fp + int.!(index)] = val_stack.peek();
 				}
 				WasmOpcode.GLOBAL_GET.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					push(frame.func.instance.globals[int.!(index)].value);
 				}
 				WasmOpcode.GLOBAL_SET.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					frame.func.instance.globals[int.!(index)].value = pop();
 				}
 
 				// TODO: Loads and stores
 
 				WasmOpcode.MEMORY_SIZE.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					var pages = frame.func.instance.memories[int.!(index)].size();
 					pushu32(pages);
 				}
 				WasmOpcode.MEMORY_GROW.code => {
-					var index = codeptr.readleb32();
+					var index = codeptr.read_u32leb();
 					var result = frame.func.instance.memories[int.!(index)].grow(popu32());
 					pushu32(u32.!(result));
 				}
 				WasmOpcode.I32_CONST.code => {
-					var val = codeptr.readleb32();
+					var val = codeptr.read_u32leb();
 					pushu32(val);
 				}
 				WasmOpcode.I64_CONST.code => {
-					var val = codeptr.readleb64();
+					var val = codeptr.read_u64leb();
 					pushu64(val);
 				}
 				WasmOpcode.F32_CONST.code => {
-					var val = codeptr.readu32();
+					var val = codeptr.read_u32();
 					push(Value.F32(val));
 				}
 				WasmOpcode.F64_CONST.code => {
-					var val = codeptr.readu64();
+					var val = codeptr.read_u64();
 					push(Value.F64(val));
 				}
 
@@ -399,7 +416,7 @@ class Interpreter extends Executor {
 						state = ExecState.BREAKPOINT;
 						return false; // did not execute instruction
 					} else {
-						var orig_opcode = codeptr.orig[pc];
+						var orig_opcode = frame.func.decl.code.orig[pc];
 						opcode = orig_opcode;
 						continue;  // re-execute switch with original opcode
 					}
@@ -447,18 +464,19 @@ class Interpreter extends Executor {
 		frame = call_stack.peek();
 		if (frame == null) {
 			state = ExecState.FINISHED;
-			codeptr.clear();
+			codeptr.reset(null, 0, 0);
 		} else {
 			// Advance past caller's call instruction.
-			codeptr.reset(frame);
-			var opcode = codeptr.readopcode();
+			var code = frame.func.decl.code.code;
+			codeptr.reset(code, 0, code.length);
+			var opcode = codeptr.read_u8();
 			match (opcode) {
 				WasmOpcode.CALL.code => {
-					codeptr.readleb32();
+					codeptr.read_u32leb();
 				}
 				WasmOpcode.CALL_INDIRECT.code => {
-					codeptr.readleb32();
-					codeptr.readleb32();
+					codeptr.read_u32leb();
+					codeptr.read_u32leb();
 				}
 			}
 			frame.pc = codeptr.pos;
@@ -579,59 +597,6 @@ enum InternalOpcode(code: u8) {
 	PROBE(0x13)
 }
 def TRUE = Value.I32(1), FALSE = Value.I32(0);
-class CodePtr {
-	var code: Array<byte>;
-	var orig: Array<byte>;
-	var pos: int;
-	def readopcode() -> byte {
-		return code[pos++];
-	}
-	def readleb32() -> u32 {
-		// TODO(fast): reuse decoder
-		var d = Decoder.new(code);
-		d.pos = pos;
-		var r = d.read_u32leb();
-		pos = d.pos;
-		return r;
-	}
-	def readleb64() -> u64 {
-		// TODO(fast): reuse decoder
-		var d = Decoder.new(code);
-		d.pos = pos;
-		var r = d.read_u64leb();
-		pos = d.pos;
-		return r;
-	}
-	def readu32() -> u32 {
-		// TODO(fast): reuse decoder
-		var d = Decoder.new(code);
-		d.pos = pos;
-		var r = d.read_u32();
-		pos = d.pos;
-		return r;
-	}
-	def readu64() -> u64 {
-		// TODO(fast): reuse decoder
-		var d = Decoder.new(code);
-		d.pos = pos;
-		var r = d.read_u64();
-		pos = d.pos;
-		return r;
-	}
-	def readmemarg() -> (int, u32);
-	def reset(f: Frame) {
-		code = f.func.decl.code.code;
-		orig = f.func.decl.code.orig;
-		pos = f.pc;
-	}
-	def clear() {
-		code = orig = null;
-		pos = 0;
-	}
-	def end() -> bool {
-		return pos >= code.length;
-	}
-}
 type Result {
 	case Break {}
 	case Value(vals: Array<Value>) {}

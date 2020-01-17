@@ -7,12 +7,9 @@
 // error. Read operations only succeed if all of the data they expect is
 // in the current buffer and instead signal an end-of-file error if they
 // would go past the end of the current buffer. When the caller has more data
-// to supply, they can use the append() and extract() calls to create new
-// instances that remember the position from the beginning of the
-// stream but do not retain any bytes before the current position.
-def LEB32_MAX_LENGTH = 5;
-def LEB64_MAX_LENGTH = 10;
-class Decoder(data: Array<byte>) {
+// to supply, they can use the append() and divest() calls add data to this
+// buffer while minding propering aliasing.
+class Decoder(var data: Array<byte>) {
 	var pos: int;
 	var eof: bool;
 	var error_pos = int.max;
@@ -50,13 +47,14 @@ class Decoder(data: Array<byte>) {
 		pos = npos;
 	}
 	// Set the current position of the decoder and reset any EOF error.
-	def reset(npos: int) -> this {
-		pos = npos;
-		if (eof) {
-			error_pos = int.max;
-			error_msg = null;
-			eof = false;
-		}
+	def reset(x: Array<byte>, xpos: int, xlength: int) -> this {
+		skipped = 0;
+		error_pos = int.max;
+		error_msg = null;
+		eof = false;
+		data = x;
+		pos = xpos;
+		limit = xpos + xlength;
 	}
 	// Record an error at the current position.
 	def fail<T>(msg: string, arg: T) -> this {
@@ -223,57 +221,63 @@ class Decoder(data: Array<byte>) {
 		pos += length;
 	}
 
-	// Append more data to the buffer of this decoder, returning a new decoder
-	// if necessary. In either case, the returned decoder will have its EOF flag
-	// reset. The {hint} parameter is a size hint so that if a new buffer needs
-	// to be created, it can be made large enough to accommodate future {append()}
-	// calls.
-	def append(hint: int, x: Array<byte>, xpos: int, xlength: int) -> Decoder {
+	// Append more data to the buffer of this decoder. Reuses the provided buffer if
+	// there is no remaining data in this one. The optional {hint} argument can be
+	// used by the caller to indicate that it expects to buffer that given number of
+	// bytes, and thus this method should preallocate that much.
+	def append(hint: int, x: Array<byte>, xpos: int, xlength: int) -> this {
+		if (eof) {
+			// Reset EOF flag and error because we have new data
+			error_pos = int.max;
+			error_msg = null;
+			eof = false;
+		}
 		if ((data.length - limit) >= xlength) {
 			// There is enough space to copy into this decoder's buffer.
-			for (i < xlength) {
-				data[pos + i] = x[xpos + i];
-			}
+			for (i < xlength) data[limit + i] = x[xpos + i];
 			limit += xlength;
-			reset(pos);  // reset EOF
-			return this;
+			return;
+		}
+		var avail = available(), diff = 0;
+		if (avail == 0 && x.length >= hint) {
+			// Reuse {x} in-place.
+			// TODO: check hint > x.length?
+			diff = pos - xpos;
+			data = x;
+			pos = xpos;
+			limit = xpos + xlength;
 		} else {
 			// Not enough space. Copy the old data and the new data together
 			// into a new buffer in a new decoder.
-			var avail = available();
 			var combined = avail + xlength;
 			var nlength = if(hint > combined, hint, combined);
 			var nbuf = Array<byte>.new(nlength);
-			for (i < avail) {
-				nbuf[i] = data[pos + i];
-			}
-			for (i < xlength) {
-				nbuf[avail + i] = x[xpos + i];
-			}
-			var result = Decoder.new(nbuf);
-			result.limit = combined;
-			if (error_pos < int.max) result.error_pos = error_pos - pos;
-			result.error_msg = error_msg;
-			result.skipped = pos;
-			return result;
+			for (i < avail) nbuf[i] = data[pos + i];
+			for (i < xlength) nbuf[avail + i] = x[xpos + i];
+
+			diff = pos;
+			data = nbuf;
+			pos = 0;
+			limit = combined;
 		}
+		if (error_pos < int.max) error_pos -= diff;
+		skipped += diff;
 	}
-	// Extract the available bytes from this decoder, producing a new decoder.
-	// The new decoder will have its EOF flag equal to this one's.
-	def extract(hint: int) -> Decoder {
+	// Divest from the given buffer {alias} so that this decoder no longer aliases it.
+	// Callers should use this method if they have previously provided {alias}
+	// to this decoder through the constructor or {append()} but now need to
+	// reuse {alias}.
+	def divest(hint: int, alias: Array<byte>) -> this {
+		if (alias != data) return; // nothing to do
 		var avail = available();
 		var nlength = if(hint > avail, hint, avail);
 		var nbuf = Array<byte>.new(nlength);
-		for (i < avail) {
-			nbuf[i] = data[pos + i];
-		}
-		var result = Decoder.new(nbuf);
-		result.limit = avail;
-		if (error_pos < int.max) result.error_pos = error_pos - pos;
-		result.error_msg = error_msg;
-		result.eof = eof;
-		result.skipped = skipped + pos;
-		return result;
+		for (i < avail) nbuf[i] = data[pos + i];  // copy data out
+		data = nbuf;
+		skipped += pos;
+		limit = avail;
+		if (error_pos < int.max) error_pos = error_pos - pos;
+		pos = 0;
 	}
 }
 // A utility class to represent either a successfully decoded item or an error.
