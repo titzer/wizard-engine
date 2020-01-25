@@ -3,25 +3,29 @@
 
 // Implements that validation logic for the code of a function.
 class CodeValidator(module: Module) {
-	def parser = BinImmParser.new(module, null);
+	def decoder = Decoder.new([]);
+	def parser = BinImmParser.new(module, decoder);
 	def locals = Vector<ValueType>.new();
 	def val_stack = Stack<ValueType>.new();
 	def ctl_stack = Stack<ControlEntry>.new();
-	def ctl_summary = Vector<int>.new();
+	def ctl_xfers = Vector<(u23, i23, u10, u23)>.new();
 	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
 	var func: FunctionDecl;
 	var opcode_pt: int;
 
-	def validate(f: FunctionDecl) {
+	def validate(f: FunctionDecl) -> bool {
 		func = f;
-		parser.decoder = Decoder.new(f.code.orig);  // TODO(fast): reuse Decoder
+		decoder.reset(f.code.orig, 0, f.code.orig.length);
 		ctl_stack.clear();
 		val_stack.clear();
+		ctl_xfers.resize(0);
 		setupParams();
 		readLocalDecls();
 		opcode_pt = parser.decoder.pos;
 		pushControl(WasmOpcode.UNREACHABLE.code, f.sig);
 		validateCode();
+		if (ctl_xfers.size() > 0) func.code.ctl_xfer = ctl_xfers.extract();
+		return decoder.ok();
 	}
 
 	def setupParams() {
@@ -72,16 +76,19 @@ class CodeValidator(module: Module) {
 					var sig = parser.readBlockType();
 					popE(ValueType.I32);
 					checkArgs(sig.params);
-					pushControl(opcode, sig);
+					var ctl = pushControl(opcode, sig);
+					var ctl_index = ctl_xfers.size();
+					ctl_xfers.add(u23.!(opcode_pt), 0, 0, 0);
+					ctl.ctl_refs.add(ctl_index);
 				}
 				WasmOpcode.ELSE.code => {
+					addCtlRef(ctl_top, opcode_pt); // else implicitly jumps to end
 					checkArgsAndTransfer(ctl_top.sig.results,
 								ctl_top.val_stack_top);
-					resolveBranches(ctl_top, opcode_pt);
+					resolveBranches(ctl_top, opcode_pt + 1);
 					if (ctl_top.start_opcode != WasmOpcode.IF.code) {
 						return parser.FAIL1(opcode_pt, "mismatched else", ());
 					}
-					ctl_top.refs = List.new(opcode_pt, ctl_top.refs);
 					ctl_top.start_opcode = opcode;
 					val_stack.top = ctl_top.val_stack_top;
 					pushTypes(ctl_top.sig.params);
@@ -96,25 +103,25 @@ class CodeValidator(module: Module) {
 					if (ctl.start_opcode == WasmOpcode.LOOP.code) {
 						resolveBranches(ctl, ctl.start_pt + 1);
 					} else {
-						resolveBranches(ctl, opcode_pt + 1);
+						resolveBranches(ctl, opcode_pt);
 					}
 				}
 				WasmOpcode.BR.code => {
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
+					addCtlRef(target, opcode_pt);
 					checkAndPopArgs(target.sig.results);
 					ctl_top.reachable = false;
 					val_stack.top = ctl_top.val_stack_top;
-					target.refs = List.new(opcode_pt, target.refs);
 				}
 				WasmOpcode.BR_IF.code => {
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
 					popE(ValueType.I32);
+					addCtlRef(target, opcode_pt);
 					checkArgs(target.sig.results);
-					target.refs = List.new(opcode_pt, target.refs);
 				}
 				WasmOpcode.BR_TABLE.code => {
 					var labels = parser.readLabels();
@@ -124,7 +131,7 @@ class CodeValidator(module: Module) {
 						var target = getControl(depth);
 						if (target == null) return;
 						checkArgs(target.sig.results);
-						target.refs = List.new(opcode_pt + i++, target.refs);
+						addCtlRef(target, opcode_pt + i++);
 					}
 					ctl_top.reachable = false;
 					val_stack.top = ctl_top.val_stack_top;
@@ -238,7 +245,29 @@ class CodeValidator(module: Module) {
 		}
 	}
 
-	def resolveBranches(target: ControlEntry, pc: int);
+	def resolveBranches(target: ControlEntry, pc: int) {
+		var refs = target.ctl_refs;
+		for (i = refs.size() - 1; i >= 0; i--) {
+			var index = refs[i];
+			var t = ctl_xfers[index];
+			var delta = i23.!(pc - int.!(t.0));
+			ctl_xfers[index] = (t.0, delta, t.2, t.3);
+		}
+		refs.resize(0);
+	}
+	def addCtlRef(target: ControlEntry, pc: int) {
+		var index = ctl_xfers.size();
+		var valcount = target.sig.results.length;
+		var popcount = val_stack.top - valcount - target.val_stack_top;
+		ctl_xfers.add(u23.!(pc), 0, u10.!(valcount), u23.!(popcount));
+		target.ctl_refs.add(index);
+		if (false) {
+			var buf = StringBuffer.new();
+			buf.put3("++val_stack.top=%d, valcount=%d, target.val_stack_top=%d\n",
+				val_stack.top, valcount, target.val_stack_top);
+			System.puts(buf.extract());
+		}
+	}
 	def checkArgs(p: Array<ValueType>) {
 		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
 		val_stack.pushA(p);  // TODO: unreachable concern?
@@ -299,7 +328,7 @@ class CodeValidator(module: Module) {
 		ctl.sig = sig;
 		ctl.val_stack_top = val_stack.top;
 		ctl.reachable = true;
-		ctl.refs = null;
+		ctl.ctl_refs.resize(0);
 		return ctl;
 	}
 	def popControl() -> ControlEntry {
@@ -331,5 +360,5 @@ class ControlEntry {
 	var sig: TypeDecl.Function;
 	var reachable = true;
 	var val_stack_top: int;
-	var refs: List<int>;
+	def ctl_refs = Vector<int>.new();
 }
