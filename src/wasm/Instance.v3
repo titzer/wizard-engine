@@ -52,13 +52,24 @@ class Instance(module: Module, imports: Array<Exportable>) {
 	def exports = Array<Exportable>.new(module.exports.size());
 	def dropped_elems = Array<bool>.new(module.elems.size());
 	def dropped_data = Array<bool>.new(module.data.size());
-	var valid = true;
-	var error_msg: string;
 
-	// Creates a new instance and internal objects. May fail and end up {valid == false}
-	// if the supplied imports do not validate. Loads active element and data segments,
-	// but does *not* execute the start function.
-	new() {
+	// Lazily allocates and caches functions for this instance.
+	def getFunction(index: int) -> Function {
+		var f = functions[index];
+		if (f == null) {
+			f = functions[index] = WasmFunction.new(this, module.functions[index]);
+		}
+		return f;
+	}
+	def getFunctions() -> Array<Function> {
+		return functions;
+	}
+}
+// Capable of creating an instance of a module, given a set of imports.
+class Instantiator(module: Module, imports: Array<Exportable>) {
+	private def instance = Instance.new(module, imports);
+	def err = WasmErrorGen.new(module.filename);
+	def run() -> Instance {
 		if (imports.length != module.imports.size()) return fail("import count mismatch");
 
 		// 1. Organize imports
@@ -67,6 +78,10 @@ class Instance(module: Module, imports: Array<Exportable>) {
 		var memory_index = 0;
 		var global_index = 0;
 
+		var functions = instance.getFunctions();
+		var tables = instance.tables;
+		var memories = instance.memories;
+		var globals = instance.globals;
 		for (i < imports.length) {
 			var imp = imports[i];
 			var decl = module.imports[i];
@@ -80,7 +95,7 @@ class Instance(module: Module, imports: Array<Exportable>) {
 				Global(decl) =>
 					globals[global_index++] = checkGlobal(decl, imp);
 			}
-			if (!valid) return;
+			if (err.error()) return null;
 		}
 
 		// 2. Instantiate memories, tables, globals, etc.
@@ -110,7 +125,7 @@ class Instance(module: Module, imports: Array<Exportable>) {
 			if (!e.active) continue;
 			var offset = Value.I32.!(evalInitExpr(e.offset)).val;
 			loadElems(tables[e.table_index], offset, e.details);
-			dropped_elems[i] = true;
+			instance.dropped_elems[i] = true;
 		}
 
 		// 4. Load data segments.
@@ -119,34 +134,29 @@ class Instance(module: Module, imports: Array<Exportable>) {
 			if (!d.active) continue;
 			var offset = Value.I32.!(evalInitExpr(d.offset)).val;
 			loadData(memories[d.mem_index], offset, d.data);
-			dropped_data[i] = true;
+			instance.dropped_data[i] = true;
 		}
 
 		// 5. Organize exports
+		var exports = instance.exports;
 		for (i < module.exports.size()) {
 			var exp = module.exports[i];
 			var v: Exportable;
 			match (exp.details) {
-				Function(index) => v = getFunction(index);
+				Function(index) => v = instance.getFunction(index);
 				Table(index) => v = tables[index];
 				Memory(index) => v = memories[index];
 				Global(index) => v = globals[index];
 			}
 			exports[i] = v;
 		}
+		return instance;
 	}
-	// Lazily allocates and caches functions for this instance.
-	def getFunction(index: int) -> Function {
-		var f = functions[index];
-		if (f == null) {
-			f = functions[index] = WasmFunction.new(this, module.functions[index]);
-		}
-		return f;
-	}
-	private def fail(msg: string) {
-		valid = false;
-		error_msg = msg;
+	private def fail(msg: string) -> Instance {
+		err.error_msg = msg;
+		err.error_pos = 0;
 		clear();
+		return null;
 	}
 	private def checkFunction(decl: FunctionDecl, imp: Exportable) -> Function {
 		if (!Function.?(imp)) {
@@ -206,20 +216,20 @@ class Instance(module: Module, imports: Array<Exportable>) {
 			F32(val) => return Value.F32(val);
 			F64(val) => return Value.F64(val);
 			Global(global_index) => {
-				return globals[global_index].value;
+				return instance.globals[global_index].value;
 			}
 		}
 	}
 	// Upon error, clear internal fields to prevent retaining garbage.
 	private def clear() {
-		for (i = module.memories.imported.size(); i < memories.length; i++) {
-			var m = memories[i];
+		for (i = module.memories.imported.size(); i < instance.memories.length; i++) {
+			var m = instance.memories[i];
 			if (m != null) m.deallocate();	// explicitly deallocate memory
 		}
-		for (i < memories.length) memories[i] = null;
-		for (i < functions.length) functions[i] = null;
-		for (i < globals.length) globals[i] = null;
-		for (i < tables.length) tables[i] = null;
+		Arrays.clear(instance.memories);
+		Arrays.clear(instance.getFunctions());
+		Arrays.clear(instance.globals);
+		Arrays.clear(instance.tables);
 	}
 	private def checkLimits(fmin: int, fmax: int, tmin: int, tmax: int) -> bool {
 		if (fmin < tmin) return false;
@@ -244,7 +254,7 @@ class Instance(module: Module, imports: Array<Exportable>) {
 				var ft = FunctionTable.!(table);
 				if (!checkBounds(offset, vals.length, ft.elems.length)) return;
 				for (i < vals.length) {
-					ft.elems[i + int.!(offset)] = getFunction(vals[i]);
+					ft.elems[i + int.!(offset)] = instance.getFunction(vals[i]);
 				}
 			}
 			Exprs(vals) => {
