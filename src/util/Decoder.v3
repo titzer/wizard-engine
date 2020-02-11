@@ -11,11 +11,14 @@
 // buffer while minding propering aliasing.
 class Decoder(var data: Array<byte>, err: ErrorGen) {
 	var pos: int;
-	var eof: bool;
 	var limit = data.length;
-	// N.B. this field tracks the number of bytes from the beginning of a stream,
-	// i.e. bytes skipped by append().
+	// number of bytes skipped by append(), used for absolute position
 	var skipped: int;
+	// end-of-file state
+	var eof = false;
+	private var eof_pos = int.max;
+	private var eof_size: int;
+	private var eof_msg: string;
 
 	// Checks whether the input has been completely consumed.
 	def done() -> bool {
@@ -34,11 +37,19 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	def at(npos: int) -> this {
 		pos = npos;
 	}
+	// Calculate the absolute offset of a given position.
+	def abs(pos: int) -> int {
+		return pos + skipped;
+	}
+	// Calculate the absolute offset of the current position.
+	def abs_pos() -> int {
+		return pos + skipped;
+	}
 	// Set the current position of the decoder and reset any EOF error.
 	def reset(x: Array<byte>, xpos: int, xlength: int) -> this {
 		skipped = 0;
 		err.reset();
-		eof = false;
+		reset_eof();
 		data = x;
 		pos = xpos;
 		limit = xpos + xlength;
@@ -50,24 +61,43 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	// Record an error at the given position, if there is not already an
 	// error at an earlier position. Resets the limit for early termination.
 	def fail_at<T>(pos: int, msg: string, arg: T) -> this {
+		// earlier EOF errors have precedence
+		if (eof_pos < pos) return;
 		if (err.set(pos + skipped, msg)) {
 			err.error_msg = Strings.format1(msg, arg);
-			eof = false;
-			limit = 0;
+			reset_eof();
 		}
 	}
 	// Record an end-of-file for the quantity beginning at the given position.
-	def eof_at(pos: int, msg: string) -> this {
-		if (err.set(pos + skipped, msg)) {
-			err.error_msg = msg;
+	def eof_at(pos: int, size: int, msg: string) -> this {
+		if (pos < eof_pos) {
 			eof = true;
+			eof_pos = pos;
+			eof_size = size;
+			eof_msg = msg;
 		}
+	}
+	// Indicate no more append(). Render any EOF errors to the error generator.
+	def finish() -> this {
+		if (eof_pos < int.max) {
+			var buf = StringBuffer.new();
+			buf.puts("EOF: ");
+			buf.put1(eof_msg, eof_size);
+			err.set(eof_pos + skipped, buf.extract());
+		}
+	}
+	// Reset any latent EOF state.
+	def reset_eof() -> this {
+		eof = false;
+		eof_pos = int.max;
+		eof_size = 0;
+		eof_msg = null;
 	}
 
 	// Read a single byte.
 	def read_u8() -> byte {
 		if (pos >= limit) {
-			eof_at(pos, "expected byte");
+			eof_at(pos, 1, "expected byte");
 			return 0;
 		}
 		return data[pos++];
@@ -75,7 +105,7 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	// Read a 4-byte quantity as an unsigned integer.
 	def read_u32() -> u32 {
 		if (limit - pos < 4) {
-			eof_at(pos, "expected 4 bytes");
+			eof_at(pos, 4, "expected %d bytes");
 			return 0;
 		}
 		var b0: u32 = data[pos];
@@ -89,7 +119,7 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	// Read a 8-byte quantity as an unsigned integer.
 	def read_u64() -> u64 {
 		if (limit - pos < 8) {
-			eof_at(pos, "expected 8 bytes");
+			eof_at(pos, 8, "expected %d bytes");
 			return 0;
 		}
 		var w0 = read_u32();
@@ -116,7 +146,7 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 			if (v != upper) { fail(msg); break; }
 			if (b < 0x80) return p;
 		}
-		eof_at(pos, "unterminated LEB");
+		eof_at(pos, 0, "unterminated LEB");
 		return p;
 	}
 	private def read_x32leb(signed: bool, msg: string) -> u32 {
@@ -140,8 +170,8 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 				return result;
 			}
 		}
-		if (p == pos) eof_at(pos, "expected LEB");
-		else eof_at(pos, "unterminated LEB");
+		if (p == pos) eof_at(pos, 1, "expected LEB");
+		else eof_at(pos, 0, "unterminated LEB");
 		return 0;
 	}
 	// Read an unsigned 64-bit LEB-encoded integer.
@@ -173,8 +203,8 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 				return result;
 			}
 		}
-		if (p == pos) eof_at(pos, "expected LEB");
-		else eof_at(pos, "unterminated LEB");
+		if (p == pos) eof_at(pos, 1, "expected LEB");
+		else eof_at(pos, 0, "unterminated LEB");
 		return 0;
 
 	}
@@ -182,7 +212,7 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	// Read a string of {length} bytes.
 	def read_bytes(length: int) -> string {
 		if (limit - pos < length) {
-			eof_at(pos, "EOF expecting N bytes"); // TODO: better error msg
+			eof_at(pos, length, "expecting %d bytes");
 			return Array.new(length);
 		}
 		var result = Arrays.range(data, pos, pos + length);
@@ -193,14 +223,14 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 	// if not possible.
 	def check_bytes(length: int) -> bool {
 		if (limit - pos < length) {
-			eof_at(pos, "EOF expecting N bytes"); // TODO: better error msg
+			eof_at(pos, length, "expecting %d bytes");
 		}
 		return !eof;
 	}
 	// Read a string of {length} bytes.
 	def skip_bytes(length: int) {
 		if (limit - pos < length) {
-			eof_at(pos, "EOF expecting N bytes"); // TODO: better error msg
+			eof_at(pos, length, "expecting %d bytes");
 			return;
 		}
 		pos += length;
@@ -214,7 +244,7 @@ class Decoder(var data: Array<byte>, err: ErrorGen) {
 		if (eof) {
 			// Reset EOF flag and error because we have new data
 			err.reset();
-			eof = false;
+			reset_eof();
 		}
 		if ((data.length - limit) >= xlength) {
 			// There is enough space to copy into this decoder's buffer.
