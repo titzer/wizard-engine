@@ -18,6 +18,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var total_module_size: int;
 	private var current_section: byte;
+	private var finished: bool;
 
 	// Checks whether any error has occured yet and returns {true} if not.
 	def ok() -> bool { return err.ok() || decoder.eof; }
@@ -29,6 +30,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	// if necessary. However, do not pass an array that could be concurrently modified,
 	// as it may be decoded in place.
 	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
+		if (xlength == 0) return; // nothing to add
 		if (err.error() && !decoder.eof) return;  // Already hit a non-EOF error.
 
 		total_module_size += xlength;
@@ -43,56 +45,55 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		decoder.append(0, x, xpos, xlength);
 
 		// Run the decode loop.
-		var prev = decoder.pos;
-		while (decoder.more()) {
-			traceBuffer();
-			match (state) {
-				HEADER => readHeader();
-				SECTIONS => readSection();
-				FUNCTIONS => readFunctionBody();
-			}
-			if (decoder.eof) break;
-		}
+		decodeLoop();
 
 		// Don't allow the decoder to hold onto the caller's buffer.
 		decoder.divest(0, x);
 	}
-
-	// Finish the decoding of the pushed bytes, returning a valid module
-	def finish() -> Decoded<Module> {
-		traceBuffer();
-		if (!err.ok() && !decoder.eof) {
-			return Decoded<Module>.new(filename, err.error_pos, 0, null,
-							err.error_msg);
-		}
-		match (state) {
-			HEADER => err.fail(decoder.pos, WasmError.INVALID_HEADER,
-						"incomplete header");
-			FUNCTIONS => err.fail(decoder.pos, WasmError.INCOMPLETE_SECTION,
-						"incomplete code section");
-			SECTIONS => {
-				if (decoder.more()) {
-					err.fail1(decoder.pos, WasmError.INCOMPLETE_SECTION,
-						"incomplete %q section",
-						renderSectionName(_, current_section));
-				} else {
-					checkSectionConstraints();
+	private def decodeLoop() {
+		// Run the decode loop.
+		while (true) {
+			match (state) {
+				HEADER => readHeader();
+				SECTIONS => {
+					if (decoder.more()) readSection();
 				}
+				FUNCTIONS => readFunctionBody();
 			}
+			if (!decoder.more()) break;
+			if (decoder.eof) break;
 		}
-		return Decoded<Module>.new(filename, int.max, total_module_size, module, null);
+	}
+
+	// Finish the decoding of the pushed bytes, returning a valid module upon
+	// success, or an error.
+	def finish() -> BinParserResult {
+		finished = true;
+		// Run the decode loop to flush out EOF errors.
+		decodeLoop();
+
+		if (err.ok()) return BinParserResult.Ok(module);
+
+		return BinParserResult.Error(err.error_code, filename,
+				err.error_pos, err.error_msg);
 	}
 
 	private def readHeader() {
 		var p1 = decoder.pos, magic = decoder.read_u32();
-		if (decoder.eof) return rewind(p1, 4);
+		if (decoder.eof) {
+			return retry(p1, 8, p1, WasmError.INVALID_HEADER,
+					"EOF reading magic word", (), ());
+		}
 		if (magic != WASM_MAGIC) {
 			return err.fail2(p1, WasmError.INVALID_HEADER,
 					"incorrect Wasm magic word %x, expected %x",
 					magic, WASM_MAGIC);
 		}
 		var p2 = decoder.pos, version = decoder.read_u32();
-		if (decoder.eof) return rewind(p2, 4);
+		if (decoder.eof) {
+			return retry(p2, 4, p2, WasmError.INVALID_HEADER,
+					"EOF reading version", (), ());
+		}
 		if (version != WASM_VERSION) {
 			return err.fail2(p2, WasmError.INVALID_HEADER,
 					"incorrect Wasm version %d, expected %d",
@@ -101,29 +102,43 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		if (err.ok()) state = BpState.SECTIONS;
 	}
 
-	private def rewind(pos: int, expect: int) {
+	private def retry0(pos: int, expect: int) -> bool {
 		if (verbose) {
 			trace.put2("[rewind to +%d, expecting %d]\n", pos, expect);
 			flush();
 		}
+		if (finished) return false;
 		decoder.at(pos);
 		size_estimate = if (expect > 0,
 			if (expect < MAX_SIZE_ESTIMATE, expect, MAX_SIZE_ESTIMATE));
+		return true;
+	}
+	private def retry<A, B>(pos: int, expect: int, error_pos: int,
+			error: WasmError, msg: string, a: A, b: B) {
+		if (!retry0(pos, expect)) {
+			err.error_pos = int.max; // TODO: reseting error explicitly
+			err.fail2(error_pos, error, msg, a, b);
+		}
 	}
 
 	private def readSection() {
 		var start = decoder.pos;
 		var code = readByte("section code", renderSectionName);
+		var size_pt = decoder.pos;
 		var size = readU32("section size", 0, Limits.max_module_size);
 		if (verbose) {
 			trace.put3("=>section code=%d (%q), size=%d\n",
 				code, renderSectionName(_, code), size);
 			flush();
 		}
-		if (decoder.eof) return rewind(start, 5);  // size not available yet
+		if (decoder.eof) {
+			return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
+					"incomplete section %q, EOF expecting section size",
+					renderSectionName(_, code), ());
+		}
 
 		current_section = code;
-		var body = decoder.pos;
+		var body_pt = decoder.pos;
 		// Check for duplicate sections
 		if (code != 0 && code < seen_sections.length && seen_sections[code]) {
 			return err.fail1(start, WasmError.DUPLICATE_SECTION,
@@ -134,21 +149,28 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		if (code == BpSection.Code.code) {
 			// Transition into reading code section
 			var num_functions = readU32("function body count", 0, Limits.max_num_functions);
-			if (decoder.eof) return rewind(start, 0);
+			if (decoder.eof) {
+				return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
+					"incomplete %q section, EOF expecting function count",
+					renderSectionName(_, code), ());
+			}
 			if (num_functions != module.functions.declared.size()) {
-				return err.fail2(body, WasmError.FUNC_COUNT_MISMATCH,
+				return err.fail2(body_pt, WasmError.FUNC_COUNT_MISMATCH,
 					"number of function bodies (%d) != function declarations (%d)",
 					num_functions, module.functions.declared.size());
 			}
 			state = BpState.FUNCTIONS;
 			seen_sections[code] = true;
 			expected_code_size = int.!(size);
-			code_start = body + decoder.skipped;
+			code_start = body_pt + decoder.skipped;
 			return;
 		}
 
 		// For all other sections, rewind if they are not complete.
-		if (!decoder.check_bytes(int.!(size))) return rewind(start, int.!(size));
+		if (!decoder.check_bytes(int.!(size))) {
+			return retry(start, int.!(size), decoder.pos, WasmError.INCOMPLETE_SECTION,
+					"incomplete %q section, EOF", renderSectionName(_, code), ());
+		}
 
 		// For valid sections, record that the section has now been seen.
 		if (code >= 0 && code < seen_sections.length) {
@@ -181,7 +203,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	       }
 
 		// Check that the size of bytes read equals the section's declared size
-		var read = decoder.pos - body;
+		var read = decoder.pos - body_pt;
 		traceBuffer();
 		if (read != size) {
 			err.fail2(decoder.pos, WasmError.SECTION_SIZE_MISMATCH,
@@ -473,9 +495,15 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	private def readFunctionBody() {
 		var start = decoder.pos;
 		var size = readU32("function size", 0, Limits.max_func_size);
-		if (decoder.eof) return rewind(start, 5);
+		if (decoder.eof) {
+			return retry(start, 5, start, WasmError.INCOMPLETE_FUNCTION_BODY,
+					"incomplete function body, EOF expecting body size", (), ());
+		}
 		var body = decoder.read_bytes(int.!(size));
-		if (decoder.eof) return rewind(start, int.!(size));
+		if (decoder.eof) {
+			return retry(start, int.!(size), start, WasmError.INCOMPLETE_FUNCTION_BODY,
+					"incomplete function body, EOF", (), ());
+		}
 		var f = module.functions.declared[cur_function++];
 		f.code = FunctionCode.new(body);
 		if (cur_function == module.functions.declared.size()) {
@@ -493,6 +521,10 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	private def checkSectionConstraints() {
 		// TODO
 	}
+}
+type BinParserResult {
+	case Ok(module: Module) { }
+	case Error(code: WasmError, filename: string, error_pos: int, error_msg: string) { }
 }
 // Internal constants.
 def MAX_SIZE_ESTIMATE = 16 * 1024 * 1024;
@@ -828,13 +860,13 @@ class WasmParser(module: Module) {
 
 	def traceBuffer() {
 		if (!verbose) return;
-		trace.put2("[buf@+%d limit=%d", decoder.pos, decoder.limit);
+		trace.put2("[buf@+%d limit=%d ", decoder.pos, decoder.limit);
 		if (decoder.eof) trace.puts("eof ");
 		if (err.error_pos < int.max) {
-			trace.put1(" err@+%d", err.error_pos);
+			trace.put1("err@+%d ", err.error_pos);
 		}
 		if (err.error_msg != null) {
-			trace.put1(" msg=\"%s\"", err.error_msg);
+			trace.put1("msg=\"%s\"", err.error_msg);
 		}
 		trace.putc(']').ln();
 		flush();
