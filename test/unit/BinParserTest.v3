@@ -16,6 +16,18 @@ def Z = [
 	T("bin/sect_size0", test_sect_size0),
 	T("bin/sect_eof", test_sect_eof),
 	T("bin/sect_custom", test_sect_custom),
+	T("bin/sect_custom_ovf", test_sect_custom_ovf),
+	T("bin/types0", test_types0),
+	T("bin/types1", test_types1),
+	T("bin/typesN", test_typesN),
+	T("bin/importsN", test_importsN),
+	T("bin/funcsN", test_funcsN),
+	T("bin/tablesN", test_tablesN),
+	T("bin/memoriesN", test_memoriesN),
+	T("bin/globalsN", test_globalsN),
+	T("bin/exportsN", test_exportsN),
+	T("bin/elementsN", test_elementsN),
+	T("bin/dataN", test_dataN),
 	()
 ];
 
@@ -67,9 +79,7 @@ class BinParserTester(t: Tester) {
 	}
 }
 
-def VALID_HEADER: Array<byte> = [
-	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00
-];
+def VALID_HEADER = BinUtil.WASM_HEADER;
 
 def test_empty(t: BinParserTester) {
 	for (i = 1; i <= 1; i++) {
@@ -126,6 +136,11 @@ def COUNTED_SECTIONS = [
 	BpSection.Code,
 	BpSection.Data
 ];
+
+def EMPTY_FUNC_TYPE: Array<byte> =
+	[BpTypecon.Function.code, 0, 0];
+def ONE_FUNC_TYPES_SECTION: Array<byte> =
+	[BpSection.Type.code, 4, 1, BpTypecon.Function.code, 0, 0];
 
 class SingleEmptySectionTemplate {
 	def len = VALID_HEADER.length;
@@ -195,15 +210,134 @@ def test_sect_eof(t: BinParserTester) {
 }
 
 def test_sect_custom(t: BinParserTester) {
-	var v = Vector<byte>.new();
+	var b = BinBuilder.new();
 	for (i < 5) {
-		v.addv(VALID_HEADER);
-		v.add(0);
-		BinEncoder.append_u32leb(v, u32.!(11 + i));
-		BinEncoder.append_string(v, "my_section");
-		for (j < i) v.add(77);
-		t.valid_split(v.extract());
+		b.put_header();
+		b.add(BpSection.Unknown.code);
+		b.put_u32leb(u32.!(11 + i));
+		b.put_string("my_section");
+		for (j < i) b.add(77);
+		t.valid_split(b.extract());
 	}
+}
+
+def test_sect_custom_ovf(t: BinParserTester) {
+	def name = "x_section";
+	var b = BinBuilder.new();
+	for (i = name.length; i >= 0; i--) {
+		b.put_header();
+		b.add(BpSection.Unknown.code);
+		b.put_u32leb(u32.!(i));
+		b.put_string(name);
+		t.invalid(WasmError.OVERFLOW_SECTION, b.extract());
+	}
+}
+
+def test_types0(t: BinParserTester) {
+	def EMPTY_FUNC: Array<byte> = [BpTypecon.Function.code, 0, 0];
+	var b = BinBuilder.new();
+	for (i < 5) {
+		b.resize(0);
+		b.put_header();
+		b.beginShortSection(BpSection.Type);
+		b.put_u32leb(u32.!(i));
+		for (j < i) b.addv(EMPTY_FUNC);
+		b.endSection();
+		t.valid(b.extract());
+	}
+}
+
+def test_types1(t: BinParserTester) {
+	var b = BinBuilder.new();
+	for (count < 3) {
+		for (p < 3) {
+			for (r < 2) { // ext:multi-value
+				b.resize(0);
+				b.put_header();
+				b.beginShortSection(BpSection.Type);
+				b.put_u32leb(u32.!(count));
+				for (j < count) {
+					b.add(BpTypecon.Function.code);
+					b.add(byte.!(p));
+					for (k < p) b.add(BpTypecon.I32.code);
+					b.add(byte.!(r));
+					for (k < r) b.add(BpTypecon.F32.code);
+				}
+				b.endSection();
+				t.valid(b.extract());
+			}
+		}
+	}
+}
+
+def testCountedSection(t: BinParserTester, max: int, sect: BpSection,
+	pre: Array<byte>, entry: Array<byte>) {
+	var b = BinBuilder.new();
+
+	// Test up to 3 valid entries.
+	var raw: Array<byte>;
+	for (count < max+1) {
+		b.resize(0);
+		b.put_header();
+		if (pre != null) b.addv(pre);
+		b.beginShortSection(sect);
+		b.put_u32leb(u32.!(count));
+		for (j < count) b.addv(entry);
+		b.endSection();
+		raw = b.extract();
+
+		t.valid_split(raw); // test splitting the module at all offsets
+	}
+
+	// Test truncated module by up to 3 entries.
+	for (cut = 1; cut < entry.length * max; cut++) {
+		var m = t.mp();
+		m.push(raw, 0, raw.length - cut);
+		t.assert_invalid(WasmError.INCOMPLETE_SECTION, m.finish());
+	}
+}
+
+def test_typesN(t: BinParserTester) {
+	testCountedSection(t, 3, BpSection.Type, null, [
+		BpTypecon.Function.code, 1, BpTypecon.I32.code, 1, BpTypecon.I32.code
+	]);
+}
+
+def test_importsN(t: BinParserTester) {
+	testCountedSection(t, 3, BpSection.Import, null, [
+		1, 0x65, 1, 0x66, BpImportExportKind.Global.code, BpTypecon.I32.code, 0
+	]);
+}
+
+def test_funcsN(t: BinParserTester) {
+	testCountedSection(t, 3, BpSection.Function, ONE_FUNC_TYPES_SECTION, [0]);
+}
+
+def test_tablesN(t: BinParserTester) {
+	testCountedSection(t, 1/*ext:bulk-memory*/, BpSection.Table, null, [
+		BpTypecon.AnyFunc.code, 0, 0
+	]);
+}
+
+def test_memoriesN(t: BinParserTester) {
+	testCountedSection(t, 1/*ext:multi-memory*/, BpSection.Memory, null, [
+		0, 0
+	]);
+}
+
+def test_globalsN(t: BinParserTester) {
+	testCountedSection(t, 3, BpSection.Global, null, [
+		BpTypecon.I32.code, 0, Opcode.I32_CONST.code, 0, Opcode.END.code
+	]);
+}
+
+def test_exportsN(t: BinParserTester) { // TODO
+}
+
+def test_elementsN(t: BinParserTester) { // TODO
+}
+
+def test_dataN(t: BinParserTester) { // TODO
 }
 
 // TODO: positive/negative tests for each of the counted section elements
