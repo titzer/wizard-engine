@@ -17,7 +17,6 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	private var code_start: int;
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var total_module_size: int;
-	private var current_section: byte;
 	private var finished: bool;
 
 	// Checks whether any error has occured yet and returns {true} if not.
@@ -68,13 +67,14 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	// Finish the decoding of the pushed bytes, returning a valid module upon
 	// success, or an error.
 	def finish() -> BinParserResult {
-		finished = true;
-		decoder.reset_eof();
-		// Run the decode loop to flush out EOF errors.
-		decodeLoop();
-		decoder.finish();
-
-		if (err.ok()) return BinParserResult.Ok(module);
+		if (err.ok()) {
+			finished = true;
+			decoder.reset_eof();
+			// Run the decode loop to flush out EOF errors.
+			decodeLoop();
+			decoder.finish();
+			if (err.ok()) return BinParserResult.Ok(module);
+		}
 
 		return BinParserResult.Error(err.error_code, filename,
 				err.error_pos, err.error_msg);
@@ -88,7 +88,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		}
 		if (magic != WASM_MAGIC) {
 			return err.fail2(p1, WasmError.INVALID_HEADER,
-					"incorrect Wasm magic word %x, expected %x",
+					"incorrect Wasm magic word 0x%x, expected 0x%x",
 					magic, WASM_MAGIC);
 		}
 		var p2 = decoder.pos, version = decoder.read_u32();
@@ -125,6 +125,11 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 	private def readSection() {
 		var start = decoder.pos;
 		var code = readByte("section code", renderSectionName);
+		if (!BpConstants.valid_section[code]) {
+			return err.fail1(start, WasmError.INVALID_SECTION,
+				"unknown section code 0x%x", code);
+		}
+
 		var size_pt = decoder.pos;
 		var size = readU32("section size", 0, Limits.max_module_size);
 		if (!err.ok()) return;
@@ -139,7 +144,6 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 					renderSectionName(_, code), ());
 		}
 
-		current_section = code;
 		var body_pt = decoder.pos;
 		// Check for duplicate sections
 		if (code != 0 && code < seen_sections.length && seen_sections[code]) {
@@ -180,6 +184,10 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			seen_sections[code] = true;
 		}
 
+		// TODO: ugly; lower limit to EOF for reading beyond the end
+		var prev_limit = decoder.limit;
+		var new_limit = decoder.pos + int.!(size);
+		decoder.limit = new_limit;
 		match (code) {
 			0 => readCustomSection(size);
 			BpSection.Type.code => readMultiple("types", size,
@@ -188,10 +196,8 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 				Limits.max_num_imports, module.imports, readImportDecl);
 			BpSection.Function.code => readMultiple("functions", size,
 				Limits.max_num_functions, module.functions.declared, readFunctionDecl);
-			// TODO: enforce maximum number of tables
 			BpSection.Table.code => readMultiple("tables", size,
 				Limits.max_num_tables, module.tables.declared, readTableDecl);
-			// TODO: enforce maximum number of memories
 			BpSection.Memory.code => readMultiple("memories", size,
 				Limits.max_num_memories, module.memories.declared, readMemoryDecl);
 			BpSection.Global.code => readMultiple("globals", size,
@@ -205,9 +211,18 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			BpSection.Data.code => readMultiple("data", size,
 				Limits.max_num_data_segments, module.data, readDataDecl);
 			_ => return err.fail1(start, WasmError.INVALID_SECTION,
-				"unknown section code %x", code);
-	       }
+				"unknown section code 0x%x", code);
+		}
 
+		if (decoder.eof && err.ok()) {
+			decoder.finish(); // treat EOF as an error
+			err.error_code = WasmError.OVERFLOW_SECTION;
+			return;
+		}
+		if (decoder.limit == new_limit) {
+			// TODO: ugly; restore prior limit after reading section
+			decoder.limit = prev_limit;
+		}
 		// Check that the size of bytes read equals the section's declared size
 		var read = decoder.pos - body_pt;
 		traceBuffer();
@@ -249,6 +264,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 				trace.put2("==>%s #%d\n", thing_name, index);
 				flush();
 			}
+			if (decoder.eof) break;
 			if (decoder.pos >= max_pt) {
 				err.fail1(decoder.abs(max_pt),
 					WasmError.OVERFLOW_SECTION,
@@ -263,7 +279,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		var form = readByte("type constructor", renderTypecon);
 		if (form != BpTypecon.Function.code) {
 			err.fail2(pt, WasmError.INVALID_TYPE,
-				"invalid type %x, expected function (%x)",
+				"invalid type 0x%x, expected function (0x%x)",
 				form, BpTypecon.Function.code);
 			return invalid;
 		}
@@ -317,7 +333,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 				details = ImportDetails.Global(decl);
 			}
 			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid import kind %x", kind);
+				"invalid import kind 0x%x", kind);
 		}
 		return ImportDecl.new(module_name, field_name, details);
 	}
@@ -370,7 +386,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 				details = ExportDetails.Global(index);
 			}
 			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid export kind %x", kind);
+				"invalid export kind 0x%x", kind);
 		}
 		return ExportDecl.new(name, details);
 	}
@@ -384,7 +400,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			if ((flags & 4) == 4) init_exprs = true;
 		} else if (flags != 0) {
 			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for elements, got %x", flags);
+				"expected zero byte for elements, got 0x%x", flags);
 		} else {
 			table_index = checkIndex(pt, "table index", 0, module.tables).0;
 		}
@@ -418,7 +434,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			}
 		} else if (flags != 0) {
 			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for data segment, got %x", flags);
+				"expected zero byte for data segment, got 0x%x", flags);
 		}
 		checkIndex(pt, "memory index", u32.!(mem_index), module.memories);
 		var offset = readI32Expr("data element offset");
@@ -427,7 +443,14 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		return DataDecl.new(mem_index, offset, data, active);
 	}
 	private def readStartSection() {
-		module.start_function = readFunc().0;
+		var pt = decoder.pos;
+		var t = readFunc(), index = t.0, func = t.1;
+		module.start_function = t.0;
+		if (func != null &&
+			(func.sig.params.length > 0 || func.sig.results.length > 0)) {
+			err.fail(decoder.abs(pt), WasmError.ILLEGAL_TYPE,
+				"start function must have no params or results");
+		}
 	}
 
 	def readLimits(quantity: string, limit: u32) -> (int, int) {
@@ -470,7 +493,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
 			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
 			_ => err.fail1(pt, WasmError.ILLEGAL_TYPE,
-				"invalid table element type %x", b);
+				"invalid table element type 0x%x", b);
 		}
 		return et;
 	}
@@ -516,7 +539,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 			}
 			_ => {
 				err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-					"unexpected opcode %x (%q) in init expression", opcode,
+					"unexpected opcode 0x%x (%q) in init expression", opcode,
 					Opcodes.render(_, opcode));
 			}
 		}
@@ -524,7 +547,7 @@ class ModuleParser(vb: Verbosity, filename: string) extends WasmParser {
 		var end = readByte("end opcode", Opcodes.render);
 		if (end != Opcode.END.code) {
 			err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-				"expected %x (END) opcode, got %x", Opcode.END.code, end);
+				"expected 0x%x (END) opcode, got 0x%x", Opcode.END.code, end);
 		}
 		return (expr, vt);
 	}
@@ -805,7 +828,7 @@ class WasmParser(module: Module) {
 			BpTypecon.AnyRef.code => return ValueType.ANYREF;
 		}
 		err.fail1(pt, WasmError.INVALID_TYPE,
-			"invalid value type %x", b);
+			"invalid value type 0x%x", b);
 		return ValueType.I32;
 	}
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
