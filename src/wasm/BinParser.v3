@@ -22,10 +22,12 @@ class ModuleParser extends WasmParser {
 	private var total_module_size: int;
 	private var finished: bool;
 
+	private var eof_pos = int.max;
+
 	// Checks whether any error has occured yet and returns {true} if not.
-	def ok() -> bool { return err.ok() || decoder.eof; }
+	def ok() -> bool { return err.ok() || eof; }
 	// Checks whether any error has occurred yet and returns {true} if so.
-	def error() -> bool { return err.error() && !decoder.eof; }
+	def error() -> bool { return err.error() && !eof; }
 
 	// Push new data into the parser from the specified range. The given array is
 	// not modified or retained by this call; internal copies of data are made
@@ -63,7 +65,7 @@ class ModuleParser extends WasmParser {
 			}
 			if (!decoder.more()) break;
 			if (!err.ok()) break;
-			if (decoder.eof) break;
+			if (eof) break;
 		}
 	}
 
@@ -72,10 +74,9 @@ class ModuleParser extends WasmParser {
 	def finish() -> BinParserResult {
 		if (err.ok()) {
 			finished = true;
-			decoder.reset_eof();
+			decoder.eof_behavior = Decoder.eof_error;
 			// Run the decode loop to flush out EOF errors.
 			decodeLoop();
-			decoder.finish();
 			if (err.ok()) return BinParserResult.Ok(module);
 		}
 
@@ -85,7 +86,7 @@ class ModuleParser extends WasmParser {
 
 	private def readHeader() {
 		var p1 = decoder.pos, magic = decoder.read_u32();
-		if (decoder.eof) {
+		if (eof) {
 			return retry(p1, 8, p1, WasmError.INVALID_HEADER,
 					"EOF: expecting magic word", (), ());
 		}
@@ -95,7 +96,7 @@ class ModuleParser extends WasmParser {
 					magic, WASM_MAGIC);
 		}
 		var p2 = decoder.pos, version = decoder.read_u32();
-		if (decoder.eof) {
+		if (eof) {
 			return retry(p1, 4, p2, WasmError.INVALID_HEADER,
 					"EOF: expecting version", (), ());
 		}
@@ -141,7 +142,7 @@ class ModuleParser extends WasmParser {
 				code, renderSectionName(_, code), size);
 			flush();
 		}
-		if (decoder.eof) {
+		if (eof) {
 			return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
 					"EOF: expecting size for %q section",
 					renderSectionName(_, code), ());
@@ -159,7 +160,7 @@ class ModuleParser extends WasmParser {
 		if (code == BpSection.Code.code) {
 			// Transition into reading code section
 			var num_functions = readU32("function body count", 0, limits.max_num_functions);
-			if (decoder.eof) {
+			if (eof) {
 				return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
 					"EOF: expecting count in code section",
 					(), ());
@@ -217,8 +218,7 @@ class ModuleParser extends WasmParser {
 				"unknown section code 0x%x", code);
 		}
 
-		if (decoder.eof && err.ok()) {
-			decoder.finish(); // treat EOF as an error
+		if (eof && err.ok()) {
 			err.error_code = WasmError.OVERFLOW_SECTION;
 			return;
 		}
@@ -267,7 +267,7 @@ class ModuleParser extends WasmParser {
 				trace.put2("==>%s #%d\n", thing_name, index);
 				flush();
 			}
-			if (decoder.eof) break;
+			if (eof) break;
 			if (decoder.pos >= max_pt) {
 				err.fail1(decoder.abs(max_pt),
 					WasmError.OVERFLOW_SECTION,
@@ -569,12 +569,12 @@ class ModuleParser extends WasmParser {
 		}
 		var start = decoder.pos;
 		var size = readU32("function size", 0, limits.max_func_size);
-		if (decoder.eof) {
+		if (eof) {
 			return retry(start, 5, start, WasmError.INCOMPLETE_FUNCTION_BODY,
 					"EOF: expecting function body size", (), ());
 		}
 		var body = decoder.read_bytes(int.!(size));
-		if (decoder.eof) {
+		if (eof) {
 			return retry(start, int.!(size), start, WasmError.INCOMPLETE_FUNCTION_BODY,
 					"EOF: incomplete function body", (), ());
 		}
@@ -791,10 +791,17 @@ class BinImmParser extends WasmParser {
 // Contains common routines for the module parser and function body parser.
 class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 	def err = WasmErrorGen.new(module.filename);
-	var decoder = Decoder.new([], err);
+	var decoder = Decoder.new(EMPTY_BYTES, err);
 	var verbose = false;
 	def trace = StringBuffer.new();
+	var eof = false;
 
+	new() {
+		decoder.eof_behavior = eof_set_flag;
+	}
+	def eof_set_flag(d: Decoder, pos: int, size: int, msg: string) {
+		eof = true;
+	}
 	def readTableIndex() -> int {
 		return readIndex("table index", module.tables).0;
 	}
@@ -856,7 +863,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
 		var pt = decoder.pos;
 		var val = decoder.read_u32leb();
-		if (decoder.eof) return 0;
+		if (eof) return 0;
 		if (val < min) err.fail3(pt, WasmError.EXCEEDED_LIMIT,
 			"%s %d exceeds minimum %d", quantity, val, min);
 		if (val > max) err.fail3(pt, WasmError.EXCEEDED_LIMIT,
@@ -871,7 +878,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 	def readU64(quantity: string) -> u64 {
 		var pt = decoder.pos;
 		var val = decoder.read_u64leb();
-		if (decoder.eof) return 0;
+		if (eof) return 0;
 		if (verbose) {
 			traceBytes(pt, quantity);
 			trace.putd(val).ln();
@@ -924,7 +931,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 	def traceBuffer() {
 		if (!verbose) return;
 		trace.put2("[buf@+%d limit=%d ", decoder.pos, decoder.limit);
-		if (decoder.eof) trace.puts("eof ");
+		if (eof) trace.puts("eof ");
 		if (err.error_pos < int.max) {
 			trace.put1("err@+%d ", err.error_pos);
 		}
@@ -945,3 +952,194 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 	}
 }
 def STDOUT = System.fileWriteK(1, _, _, _);
+def EMPTY_BYTES = Array<byte>.new(0);
+
+// A finite state machine that implements a push-based parser for binary
+// modules. This class handles the decoding of complete sections and
+// complete function bodies, invoking callbacks when sections, bodies,
+// and the overall module is finished.
+class BpFsm extends WasmParser {
+	def callback: ModuleParserCallback;
+	var section_decoder: Decoder;
+	var function_decoder: Decoder;
+
+	// Internal state
+	var state: BpFsmState;
+	var current_pos: int;
+	var more = true;
+	var accept = false;
+
+	/* TODO: move state from BpFsmState enum to fields here.
+	var current_section: BpSection;
+	var section_start: int;
+	var section_end: int;
+	var function_body_count: u32;
+	var current_function_body: u32;
+	*/
+	new(vb: Verbosity, extensions: Extension.set, limits: Limits, callback: ModuleParserCallback)
+			super(extensions, limits, callback.module) {
+		section_decoder = Decoder.new(EMPTY_BYTES, err);
+		section_decoder.eof_behavior = eof_is_section_overflow;
+		function_decoder = Decoder.new(EMPTY_BYTES, err);
+		function_decoder.eof_behavior = eof_is_function_overflow;
+		verbose = vb.tag > Verbosity.SILENT.tag;
+	}
+
+	def push(x: Array<byte>, xpos: int, xlength: int) {
+		eof = false;
+		decoder.append(0, x, xpos, xlength);
+		decodeLoop();
+	}
+	def finish() -> BinParserResult {
+		eof = false;
+		more = false;
+		decodeLoop();
+		if (accept && err.ok()) return BinParserResult.Ok(callback.module);
+		return BinParserResult.Error(err.error_code, callback.module.filename,
+				err.error_pos, err.error_msg);
+	}
+
+	private def decodeLoop() {
+		while (true) {
+			advance();
+			if (eof) return;
+			if (accept) return;
+			if (err.error()) return;
+		}
+	}
+	private def advance() {
+		current_pos = decoder.pos;
+		if (verbose) {
+			trace.put3("@+%d [%d bytes] state=%s\n", abs(),
+				decoder.available(), state.name);
+			flush();
+		}
+		match (state) {
+			MAGIC => {
+				var magic = decoder.read_u32();
+				if (eof) return if(!retry(), err.fail(abs(), WasmError.INVALID_HEADER, "EOF: expecting magic word"));
+				if (magic != WASM_MAGIC) err.fail2(abs(), WasmError.INVALID_HEADER, "expected magic word %x, got %x", WASM_MAGIC, magic);
+				state = BpFsmState.VERSION;
+			}
+			VERSION => {
+				var version = decoder.read_u32();
+				if (eof) return if(!retry(), err.fail(abs(), WasmError.INVALID_HEADER, "EOF: expecting wasm version"));
+				if (version != WASM_VERSION) err.fail2(abs(), WasmError.INVALID_HEADER, "expected wasm version %x, got %x", WASM_VERSION, version);
+				state = BpFsmState.SECTION_START;
+			}
+			SECTION_START => {
+				var b = readByte("section code", renderSectionName);
+				if (eof) {
+					if (!retry()) accept = true;
+					return;
+				}
+				state = BpFsmState.SECTION(checkSectionCode(b));
+			}
+			SECTION(kind) => {
+				var size = readU32("section size", 0, limits.max_module_size);
+				if (eof) return if(!retry(), err_incomplete_section(kind, -1));
+				state = BpFsmState.SECTION_WITH_SIZE(kind, size);
+			}
+			SECTION_WITH_SIZE(kind, size) => {
+				match (kind) {
+					Code => {
+						var count = readU32("function body count", 0, limits.max_num_functions);
+						if (eof) return if(!retry(), err_incomplete_section(kind, int.!(size)));
+						var expected = callback.module.functions.declared.length;
+						if (count != expected) {
+							err.fail2(abs(), WasmError.FUNC_COUNT_MISMATCH, "expected %d function bodies, got %d", expected, count);
+							return;
+						}
+						var end = u32.!(decoder.abs(current_pos)) + size;
+						if (count == 0) {
+							checkSectionLength("code", decoder.abs(decoder.pos), end);
+							state = BpFsmState.SECTION_START;
+						} else {
+							state = BpFsmState.BODY(end, count, 0);
+						}
+					}
+					_ => {
+						decoder.sub_bytes(section_decoder, int.!(size));
+						if (eof) return if(!retry(), err_incomplete_section(kind, int.!(size)));
+						callback.decodeSection(kind, size, section_decoder);
+						state = BpFsmState.SECTION_START;
+					}
+				}
+			}
+			BODY(end, count, index) => {
+				var size = readU32("function body size", 0, limits.max_func_size);
+				if (eof) return if(!retry(), err_incomplete_function(index, -1));
+				state = BpFsmState.BODY_WITH_SIZE(end, count, index, size);
+			}
+			BODY_WITH_SIZE(end, count, index, size) => {
+				decoder.sub_bytes(function_decoder, int.!(size));
+				if (eof) return if(!retry(), err_incomplete_function(index, int.!(size)));
+				callback.decodeFunctionBody(index, size, function_decoder);
+				var next = index + 1;
+				if (next == count) {
+					checkSectionLength("code", decoder.abs(decoder.pos), end);
+					state = BpFsmState.SECTION_START;
+				} else {
+					state = BpFsmState.BODY(end, count, index + 1);
+				}
+			}
+		}
+	}
+	def checkSectionLength(which: string, abs: int, end: u32) {
+		if (abs < end) err.fail1(abs, WasmError.INCOMPLETE_SECTION, "%s section shorter than expected", which);
+		if (abs > end) err.fail1(abs, WasmError.OVERFLOW_SECTION, "%s section longer than expected", which);
+	}
+	def retry() -> bool {
+		if (more) {
+			decoder.pos = current_pos;
+			return true;
+		}
+		return false;
+	}
+	def checkSectionCode(b: byte) -> BpSection {
+		if (!BpConstants.valid_section[b]) {
+			err.fail1(abs(),
+				WasmError.INVALID_SECTION, "unknown section code 0x%x", b);
+		}
+		return BpConstants.enum_section[b];
+	}
+	def eof_is_section_overflow(d: Decoder, pos: int, size: int, msg: string) {
+		var buf = StringBuffer.new();
+		buf.puts("section overflow: "); // TODO: which section
+		buf.put1(msg, size);
+		err.fail(d.abs(pos), WasmError.OVERFLOW_SECTION, buf.extract());
+	}
+	def eof_is_function_overflow(d: Decoder, pos: int, size: int, msg: string) {
+		var buf = StringBuffer.new();
+		buf.puts("function overflow: "); // TODO: which function
+		buf.put1(msg, size);
+		err.fail(d.abs(pos), WasmError.OVERFLOW_FUNCTION, buf.extract());
+	}
+	def abs() -> int {
+		return decoder.abs(current_pos);
+	}
+	def err_incomplete_section(kind: BpSection, size: int) {
+		if (size < 0) err.fail1(abs(), WasmError.INCOMPLETE_SECTION, "EOF: incomplete %q section, expected length", renderSectionName(_, kind.code));
+		else err.fail2(abs(), WasmError.INCOMPLETE_SECTION, "EOF: incomplete %q section, expected %d bytes", renderSectionName(_, kind.code), size);
+	}
+	def err_incomplete_function(index: u32, size: int) {
+		if (size < 0) err.fail1(abs(), WasmError.INCOMPLETE_FUNCTION_BODY, "EOF: incomplete function body #%d, expected length", index);
+		else err.fail2(abs(), WasmError.INCOMPLETE_FUNCTION_BODY, "EOF: incomplete function body #%d, expected %d bytes", index, size);
+	}
+}
+// The callbacks for sections, function bodies, and finishing a module.
+class ModuleParserCallback(module: Module) {
+	def decodeSection(kind: BpSection, size: u32, d: Decoder);
+	def decodeFunctionBody(index: u32, size: u32, d: Decoder);
+}
+// The states for the module parser finite state machine.
+type BpFsmState {
+	case MAGIC;
+	case VERSION;
+	case SECTION_START;
+	case SECTION(kind: BpSection);
+	case SECTION_WITH_SIZE(kind: BpSection, size: u32);
+	case BODY(end: u32, count: u32, index: u32);
+	case BODY_WITH_SIZE(end: u32, count: u32, index: u32, size: u32);
+
+}

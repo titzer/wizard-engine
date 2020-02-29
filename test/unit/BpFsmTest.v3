@@ -1,0 +1,318 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def T = UnitTests.registerT(_, BpFsmTester.new, _);
+
+def DEFAULT_LIMITS = Limits.new();
+def Z = [
+	T("bpfsm/empty", test_empty),
+	T("bpfsm/hdr", test_hdr),
+	T("bpfsm/sect0", test_sect0),
+	T("bpfsm/sect1", test_sect1),
+	T("bpfsm/sect2", test_sect2),
+	T("bpfsm/sect3", test_sect3),
+	T("bpfsm/unknown", test_unknown),
+	T("bpfsm/multisect", test_multisect),
+	T("bpfsm/body0", test_body0),
+	T("bpfsm/body1", test_body1),
+	T("bpfsm/body2", test_body2),
+	T("bpfsm/body3", test_body3),
+	T("bpfsm/multibody1", test_multibody1),
+	T("bpfsm/multibody2", test_multibody2),
+	T("bpfsm/bodysect", test_bodysect),
+	()
+];
+
+class GatherCallback extends ModuleParserCallback {
+	def sections = Vector<(BpSection, Array<byte>)>.new();
+	def bodies = Vector<Array<byte>>.new();
+	new(module: Module) super(module) { }
+
+	def decodeSection(kind: BpSection, size: u32, d: Decoder) {
+		sections.add((kind, d.read_bytes(int.!(size))));
+	}
+	def decodeFunctionBody(index: u32, size: u32, d: Decoder) {
+		bodies.add(d.read_bytes(int.!(size)));
+	}
+	def reset() -> this {
+		sections.resize(0);
+		bodies.resize(0);
+	}
+}
+
+class BpFsmTester(t: Tester) {
+	var extensions: Extension.set;
+	var limits = Limits.new();
+	def module = Module.new("BpFsmTest.v3");
+	def g = GatherCallback.new(module);
+	def valid(raw: Array<byte>) {
+		validN(raw, 0, raw.length);
+	}
+	def validN(raw: Array<byte>, pos: int, length: int) {
+		for (i < length) {
+			var m = fsm();
+			m.push(raw, pos, i);
+			m.push(raw, pos + i, length - i);
+			if (!assert_valid(m.finish())) return;
+		}
+	}
+	def invalid(expected: WasmError, raw: Array<byte>) {
+		invalidN(expected, (raw, 0, raw.length));
+	}
+	def invalidN(expected: WasmError, t: (Array<byte>, int, int)) {
+		var raw = t.0, pos = t.1, length = t.2;
+		var m = fsm();
+		m.push(raw, 0, length);
+		assert_invalid(expected, m.finish());
+	}
+	def assert_invalid(expected: WasmError, r: BinParserResult) -> bool {
+		match (r) {
+			Ok(module) => {
+				t.fail1("expected error %s, but passed", expected.name);
+				return false;
+			}
+			Error(code, filename, error_pos, error_msg) => {
+				if (code == expected) return true;
+				var buf = StringBuffer.new();
+				buf.put2("expected error %s, but got %s: ", expected.name, code.name);
+				buf.put2("@+%d %s", error_pos, nonnull(error_msg));
+				t.fail(buf.extract());
+				return false;
+			}
+		}
+	}
+	def assert_valid(r: BinParserResult) -> bool {
+		match (r) {
+			Ok(module) => return true;
+			Error(code, filename, error_pos, error_msg) => {
+				var buf = StringBuffer.new();
+				buf.put1("expected success, but got %s: ", code.name);
+				buf.put2("@+%d %s", error_pos, nonnull(error_msg));
+				t.fail(buf.extract());
+				return false;
+			}
+		}
+	}
+	def fsm() -> BpFsm {
+		var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
+		return BpFsm.new(v, extensions, limits, g.reset());
+	}
+	def nonnull(s: string) -> string {
+		return if(s != null, s, "<null>");
+	}
+	def assert_sections(expected: Array<(BpSection, Array<byte>)>) {
+		if (g.sections.length != expected.length) return t.fail2("expected %d sections, got %2", expected.length, g.sections.length);
+
+		for (i < expected.length) {
+			var e = expected[i], s = g.sections[i];
+			if (s.0 != e.0) return t.fail2("expected %s section, got %s", e.0.name, s.0.name);
+			if (!t.assertb(e.1, s.1).ok) return;
+		}
+	}
+	def assert_bodies(expected: Array<Array<byte>>) {
+		if (g.bodies.length != expected.length) return t.fail2("expected %d bodies, got %2", expected.length, g.sections.length);
+
+		for (i < expected.length) {
+			var e = expected[i], s = g.bodies[i];
+			if (!t.assertb(e, s).ok) return;
+		}
+	}
+}
+
+def VALID_HEADER = BinUtil.WASM_HEADER;
+
+def test_empty(t: BpFsmTester) {
+	for (i < VALID_HEADER.length) {
+		var mod = Arrays.range(VALID_HEADER, 0, i);
+		t.invalid(WasmError.INVALID_HEADER, mod);
+	}
+}
+
+def test_hdr(t: BpFsmTester) {
+	t.valid(VALID_HEADER);
+}
+
+def test_sect0(t: BpFsmTester) {
+	var b = BinBuilder.new();
+	var data: Array<byte> = [55, 66, 77];
+	for (sect in BpSection) {
+		if (sect == BpSection.Code) continue;
+		b.reset_header();
+
+		b.add(sect.code);
+		b.put_u32leb(3);
+		b.addv(data);
+		t.validN(b.storage());
+		t.assert_sections([(sect, data)]);
+	}
+}
+
+def test_sect1(t: BpFsmTester) {
+	var data: Array<byte> = [55, 66, 77];
+	var b = BinBuilder.new();
+	for (sect in BpSection) {
+		if (sect == BpSection.Code) continue;
+		b.reset_header();
+
+		b.add(sect.code);
+		b.put_u32leb(4);
+		b.addv(data);
+		t.invalidN(WasmError.INCOMPLETE_SECTION, b.storage());
+	}
+}
+
+def test_sect2(t: BpFsmTester) {
+	var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
+	def data: Array<byte> = [33, 44, 55, 97];
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Unknown);
+	b.addv(data);
+	b.endSection();
+
+	for (i < b.length) {
+		var m = BpFsm.new(v, t.extensions, t.limits, t.g.reset());
+		var x = b.storage();
+		m.push(x.0, 0, i);
+		t.t.asserti(0, t.g.sections.length);
+		m.push(x.0, i, b.length - i);
+		t.assert_sections([(BpSection.Unknown, data)]);
+	}
+}
+
+def test_sect3(t: BpFsmTester) {
+	var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
+	def data: Array<byte> = [31, 42, 57, 67, 99, 189];
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Data);
+	b.addv(data);
+	b.endSection();
+
+	var m = BpFsm.new(v, t.extensions, t.limits, t.g.reset());
+	for (i < b.length) {
+		t.t.asserti(0, t.g.sections.length);
+		var x = b.storage();
+		m.push(x.0, i, 1);
+	}
+	t.assert_sections([(BpSection.Data, data)]);
+}
+
+def test_unknown(t: BpFsmTester) {
+	var data: Array<byte> = [88, 99, 55];
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginShortSection(BpSection.Data);
+	b.addv(data);
+	b.endSection();
+	b.add(97);
+	b.add(0);
+	t.invalidN(WasmError.INVALID_SECTION, b.storage());
+}
+
+def test_multisect(t: BpFsmTester) {
+	var data1: Array<byte> = [1, 66, 109, 254];
+	var data2: Array<byte> = [3, 4, 6, 177];
+	var b = BinBuilder.new().reset_header();
+	b.beginShortSection(BpSection.Memory);
+	b.addv(data1);
+	b.endSection();
+	b.beginShortSection(BpSection.Table);
+	b.addv(data2);
+	b.endSection();
+	t.validN(b.storage());
+	t.assert_sections([(BpSection.Memory, data1),
+			(BpSection.Table, data2)]);
+}
+
+def test_body0(t: BpFsmTester) {
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.endSection();
+	t.invalidN(WasmError.INCOMPLETE_SECTION, b.storage());
+}
+
+def test_body1(t: BpFsmTester) {
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(0);
+	b.endSection();
+	t.validN(b.storage());
+}
+
+def test_body2(t: BpFsmTester) {
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(1);
+	b.add(0);
+	b.endSection();
+	t.invalidN(WasmError.FUNC_COUNT_MISMATCH, b.storage());
+}
+
+def test_body3(t: BpFsmTester) {
+	t.module.functions.declared.add(FunctionDecl.new(0, 0, SigCache.v_v));
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(1);
+	b.add(0);
+	b.endSection();
+	t.validN(b.storage());
+	t.assert_bodies([[]]);
+}
+
+def test_bodysect(t: BpFsmTester) {
+	t.module.functions.declared.add(FunctionDecl.new(0, 0, SigCache.v_v));
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(1);
+	b.add(0);
+	b.endSection();
+	b.beginShortSection(BpSection.Data);
+	b.add(117);
+	b.endSection();
+	t.validN(b.storage());
+	t.assert_sections([(BpSection.Data, [117])]);
+	t.assert_bodies([[]]);
+}
+
+def test_multibody1(t: BpFsmTester) {
+	t.module.functions.declared.add(FunctionDecl.new(0, 0, SigCache.v_v));
+	t.module.functions.declared.add(FunctionDecl.new(1, 0, SigCache.v_v));
+	var body1: Array<byte> = [99, 88, 77];
+	var body2: Array<byte> = [109, 108, 107];
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(2);
+	b.put_u32leb(u32.!(body1.length));
+	b.addv(body1);
+	b.put_u32leb(u32.!(body2.length));
+	b.addv(body2);
+	b.endSection();
+	t.validN(b.storage());
+	t.assert_bodies([body1, body2]);
+}
+
+def test_multibody2(t: BpFsmTester) {
+	t.module.functions.declared.add(FunctionDecl.new(0, 0, SigCache.v_v));
+	t.module.functions.declared.add(FunctionDecl.new(1, 0, SigCache.v_v));
+	var body1: Array<byte> = [69, 58, 47];
+	var body2: Array<byte> = [149, 148, 147];
+	var b = BinBuilder.new();
+	b.reset_header();
+	b.beginSection(BpSection.Code);
+	b.add(2);
+	b.put_u32leb(u32.!(body1.length));
+	b.addv(body1);
+	b.put_u32leb(u32.!(body2.length));
+	b.addv(body2);
+	b.endSection();
+	b.add(66);
+	t.invalidN(WasmError.INVALID_SECTION, b.storage());
+	t.assert_bodies([body1, body2]);
+}
