@@ -5,29 +5,26 @@
 // representation. The parser uses a "push" model which allows the creator
 // to input segments of data into the parser incrementally, e.g. if streaming
 // it over a network.
-class ModuleParser extends WasmParser {
+class ModuleParser {
 	def filename: string;
+	def err = WasmErrorGen.new(filename);
+	def module = Module.new(filename);
+	def extensions: Extension.set;
+	def limits: Limits;
+	var parser: WasmParser;
+	var verbose: bool;
 
-	new(vb: Verbosity, extensions: Extension.set, limits: Limits, filename: string)
-		super(extensions, limits, Module.new(filename)) {
+	new(vb: Verbosity, extensions, limits, filename) {
 		verbose = vb.tag > Verbosity.SILENT.tag;
+		var callback = ModuleParserCallback.new(this);
+		fsm = BpFsm.new(vb, extensions, limits, err, callback);
+		parser = WasmParser.new(extensions, limits, module, err, fsm.decoder);
+		parser.verbose = verbose;
 	}
 
-	private var state = BpState.HEADER;
-	private var cur_function: int;
-	private var size_estimate: int;
-	private var expected_code_size: u32;
-	private var code_start: int;
+	private var fsm: BpFsm;
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var total_module_size: int;
-	private var finished: bool;
-
-	private var eof_pos = int.max;
-
-	// Checks whether any error has occured yet and returns {true} if not.
-	def ok() -> bool { return err.ok() || eof; }
-	// Checks whether any error has occurred yet and returns {true} if so.
-	def error() -> bool { return err.error() && !eof; }
 
 	// Push new data into the parser from the specified range. The given array is
 	// not modified or retained by this call; internal copies of data are made
@@ -36,217 +33,87 @@ class ModuleParser extends WasmParser {
 	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
 		if (xlength == 0) return; // nothing to do
 		if (err.error()) return;  // already hit an error
-
-		total_module_size += xlength;
-		if (total_module_size > limits.max_module_size) {
-			// Enforce maximum module size.
-			err.fail1(decoder.pos, WasmError.EXCEEDED_LIMIT,
-				"maximum module size of %d exceeded",
-				limits.max_module_size);
-			return;
-		}
-		// Append data to end of current buffer.
-		decoder.append(0, x, xpos, xlength);
-
-		// Run the decode loop.
-		decodeLoop();
-
-		// Don't allow the decoder to hold onto the caller's buffer.
-		decoder.divest(0, x);
-	}
-	private def decodeLoop() {
-		// Run the decode loop.
-		while (true) {
-			traceBuffer();
-			match (state) {
-				HEADER => readHeader();
-				SECTIONS => if (decoder.more()) readSection();
-				FUNCTIONS => readFunctionBody();
-			}
-			if (!decoder.more()) break;
-			if (!err.ok()) break;
-			if (eof) break;
-		}
+		fsm.push(x, xpos, xlength);
 	}
 
 	// Finish the decoding of the pushed bytes, returning a valid module upon
 	// success, or an error.
 	def finish() -> BinParserResult {
-		if (err.ok()) {
-			finished = true;
-			decoder.eof_behavior = Decoder.eof_error;
-			// Run the decode loop to flush out EOF errors.
-			decodeLoop();
-			if (err.ok()) return BinParserResult.Ok(module);
-		}
-
-		return BinParserResult.Error(err.error_code, filename,
-				err.error_pos, err.error_msg);
+		return fsm.finish();
 	}
 
-	private def readHeader() {
-		var p1 = decoder.pos, magic = decoder.read_u32();
-		if (eof) {
-			return retry(p1, 8, p1, WasmError.INVALID_HEADER,
-					"EOF: expecting magic word", (), ());
-		}
-		if (magic != WASM_MAGIC) {
-			return err.fail2(p1, WasmError.INVALID_HEADER,
-					"incorrect Wasm magic word 0x%x, expected 0x%x",
-					magic, WASM_MAGIC);
-		}
-		var p2 = decoder.pos, version = decoder.read_u32();
-		if (eof) {
-			return retry(p1, 4, p2, WasmError.INVALID_HEADER,
-					"EOF: expecting version", (), ());
-		}
-		if (version != WASM_VERSION) {
-			return err.fail2(p2, WasmError.INVALID_HEADER,
-					"incorrect Wasm version %d, expected %d",
-					version, magic);
-		}
-		if (err.ok()) state = BpState.SECTIONS;
-	}
-
-	private def retry0(pos: int, expect: int) -> bool {
-		if (verbose) {
-			trace.put2("[rewind to +%d, expecting %d]\n", pos, expect);
-			flush();
-		}
-		if (finished) return false;
-		decoder.at(pos);
-		size_estimate = if (expect > 0,
-			if (expect < MAX_SIZE_ESTIMATE, expect, MAX_SIZE_ESTIMATE));
-		return true;
-	}
-	private def retry<A, B>(pos: int, expect: int, error_pos: int,
-			error: WasmError, msg: string, a: A, b: B) {
-		if (!retry0(pos, expect)) {
-			err.fail2(error_pos, error, msg, a, b);
-		}
-	}
-
-	private def readSection() {
-		var start = decoder.pos;
-		var code = readByte("section code", renderSectionName);
-		if (!BpConstants.valid_section[code]) {
-			return err.fail1(start, WasmError.INVALID_SECTION,
-				"unknown section code 0x%x", code);
-		}
-
-		var size_pt = decoder.pos;
-		var size = readU32("section size", 0, limits.max_module_size);
-		if (!err.ok()) return;
-		if (verbose) {
-			trace.put3("=>section code=%d (%q), size=%d\n",
-				code, renderSectionName(_, code), size);
-			flush();
-		}
-		if (eof) {
-			return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
-					"EOF: expecting size for %q section",
-					renderSectionName(_, code), ());
-		}
-
-		var body_pt = decoder.pos;
-		// Check for duplicate sections
-		if (code != 0 && code < seen_sections.length && seen_sections[code]) {
-			return err.fail1(start, WasmError.DUPLICATE_SECTION,
-				"duplicate %q section", renderSectionName(_, code));
-		}
-
-		// The code section has a special state: function bodies are
-		// handled individually.
-		if (code == BpSection.Code.code) {
-			// Transition into reading code section
-			var num_functions = readU32("function body count", 0, limits.max_num_functions);
-			if (eof) {
-				return retry(start, 5, size_pt, WasmError.INCOMPLETE_SECTION,
-					"EOF: expecting count in code section",
-					(), ());
+	def decodeSection(kind: BpSection, size: u32, d: Decoder) {
+		var start = d.pos;
+		parser.decoder = d;
+		parser.traceBuffer();
+		if (kind != BpSection.Unknown) {
+			if (seen_sections[kind.code]) {
+				return err.fail1(d.abs(d.pos-1), WasmError.DUPLICATE_SECTION,
+					"duplicate %q section", renderSectionName(_, kind.code));
+			} else {
+				seen_sections[kind.code] = true;
 			}
-			if (num_functions != module.functions.declared.length) {
-				return err.fail2(body_pt, WasmError.FUNC_COUNT_MISMATCH,
-					"expecting %d function bodies, got %d",
-					module.functions.declared.length, num_functions);
-			}
-			seen_sections[code] = true;
-			state = BpState.FUNCTIONS;
-			expected_code_size = size;
-			code_start = decoder.abs(body_pt);
-			return;
 		}
-
-		// For all other sections, rewind if they are not complete.
-		if (!decoder.check_bytes(int.!(size))) {
-			return retry(start, int.!(size), decoder.pos, WasmError.INCOMPLETE_SECTION,
-					"EOF: incomplete %q section", renderSectionName(_, code), ());
-		}
-
-		// For valid sections, record that the section has now been seen.
-		if (code >= 0 && code < seen_sections.length) {
-			seen_sections[code] = true;
-		}
-
-		// TODO: ugly; lower limit to EOF for reading beyond the end
-		var prev_limit = decoder.limit;
-		var new_limit = decoder.pos + int.!(size);
-		decoder.limit = new_limit;
-		match (code) {
-			0 => readCustomSection(size);
-			BpSection.Type.code => readMultiple("types", size,
-				limits.max_num_types, module.types.declared, readTypeDecl);
-			BpSection.Import.code => readMultiple("imports", size,
-				limits.max_num_imports, module.imports, readImportDecl);
-			BpSection.Function.code => readMultiple("functions", size,
-				limits.max_num_functions, module.functions.declared, readFunctionDecl);
-			BpSection.Table.code => readMultiple("tables", size,
-				limits.max_num_tables, module.tables.declared, readTableDecl);
-			BpSection.Memory.code => readMultiple("memories", size,
-				limits.max_num_memories, module.memories.declared, readMemoryDecl);
-			BpSection.Global.code => readMultiple("globals", size,
-				limits.max_num_globals, module.globals.declared, readGlobalDecl);
-			BpSection.Export.code => readMultiple("exports", size,
-				limits.max_num_exports, module.exports, readExportDecl);
-			BpSection.Start.code =>
+		match (kind) {
+			Unknown => readCustomSection(size);
+			Type => readMultiple("types", size,
+				limits.max_num_types, module.types.declared,
+				parser.readTypeDecl);
+			Import => readMultiple("imports", size,
+				limits.max_num_imports, module.imports,
+				parser.readImportDecl);
+			Function => readMultiple("functions", size,
+				limits.max_num_functions, module.functions.declared,
+				parser.readFunctionDecl);
+			Table => readMultiple("tables", size,
+				limits.max_num_tables, module.tables.declared,
+				parser.readTableDecl);
+			Memory => readMultiple("memories", size,
+				limits.max_num_memories, module.memories.declared,
+				parser.readMemoryDecl);
+			Global => readMultiple("globals", size,
+				limits.max_num_globals, module.globals.declared,
+				parser.readGlobalDecl);
+			Export => readMultiple("exports", size,
+				limits.max_num_exports, module.exports,
+				parser.readExportDecl);
+			Start =>
 				readStartSection();
-			BpSection.Element.code => readMultiple("elements", size,
-				limits.max_num_table_entries, module.elems, readElemDecl);
-			BpSection.Data.code => readMultiple("data", size,
-				limits.max_num_data_segments, module.data, readDataDecl);
-			_ => return err.fail1(start, WasmError.INVALID_SECTION,
-				"unknown section code 0x%x", code);
+			Element => readMultiple("elements", size,
+				limits.max_num_table_entries, module.elems,
+				parser.readElemDecl);
+			Data => readMultiple("data", size,
+				limits.max_num_data_segments, module.data,
+				parser.readDataDecl);
+			_ => return err.fail1(d.abs(d.pos), WasmError.INVALID_SECTION,
+				"unexpected section code 0x%x", kind.code);
 		}
-
-		if (eof && err.ok()) {
-			err.error_code = WasmError.OVERFLOW_SECTION;
-			return;
-		}
-		if (decoder.limit == new_limit) {
-			// TODO: ugly; restore prior limit after reading section
-			decoder.limit = prev_limit;
-		}
-		// Check that the size of bytes read equals the section's declared size
-		var read = decoder.pos - body_pt;
-		traceBuffer();
-		checkReadSize(code, body_pt, size);
-	}
-	private def checkReadSize(code: byte, body_pt: int, size: u32) {
-		var read = decoder.pos - body_pt;
+		var read = d.pos - start;
 		if (read < size) {
-			var pt = decoder.abs_pos();
-			err.fail2(pt, WasmError.INCOMPLETE_SECTION,
-				"expected section size of %d, read %d bytes", size, read);
-		} else if (read > size) {
-			var pt = decoder.abs(decoder.pos - (read - int.!(size)));
-			err.fail2(pt, WasmError.OVERFLOW_SECTION,
-				"expected section size of %d, read %d bytes", size, read);
+			err.fail2(d.abs(d.pos),
+				WasmError.INCOMPLETE_SECTION,
+				"expected section size of %d, read %d bytes",
+				size, read);
+		}
+	}
+	def beginCodeSection(abspos: int, count: u32) {
+		var kind = BpSection.Code;
+		if (seen_sections[kind.code]) {
+			return err.fail1(abspos - 1, WasmError.DUPLICATE_SECTION,
+				"duplicate %q section", renderSectionName(_, kind.code));
+		} else {
+			seen_sections[kind.code] = true;
+			var expected = module.functions.declared.length;
+			if (count != expected) {
+				err.fail2(abspos, WasmError.FUNC_COUNT_MISMATCH, "expected %d function bodies, got %d", expected, count);
+			}
 		}
 	}
 
-	private def readCustomSection(size: u32) {
+	def readCustomSection(size: u32) {
+		var decoder = parser.decoder;
 		var start = decoder.pos;
-		var name_len = readU32("name length", 0, limits.max_module_size);
+		var name_len = parser.readU32("name length", 0, limits.max_module_size);
 		var name = decoder.read_bytes(int.!(name_len));
 		var payload_len = int.!(size) - (decoder.pos - start);
 		if (payload_len < 0) {
@@ -256,18 +123,19 @@ class ModuleParser extends WasmParser {
 		var payload = decoder.read_bytes(payload_len);
 		module.custom_sections.add(CustomSection.new(name, payload));
 	}
-	private def readMultiple<T>(thing_name: string, size: u32,
+	def readMultiple<T>(thing_name: string, size: u32,
 		max: u32, vec: Vector<T>, read: int -> T) {
+		var decoder = parser.decoder;
 		var max_pt = decoder.pos + int.!(size);
-		var count = readU32(thing_name, 0, max);
+		var count = parser.readU32(thing_name, 0, max);
 		if (!err.ok()) return;
 		if (count < MAX_GROW_SIZE) vec.grow(int.!(count));
 		for (index < int.!(count)) {
 			if (verbose) {
-				trace.put2("==>%s #%d\n", thing_name, index);
-				flush();
+				parser.trace.put2("==>%s #%d\n", thing_name, index);
+				parser.flush();
 			}
-			if (eof) break;
+			if (err.error()) break;
 			if (decoder.pos >= max_pt) {
 				err.fail1(decoder.abs(max_pt),
 					WasmError.OVERFLOW_SECTION,
@@ -277,181 +145,10 @@ class ModuleParser extends WasmParser {
 			vec.set(index, thing);
 		}
 	}
-	private def readTypeDecl(index: int) -> TypeDecl {
-		var pt = decoder.pos, invalid: TypeDecl;
-		var form = readByte("type constructor", renderTypecon);
-		if (form != BpTypecon.Function.code) {
-			err.fail2(pt, WasmError.INVALID_TYPE,
-				"invalid type 0x%x, expected function (0x%x)",
-				form, BpTypecon.Function.code);
-			return invalid;
-		}
-		pt = decoder.pos;
-		var param_count = readU32("param count", 0, limits.max_num_func_params);
-		if (!err.ok()) return invalid;
-		var ptypes = Array<ValueType>.new(int.!(param_count));
-		for (j < param_count) {
-			ptypes[int.!(j)] = readValueType();
-		}
-		var ret_count = readU32("result count", 0, limits.max_num_func_results);
-		if (!err.ok()) return invalid;
-		var rtypes = Array<ValueType>.new(int.!(ret_count));
-		for (j < ret_count) {
-			rtypes[int.!(j)] = readValueType();
-		}
-		return TypeDecl.Function(ptypes, rtypes);
-	}
-	private def readImportDecl(index: int) -> ImportDecl {
-		var module_name = readString("import module name");
-		var field_name = readString("import field name");
+	def readStartSection() {
+		var decoder = parser.decoder;
 		var pt = decoder.pos;
-		var kind = readByte("import kind", renderImportKind);
-		var result: ImportDecl;
-		var details: ImportDetails;
-		match (kind) {
-			BpImportExportKind.Function.code => {
-				var sig = readSig();
-				var decl = FunctionDecl.new(module.functions.size(), sig.0, sig.1);
-				module.functions.imported.add(decl);
-				details = ImportDetails.Function(decl);
-			}
-			BpImportExportKind.Table.code => {
-				checkMaxNumTables(pt);
-				var et = readElemType();
-				var l = readLimits("table", limits.max_table_size);
-				var decl = TableDecl.new(module.tables.size(), et, l.0, l.1);
-				module.tables.imported.add(decl);
-				details = ImportDetails.Table(decl);
-			}
-			BpImportExportKind.Memory.code => {
-				checkMaxNumMemories(pt);
-				var l = readMemoryLimits("memory", limits.max_memory_pages);
-				var decl = MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
-				module.memories.imported.add(decl);
-				details = ImportDetails.Memory(decl);
-			}
-			BpImportExportKind.Global.code => {
-				var t = readValueType();
-				var mut = readByte("flags", renderGlobalFlags) != 0;
-				var decl = GlobalDecl.new(module.globals.size(), t, mut, InitExpr.I32(0));
-				module.globals.imported.add(decl);
-				details = ImportDetails.Global(decl);
-			}
-			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid import kind 0x%x", kind);
-		}
-		return ImportDecl.new(module_name, field_name, details);
-	}
-	private def readFunctionDecl(index: int) -> FunctionDecl {
-		var pt = decoder.pos;
-		var sig = readSig();
-		return FunctionDecl.new(module.functions.size(), sig.0, sig.1);
-	}
-	private def readTableDecl(index: int) -> TableDecl {
-		checkMaxNumTables(decoder.pos);
-		var et = readElemType();
-		var l = readLimits("table", limits.max_table_size);
-		return TableDecl.new(module.tables.size(), et, l.0, l.1);
-	}
-	private def readMemoryDecl(index: int) -> MemoryDecl {
-		checkMaxNumMemories(decoder.pos);
-		var l = readMemoryLimits("memory", limits.max_memory_pages);
-		return MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
-	}
-	private def readGlobalDecl(index: int) -> GlobalDecl {
-		var vt = readValueType();
-		var mut = readByte("flags", renderGlobalFlags) != 0;
-		var pos = decoder.pos;
-		var init = readInitExpr("global initializer"), vti = init.1;
-		if (!ValueTypes.isAssignable(vti, vt)) {
-			err.fail2(decoder.abs(pos), WasmError.TYPE_MISMATCH,
-				"expected type %q in global initializer, got %q",
-				ValueTypes.render(_, vt), ValueTypes.render(_, vti));
-		}
-		return GlobalDecl.new(module.globals.size(), vt, mut, init.0);
-	}
-	private def readExportDecl(index: int) -> ExportDecl {
-		var name = readString("export name");
-		var pt = decoder.pos;
-		var kind = readByte("export kind", renderImportKind);
-		var details: ExportDetails;
-		match (kind) {
-			BpImportExportKind.Function.code => {
-				var index = readFunc().0;
-				details = ExportDetails.Function(index);
-			}
-			BpImportExportKind.Table.code => {
-				var index = readTableIndex();
-				details = ExportDetails.Table(index);
-			}
-			BpImportExportKind.Memory.code => {
-				var index = readMemoryIndex();
-				details = ExportDetails.Memory(index);
-			}
-			BpImportExportKind.Global.code => {
-				var index = readGlobal().0;
-				details = ExportDetails.Global(index);
-			}
-			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid export kind 0x%x", kind);
-		}
-		return ExportDecl.new(name, details);
-	}
-	private def readElemDecl(index: int) -> ElemDecl {
-		var pt = decoder.pos;
-		var flags = readByte("data flags", renderNone);
-		var active = true, table_index = 0, init_exprs = false;
-		if (extensions.BULK_MEMORY) {
-			if ((flags & 1) == 1) active = false;
-			if ((flags & 2) == 2) table_index = readTableIndex();
-			if ((flags & 4) == 4) init_exprs = true;
-		} else if (flags != 0) {
-			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for elements, got 0x%x", flags);
-		} else {
-			table_index = checkIndex(pt, "table index", 0, module.tables).0;
-		}
-		var offset = readI32Expr("elements offset");
-		var count = readU32("element count", 0, limits.max_num_table_entries);
-		var details: ElemDetails;
-		if (init_exprs) { // init expressions
-			var array = Array<InitExpr>.new(int.!(count));
-			for (i < int.!(count)) {
-				// TODO: typecheck init exprs for elements
-				array[i] = readInitExpr("element").0;
-			}
-			details = ElemDetails.Exprs(array);
-		} else {  // function indices
-			var array = Array<int>.new(int.!(count));
-			for (i < int.!(count)) {
-				array[i] = readFunc().0;
-			}
-			details = ElemDetails.FuncRefs(array);
-		}
-		return ElemDecl.new(table_index, offset, details, active);
-	}
-	private def readDataDecl(index: int) -> DataDecl {
-		var pt = decoder.pos;
-		var flags = readByte("data flags", renderNone);
-		var active = true, mem_index = 0;
-		if (extensions.BULK_MEMORY) {
-			if ((flags & 1) == 1) {
-				active = false;
-				mem_index = readMemoryIndex();
-			}
-		} else if (flags != 0) {
-			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for data segment, got 0x%x", flags);
-		}
-		checkIndex(pt, "memory index", u32.!(mem_index), module.memories);
-		var offset = readI32Expr("data element offset");
-		var len = readU32("data segment size", 0, limits.max_data_segment_size);
-		var data = decoder.read_bytes(int.!(len));
-		return DataDecl.new(mem_index, offset, data, active);
-	}
-	private def readStartSection() {
-		var pt = decoder.pos;
-		var t = readFunc(), index = t.0, func = t.1;
+		var t = parser.readFunc(), index = t.0, func = t.1;
 		module.start_function = t.0;
 		if (func != null &&
 			(func.sig.params.length > 0 || func.sig.results.length > 0)) {
@@ -460,152 +157,32 @@ class ModuleParser extends WasmParser {
 		}
 	}
 
-	def readLimits(quantity: string, limit: u32) -> (int, int) {
-		var flags = readByte("flags", renderLimitFlags);
-		var min = readU32("initial", 0, limit);
-		var has_max = (flags & 1) == 1;
-		var max = -1;
-		if (has_max) {
-			var pt = decoder.pos;
-			var m = readU32("maximum", min, limit);
-			max = int.!(max);
-		}
-		return (int.!(min), max);
-	}
-	def readMemoryLimits(quantity: string, limit: u32) -> (int, int, bool) {
-		var pt = decoder.pos;
-		var flags = readByte("flags", renderLimitFlags);
-		var min = readU32("initial", 0, limit);
-		var has_max = (flags & 1) == 1;
-		var max = -1, shared = false;
-		if (has_max) {
-			var pt = decoder.pos;
-			var m = readU32("maximum", min, limit);
-			max = int.!(max);
-		}
-		if (extensions.ATOMICS) {
-			shared = (flags & 2) == 2;
-			if (shared && !has_max) {
-				err.fail(pt, WasmError.EXPECTED_MAXIMUM,
-					"shared memory must have maximum");
-			}
-		}
-		return (int.!(min), max, shared);
-	}
-	def readElemType() -> ElemType {
-		var pt = decoder.pos;
-		var b = readByte("element type", renderTypecon);
-		var et: ElemType;
-		match (b) {
-			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
-			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
-			_ => err.fail1(pt, WasmError.ILLEGAL_TYPE,
-				"invalid table element type 0x%x", b);
-		}
-		return et;
-	}
-	def readI32Expr(quantity: string) -> InitExpr {
-		var pt = decoder.pos;
-		var init = readInitExpr(quantity), vt = init.1;
-		if (!ValueTypes.isAssignable(vt, ValueType.I32)) {
-			err.fail1(pt, WasmError.TYPE_MISMATCH,
-				"expected i32 init expr, got %q",
-				ValueTypes.render(_, vt));
-		}
-		return init.0;
-	}
-	def readInitExpr(quantity: string) -> (InitExpr, ValueType) {
-		var pt = decoder.pos, expr: InitExpr;
-		def opcode = readByte("opcode", Opcodes.render);
-		var vt: ValueType;
-		match (opcode) {
-			Opcode.I32_CONST.code => {
-				var val = readU32("i32 constant", 0, u32.max);
-				expr = InitExpr.I32(int.!(val));
-				vt = ValueType.I32;
-			}
-			Opcode.I64_CONST.code => {
-				var val = readU64("i64 constant");
-				expr = InitExpr.I64(long.!(val));
-				vt = ValueType.I64;
-			}
-			Opcode.F32_CONST.code => {
-				var val = decoder.read_u32();
-				expr = InitExpr.F32(val);
-				vt = ValueType.F32;
-			}
-			Opcode.F64_CONST.code => {
-				var val = decoder.read_u64();
-				expr = InitExpr.F64(val);
-				vt = ValueType.F64;
-			}
-			Opcode.GLOBAL_GET.code => {
-				var g = readGlobal();
-				expr = InitExpr.Global(g);
-				if (g.1 != null) vt = g.1.valtype;
-			}
-			_ => {
-				err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-					"unexpected opcode 0x%x (%q) in init expression", opcode,
-					Opcodes.render(_, opcode));
-			}
-		}
-		pt = decoder.pos;
-		var end = readByte("end opcode", Opcodes.render);
-		if (end != Opcode.END.code) {
-			err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-				"expected 0x%x (END) opcode, got 0x%x", Opcode.END.code, end);
-		}
-		return (expr, vt);
-	}
-	private def readFunctionBody() {
-		if (cur_function == module.functions.declared.length) {
-			state = BpState.SECTIONS;
-			var read = decoder.abs_pos() - code_start;
-			var logical_body_pt = decoder.pos - read;
-			checkReadSize(BpSection.Code.code, logical_body_pt,
-					expected_code_size);
-			return;
-		}
+	def decodeFunctionBody(index: u32, size: u32, d: Decoder) {
+		var decoder = parser.decoder = d;
 		var start = decoder.pos;
-		var size = readU32("function size", 0, limits.max_func_size);
-		if (eof) {
-			return retry(start, 5, start, WasmError.INCOMPLETE_FUNCTION_BODY,
-					"EOF: expecting function body size", (), ());
-		}
+		var size = parser.readU32("function size", 0, limits.max_func_size);
 		var body = decoder.read_bytes(int.!(size));
-		if (eof) {
-			return retry(start, int.!(size), start, WasmError.INCOMPLETE_FUNCTION_BODY,
-					"EOF: incomplete function body", (), ());
-		}
-		var f = module.functions.declared[cur_function++];
+		var f = module.functions.declared[int.!(index)];
 		f.code = FunctionCode.new(body);
 	}
-
-	private def checkSectionConstraints() {
-		// TODO
+}
+class ModuleParserCallback(mp: ModuleParser) extends BpFsmCallback(mp.module) {
+	def decodeSection(kind: BpSection, size: u32, d: Decoder) {
+		mp.decodeSection(kind, size, d);
 	}
-	def checkMaxNumTables(pt: int) {
-		var max = limits.max_num_tables;
-		if (module.tables.size() >= max) {
-			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
-				"exceeded maximum of %d total tables", max);
-		}
+	def beginCodeSection(abspos: int, count: u32) {
+		mp.beginCodeSection(abspos, count);
 	}
-	def checkMaxNumMemories(pt: int) {
-		var max = limits.max_num_memories;
-		if (module.memories.size() >= max) {
-			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
-				"exceeded maximum of %d total memories", max);
-		}
+	def decodeFunctionBody(index: u32, size: u32, d: Decoder) {
+		mp.decodeFunctionBody(index, size, d);
 	}
 }
+
 type BinParserResult {
 	case Ok(module: Module) { }
 	case Error(code: WasmError, filename: string, error_pos: int, error_msg: string) { }
 }
 // Internal constants.
-def MAX_SIZE_ESTIMATE = 16 * 1024 * 1024;
 def MAX_GROW_SIZE = 1000000;
 // Header constants.
 def WASM_MAGIC = 0x6d736100u;
@@ -615,12 +192,6 @@ enum Verbosity {
 	SILENT,	    // no output
 	DIAGNOSTIC, // summarizes sections prior to error, verbose near error
 	VERBOSE	    // details for everything printed
-}
-// Used internally in the binary parser.
-enum BpState {
-	HEADER,
-	SECTIONS,
-	FUNCTIONS
 }
 def renderSectionName(buf: StringBuffer, b: byte) -> StringBuffer {
 	var s = "unknown";
@@ -682,123 +253,13 @@ def renderLimitFlags(buf: StringBuffer, b: byte) -> StringBuffer {
 def EMPTY: Array<ValueType> = [];
 def FUNC_VEC128 = TypeDecl.Function(EMPTY, [ValueType.VEC128]);
 def FUNC_ANYREF = TypeDecl.Function(EMPTY, [ValueType.ANYREF]);
-// A binary parser customized to immediates.
-class BinImmParser extends WasmParser {
-	new(extensions: Extension.set, limits: Limits,
-		module: Module, decoder: Decoder) super(extensions, limits, module) {
-		this.decoder = decoder;
-	}
-	// skip an immediate of the given kind and return its size
-	def skipImm(kind: ImmKind) -> int {
-		var pt = decoder.pos;
-		match (kind) {
-			NONE => ;
-			BLOCK_TYPE => readBlockType();
-			LABEL => readLabel();
-			LABELS => readLabels();
-			FUNC_INDEX => readFunc();
-			SIG_TABLE_INDEX => { readSig(); readTableIndex(); }
-			LOCAL_INDEX => readLocalIndex();
-			GLOBAL_INDEX => readGlobal();
-			MEMORY_INDEX => readMemoryIndex();
-			MEMARG => readMemoryArg();
-			I32 => readI32();
-			I64 => readI64();
-			F32 => readF32();
-			F64 => readF64();
-		}
-		return decoder.pos - pt;
-	}
-	def readBlockType() -> TypeDecl.Function {
-		var pt = decoder.pos, b = readByte("block type", renderTypecon);
-		match (b) {
-			BpTypecon.EmptyBlock.code => return SigCache.v_v;
-			BpTypecon.I32.code => return SigCache.v_i;
-			BpTypecon.I64.code => return SigCache.v_l;
-			BpTypecon.F32.code => return SigCache.v_f;
-			BpTypecon.F64.code => return SigCache.v_d;
-			BpTypecon.VEC128.code => return FUNC_VEC128;
-			BpTypecon.AnyRef.code => return FUNC_ANYREF;
-		}
-		decoder.at(pt); // backup and try again as full signed LEB
-		var index = decoder.read_i32leb(), r: TypeDecl.Function;
-		if (index < 0 || index > module.types.size()) {
-			err.fail1(pt, WasmError.INVALID_BLOCK_TYPE,
-				"invalid block type %d", index);
-			return r;
-		}
-		var t = module.types[index];
-		if (TypeDecl.Function.?(t)) {
-			return TypeDecl.Function.!(t);
-		} else {
-			var d: TypeDecl.Function;
-			err.fail1(pt, WasmError.ILLEGAL_BLOCK_TYPE,
-				"expected type index %d to be a function", index);
-			return r;
-		}
-	}
-	def readLabel() -> u32 {
-		var depth = decoder.read_u32leb();
-		return depth;
-	}
-	def readLabels() -> Array<u32> {
-		var pt = decoder.pos;
-		var count = decoder.read_u32leb(), max = limits.max_func_size;
-		if (count > max) {
-			err.fail2(pt, WasmError.EXCEEDED_LIMIT,
-				"target count %d exceeds maximum %d", count, max);
-			return null;
-		}
-		var length = int.!(count + 1);
-		var result = Array<u32>.new(length);
-		for (i < length) result[i] = decoder.read_u32leb();
-		return result;
-	}
-	def readLocalIndex() -> u32 {
-		var index = decoder.read_u32leb();
-		return index;
-	}
-	def readMemoryArg() -> (u32, int, u32) {
-		var pt = decoder.pos;
-		var flags = readU32("memarg flags", 0, u32.max); // TODO render
-		var mem_index = 0;
-		if (extensions.MULTI_MEMORY && (flags & 0x40) != 0) {
-			mem_index = readMemoryIndex();
-			flags ^= 0x40;  // flip flag back
-		} else {
-			checkIndex(pt, "memory index", 0, module.memories);
-		}
-		var offset = readU32("memarg offset", 0, u32.max);
-		return (flags, mem_index, offset);
-	}
-	def readI32() -> u32 {
-		var val = decoder.read_u32leb();
-		return val;
-	}
-	def readI64() -> u64 {
-		var val = decoder.read_u64leb();
-		return val;
-	}
-	def readF32() -> u32 {
-		var val = decoder.read_u32();
-		return val;
-	}
-	def readF64() -> u64 {
-		var val = decoder.read_u64();
-		return val;
-	}
-}
 // Contains common routines for the module parser and function body parser.
-class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
-	def err = WasmErrorGen.new(module.filename);
-	var decoder = Decoder.new(EMPTY_BYTES, err);
+class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
+	var err: WasmErrorGen, var decoder: Decoder) {
 	var verbose = false;
 	def trace = StringBuffer.new();
 	var eof = false;
 
-	new() {
-		decoder.eof_behavior = eof_set_flag;
-	}
 	def eof_set_flag(d: Decoder, pos: int, size: int, msg: string) {
 		eof = true;
 	}
@@ -914,6 +375,375 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 		return r;
 	}
 
+	// skip an immediate of the given kind and return its size
+	def skipImm(kind: ImmKind) -> int {
+		var pt = decoder.pos;
+		match (kind) {
+			NONE => ;
+			BLOCK_TYPE => readBlockType();
+			LABEL => readLabel();
+			LABELS => readLabels();
+			FUNC_INDEX => readFunc();
+			SIG_TABLE_INDEX => { readSig(); readTableIndex(); }
+			LOCAL_INDEX => readLocalIndex();
+			GLOBAL_INDEX => readGlobal();
+			MEMORY_INDEX => readMemoryIndex();
+			MEMARG => readMemoryArg();
+			I32 => readI32();
+			I64 => readI64();
+			F32 => readF32();
+			F64 => readF64();
+		}
+		return decoder.pos - pt;
+	}
+	def readBlockType() -> TypeDecl.Function {
+		var pt = decoder.pos, b = readByte("block type", renderTypecon);
+		match (b) {
+			BpTypecon.EmptyBlock.code => return SigCache.v_v;
+			BpTypecon.I32.code => return SigCache.v_i;
+			BpTypecon.I64.code => return SigCache.v_l;
+			BpTypecon.F32.code => return SigCache.v_f;
+			BpTypecon.F64.code => return SigCache.v_d;
+			BpTypecon.VEC128.code => return FUNC_VEC128;
+			BpTypecon.AnyRef.code => return FUNC_ANYREF;
+		}
+		decoder.at(pt); // backup and try again as full signed LEB
+		var index = decoder.read_i32leb(), r: TypeDecl.Function;
+		if (index < 0 || index > module.types.size()) {
+			err.fail1(pt, WasmError.INVALID_BLOCK_TYPE,
+				"invalid block type %d", index);
+			return r;
+		}
+		var t = module.types[index];
+		if (TypeDecl.Function.?(t)) {
+			return TypeDecl.Function.!(t);
+		} else {
+			var d: TypeDecl.Function;
+			err.fail1(pt, WasmError.ILLEGAL_BLOCK_TYPE,
+				"expected type index %d to be a function", index);
+			return r;
+		}
+	}
+	def readLabel() -> u32 {
+		var depth = decoder.read_u32leb();
+		return depth;
+	}
+	def readLabels() -> Array<u32> {
+		var pt = decoder.pos;
+		var count = decoder.read_u32leb(), max = limits.max_func_size;
+		if (count > max) {
+			err.fail2(pt, WasmError.EXCEEDED_LIMIT,
+				"target count %d exceeds maximum %d", count, max);
+			return null;
+		}
+		var length = int.!(count + 1);
+		var result = Array<u32>.new(length);
+		for (i < length) result[i] = decoder.read_u32leb();
+		return result;
+	}
+	def readLocalIndex() -> u32 {
+		var index = decoder.read_u32leb();
+		return index;
+	}
+	def readMemoryArg() -> (u32, int, u32) {
+		var pt = decoder.pos;
+		var flags = readU32("memarg flags", 0, u32.max); // TODO render
+		var mem_index = 0;
+		if (extensions.MULTI_MEMORY && (flags & 0x40) != 0) {
+			mem_index = readMemoryIndex();
+			flags ^= 0x40;  // flip flag back
+		} else {
+			checkIndex(pt, "memory index", 0, module.memories);
+		}
+		var offset = readU32("memarg offset", 0, u32.max);
+		return (flags, mem_index, offset);
+	}
+	def readI32() -> u32 {
+		var val = decoder.read_u32leb();
+		return val;
+	}
+	def readI64() -> u64 {
+		var val = decoder.read_u64leb();
+		return val;
+	}
+	def readF32() -> u32 {
+		var val = decoder.read_u32();
+		return val;
+	}
+	def readF64() -> u64 {
+		var val = decoder.read_u64();
+		return val;
+	}
+	def readLimits(quantity: string, limit: u32) -> (int, int) {
+		var flags = readByte("flags", renderLimitFlags);
+		var min = readU32("initial", 0, limit);
+		var has_max = (flags & 1) == 1;
+		var max = -1;
+		if (has_max) {
+			var pt = decoder.pos;
+			var m = readU32("maximum", min, limit);
+			max = int.!(max);
+		}
+		return (int.!(min), max);
+	}
+	def readMemoryLimits(quantity: string, limit: u32) -> (int, int, bool) {
+		var pt = decoder.pos;
+		var flags = readByte("flags", renderLimitFlags);
+		var min = readU32("initial", 0, limit);
+		var has_max = (flags & 1) == 1;
+		var max = -1, shared = false;
+		if (has_max) {
+			var pt = decoder.pos;
+			var m = readU32("maximum", min, limit);
+			max = int.!(max);
+		}
+		if (extensions.ATOMICS) {
+			shared = (flags & 2) == 2;
+			if (shared && !has_max) {
+				err.fail(pt, WasmError.EXPECTED_MAXIMUM,
+					"shared memory must have maximum");
+			}
+		}
+		return (int.!(min), max, shared);
+	}
+	def readElemType() -> ElemType {
+		var pt = decoder.pos;
+		var b = readByte("element type", renderTypecon);
+		var et: ElemType;
+		match (b) {
+			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
+			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
+			_ => err.fail1(pt, WasmError.ILLEGAL_TYPE,
+				"invalid table element type 0x%x", b);
+		}
+		return et;
+	}
+	def readI32Expr(quantity: string) -> InitExpr {
+		var pt = decoder.pos;
+		var init = readInitExpr(quantity), vt = init.1;
+		if (!ValueTypes.isAssignable(vt, ValueType.I32)) {
+			err.fail1(pt, WasmError.TYPE_MISMATCH,
+				"expected i32 init expr, got %q",
+				ValueTypes.render(_, vt));
+		}
+		return init.0;
+	}
+	def readInitExpr(quantity: string) -> (InitExpr, ValueType) {
+		var pt = decoder.pos, expr: InitExpr;
+		def opcode = readByte("opcode", Opcodes.render);
+		var vt: ValueType;
+		match (opcode) {
+			Opcode.I32_CONST.code => {
+				var val = readU32("i32 constant", 0, u32.max);
+				expr = InitExpr.I32(int.!(val));
+				vt = ValueType.I32;
+			}
+			Opcode.I64_CONST.code => {
+				var val = readU64("i64 constant");
+				expr = InitExpr.I64(long.!(val));
+				vt = ValueType.I64;
+			}
+			Opcode.F32_CONST.code => {
+				var val = decoder.read_u32();
+				expr = InitExpr.F32(val);
+				vt = ValueType.F32;
+			}
+			Opcode.F64_CONST.code => {
+				var val = decoder.read_u64();
+				expr = InitExpr.F64(val);
+				vt = ValueType.F64;
+			}
+			Opcode.GLOBAL_GET.code => {
+				var g = readGlobal();
+				expr = InitExpr.Global(g);
+				if (g.1 != null) vt = g.1.valtype;
+			}
+			_ => {
+				err.fail2(pt, WasmError.INVALID_INIT_EXPR,
+					"unexpected opcode 0x%x (%q) in init expression", opcode,
+					Opcodes.render(_, opcode));
+			}
+		}
+		pt = decoder.pos;
+		var end = readByte("end opcode", Opcodes.render);
+		if (end != Opcode.END.code) {
+			err.fail2(pt, WasmError.INVALID_INIT_EXPR,
+				"expected 0x%x (END) opcode, got 0x%x", Opcode.END.code, end);
+		}
+		return (expr, vt);
+	}
+	def readTypeDecl(index: int) -> TypeDecl {
+		var pt = decoder.pos, invalid: TypeDecl;
+		var form = readByte("type constructor", renderTypecon);
+		if (form != BpTypecon.Function.code) {
+			err.fail2(pt, WasmError.INVALID_TYPE,
+				"invalid type 0x%x, expected function (0x%x)",
+				form, BpTypecon.Function.code);
+			return invalid;
+		}
+		pt = decoder.pos;
+		var param_count = readU32("param count", 0, limits.max_num_func_params);
+		if (!err.ok()) return invalid;
+		var ptypes = Array<ValueType>.new(int.!(param_count));
+		for (j < param_count) {
+			ptypes[int.!(j)] = readValueType();
+		}
+		var ret_count = readU32("result count", 0, limits.max_num_func_results);
+		if (!err.ok()) return invalid;
+		var rtypes = Array<ValueType>.new(int.!(ret_count));
+		for (j < ret_count) {
+			rtypes[int.!(j)] = readValueType();
+		}
+		return TypeDecl.Function(ptypes, rtypes);
+	}
+	def readImportDecl(index: int) -> ImportDecl {
+		var module_name = readString("import module name");
+		var field_name = readString("import field name");
+		var pt = decoder.pos;
+		var kind = readByte("import kind", renderImportKind);
+		var result: ImportDecl;
+		var details: ImportDetails;
+		match (kind) {
+			BpImportExportKind.Function.code => {
+				var sig = readSig();
+				var decl = FunctionDecl.new(module.functions.size(), sig.0, sig.1);
+				module.functions.imported.add(decl);
+				details = ImportDetails.Function(decl);
+			}
+			BpImportExportKind.Table.code => {
+				checkMaxNumTables(pt);
+				var et = readElemType();
+				var l = readLimits("table", limits.max_table_size);
+				var decl = TableDecl.new(module.tables.size(), et, l.0, l.1);
+				module.tables.imported.add(decl);
+				details = ImportDetails.Table(decl);
+			}
+			BpImportExportKind.Memory.code => {
+				checkMaxNumMemories(pt);
+				var l = readMemoryLimits("memory", limits.max_memory_pages);
+				var decl = MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
+				module.memories.imported.add(decl);
+				details = ImportDetails.Memory(decl);
+			}
+			BpImportExportKind.Global.code => {
+				var t = readValueType();
+				var mut = readByte("flags", renderGlobalFlags) != 0;
+				var decl = GlobalDecl.new(module.globals.size(), t, mut, InitExpr.I32(0));
+				module.globals.imported.add(decl);
+				details = ImportDetails.Global(decl);
+			}
+			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
+				"invalid import kind 0x%x", kind);
+		}
+		return ImportDecl.new(module_name, field_name, details);
+	}
+	def readFunctionDecl(index: int) -> FunctionDecl {
+		var pt = decoder.pos;
+		var sig = readSig();
+		return FunctionDecl.new(module.functions.size(), sig.0, sig.1);
+	}
+	def readTableDecl(index: int) -> TableDecl {
+		checkMaxNumTables(decoder.pos);
+		var et = readElemType();
+		var l = readLimits("table", limits.max_table_size);
+		return TableDecl.new(module.tables.size(), et, l.0, l.1);
+	}
+	def readMemoryDecl(index: int) -> MemoryDecl {
+		checkMaxNumMemories(decoder.pos);
+		var l = readMemoryLimits("memory", limits.max_memory_pages);
+		return MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
+	}
+	def readGlobalDecl(index: int) -> GlobalDecl {
+		var vt = readValueType();
+		var mut = readByte("flags", renderGlobalFlags) != 0;
+		var pos = decoder.pos;
+		var init = readInitExpr("global initializer"), vti = init.1;
+		if (!ValueTypes.isAssignable(vti, vt)) {
+			err.fail2(decoder.abs(pos), WasmError.TYPE_MISMATCH,
+				"expected type %q in global initializer, got %q",
+				ValueTypes.render(_, vt), ValueTypes.render(_, vti));
+		}
+		return GlobalDecl.new(module.globals.size(), vt, mut, init.0);
+	}
+	def readExportDecl(index: int) -> ExportDecl {
+		var name = readString("export name");
+		var pt = decoder.pos;
+		var kind = readByte("export kind", renderImportKind);
+		var details: ExportDetails;
+		match (kind) {
+			BpImportExportKind.Function.code => {
+				var index = readFunc().0;
+				details = ExportDetails.Function(index);
+			}
+			BpImportExportKind.Table.code => {
+				var index = readTableIndex();
+				details = ExportDetails.Table(index);
+			}
+			BpImportExportKind.Memory.code => {
+				var index = readMemoryIndex();
+				details = ExportDetails.Memory(index);
+			}
+			BpImportExportKind.Global.code => {
+				var index = readGlobal().0;
+				details = ExportDetails.Global(index);
+			}
+			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
+				"invalid export kind 0x%x", kind);
+		}
+		return ExportDecl.new(name, details);
+	}
+	def readElemDecl(index: int) -> ElemDecl {
+		var pt = decoder.pos;
+		var flags = readByte("data flags", renderNone);
+		var active = true, table_index = 0, init_exprs = false;
+		if (extensions.BULK_MEMORY) {
+			if ((flags & 1) == 1) active = false;
+			if ((flags & 2) == 2) table_index = readTableIndex();
+			if ((flags & 4) == 4) init_exprs = true;
+		} else if (flags != 0) {
+			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
+				"expected zero byte for elements, got 0x%x", flags);
+		} else {
+			table_index = checkIndex(pt, "table index", 0, module.tables).0;
+		}
+		var offset = readI32Expr("elements offset");
+		var count = readU32("element count", 0, limits.max_num_table_entries);
+		var details: ElemDetails;
+		if (init_exprs) { // init expressions
+			var array = Array<InitExpr>.new(int.!(count));
+			for (i < int.!(count)) {
+				// TODO: typecheck init exprs for elements
+				array[i] = readInitExpr("element").0;
+			}
+			details = ElemDetails.Exprs(array);
+		} else {  // function indices
+			var array = Array<int>.new(int.!(count));
+			for (i < int.!(count)) {
+				array[i] = readFunc().0;
+			}
+			details = ElemDetails.FuncRefs(array);
+		}
+		return ElemDecl.new(table_index, offset, details, active);
+	}
+	def readDataDecl(index: int) -> DataDecl {
+		var pt = decoder.pos;
+		var flags = readByte("data flags", renderNone);
+		var active = true, mem_index = 0;
+		if (extensions.BULK_MEMORY) {
+			if ((flags & 1) == 1) {
+				active = false;
+				mem_index = readMemoryIndex();
+			}
+		} else if (flags != 0) {
+			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
+				"expected zero byte for data segment, got 0x%x", flags);
+		}
+		checkIndex(pt, "memory index", u32.!(mem_index), module.memories);
+		var offset = readI32Expr("data element offset");
+		var len = readU32("data segment size", 0, limits.max_data_segment_size);
+		var data = decoder.read_bytes(int.!(len));
+		return DataDecl.new(mem_index, offset, data, active);
+	}
 	def traceBytes(pt: int, quantity: string) -> StringBuffer {
 		if (quantity == null) return trace;
 		var count = decoder.pos - pt;
@@ -926,6 +756,20 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module) {
 		for (i < rounded - count) trace.puts("   ");
 		trace.put1(" %s = ", quantity);
 		return trace;
+	}
+	def checkMaxNumTables(pt: int) {
+		var max = limits.max_num_tables;
+		if (module.tables.size() >= max) {
+			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
+				"exceeded maximum of %d total tables", max);
+		}
+	}
+	def checkMaxNumMemories(pt: int) {
+		var max = limits.max_num_memories;
+		if (module.memories.size() >= max) {
+			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
+				"exceeded maximum of %d total memories", max);
+		}
 	}
 
 	def traceBuffer() {
@@ -959,7 +803,7 @@ def EMPTY_BYTES = Array<byte>.new(0);
 // complete function bodies, invoking callbacks when sections, bodies,
 // and the overall module is finished.
 class BpFsm extends WasmParser {
-	def callback: ModuleParserCallback;
+	def callback: BpFsmCallback;
 	var section_decoder: Decoder;
 	var function_decoder: Decoder;
 
@@ -976,8 +820,11 @@ class BpFsm extends WasmParser {
 	var function_body_count: u32;
 	var current_function_body: u32;
 	*/
-	new(vb: Verbosity, extensions: Extension.set, limits: Limits, callback: ModuleParserCallback)
-			super(extensions, limits, callback.module) {
+	new(vb: Verbosity, extensions: Extension.set, limits: Limits, err: WasmErrorGen, callback: BpFsmCallback)
+			super(extensions, limits, callback.module,
+				err,
+				Decoder.new(EMPTY_BYTES, err)) {
+		decoder.eof_behavior = eof_set_flag;
 		section_decoder = Decoder.new(EMPTY_BYTES, err);
 		section_decoder.eof_behavior = eof_is_section_overflow;
 		function_decoder = Decoder.new(EMPTY_BYTES, err);
@@ -1010,7 +857,7 @@ class BpFsm extends WasmParser {
 	private def advance() {
 		current_pos = decoder.pos;
 		if (verbose) {
-			trace.put3("@+%d [%d bytes] state=%s\n", abs(),
+			trace.put3("@+%d [%d bytes] BpFsm.state=%s\n", abs(),
 				decoder.available(), state.name);
 			flush();
 		}
@@ -1045,12 +892,9 @@ class BpFsm extends WasmParser {
 					Code => {
 						var count = readU32("function body count", 0, limits.max_num_functions);
 						if (eof) return if(!retry(), err_incomplete_section(kind, int.!(size)));
-						var expected = callback.module.functions.declared.length;
-						if (count != expected) {
-							err.fail2(abs(), WasmError.FUNC_COUNT_MISMATCH, "expected %d function bodies, got %d", expected, count);
-							return;
-						}
-						var end = u32.!(decoder.abs(current_pos)) + size;
+						var abspos = abs();
+						callback.beginCodeSection(abspos, count);
+						var end = u32.!(abspos) + size;
 						if (count == 0) {
 							checkSectionLength("code", decoder.abs(decoder.pos), end);
 							state = BpFsmState.SECTION_START;
@@ -1128,8 +972,9 @@ class BpFsm extends WasmParser {
 	}
 }
 // The callbacks for sections, function bodies, and finishing a module.
-class ModuleParserCallback(module: Module) {
+class BpFsmCallback(module: Module) {
 	def decodeSection(kind: BpSection, size: u32, d: Decoder);
+	def beginCodeSection(abspos: int, count: u32) {}
 	def decodeFunctionBody(index: u32, size: u32, d: Decoder);
 }
 // The states for the module parser finite state machine.
