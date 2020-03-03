@@ -1,0 +1,295 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Parses textual spec tests. Only supports binary module commands and a few test
+// commands. Does not parse the full .wat or .wast formats.
+class SpecTestParser(filename: string, data: Array<byte>) {
+	private var pos: int;
+	private var line: int = 1;
+	private var col: int = 1;
+	private def strbuf = StringBuffer.new();
+	def var commands = Vector<SpecTestCommand>.new();
+	def var ok = true;
+	def var error_pos = (int.max, int.max);
+	def var error_msg: string;
+
+	def parseFile() {
+		skip();
+		while (ok && more(1)) {
+			if (!expect_ch('(')) return;
+			parseCommand();
+			if (!expect_ch(')')) return;
+		}
+	}
+
+	def parseMaybeCommands() {
+		while (ok && more(1)) {
+			if (!ch('(')) return;
+			parseCommand();
+			if (!expect_ch(')')) return;
+		}
+	}
+	def parseCommand() {
+		var pt = (line, col);
+		if (kw("module")) parseModule();
+		else if (kw("assert_return")) parseAssertReturn();
+		else if (kw("assert_trap")) parseAssertTrap();
+		else if (kw("assert_exhaustion")) parseAssertExhaustion();
+		else if (kw("assert_invalid")) parseAssertInvalid();
+		else if (kw("assert_malformed")) parseAssertMalformed();
+		else if (kw("assert_unlinkable")) parseAssertUnlinkable();
+		else if (kw("invoke")) parseInvoke();
+		else if (kw("i32.const")) parseI32Const();
+		else if (kw("i64.const")) parseI64Const();
+		else if (kw("f32.const")) parseF32Const();
+		else if (kw("f64.const")) parseF64Const();
+		else error1(pt, "expected valid command", ());
+	}
+	def parseModule() {
+		var pt = (line, col);
+		if (!kw("binary")) return error1(pt, "expected binary module", ());
+		strbuf.reset();
+		while (ok && more(1)) {
+			if (data[pos] != '\"') break;
+			doString();
+		}
+		if (wizeng.verbose) {
+			strbuf.out(SpecTestRunner.renderModuleBytes);
+		}
+		commands.add(SpecTestCommand.Module(strbuf.extract()));
+	}
+	def parseAssertReturn();
+	def parseAssertTrap();
+	def parseAssertExhaustion();
+	def parseAssertInvalid();
+	def parseAssertMalformed();
+	def parseAssertUnlinkable();
+	def parseInvoke() {
+		var funcname = parseString();
+		parseMaybeCommands();
+		if (!expect_ch(')')) return;
+		commands.add(SpecTestCommand.Invoke(funcname));
+	}
+	def parseI32Const();
+	def parseI64Const();
+	def parseF32Const();
+	def parseF64Const();
+
+	// Parses string characters into {this.strbuf}
+	def parseString() -> string {
+		strbuf.reset();
+		doString();
+		return strbuf.extract();
+	}
+	def doString() {
+		var pt = (line, col);
+		if (!more(1)) return error1(pt, "expected string, got EOF", ());
+		var c = data[pos];
+		if (c != '\"') return error1(pt, "expected string starting quote", ());
+		pos++;
+		col++;
+		while (ok && more(1)) {
+			var c = data[pos];
+			if (c == '\"') return advance(1); // end of string
+
+			if (c < ' ' || c > 127) {
+				return error1((line, col), "invalid character 0x%x in string", c);
+			}
+			if (c == '\\') {
+				if (!more(3)) break;
+				var h = data[pos+1];
+				var l = data[pos+2];
+				if (!Strings.isHexChar(h)) {
+					return error1((line, col+1), "expected hexadecimal", ());
+				}
+				if (!Strings.isHexChar(l)) {
+					return error1((line, col+2), "expected hexadecimal", ());
+				}
+				var val = Strings.hexValue(h) << 4 | Strings.hexValue(l);
+				strbuf.putc(byte.!(val));
+				pos += 3;
+				col += 3;
+			} else {
+				strbuf.putc(c);
+				pos++;
+				col++;
+			}
+
+		}
+		error1((line, col), "unexpected end of string", ());
+	}
+
+	def expect_ch(c: byte) -> bool {
+		var pt = (line, col);
+		if (!ch(c)) error1(pt, "expected \'%c\'", c);
+		return true;
+	}
+	// Eat the character {c} if it is next in the input, returning {true} if so.
+	def ch(c: byte) -> bool {
+		if (!more(1)) return false;
+		if (data[pos] != c) return false;
+		advance(1);
+		return true;
+	}
+
+	// Eat the characters {k} if they are next in the input, returning {true} if so.
+	def chs(k: Array<byte>) -> bool {
+		var l = k.length;
+		if (!more(l)) return false;
+		for (i < l) {
+			if (data[pos + i] != k[i]) return false;
+		}
+		advance(l);
+		return true;
+	}
+
+	// Eat the keyword {k} if it is next in the input, returning {true} if so.
+	def kw(k: Array<byte>) -> bool {
+		var l = k.length;
+		if (!more(l)) return false;
+		for (i < l) {
+			if (data[pos + i] != k[i]) return false;
+		}
+		if (more(1)) {
+			var c = data[pos + l];
+			if (isKeywordMiddle(c)) return false;
+		}
+		advance(l);
+		return true;
+	}
+
+	// Advance by {k} non-whitespace characters.
+	def advance(k: int) {
+		pos += k;
+		col += k;
+		skip();
+	}
+	// Skip whitespace from the current position.
+	def skip() {
+		while (pos < data.length) {
+			var c = data[pos];
+			match (c) {
+				' ' => {
+					col++;
+					pos++;
+				}
+				'\t' => {
+					col = (col + 8) & ~7;
+					pos++;
+				}
+				'\n' => {
+					col = 1;
+					line++;
+					pos++;
+				}
+				';' => {
+					var p = pos, d = data;
+					while (p++ < d.length && d[p] != '\n') ;
+					pos = p;
+				}
+				_ => return;
+			}
+		}
+	}
+	def more(num: int) -> bool {
+		return data.length - pos >= num;
+	}
+	def error1<T>(pos: (int, int), fmt: string, arg: T) {
+		ok = false;
+		if (pos.0 < error_pos.0 ||
+			(pos.0 == error_pos.0 && pos.1 < error_pos.1)) {
+			error_pos = pos;
+			error_msg = Strings.format1(fmt, arg);
+		}
+	}
+}
+def isKeywordMiddle(c: byte) -> bool {
+	return 'a' <= c && c <= 'z' ||
+		'A' <= c && c <= 'Z' ||
+		'0' <= c && c <= '9' ||
+		c == '_' ||
+		c == '-';
+}
+
+type SpecTestCommand {
+	case Module(bytes: Array<byte>);
+	case Register(varname: string);
+	case Invoke(funcname: string);
+	case AssertReturn;
+	case AssertTrap(msg: string);
+	case AssertExhaustion(msg: string);
+	case AssertInvalid(msg: string);
+	case AssertMalformed(msg: string);
+	case AssertUnlinkable(msg: string);
+	case Constant(val: Value);
+}
+
+type SpecTestValue {
+	case Module(r: BinParserResult);
+	case WasmValue(val: Value);
+	case WasmTrap(reason: TrapReason);
+}
+
+component SpecTestRunner {
+	def trace = StringBuffer.new();
+	new() {
+		// install the run method in the main entrypoint
+		wizeng.runSpecTests = runSpecTests;
+	}
+	def runSpecTests(args: Array<string>) -> int {
+		var ran = 0;
+		for (a in args) {
+			if (a == null) continue;
+			if (Strings.endsWith(a, ".wast")) {
+				ran++;
+				runTest(a);
+			}
+		}
+		if (ran == 0 && !wizeng.printVersion) {
+			System.puts("wizeng-spec: no input files\n");
+			return 3;
+		}
+
+		return 0;
+	}
+	def runTest(filename: string) {
+		trace.puts("+");
+		trace.puts(filename);
+		trace.puts("\n");
+		flush();
+		var data = System.fileLoad(filename);
+		if (data == null) {
+			trace.puts("-fail: could not load file\n");
+			return flush();
+		}
+		var p = SpecTestParser.new(filename, data);
+		p.parseFile();
+		if (!p.ok) {
+			trace.put1("-fail: %s ", filename);
+			trace.put3("%d:%d %s\n", p.error_pos.0, p.error_pos.1, p.error_msg);
+			return flush();
+		}
+		trace.puts("-ok\n");
+		flush();
+	}
+	def verbose(str: string) {
+		if (wizeng.verbose) System.puts(str);
+	}
+	def flush() {
+		trace.out(STDOUT);
+		trace.reset();
+	}
+	def renderModuleBytes(data: Array<byte>, pos: int, length: int) {
+		trace.puts("(module binary");
+		for (i < length) {
+			if (i % 16 == 0) {
+				if (i > 0) trace.puts("\"");
+				trace.puts("\n  \"");
+			}
+			trace.put1("\\%x", data[pos + i]);
+		}
+		trace.puts("\")\n");
+		flush();
+	}
+}
+def STDOUT = System.fileWriteK(1, _, _, _);
