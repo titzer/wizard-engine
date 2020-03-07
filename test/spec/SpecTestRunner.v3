@@ -343,12 +343,35 @@ type StCommand {
 }
 
 type StValue {
-	case Instance(i: Instance);
+	case Instance(sti: StInstance);
 	case InvalidModule(r: BinParserResult);
 	case QuotedModule(s: string);
 	case UnlinkableModule(m: Module);
 	case WasmValue(val: Value);
 	case WasmTrap(reason: TrapReason);
+}
+class StEnv<T> {
+	def modules = Vector<(string, T)>.new();
+	def register(name: string, t: T) {
+		modules.add(name, t);
+	}
+	def lookup(name: string) -> T {
+		for (i < modules.length) {
+			var m = modules[i];
+			if (Strings.equals(m.0, name)) return m.1;
+		}
+		var d: T;
+		return d;
+	}
+}
+class StInstance(instance: Instance) extends StEnv<Exportable> {
+	new() {
+		for (i < instance.exports.length) {
+			var name = instance.module.exports[i].name;
+			var e = instance.exports[i];
+			register(name, e);
+		}
+	}
 }
 
 component SpecTestRunner {
@@ -386,7 +409,8 @@ component SpecTestRunner {
 		var p = SpecTestParser.new(filename, data);
 		p.parseFile();
 		if (p.ok) {
-			if (executeCommands(p.commands)) trace.puts("-ok");
+			var ip = StInterpreter.new(filename, trace);
+			if (ip.run(p.commands)) trace.puts("-ok");
 			flush();
 		} else {
 			trace.put1("-fail: %s ", filename);
@@ -401,70 +425,6 @@ component SpecTestRunner {
 		trace.out(STDOUT);
 		trace.reset();
 	}
-	def executeCommands(commands: Vector<SpecTestCommand>) -> bool {
-		var stack = Stack<StValue>.new();
-		for (i < commands.length) {
-			var cmd = commands[i];
-			if (wizeng.verbose) {
-				trace.puts("execute: ");
-				trace.puts(cmd.cmd.name);
-				trace.put2(" @ %d:%d", cmd.loc.0, cmd.loc.1);
-				trace.ln();
-				flush();
-			}
-			match (cmd.cmd) {
-				BinaryModule(bytes) => {
-					stack.push(parseBinary(bytes));
-				}
-				QuotedModule(str) => {
-					stack.push(StValue.QuotedModule(str));
-				}
-				Register(varname) => {
-					var instance = stack.pop();
-				}
-				Invoke(funcname) => {
-					// TODO: scan stack backwards for module
-				}
-				AssertReturn => {
-					var expected = stack.pop();
-					var value = stack.pop();
-					var instance = stack.pop();
-				}
-				AssertTrap(msg) => {
-					var result = stack.pop();
-				}
-				AssertExhaustion(msg) => {
-					var result = stack.pop();
-				}
-				AssertInvalid(msg) => {
-					var module = stack.pop();
-				}
-				AssertMalformed(msg) => {
-					var module = stack.pop();
-				}
-				AssertUnlinkable(msg) => {
-					var module = stack.pop();
-				}
-				Constant(val) => {
-					stack.push(StValue.WasmValue(val));
-				}
-			}
-		}
-		return true;
-	}
-	def parseBinary(bytes: Array<byte>) -> StValue {
-		var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
-		var extensions: Extension.set;
-		var limits = Limits.new();
-		var mp = ModuleParser.new(v, extensions, limits, "test");
-		mp.push(bytes, 0, bytes.length);
-		var r = mp.finish();
-		match (r) {
-			Ok(module) => return doInstantiate(module);
-			Error => return StValue.InvalidModule(r);
-		}
-	}
-	def doInstantiate(module: Module) -> StValue;
 	def renderBinaryModule(data: Array<byte>, pos: int, length: int) {
 		trace.puts("(module binary");
 		for (i < length) {
@@ -499,6 +459,172 @@ component SpecTestRunner {
 		}
 		trace.puts("\")\n");
 		flush();
+	}
+}
+class StInterpreter(filename: string, trace: StringBuffer) {
+	def env = StEnv<StInstance>.new();
+	def stack = Stack<StValue>.new();
+	var ok = true;
+	var loc: (int, int);
+	def run(commands: Vector<SpecTestCommand>) -> bool {
+		for (i < commands.length) {
+			var cmd = commands[i];
+			loc = cmd.loc;
+			if (wizeng.verbose) {
+				trace.puts("execute: ");
+				trace.puts(cmd.cmd.name);
+				trace.put2(" @ %d:%d", cmd.loc.0, cmd.loc.1);
+				trace.ln();
+				flush();
+			}
+			match (cmd.cmd) {
+				BinaryModule(bytes) => {
+					stack.push(parseBinary(bytes));
+				}
+				QuotedModule(str) => {
+					stack.push(StValue.QuotedModule(str));
+				}
+				Register(varname) => {
+					var sti = popI();
+					if (!ok) return false;
+					env.register(varname, sti.sti);
+					stack.push(sti);
+				}
+				Invoke(funcname) => {
+					var i = stack.top - 1;
+					// count arguments
+					while (i >= 0) {
+						var v = stack.elems[i];
+						if (!StValue.WasmValue.?(v)) break;
+						i--;
+					}
+					// pop arguments
+					var arity = stack.top - i - 1;
+					var args = Array<Value>.new(arity);
+					for (i < arity) {
+						args[arity - i - 1] = popV().val;
+					}
+					// pop instance
+					var sti = popI();
+					if (!ok) return false;
+					stack.push(sti);
+					// lookup function
+					var exp = sti.sti.lookup(funcname);
+					if (exp == null) return error(Strings.format1("func \"%s\" not found", funcname));
+					if (!WasmFunction.?(exp)) return error(Strings.format1("export \"%s\" is not a function", funcname));
+					var func = WasmFunction.!(exp);
+					// create interpreter
+					var interp = Interpreter.new();
+					// run interpreter
+					var result = interp.run(-1, func, args);
+					// unpack result
+					match (result) {
+						Break => return error("interpreter hit breakpoint");
+						Value(vals) => {
+							for (v in vals) {
+								stack.push(StValue.WasmValue(v));
+							}
+						}
+						Trap(reason) => stack.push(StValue.WasmTrap(reason));
+					}
+				}
+				AssertReturn => {
+					var expected = popV();
+					var value = popV();
+					if (!ok) return false;
+				}
+				AssertTrap(msg) => {
+					var trap = pop<StValue.WasmTrap>("trap");
+				}
+				AssertExhaustion(msg) => {
+					var result = popR();
+				}
+				AssertInvalid(msg) => {
+					pop<StValue.InvalidModule>("invalid module");
+				}
+				AssertMalformed(msg) => {
+					pop<StValue.QuotedModule>("quoted module");
+				}
+				AssertUnlinkable(msg) => {
+					pop<StValue.UnlinkableModule>("unlinkable module");
+				}
+				Constant(val) => {
+					stack.push(StValue.WasmValue(val));
+				}
+			}
+		}
+		return true;
+	}
+	def error(msg: string) -> bool {
+		if (!ok) return false;
+		ok = false;
+		trace.puts("-fail: ");
+		trace.put3("%s @ %d:%d ", filename, loc.0, loc.1);
+		trace.puts(msg);
+		flush();
+		return false;
+	}
+	def parseBinary(bytes: Array<byte>) -> StValue {
+		var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
+		var extensions: Extension.set;
+		var limits = Limits.new();
+		var mp = ModuleParser.new(v, extensions, limits, "test");
+		mp.push(bytes, 0, bytes.length);
+		var r = mp.finish();
+		match (r) {
+			Ok(module) => return doInstantiate(module);
+			Error => return StValue.InvalidModule(r);
+		}
+	}
+	def doInstantiate(module: Module) -> StValue {
+		var imports = Array<Exportable>.new(module.imports.length);
+		for (i < module.imports.length) {
+			var imp = module.imports[i];
+			var sti = env.lookup(imp.modname);
+			if (sti == null) return StValue.UnlinkableModule(module);
+			var exp = sti.lookup(imp.name);
+			if (exp == null) return StValue.UnlinkableModule(module);
+			imports[i] = exp;
+		}
+		var i = Instantiator.new(module, imports);
+		var r = i.run();
+		if (i.err.ok()) return StValue.Instance(StInstance.new(r));
+		return StValue.UnlinkableModule(module);
+	}
+	def popV() -> StValue.WasmValue {
+		return pop<StValue.WasmValue>("value");
+	}
+	def popI() -> StValue.Instance {
+		return pop<StValue.Instance>("instance");
+	}
+	def popR() -> StValue {
+		var v = pop<StValue>("result");
+		if (!ok) return v;
+		match (v) {
+			WasmValue => return v;
+			WasmTrap => return v;
+			_ => error(Strings.format1("expected result, found: %s", v.name));
+		}
+		return v;
+	}
+	def pop<T>(expected: string) -> T {
+		var d: T;
+		if (stack.top == 0) {
+			error(Strings.format1("expected %s, found empty stack", expected));
+			return d;
+		}
+		var v = stack.pop();
+		if (T.?(v)) return T.!(v);
+		error(Strings.format2("expected %s, found: %s", expected, v.name));
+		return d;
+	}
+	def renderStValue(buf: StringBuffer, v: StValue) -> StringBuffer {
+		buf.puts(v.name);
+		return buf;
+	}
+	def flush() {
+		trace.out(STDOUT);
+		trace.reset();
 	}
 }
 def STDOUT = System.fileWriteK(1, _, _, _);
