@@ -1,5 +1,8 @@
 all: bin/wizeng.x86-linux bin/wizeng-unit.x86-linux bin/wizeng-spec.x86-linux
 
+clean:
+	rm -f bin/*
+
 SRC=src/*.v3 src/*/*.v3
 TEST=test/*/*.v3
 SPEC=test/spec/*.v3
