@@ -1,389 +1,4 @@
-// Copyright 2020 Ben L. Titzer. All rights reserved.
-// See LICENSE for details of Apache 2.0 license.
 
-// Parses textual spec tests. Only supports binary module commands and a few test
-// commands. Does not parse the full .wat or .wast formats.
-class SpecTestParser(filename: string, input: Array<byte>) {
-	private var pos: int;
-	private var line: int = 1;
-	private var col: int = 1;
-	private def strbuf = StringBuffer.new();
-	def var commands = Vector<SpecTestCommand>.new();
-	def var ok = true;
-	def var error_loc = (int.max, int.max);
-	def var error_msg: string;
-
-	def parseFile() {
-		skip();
-		parseMaybeCommands();
-	}
-
-	def parseMaybeCommands() {
-		while (ok && more(1)) {
-			if (!ch('(')) return;
-			parseCommand();
-			if (!expect_ch(')')) return;
-		}
-	}
-	def parseOneCommand() -> SpecTestCommand {
-		if (!ch('(')) return null;
-		parseCommand();
-		if (!expect_ch(')')) return null;
-		return if(commands.length > 0, commands[0]);
-	}
-	def parseCommand() {
-		var loc = (line, col);
-		if (kw("module")) parseModule(loc);
-		else if (kw("assert_return")) parseAssertReturn(loc);
-		else if (kw("assert_trap")) parseAssertTrap(loc);
-		else if (kw("assert_uninstantiable")) parseAssertTrap(loc);
-		else if (kw("assert_exhaustion")) parseAssertExhaustion(loc);
-		else if (kw("assert_invalid")) parseAssertInvalid(loc);
-		else if (kw("assert_malformed")) parseAssertMalformed(loc);
-		else if (kw("assert_unlinkable")) parseAssertUnlinkable(loc);
-		else if (kw("invoke")) parseInvoke(loc);
-		else if (kw("get")) parseGetGlobal(loc);
-		else if (kw("i32.const")) parseI32Const(loc);
-		else if (kw("i64.const")) parseI64Const(loc);
-		else if (kw("f32.const")) parseF32Const(loc);
-		else if (kw("f64.const")) parseF64Const(loc);
-		else if (kw("register")) parseRegister(loc);
-		else if (kw("action")) parseAction(loc);
-		else error1(loc, "expected valid command", ());
-	}
-	def parseStrings() -> string {
-		var loc = (line, col);
-		strbuf.reset();
-		if (!more(1) || input[pos] != '\"') error1(loc, "expected string", ());
-		while (ok && more(1)) {
-			if (input[pos] != '\"') break;
-			doString();
-		}
-		return strbuf.extract();
-	}
-	def parseVarName() -> string {
-		var start = pos;
-		if (!more(2) || input[pos] != '$') return null;
-		var p = start + 1;
-		while (p < input.length) {
-			if (!isKeywordMiddle(input[p])) break;
-			p++;
-		}
-		advance(p - start);
-		return Arrays.range(input, start, p);
-	}
-	def parseModule(loc: (int, int)) {
-		var varname = parseVarName();
-		if (kw("binary")) {
-			var bytes = parseStrings();
-			cmd(loc, StCommand.BinaryModule(varname, bytes));
-		} else if (kw("quote")) {
-			var source = parseStrings();
-			cmd(loc, StCommand.QuotedModule(varname, source));
-		} else {
-			return error1(loc, "expected binary or quoted module", ());
-		}
-	}
-	def parseAssertReturn(loc: (int, int)) {
-		parseMaybeCommands();
-		cmd(loc, StCommand.AssertReturn);
-	}
-	def parseAssertTrap(loc: (int, int)) {
-		parseStringCommand(loc, StCommand.AssertTrap);
-	}
-	def parseAssertExhaustion(loc: (int, int)) {
-		parseStringCommand(loc, StCommand.AssertExhaustion);
-	}
-	def parseAssertInvalid(loc: (int, int)) {
-		parseStringCommand(loc, StCommand.AssertInvalid);
-	}
-	def parseAssertMalformed(loc: (int, int)) {
-		parseStringCommand(loc, StCommand.AssertMalformed);
-	}
-	def parseAssertUnlinkable(loc: (int, int)) {
-		parseStringCommand(loc, StCommand.AssertUnlinkable);
-	}
-	def parseInvoke(loc: (int, int)) {
-		var varname = parseVarName();
-		var funcname = parseString();
-		parseMaybeCommands();
-		cmd(loc, StCommand.Invoke(varname, funcname));
-	}
-	def parseGetGlobal(loc: (int, int)) {
-		var varname = parseVarName();
-		var globalname = parseString();
-		parseMaybeCommands();
-		cmd(loc, StCommand.GetGlobal(varname, globalname));
-	}
-	def parseI32Const(loc: (int, int)) {
-		var c = input[pos], sign = 1u;
-		if (c == '-') {
-			sign = 0xFFFFFFFFu;
-			pos++;
-			if (!more(1)) return error1(loc, "expected int32, got EOF", ());
-			c = input[pos];
-		}
-		var val: u32;
-		if (c == '0') {
-			var x = peek_ch(1);
-			if (x == 'x' || x == 'X') {
-				val = parseI32Hex(loc);
-			}
-			else val = parseI32Dec(loc);
-		} else {
-			val = parseI32Dec(loc);
-		}
-		cmd(loc, StCommand.Constant(Value.I32(u32.!(sign * val))));
-	}
-	def parseI32Hex(loc: (int, int)) -> u32 {
-		var a = input, i = pos + 2, max = a.length;
-		var accum = 0u;
-		while (i < max) {
-			var v = Strings.hexValue(a[i]);
-			if (v < 0 || v > 15) break;
-			accum = (accum << 4) + u32.!(v);
-			i++;
-		}
-		var count = i - pos;
-		if (count == 2) error1(loc, "expected hexadecimal i32", ());
-		if (count > 10) error1(loc, "hexadecimal i32 too long", ());
-		pos = i;
-		skip();
-		return accum;
-	}
-	def parseI32Dec(loc: (int, int)) -> u32 {
-		// Parse a (positive) decimal integer starting at pos.
-		var a = input, i = pos, v1 = a[i++];
-		if (v1 < '0' || v1 > '9') {
-			error1(loc, "expected decimal i32", ());
-			return 0;
-		}
-
-		var max = a.length, accum = v1 - u32.!('0');
-		while (i < max) {
-			var d = a[i] - '0';
-			if (d < 0 || d > 9) break;
-			var n = u64.!(accum) * 10 + d;
-			if (n > u32.max) {
-				error1(loc, "decimal i32 too large", ());
-				return 0;
-			}
-			accum = u32.!(n);
-			i++;
-		}
-		pos = i;
-		skip();
-		return accum;
-	}
-	def parseI64Const(loc: (int, int));
-	def parseF32Const(loc: (int, int));
-	def parseF64Const(loc: (int, int));
-	def parseRegister(loc: (int, int)) {
-		var regname = parseString();
-		var varname = parseVarName();
-		cmd(loc, StCommand.Register(varname, regname));
-	}
-	def parseAction(loc: (int, int)) {
-		parseMaybeCommands();
-	}
-	def parseStringCommand(loc: (int, int), f: string -> StCommand) {
-		parseMaybeCommands();
-		if (!ok) return;
-		var str = if(peek_ch(0) == '\"', parseString());
-		cmd(loc, f(str));
-	}
-
-	def parseString() -> string {
-		strbuf.reset();
-		doString();
-		return strbuf.extract();
-	}
-	def doString() {
-		// Parses string characters into {this.strbuf}
-		var loc = (line, col);
-		if (!more(1)) return error1(loc, "expected string, got EOF", ());
-		var c = input[pos];
-		if (c != '\"') return error1(loc, "expected string starting quote", ());
-		pos++;
-		col++;
-		while (ok && more(1)) {
-			var c = input[pos];
-			if (c == '\"') return advance(1); // end of string
-
-			if (c < ' ' || c > 127) {
-				return error1((line, col), "invalid character 0x%x in string", c);
-			}
-			if (c == '\\') {
-				if (!more(3)) break;
-				var h = peek_hex(1), l = peek_hex(2);
-				strbuf.putc(byte.!(h << 4 | l));
-				pos += 3;
-				col += 3;
-			} else {
-				strbuf.putc(c);
-				pos++;
-				col++;
-			}
-
-		}
-		error1((line, col), "unexpected end of string", ());
-	}
-
-	// expect and consume the given character {c}
-	def expect_ch(c: byte) -> bool {
-		var loc = (line, col);
-		if (!ch(c)) error1(loc, "expected \'%c\'", c);
-		return true;
-	}
-	// Peek at the character {offset} ahead, returning -1 if that is EOF.
-	def peek_ch(offset: int) -> int {
-		if (more(1 + offset)) return input[pos + offset];
-		return -1;
-	}
-	// Peek at the character {offset} ahead, returning its hexadecimal
-	// value.
-	def peek_hex(offset: int) -> int {
-		var h = input[pos + offset];
-		if (!Strings.isHexChar(h)) {
-			error1((line, col + offset), "expected hexadecimal", ());
-			return 0;
-		}
-		return Strings.hexValue(h);
-	}
-	// Eat the character {c} if it is next in the input, returning {true} if so.
-	def ch(c: byte) -> bool {
-		if (!more(1)) return false;
-		if (input[pos] != c) return false;
-		advance(1);
-		return true;
-	}
-
-	// Eat the keyword {k} if it is next in the input, returning {true} if so.
-	def kw(k: Array<byte>) -> bool {
-		var l = k.length;
-		if (!more(l)) return false;
-		for (i < l) {
-			if (input[pos + i] != k[i]) return false;
-		}
-		if (more(l+1)) {
-			var c = input[pos + l];
-			if (isKeywordMiddle(c)) return false;
-		}
-		advance(l);
-		return true;
-	}
-
-	// Advance by {k} non-whitespace characters, and then skip whitespace.
-	def advance(k: int) {
-		pos += k;
-		col += k;
-		skip();
-	}
-	// Skip whitespace from the current position.
-	def skip() {
-		while (pos < input.length) {
-			var c = input[pos];
-			match (c) {
-				' ' => {
-					col++;
-					pos++;
-				}
-				'\t' => {
-					col = (col + 8) & ~7;
-					pos++;
-				}
-				'\n' => {
-					col = 1;
-					line++;
-					pos++;
-				}
-				';' => {
-					var p = pos, d = input;
-					while (p++ < d.length && d[p] != '\n') ;
-					pos = p;
-				}
-				_ => return;
-			}
-		}
-	}
-	def more(num: int) -> bool {
-		return input.length - pos >= num;
-	}
-	def error1<T>(loc: (int, int), fmt: string, arg: T) {
-		ok = false;
-		if (loc.0 < error_loc.0 ||
-			(loc.0 == error_loc.0 && loc.1 < error_loc.1)) {
-			error_loc = loc;
-			error_msg = Strings.format1(fmt, arg);
-		}
-		if (UnitTests.fatal) {
-			var msg = StringBuffer.new();
-			msg.puts(filename);
-			msg.put3(" @ %d:%d %s", error_loc.0, error_loc.1, error_msg);
-			printCurrentLine();
-			System.error("SpecTestParserError", msg.extract());
-		}
-	}
-	def printCurrentLine() {
-		var b = pos - 1;
-		while (b >= 0) { // scan backwards to previous newline
-			if (input[b] == '\n') { b++; break; }
-			b--;
-		}
-		if (b < 0) b = 0;
-		var col = 0;
-		while (b < input.length) { // print current line
-			var c = input[b];
-			if (c == '\n') break;
-			if (b < pos) {
-				if (c == '\t') col = (col + 8) & ~7;
-				else col++;
-			}
-			System.putc(c);
-			b++;
-		}
-		System.ln();
-		for (i < col) System.putc(' '); // print caret pointing to column
-		System.putc('^');
-		System.ln();
-	}
-	def cmd(loc: (int, int), cmd: StCommand) {
-		commands.add(SpecTestCommand.new(loc, cmd));
-	}
-}
-def isKeywordMiddle(c: byte) -> bool {
-	return 'a' <= c && c <= 'z' ||
-		'A' <= c && c <= 'Z' ||
-		'0' <= c && c <= '9' ||
-		c == '_' ||
-		c == '-';
-}
-
-class SpecTestCommand(loc: (int, int), cmd: StCommand) {
-}
-type StCommand {
-	case BinaryModule(varname: string, bytes: Array<byte>);
-	case QuotedModule(varname: string, str: string);
-	case Register(varname: string, regname: string);
-	case Invoke(varname: string, funcname: string);
-	case GetGlobal(varname: string, globalname: string);
-	case AssertReturn;
-	case AssertTrap(msg: string);
-	case AssertExhaustion(msg: string);
-	case AssertInvalid(msg: string);
-	case AssertMalformed(msg: string);
-	case AssertUnlinkable(msg: string);
-	case Constant(val: Value);
-}
-
-type StValue {
-	case Instance(sti: StInstance);
-	case InvalidModule(r: BinParserResult);
-	case QuotedModule(s: string);
-	case UnlinkableModule(m: Module);
-	case WasmValue(val: Value);
-	case WasmTrap(reason: TrapReason);
-}
 class StEnv<T> {
 	def modules = Vector<(string, T)>.new();
 	def register(name: string, t: T) {
@@ -473,7 +88,7 @@ component SpecTestRunner {
 		trace.puts("\")\n");
 		flush();
 	}
-	def renderQuotedModule(data: Array<byte>, pos: int, length: int) {
+	def renderQuoteModule(data: Array<byte>, pos: int, length: int) {
 		trace.puts("(module quote");
 		for (i < length) {
 			if (i % 64 == 0) {
@@ -502,10 +117,16 @@ def newGlobal(t: ValueType, i: InitExpr, v: Value) -> Global {
 	g.value = v;
 	return g;
 }
+type StModuleResult {
+	case Ok(sti: StInstance);
+	case ParseError(r: BinParserResult);
+	case LinkError(msg: string);
+	case StartTrap(reason: TrapReason);
+}
 class StInterpreter(filename: string, trace: StringBuffer) {
 	def env = StEnv<StInstance>.new();
 	def vars = StEnv<StInstance>.new();
-	def stack = Stack<StValue>.new();
+	var last_module: StModuleResult;
 	var ok = true;
 	var loc: (int, int);
 	new() {
@@ -551,108 +172,110 @@ class StInterpreter(filename: string, trace: StringBuffer) {
 			}
 			match (cmd.cmd) {
 				BinaryModule(varname, bytes) => {
-					var i = parseBinary(bytes);
-					if (varname != null && StValue.Instance.?(i)) {
-						vars.register(varname, StValue.Instance.!(i).sti);
-					}
-					stack.push(i);
+					last_module = doModule(StCommand.BinaryModule.!(cmd.cmd));
 				}
-				QuotedModule(varname, str) => {
-					stack.push(StValue.QuotedModule(str));
+				QuoteModule(varname, str) => {
+					error("only binary modules allowed here"); // TODO
 				}
 				Register(varname, regname) => {
 					var sti = getInstance(varname);
 					if (!ok) return false;
-					env.register(regname, sti.sti);
+					env.register(regname, sti);
 				}
-				Invoke(varname, funcname) => {
-					var i = stack.top - 1;
-					// count arguments
-					while (i >= 0) {
-						var v = stack.elems[i];
-						if (!StValue.WasmValue.?(v)) break;
-						i--;
-					}
-					// pop arguments
-					var arity = stack.top - i - 1;
-					var args = Array<Value>.new(arity);
-					for (i < arity) {
-						args[arity - i - 1] = popV().val;
-					}
-					// pop instance
-					var sti = getInstance(varname);
-					if (!ok) return false;
-					// lookup function
-					var exp = sti.sti.lookup(funcname);
-					if (exp == null) return error(Strings.format1("func \"%s\" not found", funcname));
-					if (!WasmFunction.?(exp)) return error(Strings.format1("export \"%s\" is not a function", funcname));
-					var func = WasmFunction.!(exp);
-					// create interpreter
-					var interp = Interpreter.new();
-					// run interpreter
-					var result = interp.run(-1, func, args);
-					// unpack result
-					match (result) {
-						Break => return error("interpreter hit breakpoint");
-						Value(vals) => {
-							for (v in vals) {
-								stack.push(StValue.WasmValue(v));
-							}
-						}
-						Trap(reason) => stack.push(StValue.WasmTrap(reason));
-					}
+				Action(action) => {
+					doAction(action);
 				}
-				GetGlobal(varname, globalname) => {
-					// pop instance
-					var sti = getInstance(varname);
-					if (!ok) return false;
-					// lookup function
-					var exp = sti.sti.lookup(globalname);
-					if (exp == null) return error(Strings.format1("global \"%s\" not found", globalname));
-					if (!Global.?(exp)) return error(Strings.format1("export \"%s\" is not a global", globalname));
-					var global = Global.!(exp);
-					stack.push(StValue.WasmValue(global.value));
+				AssertReturn(action, expected) => {
+					var r = doAction(action);
 				}
-				AssertReturn => {
-					var expected = popV();
-					var got = popV();
-					if (!ok) return false;
-					if (expected.val != got.val) {
-						error(Strings.format2("expected %q, got %q", Values.render(_, expected.val), Values.render(_, got.val)));
-					}
+				AssertTrap(action, msg) => {
+					var r = doAction(action);
 				}
-				AssertTrap(msg) => {
-					var trap = pop<StValue.WasmTrap>("trap");
+				AssertExhaustion(action, msg) => {
+					var r = doAction(action);
 				}
-				AssertExhaustion(msg) => {
-					var result = popR();
+				AssertInvalid(module, msg) => {
+					var r = doModule(module);
 				}
-				AssertInvalid(msg) => {
-					pop<StValue.InvalidModule>("invalid module");
+				AssertMalformed(module, msg) => {
+					// do nothing.
 				}
-				AssertMalformed(msg) => {
-					pop<StValue.QuotedModule>("quoted module");
+				AssertUnlinkable(module, msg) => {
+					var r = doModule(module);
 				}
-				AssertUnlinkable(msg) => {
-					pop<StValue.UnlinkableModule>("unlinkable module");
-				}
-				Constant(val) => {
-					stack.push(StValue.WasmValue(val));
+				AssertUninstantiable(module, msg) => {
+					var r = doModule(module);
 				}
 			}
 		}
 		return true;
 	}
-	def getInstance(varname: string) -> StValue.Instance {
+	def doModule(module: StCommand.BinaryModule) -> StModuleResult {
+		var r = parseBinary(module.bytes);
+		if (module.varname != null && StModuleResult.Ok.?(r)) {
+			vars.register(module.varname, StModuleResult.Ok.!(r).sti);
+		}
+		return r;
+	}
+	def doAction(action: StAction) -> Result {
+		match (action) {
+			Invoke(varname, funcname, args) => {
+				return doInvoke(varname, funcname, args);
+			}
+			GlobalGet(varname, globalname) => {
+				return doGlobalGet(varname, globalname);
+			}
+		}
+	}
+	def doInvoke(varname: string, funcname: string, args: Array<Value>) -> Result {
+		// pop instance
+		var sti = getInstance(varname);
+		if (!ok) return Result.Break;
+		// lookup function
+		var exp = sti.lookup(funcname);
+		if (exp == null) {
+			error(Strings.format1("func \"%s\" not found", funcname));
+			return Result.Break;
+		}
+		if (!WasmFunction.?(exp)) {
+			error(Strings.format1("export \"%s\" is not a function", funcname));
+			return Result.Break;
+		}
+		var func = WasmFunction.!(exp);
+		// create interpreter
+		var interp = Interpreter.new();
+		// run interpreter
+		return interp.run(-1, func, args);
+	}
+	def doGlobalGet(varname: string, globalname: string) -> Result {
+		// pop instance
+		var sti = getInstance(varname);
+		if (!ok) return Result.Break;
+		// lookup global
+		var exp = sti.lookup(globalname);
+		if (exp == null) {
+			error(Strings.format1("global \"%s\" not found", globalname));
+			return Result.Break;
+		}
+		if (!Global.?(exp)) {
+			error(Strings.format1("export \"%s\" is not a global", globalname));
+			return Result.Break;
+		}
+		var global = Global.!(exp);
+		return Result.Value([global.value]);
+	}
+	def getInstance(varname: string) -> StInstance {
 		if (varname == null) {
-			var sti = popI();
-			if (!ok) return StValue.Instance(null);
-			stack.push(sti);
-			return sti;
+			match (last_module) {
+				Ok(sti) => return sti;
+				ParseError(r) => error("expected valid module, got invalid:");
+				LinkError(msg) => error("expected valid module, got link error");
+				StartTrap(reason) => error("expected valid module, got start trap");
+			}
 		}
 		var i = vars.lookup(varname);
 		if (i == null) error(Strings.format1("module %s not found", varname));
-		return StValue.Instance(i);
+		return i;
 	}
 	def error(msg: string) -> bool {
 		if (!ok) return false;
@@ -664,7 +287,7 @@ class StInterpreter(filename: string, trace: StringBuffer) {
 		flush();
 		return false;
 	}
-	def parseBinary(bytes: Array<byte>) -> StValue {
+	def parseBinary(bytes: Array<byte>) -> StModuleResult {
 		var v = if (wizeng.verbose, Verbosity.VERBOSE, Verbosity.SILENT);
 		var extensions: Extension.set;
 		var limits = Limits.new();
@@ -673,22 +296,22 @@ class StInterpreter(filename: string, trace: StringBuffer) {
 		var r = mp.finish();
 		match (r) {
 			Ok(module) => return doInstantiate(module);
-			Error => return StValue.InvalidModule(r);
+			Error => return StModuleResult.ParseError(r);
 		}
 	}
-	def doInstantiate(module: Module) -> StValue {
+	def doInstantiate(module: Module) -> StModuleResult {
 		var imports = Array<Exportable>.new(module.imports.length);
 		for (i < module.imports.length) {
 			var imp = module.imports[i];
 			var sti = env.lookup(imp.modname);
-			if (sti == null) return StValue.UnlinkableModule(module);
+			if (sti == null) return StModuleResult.LinkError(Strings.format1("import module \"%s\" not found", imp.modname));
 			var exp = sti.lookup(imp.name);
-			if (exp == null) return StValue.UnlinkableModule(module);
+			if (exp == null) return StModuleResult.LinkError(Strings.format2("import \"%s\".\"%s\" not found", imp.modname, imp.name));
 			imports[i] = exp;
 		}
 		var i = Instantiator.new(module, imports);
 		var r = i.run();
-		if (!i.err.ok()) return StValue.UnlinkableModule(module);
+		if (!i.err.ok()) return StModuleResult.LinkError(i.err.error_msg);
 		if (module.start_function >= 0) {
 			var func = r.getFunction(module.start_function);
 			var interp = Interpreter.new();
@@ -696,44 +319,13 @@ class StInterpreter(filename: string, trace: StringBuffer) {
 			match (result) {
 				Break => {
 					error("interpreter hit breakpoint");
-					return StValue.WasmTrap(TrapReason.NONE);
+					return StModuleResult.StartTrap(TrapReason.NONE);
 				}
-				Value => /* ignore result(s); should be none */;
-				Trap(reason) => return StValue.WasmTrap(reason);
+				Value => ; // ignore result(s); should be none
+				Trap(reason) => return StModuleResult.StartTrap(reason);
 			}
 		}
-		return StValue.Instance(StInstance.new(r));
-	}
-	def popV() -> StValue.WasmValue {
-		return pop<StValue.WasmValue>("value");
-	}
-	def popI() -> StValue.Instance {
-		return pop<StValue.Instance>("instance");
-	}
-	def popR() -> StValue {
-		var v = pop<StValue>("result");
-		if (!ok) return v;
-		match (v) {
-			WasmValue => return v;
-			WasmTrap => return v;
-			_ => error(Strings.format1("expected result, found: %s", v.name));
-		}
-		return v;
-	}
-	def pop<T>(expected: string) -> T {
-		var d: T;
-		if (stack.top == 0) {
-			error(Strings.format1("expected %s, found empty stack", expected));
-			return d;
-		}
-		var v = stack.pop();
-		if (T.?(v)) return T.!(v);
-		error(Strings.format2("expected %s, found: %s", expected, v.name));
-		return d;
-	}
-	def renderStValue(buf: StringBuffer, v: StValue) -> StringBuffer {
-		buf.puts(v.name);
-		return buf;
+		return StModuleResult.Ok(StInstance.new(r));
 	}
 	def flush() {
 		trace.out(STDOUT);

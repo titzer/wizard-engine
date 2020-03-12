@@ -1,0 +1,449 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Parses textual spec tests (wast format). Only supports binary module
+// commands, and not inline module commands.
+class SpecTestParser(filename: string, input: Array<byte>) {
+	private var pos: int;
+	private var line: int = 1;
+	private var col: int = 1;
+	private def strbuf = StringBuffer.new();
+	def var commands = Vector<SpecTestCommand>.new();
+	def var ok = true;
+	def var error_loc = (int.max, int.max);
+	def var error_msg: string;
+
+	def parseFile() {
+		skip();
+		parseList(commands, parseCommand);
+	}
+
+	def parseList<T>(vec: Vector<T>, parse: void -> T) {
+		while (ok && more(1)) {
+			if (!ch('(')) return;
+			vec.add(parse());
+			if (!expect_ch(')')) return;
+		}
+	}
+	def parseNested<T>(parse: void -> T) -> T {
+		var t: T;
+		if (!expect_ch('(')) return t;
+		t = parse();
+		expect_ch(')');
+		return t;
+	}
+	def parseOneCommandForTesting() -> SpecTestCommand {
+		if (!ch('(')) return null;
+		var c = parseCommand();
+		if (!expect_ch(')')) return null;
+		return c;
+	}
+	def parseCommand() -> SpecTestCommand {
+		var loc = (line, col);
+		var cmd: StCommand;
+		if (kw("module")) cmd = parseModule();
+		else if (kw("assert_return")) cmd = parseAssertReturn();
+		else if (kw("assert_trap")) cmd = parseAssertTrap();
+		else if (kw("assert_uninstantiable")) cmd = parseAssertUninstantiable();
+		else if (kw("assert_exhaustion")) cmd = parseAssertExhaustion();
+		else if (kw("assert_invalid")) cmd = parseAssertInvalid();
+		else if (kw("assert_malformed")) cmd = parseAssertMalformed();
+		else if (kw("assert_unlinkable")) cmd = parseAssertUnlinkable();
+		else if (kw("invoke")) cmd = StCommand.Action(parseInvoke());
+		else if (kw("get")) cmd = StCommand.Action(parseGlobalGet());
+		else if (kw("register")) cmd = parseRegister();
+		else if (kw("action")) cmd = StCommand.Action(parseNested(parseAction));
+		else error1(loc, "expected valid command", ());
+		return SpecTestCommand.new(loc, cmd);
+	}
+	def parseStrings() -> string {
+		var loc = (line, col);
+		strbuf.reset();
+		if (!more(1) || input[pos] != '\"') error1(loc, "expected string", ());
+		while (ok && more(1)) {
+			if (input[pos] != '\"') break;
+			doString();
+		}
+		return strbuf.extract();
+	}
+	def parseVarName() -> string {
+		var start = pos;
+		if (!more(2) || input[pos] != '$') return null;
+		var p = start + 1;
+		while (p < input.length) {
+			if (!isKeywordMiddle(input[p])) break;
+			p++;
+		}
+		advance(p - start);
+		return Arrays.range(input, start, p);
+	}
+	def parseModule() -> StCommand {
+		var loc = (line, col);
+		var varname = parseVarName();
+		if (kw("binary")) {
+			var bytes = parseStrings();
+			return StCommand.BinaryModule(varname, bytes);
+		} else if (kw("quote")) {
+			var source = parseStrings();
+			return StCommand.QuoteModule(varname, source);
+		} else {
+			error1(loc, "expected binary or quote module", ());
+			var cmd: StCommand;
+			return cmd;
+		}
+	}
+	def parseBinaryModule() -> StCommand.BinaryModule {
+		var loc = (line, col);
+		var t: StCommand.BinaryModule;
+		if (!expect_kw("module")) return t;
+		var varname = parseVarName();
+		if (!expect_kw("binary")) return t;
+		var bytes = parseStrings();
+		return StCommand.BinaryModule(varname, bytes);
+	}
+	def parseQuoteModule() -> StCommand.QuoteModule {
+		var loc = (line, col);
+		var t: StCommand.QuoteModule;
+		if (!expect_kw("module")) return t;
+		var varname = parseVarName();
+		if (!expect_kw("quote")) return t;
+		var bytes = parseString();
+		return StCommand.QuoteModule(varname, bytes);
+	}
+	def parseAssertReturn() -> StCommand {
+		var action = parseNested(parseAction);
+		var expected = Vector<Value>.new();
+		parseList(expected, parseConstant);
+		return StCommand.AssertReturn(action, expected.extract());
+	}
+	def parseAssertTrap() -> StCommand {
+		var action = parseNested(parseAction);
+		var msg = parseMaybeString();
+		return StCommand.AssertTrap(action, msg);
+	}
+	def parseAssertExhaustion() -> StCommand {
+		var action = parseNested(parseAction);
+		var msg = parseMaybeString();
+		return StCommand.AssertExhaustion(action, msg);
+	}
+	def parseAssertInvalid() -> StCommand {
+		var module = parseNested(parseBinaryModule);
+		var msg = parseMaybeString();
+		return StCommand.AssertInvalid(module, msg);
+	}
+	def parseAssertMalformed() -> StCommand {
+		var module = parseNested(parseQuoteModule);
+		var msg = parseMaybeString();
+		return StCommand.AssertMalformed(module, msg);
+	}
+	def parseAssertUnlinkable() -> StCommand {
+		var module = parseNested(parseBinaryModule);
+		var msg = parseMaybeString();
+		return StCommand.AssertUnlinkable(module, msg);
+	}
+	def parseAssertUninstantiable() -> StCommand {
+		var module = parseNested(parseBinaryModule);
+		var msg = parseMaybeString();
+		return StCommand.AssertUninstantiable(module, msg);
+	}
+	def parseInvoke() -> StAction.Invoke {
+		var varname = parseVarName();
+		var funcname = parseString();
+		var args = Vector<Value>.new();
+		parseList(args, parseConstant);
+		return StAction.Invoke(varname, funcname, args.extract());
+	}
+	def parseGlobalGet() -> StAction.GlobalGet {
+		var varname = parseVarName();
+		var globalname = parseString();
+		return StAction.GlobalGet(varname, globalname);
+	}
+	def parseConstant() -> Value {
+		var loc = (line, pos);
+		if (kw("i32.const")) return parseI32Const();
+		else if (kw("i64.const")) return parseI64Const();
+		else if (kw("f32.const")) return parseF32Const();
+		else if (kw("f64.const")) return parseF64Const();
+		error1(loc, "expected constant", ());
+		return Values.I32_0;
+	}
+	def parseI32Const() -> Value.I32 {
+		var loc = (line, pos);
+		var c = input[pos], sign = 1u;
+		if (c == '-') {
+			sign = 0xFFFFFFFFu;
+			pos++;
+			if (!more(1)) {
+				error1(loc, "expected int32, got EOF", ());
+				return Values.I32_0;
+			}
+			c = input[pos];
+		}
+		var val: u32;
+		if (c == '0') {
+			var x = peek_ch(1);
+			if (x == 'x' || x == 'X') {
+				val = parseI32Hex(loc);
+			}
+			else val = parseI32Dec(loc);
+		} else {
+			val = parseI32Dec(loc);
+		}
+		return Value.I32(u32.!(sign * val));
+	}
+	def parseI32Hex(loc: (int, int)) -> u32 {
+		var a = input, i = pos + 2, max = a.length;
+		var accum = 0u;
+		while (i < max) {
+			var v = Strings.hexValue(a[i]);
+			if (v < 0 || v > 15) break;
+			accum = (accum << 4) + u32.!(v);
+			i++;
+		}
+		var count = i - pos;
+		if (count == 2) error1(loc, "expected hexadecimal i32", ());
+		if (count > 10) error1(loc, "hexadecimal i32 too long", ());
+		pos = i;
+		skip();
+		return accum;
+	}
+	def parseI32Dec(loc: (int, int)) -> u32 {
+		// Parse a (positive) decimal integer starting at pos.
+		var a = input, i = pos, v1 = a[i++];
+		if (v1 < '0' || v1 > '9') {
+			error1(loc, "expected decimal i32", ());
+			return 0;
+		}
+
+		var max = a.length, accum = v1 - u32.!('0');
+		while (i < max) {
+			var d = a[i] - '0';
+			if (d < 0 || d > 9) break;
+			var n = u64.!(accum) * 10 + d;
+			if (n > u32.max) {
+				error1(loc, "decimal i32 too large", ());
+				return 0;
+			}
+			accum = u32.!(n);
+			i++;
+		}
+		pos = i;
+		skip();
+		return accum;
+	}
+	def parseI64Const() -> Value.I64; // TODO
+	def parseF32Const() -> Value.F32; // TODO
+	def parseF64Const() -> Value.F64; // TODO
+	def parseRegister() -> StCommand.Register {
+		var regname = parseString();
+		var varname = parseVarName();
+		return StCommand.Register(varname, regname);
+	}
+	def parseAction() -> StAction {
+		var action: StAction;
+		var loc = (line, pos);
+		if (kw("invoke")) {
+			action = parseInvoke();
+		} else if (kw("get")) {
+			action = parseGlobalGet();
+		} else {
+			error1(loc, "expected invoke or get action", ());
+		}
+		return action;
+	}
+
+	def parseMaybeString() -> string {
+		if (peek_ch(0) != '\"') return null;
+		return parseString();
+	}
+	def parseString() -> string {
+		strbuf.reset();
+		doString();
+		return strbuf.extract();
+	}
+	def doString() {
+		// Parses string characters into {this.strbuf}
+		var loc = (line, col);
+		if (!more(1)) return error1(loc, "expected string, got EOF", ());
+		var c = input[pos];
+		if (c != '\"') return error1(loc, "expected string starting quote", ());
+		pos++;
+		col++;
+		while (ok && more(1)) {
+			var c = input[pos];
+			if (c == '\"') return advance(1); // end of string
+
+			if (c < ' ' || c > 127) {
+				return error1((line, col), "invalid character 0x%x in string", c);
+			}
+			if (c == '\\') {
+				if (!more(3)) break;
+				var h = peek_hex(1), l = peek_hex(2);
+				strbuf.putc(byte.!(h << 4 | l));
+				pos += 3;
+				col += 3;
+			} else {
+				strbuf.putc(c);
+				pos++;
+				col++;
+			}
+
+		}
+		error1((line, col), "unexpected end of string", ());
+	}
+
+	// expect and consume the given character {c}
+	def expect_ch(c: byte) -> bool {
+		var loc = (line, col);
+		if (!ch(c)) { error1(loc, "expected \'%c\'", c); return false; }
+		return true;
+	}
+	// Peek at the character {offset} ahead, returning -1 if that is EOF.
+	def peek_ch(offset: int) -> int {
+		if (more(1 + offset)) return input[pos + offset];
+		return -1;
+	}
+	// Peek at the character {offset} ahead, returning its hexadecimal
+	// value.
+	def peek_hex(offset: int) -> int {
+		var h = input[pos + offset];
+		if (!Strings.isHexChar(h)) {
+			error1((line, col + offset), "expected hexadecimal", ());
+			return 0;
+		}
+		return Strings.hexValue(h);
+	}
+	// Eat the character {c} if it is next in the input, returning {true} if so.
+	def ch(c: byte) -> bool {
+		if (!more(1)) return false;
+		if (input[pos] != c) return false;
+		advance(1);
+		return true;
+	}
+
+	// expect and consume the given character {c}
+	def expect_kw(k: string) -> bool {
+		var loc = (line, col);
+		if (!kw(k)) { error1(loc, "expected \'%s\'", k); return false; }
+		return true;
+	}
+	// Eat the keyword {k} if it is next in the input, returning {true} if so.
+	def kw(k: string) -> bool {
+		var l = k.length;
+		if (!more(l)) return false;
+		for (i < l) {
+			if (input[pos + i] != k[i]) return false;
+		}
+		if (more(l+1)) {
+			var c = input[pos + l];
+			if (isKeywordMiddle(c)) return false;
+		}
+		advance(l);
+		return true;
+	}
+
+	// Advance by {k} non-whitespace characters, and then skip whitespace.
+	def advance(k: int) {
+		pos += k;
+		col += k;
+		skip();
+	}
+	// Skip whitespace from the current position.
+	def skip() {
+		while (pos < input.length) {
+			var c = input[pos];
+			match (c) {
+				' ' => {
+					col++;
+					pos++;
+				}
+				'\t' => {
+					col = (col + 8) & ~7;
+					pos++;
+				}
+				'\n' => {
+					col = 1;
+					line++;
+					pos++;
+				}
+				';' => {
+					var p = pos, d = input;
+					while (p++ < d.length && d[p] != '\n') ;
+					pos = p;
+				}
+				_ => return;
+			}
+		}
+	}
+	def more(num: int) -> bool {
+		return input.length - pos >= num;
+	}
+	def error1<T>(loc: (int, int), fmt: string, arg: T) {
+		ok = false;
+		if (loc.0 < error_loc.0 ||
+			(loc.0 == error_loc.0 && loc.1 < error_loc.1)) {
+			error_loc = loc;
+			error_msg = Strings.format1(fmt, arg);
+		}
+		if (UnitTests.fatal) {
+			var msg = StringBuffer.new();
+			msg.puts(filename);
+			msg.put3(" @ %d:%d %s", error_loc.0, error_loc.1, error_msg);
+			printCurrentLine();
+			System.error("SpecTestParserError", msg.extract());
+		}
+	}
+	def printCurrentLine() {
+		var b = pos - 1;
+		while (b >= 0) { // scan backwards to previous newline
+			if (input[b] == '\n') { b++; break; }
+			b--;
+		}
+		if (b < 0) b = 0;
+		var col = 0;
+		while (b < input.length) { // print current line
+			var c = input[b];
+			if (c == '\n') break;
+			if (b < pos) {
+				if (c == '\t') col = (col + 8) & ~7;
+				else col++;
+			}
+			System.putc(c);
+			b++;
+		}
+		System.ln();
+		for (i < col) System.putc(' '); // print caret pointing to column
+		System.putc('^');
+		System.ln();
+	}
+	def cmd(loc: (int, int), cmd: StCommand) {
+		commands.add(SpecTestCommand.new(loc, cmd));
+	}
+}
+def isKeywordMiddle(c: byte) -> bool {
+	return 'a' <= c && c <= 'z' ||
+		'A' <= c && c <= 'Z' ||
+		'0' <= c && c <= '9' ||
+		c == '_' ||
+		c == '-';
+}
+
+class SpecTestCommand(loc: (int, int), cmd: StCommand) {
+}
+type StCommand {
+	case BinaryModule(varname: string, bytes: Array<byte>);
+	case QuoteModule(varname: string, source: string);
+	case Register(varname: string, regname: string);
+	case Action(action: StAction);
+	case AssertReturn(action: StAction, expected: Array<Value>);
+	case AssertTrap(action: StAction, msg: string);
+	case AssertExhaustion(action: StAction, msg: string);
+	case AssertInvalid(module: StCommand.BinaryModule, msg: string);
+	case AssertMalformed(module: StCommand.QuoteModule, msg: string);
+	case AssertUnlinkable(module: StCommand.BinaryModule, msg: string);
+	case AssertUninstantiable(module: StCommand.BinaryModule, msg: string);
+}
+type StAction {
+	case Invoke(varname: string, funcname: string, args: Array<Value>);
+	case GlobalGet(varname: string, globalname: string);
+}
