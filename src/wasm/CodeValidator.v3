@@ -2,7 +2,8 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Implements that validation logic for the code of a function.
-class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, err: WasmErrorGen) {
+class CodeValidator(extensions: Extension.set, limits: Limits,
+		module: Module, err: WasmErrorGen) {
 	var decoder: Decoder;
 	def parser = WasmParser.new(extensions, limits, module, err, null);
 	def locals = Vector<ValueType>.new();
@@ -11,21 +12,30 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def ctl_xfers = Vector<(u23, i23, u10, u23)>.new();
 	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
 	var func: FunctionDecl;
-	var opcode_pt: int;
+	var start_pos: int;
+	var opcode_pos: int;
+	def trace = if(Trace.verify, StringBuffer.new());
 
 	def validateFunc(f: FunctionDecl) -> CodeValidatorResult {
 		var d = Decoder.new(f.code.orig, err);
 		return validate(f, d);
 	}
 	def validate(f: FunctionDecl, d: Decoder) -> CodeValidatorResult {
+		if (trace != null) {
+			trace.put2("verify(func #%d: %q)\n",
+				f.index, ValueTypes.renderSig(_, f.sig));
+			trace.out(Trace.STDOUT);
+			trace.reset();
+		}
 		func = f;
 		decoder = d;
 		parser.decoder = d;
 		ctl_stack.clear();
 		val_stack.clear();
 		ctl_xfers.resize(0);
+		start_pos = parser.decoder.pos;
 		setupLocals();
-		opcode_pt = parser.decoder.pos;
+		opcode_pos = parser.decoder.pos;
 		pushControl(Opcode.UNREACHABLE.code, f.sig);
 		validateCode();
 		if (ctl_stack.top != 0) {
@@ -48,6 +58,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			var pt = decoder.pos;
 			var count = parser.readU32("local count", 0, max);
 			var ltype = parser.readValueType();
+			if (trace != null) traceLocals(count, ltype);
 			locals.putn(ltype, int.!(count));
 			if ((locals.length - start) > max) {
 				err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
@@ -57,11 +68,17 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		}
 		func.code.num_locals = locals.length;
 	}
+	def traceLocals(count: u32, ltype: ValueType) {
+		trace.put2("  locals %d: %q\n", count, ValueTypes.render(_, ltype));
+		trace.out(Trace.STDOUT);
+		trace.reset();
+	}
 	def validateCode() {
 		var d = parser.decoder;
 		while (d.pos < d.limit) {
-			opcode_pt = parser.decoder.pos;
+			opcode_pos = parser.decoder.pos;
 			var opcode = parser.readByte("opcode", Opcodes.render);
+			if (trace != null) traceOpcode();
 			// FAST: Handle short operators (predictable direct branch)
 			if (Opcodes.isShortOperator[opcode]) {
 				// TODO(fast): combine signature read with isOperator() check
@@ -93,23 +110,23 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					checkArgs(sig.params);
 					var ctl = pushControl(opcode, sig);
 					var ctl_index = ctl_xfers.length;
-					ctl_xfers.put(u23.!(opcode_pt), 0, 0, 0);
+					ctl_xfers.put(pc(opcode_pos), 0, 0, 0);
 					ctl.ctl_refs.put(ctl_index);
 				}
 				Opcode.ELSE.code => {
 					if (ctl_top.start_opcode != Opcode.IF.code) {
-						return err.fail(opcode_pt, WasmError.MISMATCHED_ELSE,
+						return err.fail(opcode_pos, WasmError.MISMATCHED_ELSE,
 							"mismatched else");
 					}
 					checkArgsAndTransfer();
 					var if_branch = ctl_top.ctl_refs[0];
 					// branches within if-true block go to "else"...
-					resolveBranches(ctl_top, opcode_pt);
+					resolveBranches(ctl_top, opcode_pos);
 					// ... except false target of "if"
 					ctl_top.ctl_refs.put(if_branch);
-					resolveBranches(ctl_top, opcode_pt + 1);
+					resolveBranches(ctl_top, opcode_pos + 1);
 					// "else" implicitly goes to end
-					addCtlRef(ctl_top, opcode_pt);
+					addCtlRef(ctl_top, opcode_pos);
 
 					ctl_top.start_opcode = opcode;
 					val_stack.top = ctl_top.val_stack_top;
@@ -117,22 +134,22 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				Opcode.END.code => {
 					if (ctl_stack.top == 0) {
-						return err.fail(opcode_pt, WasmError.OOB_LABEL,
+						return err.fail(opcode_pos, WasmError.OOB_LABEL,
 							"empty control stack");
 					}
 					checkArgsAndTransfer();
 					var ctl = popControl();
 					if (ctl.start_opcode == Opcode.LOOP.code) {
-						resolveBranches(ctl, ctl.start_pt);
+						resolveBranches(ctl, ctl.start_pos);
 					} else {
-						resolveBranches(ctl, opcode_pt);
+						resolveBranches(ctl, opcode_pos);
 					}
 				}
 				Opcode.BR.code => {
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
-					addCtlRef(target, opcode_pt);
+					addCtlRef(target, opcode_pos);
 					checkAndPopArgs(target.sig.results);
 					ctl_top.reachable = false;
 					val_stack.top = ctl_top.val_stack_top;
@@ -142,19 +159,19 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					var target = getControl(depth);
 					if (target == null) return;
 					popE(ValueType.I32);
-					addCtlRef(target, opcode_pt);
+					addCtlRef(target, opcode_pos);
 					checkArgs(target.sig.results);
 				}
 				Opcode.BR_TABLE.code => {
 					var labels = parser.readLabels();
 					popE(ValueType.I32);
 					var i = 0;
-					ctl_xfers.put(u23.!(opcode_pt), i23.!(labels.length), 0, 0);
+					ctl_xfers.put(pc(opcode_pos), i23.!(labels.length), 0, 0);
 					for (depth in labels) {
 						var target = getControl(depth);
 						if (target == null) return;
 						checkArgs(target.sig.results);
-						addCtlRef(target, opcode_pt + ++i);
+						addCtlRef(target, opcode_pos + ++i);
 					}
 					ctl_top.reachable = false;
 					val_stack.top = ctl_top.val_stack_top;
@@ -272,29 +289,54 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		var memarg = parser.readMemoryArg();
 		var align = memarg.0;
 		if (align > max) {
-			err.fail2(opcode_pt, WasmError.INVALID_ALIGNMENT,
+			err.fail2(opcode_pos, WasmError.INVALID_ALIGNMENT,
 				"expect max alignment %d, got %d", max, align);
 		}
 		var sig = Opcodes.signatures[opcode];
 		checkAndPopArgs(sig.params);
 		pushTypes(sig.results);
 	}
-
-	def resolveBranches(target: ControlEntry, pc: int) {
-		var refs = target.ctl_refs;
+	def traceOpcode() {
+		trace.put2("  %x(+%d): ", opcode_pos, opcode_pos - start_pos);
+		var codeptr = parser.decoder;
+		var prev = codeptr.pos;
+		codeptr.pos = opcode_pos;
+		Opcodes.renderInstr(trace, module, codeptr);
+		codeptr.pos = prev;
+		trace.ln();
+		trace.out(Trace.STDOUT);
+		trace.reset();
+	}
+	def resolveBranches(target: ControlEntry, pos: int) {
+		var refs = target.ctl_refs, ppc = pc(pos);
 		for (i = refs.length - 1; i >= 0; i--) {
 			var index = refs[i];
 			var t = ctl_xfers[index];
-			var delta = i23.!(pc - int.!(t.0));
+			var delta = i23.!(ppc - int.!(t.0));
 			ctl_xfers[index] = (t.0, delta, t.2, t.3);
+			if (trace != null) {
+				trace.put2("    resolveBranch(@+%d to +%d)\n",
+					int.!(t.0), int.!(ppc));
+				trace.out(Trace.STDOUT);
+				trace.reset();
+			}
 		}
 		refs.resize(0);
 	}
-	def addCtlRef(target: ControlEntry, pc: int) {
+	def addCtlRef(target: ControlEntry, pt: int) {
 		var index = ctl_xfers.length;
 		var valcount = target.sig.results.length;
 		var popcount = val_stack.top - valcount - target.val_stack_top;
-		ctl_xfers.put(u23.!(pc), 0, u10.!(valcount), u23.!(popcount));
+		var ppc = pc(pt);
+		ctl_xfers.put(ppc, 0, u10.!(valcount), u23.!(popcount));
+		if (trace != null) {
+			trace.put2("    addCtlRef(@+%d to +%d.label, ",
+				int.!(ppc), int.!(pc(target.start_pos)));
+			trace.put2("valcount=%d, popcount=%d)\n",
+				valcount, popcount);
+			trace.out(Trace.STDOUT);
+			trace.reset();
+		}
 		target.ctl_refs.put(index);
 	}
 	def checkArgs(p: Array<ValueType>) {
@@ -309,7 +351,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		var p = ctl_top.sig.results;
 		var count = val_stack.top - ctl_top.val_stack_top;
 		if (ctl_top.reachable && count != p.length) {
-			err.fail2(opcode_pt, WasmError.TYPE_MISMATCH,
+			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
 				"expected %d values for fallthru, found %d", p.length, count);
 		}
 		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
@@ -322,7 +364,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	}
 	def pop() -> ValueType {
 		if (val_stack.top <= ctl_top.val_stack_top) {
-			if (ctl_top.reachable) err.fail(opcode_pt, WasmError.TYPE_MISMATCH,
+			if (ctl_top.reachable) err.fail(opcode_pos, WasmError.TYPE_MISMATCH,
 				"empty value stack");
 			return ValueType.I32;
 		}
@@ -331,21 +373,21 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def popE(expected: ValueType) {
 		if (val_stack.top <= ctl_top.val_stack_top) {
 			if (ctl_top.reachable) {
-				err.fail1(opcode_pt, WasmError.TYPE_MISMATCH, "empty value stack, expected %q",
+				err.fail1(opcode_pos, WasmError.TYPE_MISMATCH, "empty value stack, expected %q",
 						ValueTypes.render(_, expected));
 			}
 			return; // unreachable or already signalled an error
 		}
 		var t = val_stack.pop();
 		if (!ValueTypes.isAssignable(t, expected)) {
-			err.fail2(opcode_pt, WasmError.TYPE_MISMATCH,
+			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
 				"expected type %q, got %q",
 				ValueTypes.render(_, expected), ValueTypes.render(_, t));
 		}
 	}
 	def popAny() -> ValueType {
 		if (val_stack.top <= ctl_top.val_stack_top) {
-			if (ctl_top.reachable) err.fail(opcode_pt, WasmError.TYPE_MISMATCH, "empty value stack");
+			if (ctl_top.reachable) err.fail(opcode_pos, WasmError.TYPE_MISMATCH, "empty value stack");
 		}
 		return val_stack.pop();
 	}
@@ -361,7 +403,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			ctl_stack.push(ctl);
 		}
 		ctl_top = ctl;
-		ctl.start_pt = opcode_pt;
+		ctl.start_pos = opcode_pos;
 		ctl.start_opcode = opcode;
 		ctl.sig = sig;
 		ctl.val_stack_top = val_stack.top;
@@ -376,16 +418,19 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	}
 	def getControl(depth: u32) -> ControlEntry {
 		if (depth >= ctl_stack.top) {
-			err.fail2(opcode_pt, WasmError.OOB_LABEL,
+			err.fail2(opcode_pos, WasmError.OOB_LABEL,
 				"label %d exceeds control depth %d",
 				depth, ctl_stack.top);
 			return null;
 		}
 		return ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
 	}
+	def pc(pos: int) -> u23 {
+		return u23.!(pos - start_pos);
+	}
 	def getLocalType(index: u32) -> ValueType {
 		if (index >= locals.length) {
-			err.fail2(opcode_pt, WasmError.OOB_INDEX,
+			err.fail2(opcode_pos, WasmError.OOB_INDEX,
 				"local index %d exceeds local count %d",
 				index, locals.length);
 			return ValueType.I32;
@@ -399,7 +444,7 @@ type CodeValidatorResult {
 }
 // An entry in the control stack, exposed guts.
 class ControlEntry {
-	var start_pt: int;
+	var start_pos: int;
 	var start_opcode: byte;
 	var sig: TypeDecl.Function;
 	var reachable = true;
