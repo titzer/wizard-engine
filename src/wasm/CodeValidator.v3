@@ -32,7 +32,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctlxfer.reset(parser.decoder.pos);
 		setupLocals();
 		opcode_pos = parser.decoder.pos;
-		pushControl(Opcode.UNREACHABLE.code, f.sig);
+		pushControl(Opcode.UNREACHABLE.code, f.sig, 0);
 		validateCode();
 		if (ctl_stack.top != 0) {
 			err.fail(f.code.orig.length, WasmError.UNTERMINATED_BODY,
@@ -75,7 +75,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		while (d.pos < d.limit) {
 			opcode_pos = parser.decoder.pos;
 			var opcode = parser.readByte("opcode", Opcodes.render);
-			if (trace != null) traceOpcode();
+			if (trace != null) { traceOpcode(); traceStack(true); }
 			// FAST: Handle short operators (predictable direct branch)
 			if (Opcodes.isShortOperator[opcode]) {
 				// TODO(fast): combine signature read with isOperator() check
@@ -83,6 +83,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				var p = sig.params, r = sig.results;
 				if (p.length > 0) checkAndPopArgs(p);
 				if (r.length > 0) pushTypes(r);
+				if (trace != null) traceStack(false);
 				continue;
 			}
 			// Handle all other operators in the switch (indirect branch)
@@ -93,19 +94,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				}
 				Opcode.BLOCK.code => {
 					var sig = parser.readBlockType();
-					checkArgs(sig.params);
-					pushControl(opcode, sig);
+					checkArgsAndPushControl(opcode, sig);
 				}
 				Opcode.LOOP.code => {
 					var sig = parser.readBlockType();
-					checkArgs(sig.params);
-					pushControl(opcode, sig);
+					checkArgsAndPushControl(opcode, sig);
 				}
 				Opcode.IF.code => {
 					var sig = parser.readBlockType();
 					popE(ValueType.I32);
-					checkArgs(sig.params);
-					var ctl = pushControl(opcode, sig);
+					var ctl = checkArgsAndPushControl(opcode, sig);
 					ctlxfer.refV(ctl, opcode_pos, 0, 0);
 				}
 				Opcode.ELSE.code => {
@@ -147,7 +145,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var target = getControl(depth);
 					if (target == null) return;
 					ctlxfer.refS(target, opcode_pos, val_stack);
-					checkAndPopArgs(target.sig.results);
+					checkAndPopArgs(labelArgs(target));
 					ctl_top.reachable = false;
 					val_stack.top = ctl_top.val_stack_top;
 				}
@@ -157,7 +155,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (target == null) return;
 					popE(ValueType.I32);
 					ctlxfer.refS(target, opcode_pos, val_stack);
-					checkArgs(target.sig.results);
+					checkArgs(labelArgs(target));
 				}
 				Opcode.BR_TABLE.code => {
 					var labels = parser.readLabels();
@@ -168,7 +166,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					for (depth in labels) {
 						var target = getControl(depth);
 						if (target == null) return;
-						checkArgs(target.sig.results);
+						checkArgs(labelArgs(target));
 						ctlxfer.refS(target, opcode_pos + ++i,
 							val_stack);
 					}
@@ -282,7 +280,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				}
 				_ => ;
 			}
+			if (trace != null) traceStack(false);
 		}
+	}
+	def labelArgs(target: ControlEntry) -> Array<ValueType> {
+		if (target.start_opcode == Opcode.LOOP.code) return target.sig.params;
+		else return target.sig.results;
 	}
 	def checkAlignment(opcode: byte, max: u32) {
 		var memarg = parser.readMemoryArg();
@@ -365,7 +368,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def pushTypes(r: Array<ValueType>) {
 		val_stack.pushA(r);
 	}
-	def pushControl(opcode: byte, sig: TypeDecl.Function) -> ControlEntry {
+	def checkArgsAndPushControl(opcode: byte, sig: TypeDecl.Function) -> ControlEntry {
+		checkArgs(sig.params);
+		return pushControl(opcode, sig, val_stack.top - sig.params.length);
+	}
+	def pushControl(opcode: byte, sig: TypeDecl.Function,
+			val_stack_top: int) -> ControlEntry {
 		var ctl = ctl_stack.next();
 		if (ctl != null) { // FAST: reuse previous ControlEntry object
 			ctl_stack.top++;
@@ -377,7 +385,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl.start_pos = opcode_pos;
 		ctl.start_opcode = opcode;
 		ctl.sig = sig;
-		ctl.val_stack_top = val_stack.top;
+		ctl.val_stack_top = val_stack_top;
 		ctl.reachable = true;
 		ctl.ctl_refs.resize(0);
 		return ctl;
@@ -404,6 +412,22 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			return ValueType.I32;
 		}
 		return locals[int.!(index)];
+	}
+	def traceStack(before: bool) {
+		if (before) trace.put1("    stack: %d| ", val_stack.top);
+		else        trace.put1("       ==> %d| ", val_stack.top);
+
+		var start = val_stack.top - 5;
+		if (start > 0) trace.puts("... ");
+		else start = 0;
+		for (i = start; start < val_stack.top; start++) {
+			var e = val_stack.elems[i];
+			ValueTypes.render(trace, e);
+			trace.putc(' ');
+		}
+		trace.ln();
+		trace.out(Trace.STDOUT);
+		trace.reset();
 	}
 }
 type CodeValidatorResult {
