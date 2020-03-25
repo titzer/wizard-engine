@@ -2,7 +2,7 @@
 
 WIZENG=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
 
-CORE_TEST=$WIZENG/core-test/bin/
+CORE_TEST=$WIZENG/core-test/bin2/
 
 if [[ "$1" =~ "-trace" ]]; then
     # turn off the progress pipe in verbose mode
