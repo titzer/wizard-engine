@@ -21,4 +21,4 @@ for t in $TESTS; do
 done
 }
 
-run | progress
+run | tee /tmp/wizeng-spec-test.out | progress
