@@ -19,6 +19,11 @@ if [[ "$1" =~ "-trace" ]]; then
     let PROGRESS_PIPE=0
 fi
 
+if [[ "$1" = "-fatal" ]]; then
+    # turn off the progress pipe in fatal error mode
+    let PROGRESS_PIPE=0
+fi
+
 # Typecheck and verify wizeng first, printing out compile errors
 v3c $SRC $TEST
 if [ "$?" != 0 ]; then
