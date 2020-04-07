@@ -17,7 +17,7 @@ COUNT=$(echo $TESTS | awk '{print NF}')
 function run() {
 echo "#${COUNT}"
 for t in $TESTS; do
-    $WIZENG/bin/wizeng-spec.x86-linux $t
+    $WIZENG/bin/spectest.x86-linux $t
 done
 }
 

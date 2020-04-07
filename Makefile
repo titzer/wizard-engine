@@ -17,4 +17,4 @@ bin/wizeng-unit.x86-linux: $(SRC) $(TEST)
 
 bin/wizeng-spec.x86-linux: $(SRC) $(TEST)
 	v3c-x86-linux -heap-size=512m -output=bin/ $(SRC) $(SPEC)
-	mv bin/wizeng bin/wizeng-spec.x86-linux
+	mv bin/wizeng bin/spectest.x86-linux
