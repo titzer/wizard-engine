@@ -89,8 +89,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			// Handle all other operators in the switch (indirect branch)
 			match (opcode) {
 				Opcode.UNREACHABLE.code => {
-					ctl_top.reachable = false;
-					val_stack.top = ctl_top.val_stack_top;
+					setUnreachable();
 				}
 				Opcode.BLOCK.code => {
 					var sig = parser.readBlockType();
@@ -105,7 +104,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					popE(ValueType.I32);
 					var ctl = checkArgsAndPushControl(opcode, sig);
 					ctlxfer.refV(ctl, opcode_pos, 0, 0);
-					ctl_top.reachable = true;
+					ctl_top.reachable = true; // true block now reachable
+					// TODO: record/restore reachability after if
 				}
 				Opcode.ELSE.code => {
 					if (ctl_top.start_opcode != Opcode.IF.code) {
@@ -148,8 +148,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (target == null) return;
 					ctlxfer.refS(target, opcode_pos, val_stack);
 					checkAndPopArgs(labelArgs(target));
-					ctl_top.reachable = false;
-					val_stack.top = ctl_top.val_stack_top;
+					setUnreachable();
 				}
 				Opcode.BR_IF.code => {
 					var depth = parser.readLabel();
@@ -173,13 +172,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						var target = getControl(labels[i]);
 						ctlxfer.refS(target, opcode_pos + i + 1, val_stack);
 					}
-					ctl_top.reachable = false;
-					val_stack.top = ctl_top.val_stack_top;
+					setUnreachable();
 				}
 				Opcode.RETURN.code => {
 					checkAndPopArgs(func.sig.results);
-					ctl_top.reachable = false;
-					val_stack.top = ctl_top.val_stack_top;
+					setUnreachable();
 				}
 				Opcode.CALL.code => {
 					var t = parser.readFunc(), target = t.1;
@@ -194,6 +191,24 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (sig.params == null) return;
 					checkAndPopArgs(sig.params);
 					pushTypes(sig.results);
+				}
+				Opcode.RETURN_CALL.code => {
+					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
+					var t = parser.readFunc(), target = t.1;
+					if (target == null) return;
+					checkAndPopArgs(target.sig.params);
+					checkReturnSig(target.sig.results);
+					setUnreachable();
+				}
+				Opcode.RETURN_CALL_INDIRECT.code => {
+					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
+					var sig = parser.readSig().1;
+					var t = parser.readTableImm();
+					popE(ValueType.I32);
+					if (sig.params == null) return;
+					checkAndPopArgs(sig.params);
+					checkReturnSig(sig.results);
+					setUnreachable();
 				}
 				Opcode.DROP.code => {
 					popAny();
@@ -285,10 +300,26 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					parser.decoder.skip_bytes(8);
 					val_stack.push(ValueType.F64);
 				}
-				_ => ;
+				_ => {
+					err.fail1(opcode_pos, WasmError.INVALID_OPCODE,
+						"invalid opcode 0x%x", opcode);
+				}
 			}
 			if (trace != null) traceStack(false);
 		}
+	}
+	def checkExtension(ext: Extension, opcode: byte) -> bool {
+		if (extensions != (extensions | ext)) {
+			err.fail3(opcode_pos, WasmError.INVALID_OPCODE,
+				"opcode 0x%x (%s) is enabled by \"%s\" extension",
+				opcode, Opcodes.opcodes[opcode].name, ext.short_name);
+			return false;
+		}
+		return true;
+	}
+	def setUnreachable() {
+		ctl_top.reachable = false;
+		val_stack.top = ctl_top.val_stack_top;
 	}
 	def mergeArgTypes(labels: Array<u32>) -> Array<ValueType> {
 		var args = SigCache.arr_v;
@@ -396,6 +427,22 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				"expected type %q, got %q",
 				ValueTypes.render(_, expected),
 				ValueTypes.render(_, t));
+		}
+	}
+	def checkReturnSig(results: Array<ValueType>) {
+		var expected = func.sig.results;
+		if (results.length != expected.length) {
+			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
+				"expected %d return values, got %d", expected.length, results.length);
+			return;
+		}
+		for (i < results.length) {
+			var t = results[i], e = expected[i];
+			if (!ValueTypes.isAssignable(t, e)) {
+				err.fail3(opcode_pos, WasmError.TYPE_MISMATCH,
+					"expected return type [%d] = %q, got %q",
+					i, ValueTypes.render(_, e), ValueTypes.render(_, t));
+			}
 		}
 	}
 	def popAny() -> ValueType {
