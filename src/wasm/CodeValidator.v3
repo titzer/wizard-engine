@@ -25,6 +25,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			trace.reset();
 		}
 		func = f;
+		d.pos_offset = func.code.abs_start;
 		parser.decoder = d;
 		ctl_stack.clear();
 		val_stack.clear();
@@ -34,8 +35,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		pushControl(Opcode.UNREACHABLE.code, f.sig, 0);
 		validateCode();
 		if (ctl_stack.top != 0) {
-			err.fail(f.code.orig.length, WasmError.UNTERMINATED_BODY,
-				"unterminated function body");
+			err.rel(d, f.code.orig.length).UnterminatedFunctionBody();
 		}
 		func.code.ctl_xfer = ctlxfer.extract();
 		if (err.ok()) return CodeValidatorResult.Ok;
@@ -56,10 +56,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			var ltype = parser.readValueType();
 			if (trace != null) traceLocals(count, ltype);
 			locals.putn(ltype, int.!(count));
-			if ((locals.length - start) > max) {
-				err.fail1(parser.decoder.abs(pt),
-					WasmError.EXCEEDED_LIMIT,
-					"maximum %d total locals exceeded", max);
+			var size = locals.length - start;
+			if (size > max) {
+				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
 				break;
 			}
 		}
@@ -69,6 +68,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		trace.put2("  locals %d: %q\n", count, ValueTypes.render(_, ltype));
 		trace.out(Trace.STDOUT);
 		trace.reset();
+	}
+	def err_atpc() -> WasmErrorGen {
+		return err.rel(parser.decoder, opcode_pos);
 	}
 	def validateCode() {
 		var d = parser.decoder;
@@ -109,9 +111,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				}
 				Opcode.ELSE.code => {
 					if (ctl_top.start_opcode != Opcode.IF.code) {
-						return err.fail(opcode_pos,
-							WasmError.MISMATCHED_ELSE,
-							"mismatched else");
+						return err_atpc().MismatchedElse();
 					}
 					checkArgsAndTransfer();
 					var if_branch = ctl_top.ctl_refs[0];
@@ -129,11 +129,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					pushTypes(ctl_top.sig.params);
 				}
 				Opcode.END.code => {
-					if (ctl_stack.top == 0) {
-						return err.fail(opcode_pos,
-							WasmError.OOB_LABEL,
-							"empty control stack");
-					}
+					if (ctl_stack.top == 0) return err_atpc().EmptyControlStack();
 					checkArgsAndTransfer();
 					var ctl = popControl();
 					if (ctl.start_opcode == Opcode.LOOP.code) {
@@ -244,9 +240,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var g = parser.readGlobal().1;
 					if (g == null) return;
 					if (!g.mutable) {
-						err.fail1(opcode_pos, WasmError.ILLEGAL_ASSIGNMENT,
-							"illegal assignment to immutable global #%d", g.index);
-					}
+						err_atpc().IllegalAssignmentToImmutableGlobal(g.index);
+ 					}
 					popE(g.valtype);
 				}
 
@@ -301,8 +296,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					val_stack.push(ValueType.F64);
 				}
 				_ => {
-					err.fail1(opcode_pos, WasmError.INVALID_OPCODE,
-						"invalid opcode 0x%x", opcode);
+					err_atpc().InvalidOpcode(opcode);
 				}
 			}
 			if (trace != null) traceStack(false);
@@ -310,9 +304,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	}
 	def checkExtension(ext: Extension, opcode: byte) -> bool {
 		if (extensions != (extensions | ext)) {
-			err.fail3(opcode_pos, WasmError.INVALID_OPCODE,
-				"opcode 0x%x (%s) is enabled by \"%s\" extension",
-				opcode, Opcodes.opcodes[opcode].name, ext.short_name);
+			err_atpc().OpcodeRequiresExtension(opcode, ext);
 			return false;
 		}
 		return true;
@@ -337,9 +329,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	}
 	def mergeArgTypesAt(i: int, args: Array<ValueType>, nargs: Array<ValueType>) {
 		if (args.length != nargs.length) {
-			err.fail3(opcode_pos, WasmError.TYPE_MISMATCH,
-				"br_table[0] label expects %d values, br_table[%d] label expects %d",
-				i, args.length, nargs.length);
+			err_atpc().BrTableArityMismatch(i, args.length, nargs.length);
 			return;
 		}
 		for (j < args.length) {
@@ -347,11 +337,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			var t = ValueTypes.leastUpperBound(e, g);
 			if (!t.0) {
 				var buf = StringBuilder.new();
-				buf.put2("br_table[%d][%d] ", i, j);
-				buf.put2("type %q cannot be merged with type %q",
-					 ValueTypes.render(_, e), ValueTypes.render(_, g));
-				err.fail(opcode_pos, WasmError.TYPE_MISMATCH,
-					buf.extract());
+				err_atpc().BrTableTypeMismatch(i, j, e, g);
 				return;
 			}
 			args[j] = t.1;
@@ -360,10 +346,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def checkAlignment(opcode: byte, max: u32) {
 		var memarg = parser.readMemoryArg();
 		var align = memarg.0;
-		if (align > max) {
-			err.fail2(opcode_pos, WasmError.INVALID_ALIGNMENT,
-				"expect max alignment %d, got %d", max, align);
-		}
+		if (align > max) err_atpc().IllegalAlignment(max, align);
 		var sig = Opcodes.signatures[opcode];
 		checkAndPopArgs(sig.params);
 		pushTypes(sig.results);
@@ -391,9 +374,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		var p = ctl_top.sig.results;
 		var count = val_stack.top - ctl_top.val_stack_top;
 		if (count > p.length || (ctl_top.reachable && count < p.length)) {
-			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
-				"expected %d values for fallthru, found %d",
-				p.length, count);
+			err_atpc().ArityMismatchAtFallthru(p.length, count);
 		}
 		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
 		val_stack.top = ctl_top.val_stack_top;
@@ -405,9 +386,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	}
 	def pop() -> ValueType {
 		if (val_stack.top <= ctl_top.val_stack_top) {
-			if (ctl_top.reachable) err.fail(opcode_pos,
-				WasmError.TYPE_MISMATCH,
-				"empty value stack");
+			if (ctl_top.reachable) err_atpc().EmptyValueStack();
 			return ValueType.I32;
 		}
 		return val_stack.pop();
@@ -415,39 +394,31 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def popE(expected: ValueType) {
 		if (val_stack.top <= ctl_top.val_stack_top) {
 			if (ctl_top.reachable) {
-				err.fail1(opcode_pos, WasmError.TYPE_MISMATCH,
-						"empty value stack, expected %q",
-						ValueTypes.render(_, expected));
+				err_atpc().EmptyValueStackExpecting(expected);
 			}
 			return; // unreachable or already signalled an error
 		}
 		var t = val_stack.pop();
 		if (!ValueTypes.isAssignable(t, expected)) {
-			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
-				"expected type %q, got %q",
-				ValueTypes.render(_, expected),
-				ValueTypes.render(_, t));
+			err_atpc().ExpectedType(expected, t);
 		}
 	}
 	def checkReturnSig(results: Array<ValueType>) {
 		var expected = func.sig.results;
 		if (results.length != expected.length) {
-			err.fail2(opcode_pos, WasmError.TYPE_MISMATCH,
-				"expected %d return values, got %d", expected.length, results.length);
+			err_atpc().ReturnArityMismatch(expected.length, results.length);
 			return;
 		}
 		for (i < results.length) {
 			var t = results[i], e = expected[i];
 			if (!ValueTypes.isAssignable(t, e)) {
-				err.fail3(opcode_pos, WasmError.TYPE_MISMATCH,
-					"expected return type [%d] = %q, got %q",
-					i, ValueTypes.render(_, e), ValueTypes.render(_, t));
+				err_atpc().ReturnSigMismatch(i, e, t);
 			}
 		}
 	}
 	def popAny() -> ValueType {
 		if (val_stack.top <= ctl_top.val_stack_top) {
-			if (ctl_top.reachable) err.fail(opcode_pos, WasmError.TYPE_MISMATCH, "empty value stack");
+			if (ctl_top.reachable) err_atpc().EmptyValueStack();
 		}
 		return val_stack.pop();
 	}
@@ -483,9 +454,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	}
 	def getControl(depth: u32) -> ControlEntry {
 		if (depth >= ctl_stack.top) {
-			err.fail2(opcode_pos, WasmError.OOB_LABEL,
-				"label %d exceeds control depth %d",
-				depth, ctl_stack.top);
+			err_atpc().OobLabel(depth, ctl_stack.top);
 			return null;
 		}
 		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
@@ -498,9 +467,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	}
 	def getLocalType(index: u32) -> ValueType {
 		if (index >= locals.length) {
-			err.fail2(opcode_pos, WasmError.OOB_INDEX,
-				"local index %d exceeds local count %d",
-				index, locals.length);
+			err_atpc().OobLocalIndex(index, locals.length);
 			return ValueType.I32;
 		}
 		return locals[int.!(index)];

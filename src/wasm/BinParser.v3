@@ -39,8 +39,7 @@ class BinParser {
 	def finish() -> BinParserResult {
 		var func_count = module.functions.declared.length;
 		if (func_count > 0 && !seen_sections[BpSection.Code.code]) {
-			err.fail1(parser.decoder.pos, WasmError.FUNC_COUNT_MISMATCH,
-					"expected %d function bodies, missing code section", func_count);
+			err.at(parser.decoder).MissingCodeSection(func_count);
 		}
 		return fsm.finish();
 	}
@@ -51,8 +50,7 @@ class BinParser {
 		parser.traceBuffer();
 		if (kind != BpSection.Unknown) {
 			if (seen_sections[kind.code]) {
-				return err.fail1(d.abs(d.pos-1), WasmError.DUPLICATE_SECTION,
-					"duplicate %q section", renderSectionName(_, kind.code));
+				return err.rel(d, d.pos-1).DuplicateSection(kind);
 			} else {
 				seen_sections[kind.code] = true;
 			}
@@ -79,28 +77,22 @@ class BinParser {
 					ReadClosureOf.new(module.elems, parser.readElemDecl));
 			Data => readMultiple("data", size, limits.max_num_data_segments,
 					ReadClosureOf.new(module.data, parser.readDataDecl));
-			_ => return err.fail1(d.abs(d.pos), WasmError.INVALID_SECTION,
-				"unexpected section code 0x%x", kind.code);
+			_ => return err.at(d).InvalidSectionCode(kind.code);
 		}
 		var read = d.pos - start;
 		if (read < size) {
-			err.fail2(d.abs(d.pos),
-				WasmError.INCOMPLETE_SECTION,
-				"expected section size of %d, read %d bytes",
-				size, read);
+			err.at(d).IncompleteSection(kind.code, read, size);
 		}
 	}
 	def beginCodeSection(abspos: int, count: u32) {
 		var kind = BpSection.Code;
 		if (seen_sections[kind.code]) {
-			return err.fail1(abspos - 1, WasmError.DUPLICATE_SECTION,
-				"duplicate %q section", renderSectionName(_, kind.code));
+			return err.abs(abspos - 1).DuplicateSection(kind);
 		} else {
 			seen_sections[kind.code] = true;
 			var expected = module.functions.declared.length;
 			if (count != expected) {
-				err.fail2(abspos, WasmError.FUNC_COUNT_MISMATCH,
-					"expected %d function bodies, got %d", expected, count);
+				err.abs(abspos).FuncCountMismatch(expected, count);
 			}
 		}
 	}
@@ -111,8 +103,7 @@ class BinParser {
 		var name = parser.readUtf8String("custom section name");
 		var payload_len = int.!(size) - (decoder.pos - start);
 		if (payload_len < 0) {
-			return err.fail2(start, WasmError.OVERFLOW_SECTION,
-				"custom section name length %d exceeds section size %d", name.length, size);
+			return err.rel(decoder, start).CustomSectionNameLengthTooLong(name.length, size);
 		}
 		var payload = decoder.read_bytes(payload_len);
 		module.custom_sections.put(CustomSection.new(name, payload));
@@ -139,8 +130,7 @@ class BinParser {
 		module.start_function = t.0;
 		if (func != null &&
 			(func.sig.params.length > 0 || func.sig.results.length > 0)) {
-			err.fail(decoder.abs(pt), WasmError.ILLEGAL_TYPE,
-				"start function must have no params or results");
+			err.rel(decoder, pt).IllegalStartFunctionType(func.sig);
 		}
 	}
 
@@ -148,6 +138,10 @@ class BinParser {
 		var decoder = parser.decoder = d;
 		var start = decoder.pos;
 		var body = decoder.read_bytes(int.!(size));
+		if (index >= module.functions.declared.usize()) {
+			err.at(d).FuncCountMismatch(module.functions.declared.length, index);
+			return;
+		}
 		var f = module.functions.declared[int.!(index)];
 		decoder.pos = start;
 		f.code = FunctionCode.new(body);
@@ -172,11 +166,11 @@ class ReadClosureOf<T>(vec: Vector<T>, readFunc: int -> T) extends ReadClosure {
 	def read(index: int) {
 		vec.put(readFunc(index));
 	}
-	
+
 }
 class ReadClosureWithArgOf<A,T>(vec: Vector<T>, newArg: int -> A, readFunc: (int, A) -> T) extends ReadClosure {
 	var arg: A;
-	
+
 	def setCount(count: u32) {
 		arg = newArg(int.!(count));
 		if (count < MAX_GROW_SIZE) vec.grow(int.!(count));
@@ -184,7 +178,7 @@ class ReadClosureWithArgOf<A,T>(vec: Vector<T>, newArg: int -> A, readFunc: (int
 	def read(index: int) {
 		vec.put(readFunc(index, arg));
 	}
-	
+
 }
 class BinParserCallback(mp: BinParser) extends BpFsmCallback(mp.module) {
 	def decodeSection(kind: BpSection, size: u32, d: Decoder) {
@@ -205,25 +199,6 @@ type BinParserResult {
 // Internal constants.
 def MAX_GROW_SIZE = 1000000;
 // Header constants.
-def WASM_MAGIC = 0x6d736100u;
-def WASM_VERSION = 0x01u;
-def renderSectionName(buf: StringBuilder, b: byte) -> StringBuilder {
-	var s = "unknown";
-	match (b) {
-		BpSection.Type.code => s = "type";
-		BpSection.Import.code => s = "import";
-		BpSection.Function.code => s = "function";
-		BpSection.Table.code => s = "table";
-		BpSection.Memory.code => s = "memory";
-		BpSection.Global.code => s = "global";
-		BpSection.Export.code => s = "export";
-		BpSection.Start.code => s = "start";
-		BpSection.Element.code => s = "element";
-		BpSection.Code.code => s = "code";
-		BpSection.Data.code => s = "data";
-	}
-	return buf.puts(s);
-}
 def renderImportKind(buf: StringBuilder, b: byte) -> StringBuilder {
 	var s = "unknown";
 	match (b) {
@@ -286,11 +261,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return readTableIndex();
 		} else {
 			var b = readByte("table index", StringBuilder.putd);
-			if (b != 0) {
-				err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-					"expected zero byte for table index, got 0x%x", b);
-			}
-			checkIndex(pt, "table index", 0, module.tables.size());
+			if (b != 0) err.rel(decoder, pt).ExpectedTableIndexZeroByte(b);
+			checkIndex(pt, "table index", 0, module.tables.usize());
 			return 0;
 		}
 	}
@@ -301,8 +273,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return (r.0, TypeDecl.Function.!(r.1));
 		} else {
 			var d: TypeDecl.Function;
-			err.fail1(pt, WasmError.ILLEGAL_TYPE,
-				"expected type index %d to be a function", r.0);
+			err.rel(decoder, pt).ExpectedFunctionType(r.0);
 			return (r.0, d);
 		}
 	}
@@ -318,11 +289,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return readMemoryIndex();
 		} else {
 			var b = readByte("memory index", StringBuilder.putd);
-			if (b != 0) {
-				err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-					"expected zero byte for memory index, got 0x%x", b);
-			}
-			checkIndex(pt, "memory index", 0, module.memories.size());
+			if (b != 0) err.rel(decoder, pt).ExpectedMemoryIndexZeroByte(b);
+			checkIndex(pt, "memory index", 0, module.memories.usize());
 			return 0;
 		}
 	}
@@ -330,10 +298,10 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return readIndex("global index", module.globals);
 	}
 	def readIndex<T>(quantity: string, space: IndexSpace<T>) -> (int, T) {
-		var t = readAndCheckIndex(quantity, space.size());
+		var t = readAndCheckIndex(quantity, space.usize());
 		return (t.1, if(t.0, space[t.1]));
 	}
-	def readAndCheckIndex(quantity: string, max: int) -> (bool, int) {
+	def readAndCheckIndex(quantity: string, max: u32) -> (bool, int) {
 		var pt = decoder.pos;
 		var index = decoder.read_u32leb();
 		if (trace != null) {
@@ -343,10 +311,9 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return checkIndex(pt, quantity, index, max);
 	}
-	def checkIndex(pt: int, quantity: string, index: u32, max: int) -> (bool, int) {
+	def checkIndex(pt: int, quantity: string, index: u32, max: u32) -> (bool, int) {
 		if (index >= max) {
-			err.fail3(pt, WasmError.OOB_INDEX,
-				"%s %d exceeds maximum %d", quantity, index, max);
+			err.rel(decoder, pt).OobIndex(quantity, index, max);
 			return (false, int.!(index));
 		}
 		return (true, int.!(index));
@@ -361,18 +328,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.VEC128.code => return ValueType.VEC128;
 			BpTypecon.AnyRef.code => return ValueType.ANYREF;
 		}
-		err.fail1(pt, WasmError.INVALID_TYPE,
-			"invalid value type 0x%x", b);
+		err.rel(decoder, pt).InvalidValueTypecon(b);
 		return ValueType.I32;
 	}
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
 		var pt = decoder.pos;
 		var val = decoder.read_u32leb();
 		if (eof) return 0;
-		if (val < min) err.fail3(pt, WasmError.EXCEEDED_LIMIT,
-			"%s %d exceeds minimum %d", quantity, val, min);
-		if (val > max) err.fail3(pt, WasmError.EXCEEDED_LIMIT,
-			"%s %d exceeds maximum %d", quantity, val, max);
+		if (val < min) err.rel(decoder, pt).QuantityBelowMinimum(quantity, int.!(val), min);
+		if (val > max) err.rel(decoder, pt).QuantityExceededMaximum(quantity, val, max);
 		if (trace != null) {
 			traceBytes(pt, quantity);
 			trace.putd(val).ln();
@@ -406,14 +370,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			trace.puts("\"\n");
 			flush();
 		}
-		if (!Utf8.validate(str)) {
-			err.fail(pt, WasmError.INVALID_UTF8_STRING, "invalid utf-8 string");
-			if (UnitTests.fatal) var x = 1/ 0;
-		}
-		return str;
-	}
-	def invalidUtf8(pt: int, str: string) -> string {
-		err.fail(pt, WasmError.INVALID_UTF8_STRING, "invalid utf-8 string");
+		if (!Utf8.validate(str)) err.rel(decoder, pt).InvalidUtf8String();
 		return str;
 	}
 	def readByte(quantity: string, render: (StringBuilder, byte) -> StringBuilder) -> byte {
@@ -440,8 +397,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		decoder.at(pt); // backup and try again as full signed LEB
 		var index = decoder.read_i32leb(), r = SigCache.v_v;
 		if (index < 0 || index > module.types.size()) {
-			err.fail1(pt, WasmError.INVALID_BLOCK_TYPE,
-				"invalid block type %d", index);
+			err.rel(decoder, pt).InvalidBlockType(index);
 			return r;
 		}
 		var t = module.types[index];
@@ -449,8 +405,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return TypeDecl.Function.!(t);
 		} else {
 			var d: TypeDecl.Function;
-			err.fail1(pt, WasmError.ILLEGAL_BLOCK_TYPE,
-				"expected type index %d to be a function", index);
+			err.rel(decoder, pt).ExpectedFunctionType(index);
 			return r;
 		}
 	}
@@ -462,8 +417,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var pt = decoder.pos;
 		var count = decoder.read_u32leb(), max = limits.max_func_size;
 		if (count > max) {
-			err.fail2(pt, WasmError.EXCEEDED_LIMIT,
-				"target count %d exceeds maximum %d", count, max);
+			err.rel(decoder, pt).QuantityExceededMaximum("label count", count, max);
 			return null;
 		}
 		var length = int.!(count + 1);
@@ -483,7 +437,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			mem_index = readMemoryIndex();
 			flags ^= 0x40;  // flip flag back
 		} else {
-			checkIndex(pt, "memory index", 0, module.memories.size());
+			checkIndex(pt, "memory index", 0, module.memories.usize());
 		}
 		var offset = readU32("memarg offset", 0, u32.max);
 		return (flags, mem_index, offset);
@@ -551,10 +505,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		if (extensions.ATOMICS) {
 			shared = (flags & 2) == 2;
-			if (shared && !has_max) {
-				err.fail(pt, WasmError.EXPECTED_MAXIMUM,
-					"shared memory must have maximum");
-			}
+			if (shared && !has_max) err.rel(decoder, pt).ExpectedSharedMemoryMaximum();
 		}
 		return (int.!(min), max, shared);
 	}
@@ -565,8 +516,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		match (b) {
 			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
 			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
-			_ => err.fail1(pt, WasmError.ILLEGAL_TYPE,
-				"invalid table element type 0x%x", b);
+			_ => err.rel(decoder, pt).IllegalTableElementType(b);
 		}
 		return et;
 	}
@@ -574,9 +524,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var pt = decoder.pos;
 		var init = readInitExpr(quantity), vt = init.1;
 		if (!ValueTypes.isAssignable(vt, ValueType.I32)) {
-			err.fail1(pt, WasmError.TYPE_MISMATCH,
-				"expected i32 init expr, got %q",
-				ValueTypes.render(_, vt));
+			err.rel(decoder, pt).ExpectedI32InitExpr(vt);
 		}
 		return init.0;
 	}
@@ -611,16 +559,13 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				if (g.1 != null) vt = g.1.valtype;
 			}
 			_ => {
-				err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-					"unexpected opcode 0x%x (%q) in init expression", opcode,
-					Opcodes.render(_, opcode));
+				err.rel(decoder, pt).UnexpectedOpcodeInInit(opcode);
 			}
 		}
 		pt = decoder.pos;
 		var end = readByte("end opcode", Opcodes.render);
 		if (end != Opcode.END.code) {
-			err.fail2(pt, WasmError.INVALID_INIT_EXPR,
-				"expected 0x%x (END) opcode, got 0x%x", Opcode.END.code, end);
+			err.rel(decoder, pt).ExpectedEndInInit(end);
 		}
 		return (expr, vt);
 	}
@@ -628,9 +573,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var pt = decoder.pos, invalid: TypeDecl;
 		var form = readByte("type constructor", renderTypecon);
 		if (form != BpTypecon.Function.code) {
-			err.fail2(pt, WasmError.INVALID_TYPE,
-				"invalid type 0x%x, expected function (0x%x)",
-				form, BpTypecon.Function.code);
+			err.rel(decoder, pt).ExpectedFunctionTypecon(form);
 			return invalid;
 		}
 		pt = decoder.pos;
@@ -684,8 +627,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				module.globals.imported.put(decl);
 				details = ImportDetails.Global(decl);
 			}
-			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid import kind 0x%x", kind);
+			_ => err.rel(decoder, pt).InvalidImportKind(kind);
 		}
 		return ImportDecl.new(module_name, field_name, details);
 	}
@@ -711,18 +653,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var pos = decoder.pos;
 		var init = readInitExpr("global initializer"), vti = init.1;
 		if (!ValueTypes.isAssignable(vti, vt)) {
-			err.fail2(decoder.abs(pos), WasmError.TYPE_MISMATCH,
-				"expected type %q in global initializer, got %q",
-				ValueTypes.render(_, vt), ValueTypes.render(_, vti));
+			err.at(decoder).TypeMismatchInGlobalInit(vt, vti);
 		}
 		return GlobalDecl.new(module.globals.size(), vt, mut, init.0);
 	}
 	def readGlobalFlags() -> bool {
-		var pos = decoder.pos;
+		var pt = decoder.pos;
 		var flags = readByte("flags", renderGlobalFlags);
 		if ((flags & 0xFE) != 0) {
-			err.fail1(decoder.abs(pos),
-				WasmError.INVALID_GLOBAL_FLAGS,"invalid global flags 0x%x", flags);
+			err.rel(decoder, pt).InvalidGlobalFlags(flags);
 		}
 		return (flags & 1) != 0;
 	}
@@ -730,8 +669,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var pt = decoder.pos;
 		var name = readUtf8String("export name");
 		if (exportSet != null && exportSet.add(name)) {
-			err.fail1(decoder.abs(pt), WasmError.DUPLICATE_EXPORT,
-				"duplicate export #%d", index);
+			err.rel(decoder, pt).DuplicateExport(index);
 		}
 		pt = decoder.pos;
 		var kind = readByte("export kind", renderImportKind);
@@ -753,8 +691,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				var index = readGlobal().0;
 				details = ExportDetails.Global(index);
 			}
-			_ => err.fail1(pt, WasmError.INVALID_IMPORT_KIND,
-				"invalid export kind 0x%x", kind);
+			_ => err.rel(decoder, pt).InvalidExportKind(kind);
 		}
 		return ExportDecl.new(name, details);
 	}
@@ -767,10 +704,9 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			if ((flags & 2) == 2) table_index = readTableIndex();
 			if ((flags & 4) == 4) init_exprs = true;
 		} else if (flags != 0) {
-			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for elements, got 0x%x", flags);
+			err.rel(decoder, pt).ExpectedElementsZeroByte(flags);
 		} else {
-			table_index = checkIndex(pt, "table index", 0, module.tables.size()).1;
+			table_index = checkIndex(pt, "table index", 0, module.tables.usize()).1;
 		}
 		var offset = readI32Expr("elements offset");
 		var count = readU32("element count", 0, limits.max_num_table_entries);
@@ -801,10 +737,9 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				mem_index = readMemoryIndex();
 			}
 		} else if (flags != 0) {
-			err.fail1(pt, WasmError.EXPECTED_ZERO_BYTE,
-				"expected zero byte for data segment, got 0x%x", flags);
+			err.rel(decoder, pt).ExpectedDataFlagsZeroByte(flags);
 		}
-		checkIndex(pt, "memory index", u32.!(mem_index), module.memories.size());
+		checkIndex(pt, "memory index", u32.!(mem_index), module.memories.usize());
 		var offset = readI32Expr("data element offset");
 		var len = readU32("data segment size", 0, limits.max_data_segment_size);
 		var data = decoder.read_bytes(int.!(len));
@@ -824,17 +759,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return trace;
 	}
 	def checkMaxNumTables(pt: int) {
-		var max = limits.max_num_tables;
-		if (module.tables.size() >= max) {
-			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
-				"exceeded maximum of %d total tables", max);
+		var max = limits.max_num_tables, size = module.tables.usize();
+		if (size >= max) {
+			err.rel(decoder, pt).QuantityExceededMaximum("total tables", size, max);
 		}
 	}
 	def checkMaxNumMemories(pt: int) {
-		var max = limits.max_num_memories;
-		if (module.memories.size() >= max) {
-			err.fail1(decoder.abs(pt), WasmError.EXCEEDED_LIMIT,
-				"exceeded maximum of %d total memories", max);
+		var max = limits.max_num_memories, size = module.memories.usize();
+		if (size >= max) {
+			err.rel(decoder, pt).QuantityExceededMaximum("total memories", size, max);
 		}
 	}
 
@@ -877,14 +810,14 @@ class BpFsm extends WasmParser {
 	var current_pos: int;
 	var more = true;
 	var accept = false;
-
-	/* TODO: move state from BpFsmState enum to fields here.
 	var current_section: BpSection;
 	var section_start: int;
-	var section_end: int;
+	var section_size: u32;
 	var function_body_count: u32;
 	var current_function_body: u32;
-	*/
+	var function_body_start: int;
+	var function_body_size: u32;
+
 	new(extensions: Extension.set, limits: Limits, err: WasmErrorGen, callback: BpFsmCallback)
 			super(extensions, limits, callback.module,
 				err,
@@ -921,81 +854,84 @@ class BpFsm extends WasmParser {
 	private def advance() {
 		current_pos = decoder.pos;
 		if (trace != null) {
-			trace.put3("@+%d [%d bytes] BpFsm.state=%s\n", abs(),
+			trace.put3("@+%d [%d bytes] BpFsm.state=%s\n", decoder.abs_pos(),
 				decoder.available(), state.name);
 			flush();
 		}
 		match (state) {
 			MAGIC => {
+				var pt = decoder.pos;
 				var magic = decoder.read_u32();
-				if (eof) return if(!retry(), err.fail(abs(), WasmError.INVALID_HEADER, "EOF: expecting magic word"));
-				if (magic != WASM_MAGIC) err.fail2(abs(), WasmError.INVALID_HEADER, "expected magic word %x, got %x", WASM_MAGIC, magic);
+				if (eof) return if(!retry(), err.at(decoder).EOFMagicWord());
+				if (magic != BpConstants.WASM_MAGIC) err.rel(decoder, pt).InvalidMagicWord(magic);
 				state = BpFsmState.VERSION;
 			}
 			VERSION => {
+				var pt = decoder.pos;
 				var version = decoder.read_u32();
-				if (eof) return if(!retry(), err.fail(abs(), WasmError.INVALID_HEADER, "EOF: expecting wasm version"));
-				if (version != WASM_VERSION) err.fail2(abs(), WasmError.INVALID_HEADER, "expected wasm version %x, got %x", WASM_VERSION, version);
+				if (eof) return if(!retry(), err.at(decoder).EOFWasmVersion());
+				if (version != BpConstants.WASM_VERSION) err.rel(decoder, pt).InvalidWasmVersion(version);
 				state = BpFsmState.SECTION_START;
 			}
 			SECTION_START => {
-				var b = readByte("section code", renderSectionName);
+				var b = readByte("section code", BpConstants.renderSectionName);
 				if (eof) {
 					if (!retry()) accept = true;
 					return;
 				}
-				state = BpFsmState.SECTION(checkSectionCode(b));
+				current_section = checkSectionCode(b);
+				state = BpFsmState.SECTION;
 			}
-			SECTION(kind) => {
-				var size = readU32("section size", 0, limits.max_module_size);
-				if (eof) return if(!retry(), err_incomplete_section(kind, -1));
-				state = BpFsmState.SECTION_WITH_SIZE(kind, size);
+			SECTION => {
+				var pt = decoder.pos;
+				section_size = readU32("section size", 0, limits.max_module_size);
+				if (eof) return if(!retry(), err_incomplete_section(decoder.abs(pt), 0));
+				section_start = decoder.abs_pos();
+				state = BpFsmState.SECTION_WITH_SIZE;
 			}
-			SECTION_WITH_SIZE(kind, size) => {
-				match (kind) {
-					Code => {
-						var count = readU32("function body count", 0, limits.max_num_functions);
-						if (eof) return if(!retry(), err_incomplete_section(kind, int.!(size)));
-						var abspos = abs();
-						callback.beginCodeSection(abspos, count);
-						var end = u32.!(abspos) + size;
-						if (count == 0) {
-							checkSectionLength("code", decoder.abs(decoder.pos), end);
-							state = BpFsmState.SECTION_START;
-						} else {
-							state = BpFsmState.BODY(end, count, 0);
-						}
+			SECTION_WITH_SIZE => {
+				match (current_section) {
+					Code => {  // code section handled specially, one function body at a time
+						function_body_count = readU32("function body count", 0, limits.max_num_functions);
+						if (eof) return if(!retry(), err_incomplete_section(section_start, section_size));
+						function_body_start = decoder.abs_pos();
+						current_function_body = 0;
+						state = BpFsmState.BODY;
+						callback.beginCodeSection(function_body_start, function_body_count);
 					}
 					_ => {
-						decoder.sub_bytes(section_decoder, int.!(size));
-						if (eof) return if(!retry(), err_incomplete_section(kind, int.!(size)));
-						callback.decodeSection(kind, size, section_decoder);
+						decoder.sub_bytes(section_decoder, int.!(section_size));
+						if (eof) return if(!retry(), err_incomplete_section(section_start, section_size));
+						callback.decodeSection(current_section, section_size, section_decoder);
 						state = BpFsmState.SECTION_START;
 					}
 				}
 			}
-			BODY(end, count, index) => {
-				var size = readU32("function body size", 0, limits.max_func_size);
-				if (eof) return if(!retry(), err_incomplete_function(index, -1));
-				state = BpFsmState.BODY_WITH_SIZE(end, count, index, size);
-			}
-			BODY_WITH_SIZE(end, count, index, size) => {
-				decoder.sub_bytes(function_decoder, int.!(size));
-				if (eof) return if(!retry(), err_incomplete_function(index, int.!(size)));
-				callback.decodeFunctionBody(index, size, function_decoder);
-				var next = index + 1;
-				if (next == count) {
-					checkSectionLength("code", decoder.abs(decoder.pos), end);
+			BODY => {
+				if (current_function_body == function_body_count) { // already read N bodies
+					var read = decoder.abs_pos() - section_start;
+					if (read < section_size) err.at(decoder).IncompleteSection(BpSection.Code.code, read, section_size);
+					if (read > section_size) err.at(decoder).OverflowSection(BpSection.Code.code, read, section_size);
 					state = BpFsmState.SECTION_START;
 				} else {
-					state = BpFsmState.BODY(end, count, index + 1);
+					function_body_size = readU32("function body size", 0, limits.max_func_size);
+					if (eof) return if(!retry(), err_incomplete_function(current_function_body, 0));
+					state = BpFsmState.BODY_WITH_SIZE;
 				}
+			}
+			BODY_WITH_SIZE => {
+				decoder.sub_bytes(function_decoder, int.!(function_body_size));
+				var next_start = decoder.abs_pos();
+				if (eof) return if(!retry(), err_incomplete_function(current_function_body, function_body_size));
+				callback.decodeFunctionBody(current_function_body, function_body_size, function_decoder);
+				function_body_start = next_start;
+				current_function_body++;
+				state = BpFsmState.BODY;
 			}
 		}
 	}
-	def checkSectionLength(which: string, abs: int, end: u32) {
-		if (abs < end) err.fail1(abs, WasmError.INCOMPLETE_SECTION, "%s section shorter than expected", which);
-		if (abs > end) err.fail1(abs, WasmError.OVERFLOW_SECTION, "%s section longer than expected", which);
+	def checkSectionLength(kind: byte, abs: int, size: u32) {
+		var read = decoder.abs_pos() - abs;
 	}
 	def retry() -> bool {
 		if (more) {
@@ -1006,33 +942,29 @@ class BpFsm extends WasmParser {
 	}
 	def checkSectionCode(b: byte) -> BpSection {
 		if (!BpConstants.valid_section[b]) {
-			err.fail1(abs(),
-				WasmError.INVALID_SECTION, "unknown section code 0x%x", b);
+			err.at(decoder).InvalidSectionCode(b);
 		}
 		return BpConstants.enum_section[b];
 	}
 	def eof_is_section_overflow(d: Decoder, pos: int, size: int, msg: string) {
-		var buf = StringBuilder.new();
-		buf.puts("section overflow: "); // TODO: which section
-		buf.put1(msg, size);
-		err.fail(d.abs(pos), WasmError.OVERFLOW_SECTION, buf.extract());
+		var kind = current_section.code;
+		var read = d.abs(pos) - section_start;
+		var size = section_size;
+		err.rel(d, pos).OverflowSection(kind, read, size);
 	}
 	def eof_is_function_overflow(d: Decoder, pos: int, size: int, msg: string) {
-		var buf = StringBuilder.new();
-		buf.puts("function overflow: "); // TODO: which function
-		buf.put1(msg, size);
-		err.fail(d.abs(pos), WasmError.OVERFLOW_FUNCTION, buf.extract());
+		var read = d.abs(pos) - function_body_start;
+		var size = function_body_size;
+		err.rel(d, pos).OverflowFunctionBody(read, size);
 	}
-	def abs() -> int {
-		return decoder.abs(current_pos);
+	def err_incomplete_section(abs: int, size: u32) {
+		var kind = current_section;
+		var read = decoder.abs_pos() - abs;
+		err.at(decoder).IncompleteSection(kind.code, read, size);
 	}
-	def err_incomplete_section(kind: BpSection, size: int) {
-		if (size < 0) err.fail1(abs(), WasmError.INCOMPLETE_SECTION, "EOF: incomplete %q section, expected length", renderSectionName(_, kind.code));
-		else err.fail2(abs(), WasmError.INCOMPLETE_SECTION, "EOF: incomplete %q section, expected %d bytes", renderSectionName(_, kind.code), size);
-	}
-	def err_incomplete_function(index: u32, size: int) {
-		if (size < 0) err.fail1(abs(), WasmError.INCOMPLETE_FUNCTION_BODY, "EOF: incomplete function body #%d, expected length", index);
-		else err.fail2(abs(), WasmError.INCOMPLETE_FUNCTION_BODY, "EOF: incomplete function body #%d, expected %d bytes", index, size);
+	def err_incomplete_function(index: u32, size: u32) {
+		var read = decoder.abs_pos() - function_body_start;
+		err.at(decoder).IncompleteFunctionBody(read, size);
 	}
 }
 // The callbacks for sections, function bodies, and finishing a module.
@@ -1042,13 +974,12 @@ class BpFsmCallback(module: Module) {
 	def decodeFunctionBody(index: u32, size: u32, d: Decoder);
 }
 // The states for the module parser finite state machine.
-type BpFsmState {
-	case MAGIC;
-	case VERSION;
-	case SECTION_START;
-	case SECTION(kind: BpSection);
-	case SECTION_WITH_SIZE(kind: BpSection, size: u32);
-	case BODY(end: u32, count: u32, index: u32);
-	case BODY_WITH_SIZE(end: u32, count: u32, index: u32, size: u32);
-
+enum BpFsmState {
+	MAGIC,
+	VERSION,
+	SECTION_START,
+	SECTION,
+	SECTION_WITH_SIZE,
+	BODY,
+	BODY_WITH_SIZE
 }
