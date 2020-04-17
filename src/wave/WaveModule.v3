@@ -1,0 +1,202 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Enumeration of the exported functions
+def iiii_v = TypeDecl.Function([ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32], []);
+enum WaveExports(sig: TypeDecl.Function, invoke: (WaveInstance, Executor, Array<Value>) -> Result) {
+	arg_len(SigCache.i_i, WaveInstance.arg_len),
+	arg_copy(SigCache.iii_i, WaveInstance.arg_copy),
+	fs_size(SigCache.ii_i, WaveInstance.fs_size),
+	fs_chmod(SigCache.iii_i, WaveInstance.fs_chmod),
+	fs_open(SigCache.iii_i, WaveInstance.fs_open),
+	fs_read(SigCache.iii_i, WaveInstance.fs_read),
+	fs_write(SigCache.iii_i, WaveInstance.fs_write),
+	fs_avail(SigCache.i_i, WaveInstance.fs_avail),
+	fs_close(SigCache.i_v, WaveInstance.fs_close),
+	throw_ex(iiii_v, WaveInstance.throw_ex)
+}
+class WaveModule {
+	def provideImports(module: Module, err: WasmErrorGen, result: Array<Exportable>)
+			-> (WasmErrorGen, Instance) -> void {
+		var wave: WaveInstance;
+		var imports = module.imports;
+		for (j < imports.length) {
+			var i = imports[j];
+			if (!Strings.equals("wave", i.modname)) continue;
+			if (!ImportDetails.Function.?(i.details)) continue;
+			var impf = ImportDetails.Function.!(i.details).decl;
+			if (wave == null) wave = WaveInstance.new();
+			var n = i.name;
+			for (ex in WaveExports) {
+				if (Strings.equals(ex.name, n)) {
+					result[j] = HostFunction.new(ex.sig, ex.invoke(wave, _, _));
+					break;
+				}
+			}
+		}
+		def d: (WasmErrorGen, Instance) -> void;
+		if (wave == null) return d;  // no matching wave exports
+
+		// Find memory and main exports
+		var exports = module.exports;
+		for (j < exports.length) {
+			var e = module.exports[j];
+			if (Strings.equals("main", e.name) && ExportDetails.Function.?(e.details)) {
+				var index = ExportDetails.Function.!(e.details).index;
+				var sig = module.functions[index].sig;
+				if (ValueTypes.isAssignableSig(sig, SigCache.i_i)) {
+					wave.main_export_index = j;
+				}
+			}
+			if (Strings.equals("memory", e.name) && ExportDetails.Memory.?(e.details)){
+				wave.memory_export_index = j;
+			}
+		}
+		if (wave.memory_export_index < 0) err.ExpectedExport("memory", "memory");
+		if (wave.main_export_index < 0) err.ExpectedExport("main", "func [i32] -> [i32]");
+		return wave.finish;
+	}
+}
+
+// State for an instance that has imported the wave module.
+class WaveInstance {
+	def fds = Array<int>.new(MAX_FDS);
+	var cmdline_args: Array<string>;
+	var main_export_index = -1;
+	var memory_export_index = -1;
+	var lastfd: int;
+	var memory: Memory;
+	var main: Function;
+	new() {
+		for (i < fds.length) fds[i] = -1;
+		fds[0] = 0;
+		fds[1] = 1;
+		fds[2] = 2;
+		lastfd = 3;
+	}
+	def finish(err: WasmErrorGen, instance: Instance) {
+		memory = Memory.!(instance.exports[memory_export_index]);
+		main = Function.!(instance.exports[main_export_index]);
+		var i = Interpreter.new();
+		var r = i.run(-1, main, [Value.I32(u32.!(cmdline_args.length))]);
+	}
+
+	// ==={Provided functions}============================================
+	def arg_len(e: Executor, args: Array<Value>) -> Result {
+		var arg = Values.v_u(args[0]);
+		if (arg >= args.length) return MINUS_1;
+		return i(cmdline_args[int.!(arg)].length);
+	}
+	def arg_copy(e: Executor, args: Array<Value>) -> Result {
+		var arg = Values.v_u(args[0]);
+		var ptr = Values.v_u(args[1]);
+		var len = Values.v_u(args[2]);
+		if (arg >= args.length) return MINUS_1;
+		var r = memory.copyIn(cmdline_args[int.!(arg)], ptr, len);
+		return i(r);
+	}
+
+	def fs_size(e: Executor, args: Array<Value>) -> Result {
+		var ptr = Values.v_u(args[0]);
+		var len = Values.v_u(args[1]);
+		var path = memory.copy(ptr, len);
+		var fd = System.fileOpen(path, true);
+		if (fd < 0) return i(0);
+		var size = System.fileLeft(fd);
+		System.fileClose(fd);
+		return i(size);
+	}
+	def fs_chmod(e: Executor, args: Array<Value>) -> Result {
+		var ptr = Values.v_u(args[0]);
+		var len = Values.v_u(args[1]);
+		var perm = Values.v_u(args[2]);
+		var path = memory.copy(ptr, len);
+		if (path == null) return MINUS_1;
+		System.chmod(path, int.!(perm));
+		return i(0);
+	}
+	def fs_open(e: Executor, args: Array<Value>) -> Result {
+		var ptr = Values.v_u(args[0]);
+		var len = Values.v_u(args[1]);
+		var mode = Values.v_u(args[2]);
+		var path = memory.copy(ptr, len);
+		if (path == null) return MINUS_1;
+		var fd = allocfd();
+		if (fd < 0) return MINUS_1; // out of file descriptors
+		var s = System.fileOpen(path, mode == 0);
+		if (s < 0) return i(s);
+		fds[fd] = s;
+		return i(fd);
+	}
+	def fs_read(e: Executor, args: Array<Value>) -> Result {
+		var fd = Values.v_i(args[0]);
+		var buf = Values.v_u(args[1]);
+		var len = Values.v_u(args[2]);
+		var s = sysfd(fd);
+		if (s < 0) return MINUS_1;
+		var t = memory.alias(buf, len);
+		if (t.0 == null) return MINUS_1;
+		var r = System.fileReadK(s, t.0, t.1, t.2);
+		return i(r);
+	}
+	def fs_write(e: Executor, args: Array<Value>) -> Result {
+		var fd = Values.v_i(args[0]);
+		var buf = Values.v_u(args[1]);
+		var len = Values.v_u(args[2]);
+		var s = sysfd(fd);
+		if (s < 0) return MINUS_1;
+		var t = memory.alias(buf, len);
+		if (t.0 == null) return MINUS_1;
+		System.fileWriteK(s, t.0, t.1, t.2);
+		return i(0);
+	}
+	def fs_avail(e: Executor, args: Array<Value>) -> Result {
+		var fd = Values.v_i(args[0]);
+		var s = sysfd(fd);
+		if (s < 0) return MINUS_1;
+		var r = System.fileLeft(s);
+		return i(r);
+	}
+	def fs_close(e: Executor, args: Array<Value>) -> Result {
+		var fd = Values.v_i(args[0]);
+		var s = sysfd(fd);
+		if (s < 0) return MINUS_1;
+		System.fileClose(s);
+		fds[fd] = -1;
+		return NONE;
+	}
+	def throw_ex(e: Executor, args: Array<Value>) -> Result {
+		var ex = Values.v_u(args[0]);
+		var ex_len = Values.v_u(args[1]);
+		var msg = Values.v_u(args[2]);
+		var msg_len = Values.v_u(args[3]);
+		var errstr = memory.copy(ex, ex_len);
+		var msgstr = memory.copy(msg, msg_len);
+		System.error(errstr, msgstr);  // TODO: print wasm-level stack trace.
+		return NONE;
+	}
+	// ===================================================================
+
+	private def i(v: int) -> Result {
+		return Result.Value([Value.I32(u32.!(v))]);
+	}
+	private def sysfd(fd: int) -> int {
+		return if(fd < 0 || fd >= fds.length, -1, fds[fd]);
+	}
+	private def allocfd() -> int {
+		for (i = lastfd; i < fds.length; i++) {
+			if (fds[i] < 0) {
+				lastfd = (i + 1) % fds.length;
+				return i;
+			}
+		}
+		for (i < lastfd) {
+			lastfd = (i + 1) % fds.length;
+			return i;
+		}
+		return -1;
+	}
+}
+def MINUS_1 = Result.Value([Value.I32(u32.!(-1))]);
+def NONE = Result.Value([]);
+def MAX_FDS = 256;
