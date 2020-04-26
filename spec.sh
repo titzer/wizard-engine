@@ -15,7 +15,7 @@ COUNT=$(echo $TESTS | awk '{print NF}')
 
 # run unittests and pipe through progress program
 function run() {
-echo "#${COUNT}"
+echo "##>${COUNT}"
 for t in $TESTS; do
     $WIZENG/bin/spectest.x86-linux $t
 done
