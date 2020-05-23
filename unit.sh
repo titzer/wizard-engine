@@ -25,14 +25,14 @@ if [[ "$1" = "-fatal" ]]; then
 fi
 
 # Typecheck and verify wizeng first, printing out compile errors
-v3c $SRC $TEST
+v3c -fp $SRC $TEST
 if [ "$?" != 0 ]; then
     exit 1
 fi
 
 # run unittests and pipe through progress program
 if [ $PROGRESS_PIPE = 1 ]; then
-    v3c -run $SRC $TEST "$@" | tee $LOG | progress
+    v3c -fp -run $SRC $TEST "$@" | tee $LOG | progress
 else
-    v3c $V3C_OPTS -run $SRC $TEST "$@"
+    v3c -fp $V3C_OPTS -run $SRC $TEST "$@"
 fi
