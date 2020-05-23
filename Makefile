@@ -1,4 +1,4 @@
-all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux
+all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
 
 clean:
 	rm -f bin/*
@@ -18,3 +18,15 @@ bin/unittest.x86-linux: $(SRC) $(TEST)
 bin/spectest.x86-linux: $(SRC) $(TEST)
 	v3c-x86-linux -heap-size=512m -output=bin/ $(SRC) $(SPEC)
 	mv bin/wizeng bin/spectest.x86-linux
+
+bin/wizeng.jvm: $(SRC)
+	v3c-jar -output=bin/ $(SRC)
+	mv bin/wizeng bin/wizeng.jvm
+
+bin/unittest.jvm: $(SRC) $(TEST)
+	v3c-jar -output=bin/ $(SRC) $(TEST)
+	mv bin/wizeng bin/unittest.jvm
+
+bin/spectest.jvm: $(SRC) $(TEST)
+	v3c-jar -output=bin/ $(SRC) $(SPEC)
+	mv bin/wizeng bin/spectest.jvm
