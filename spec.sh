@@ -2,6 +2,7 @@
 
 WIZENG=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
 
+TEST_TARGET=jvm
 CORE_TEST=$WIZENG/core-test/bin/
 
 if [[ "$1" =~ "-trace" ]]; then
@@ -10,14 +11,14 @@ if [[ "$1" =~ "-trace" ]]; then
 fi
 
 cd $CORE_TEST
-TESTS=$(ls *.wast)
+TESTS=$(ls *.bin.wast)
 COUNT=$(echo $TESTS | awk '{print NF}')
 
 # run unittests and pipe through progress program
 function run() {
 echo "##>${COUNT}"
 for t in $TESTS; do
-    $WIZENG/bin/spectest.x86-linux $t
+    $WIZENG/bin/spectest.$TEST_TARGET $t
 done
 }
 
