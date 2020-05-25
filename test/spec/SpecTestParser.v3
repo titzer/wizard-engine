@@ -103,8 +103,8 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 	}
 	def parseAssertReturn() -> StCommand {
 		var action = parseNested(parseAction);
-		var expected = Vector<Value>.new();
-		parseList(expected, parseConstant);
+		var expected = Vector<ExpectedValue>.new();
+		parseList(expected, parseExpectedValue);
 		return StCommand.AssertReturn(action, expected.extract());
 	}
 	def parseAssertTrap() -> StCommand {
@@ -160,6 +160,15 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 		else if (kw("f64.const")) return parseF64Const();
 		error1(loc, "expected constant", ());
 		return Values.I32_0;
+	}
+	def parseExpectedValue() -> ExpectedValue {
+		var loc = (line, pos);
+		if (kw("i32.const")) return ExpectedValue.Exact(parseI32Const());
+		else if (kw("i64.const")) return ExpectedValue.Exact(parseI64Const());
+		else if (kw("f32.const")) return parseF32ExpectedValue();
+		else if (kw("f64.const")) return parseF64ExpectedValue();
+		error1(loc, "expected constant", ());
+		return ExpectedValue.Exact(Values.I32_0);
 	}
 	def parseI32Const() -> Value {
 		return parseInt(false);
@@ -242,12 +251,24 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 		return accum;
 	}
 	def parseF32Const() -> Value {
-		return parseFloat(false);
+		match (parseFloat(false)) {
+			Exact(v) => return v;
+			_ => return Values.F32_nan;
+		}
 	}
 	def parseF64Const() -> Value {
+		match (parseFloat(true)) {
+			Exact(v) => return v;
+			_ => return Values.F64_nan;
+		}
+	}
+	def parseF32ExpectedValue() -> ExpectedValue {
+		return parseFloat(false);
+	}
+	def parseF64ExpectedValue() -> ExpectedValue {
 		return parseFloat(true);
 	}
-	def parseFloat(is64: bool) -> Value {
+	def parseFloat(is64: bool) -> ExpectedValue {
 		var prev = pos;
 		var loc = (line, col);
 		var c = input[pos], sign = 0;
@@ -256,29 +277,29 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 			pos++;
 			if (!more(1)) {
 				error1(loc, "expected float literal, got EOF", ());
-				return if(is64, Values.F64_0, Values.F32_0);
+				return ExpectedValue.Exact(if(is64, Values.F64_0, Values.F32_0));
 			}
 			c = input[pos];
 		}
-		var v: Value;
+		var v: ExpectedValue;
 		if (c == '0') {
 			var x = peek_ch(1);
 			if (x == 'x' || x == 'X') {
 				pos += 2;
-				v = parseFloatHex(loc, sign, is64);
+				v = ExpectedValue.Exact(parseFloatHex(loc, sign, is64));
 			}
-			else v = parseFloatDec(loc, sign, is64);
+			else v = ExpectedValue.Exact(parseFloatDec(loc, sign, is64));
 		} else if (peek_kw(0, "nan")) {
 			pos += 3;
 			v = parseFloatNan(loc, sign, is64);
 		} else if (peek_kw(0, "infinity")) {
 			pos += 8;
-			v = selectInfinity(sign, is64);
+			v = ExpectedValue.Exact(selectInfinity(sign, is64));
 		} else if (peek_kw(0, "inf")) {
 			pos += 3;
-			v = selectInfinity(sign, is64);
+			v = ExpectedValue.Exact(selectInfinity(sign, is64));
 		} else {
-			v = parseFloatDec(loc, sign, is64);
+			v = ExpectedValue.Exact(parseFloatDec(loc, sign, is64));
 		}
 		col += (pos - prev);
 		skip();
@@ -291,7 +312,7 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 			return if(sign == 1, Values.F32_minus_infinity, Values.F32_infinity);
 		}
 	}
-	def parseFloatNan(loc: (int, int), sign: int, is64: bool) -> Value {
+	def parseFloatNan(loc: (int, int), sign: int, is64: bool) -> ExpectedValue {
 		var mantissa = 0x8000000000000000ul;  // quiet nan
 		if (peek_kw(0, ":0x") || peek_kw(0, ":0X")) {
 			eat(3);
@@ -300,11 +321,14 @@ class SpecTestParser(filename: string, input: Array<byte>) {
 			mantissa = tag << if(is64, byte.!(12), byte.!(41));
 		} else if (peek_kw(0, ":canonical")) {
 			eat(10);
+			return if(is64, ExpectedValue.CanonicalF64NaN, ExpectedValue.CanonicalF32NaN);
 		} else if (peek_kw(0, ":arithmetic")) {
 			eat(11);
+			return if(is64, ExpectedValue.ArithmeticF64NaN, ExpectedValue.ArithmeticF32NaN);
 		}
-		return if(is64, Values.f64nan(sign, mantissa),
+		var v = if(is64, Values.f64nan(sign, mantissa),
 				Values.f32nan(sign, u32.!(mantissa >> 32)));
+		return ExpectedValue.Exact(v);
 	}
 	def parseFloatHex(loc: (int, int), sign: int, is64: bool) -> Value {
 		var bits: u64;
@@ -619,11 +643,58 @@ def isKeywordMiddle(c: byte) -> bool {
 
 class SpecTestCommand(loc: (int, int), cmd: StCommand) {
 }
+type ExpectedValue {
+	case Exact(v: Value);
+	case CanonicalF32NaN;
+	case ArithmeticF32NaN;
+	case CanonicalF64NaN;
+	case ArithmeticF64NaN;
+	def matches(that: Value) -> bool {
+		match (this) {
+			Exact(v) => {
+				return v == that;
+			}
+			CanonicalF32NaN => {
+				if (!Value.F32.?(that)) return false;
+				var bits = Value.F32.!(that).bits;
+				return (bits << 1) == (Values.F32_nan.bits << 1);
+			}
+			ArithmeticF32NaN => {
+				if (!Value.F32.?(that)) return false;
+				var bits = Value.F32.!(that).bits;
+				var exp1 = ((bits >> 22) & 0x1FF);
+				return exp1 == 0x1FF;
+			}
+			CanonicalF64NaN => {
+				if (!Value.F64.?(that)) return false;
+				var bits = Value.F64.!(that).bits;
+				return (bits << 1) == (Values.F64_nan.bits << 1);
+			}
+			ArithmeticF64NaN => {
+				if (!Value.F64.?(that)) return false;
+				var bits = Value.F64.!(that).bits;
+				var exp1 = ((bits >> 51) & 0xFFF);
+				return exp1 == 0xFFF;
+			}
+		}
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		var str: string;
+		match (this) {
+			Exact(v) => return Values.render(buf, v);
+			CanonicalF32NaN => str = "f32:nan:canonical";
+			ArithmeticF32NaN => str = "f32:nan:arithmetic";
+			CanonicalF64NaN => str = "f64:nan:arithmetic";
+			ArithmeticF64NaN => str = "f64:nan:arithmetic";
+		}
+		return buf.puts(str);
+	}
+}
 type StCommand {
 	case Module(module: StModule);
 	case Register(varname: string, regname: string);
 	case Action(action: StAction);
-	case AssertReturn(action: StAction, expected: Array<Value>);
+	case AssertReturn(action: StAction, expected: Array<ExpectedValue>);
 	case AssertTrap(action: StAction, msg: string);
 	case AssertExhaustion(action: StAction, msg: string);
 	case AssertInvalid(module: StModule, msg: string);
