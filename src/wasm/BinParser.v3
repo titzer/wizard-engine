@@ -41,6 +41,10 @@ class BinParser {
 		if (func_count > 0 && !seen_sections[BpSection.Code.code]) {
 			err.at(parser.decoder).MissingCodeSection(func_count);
 		}
+		var data_count = module.explicit_data_count;
+		if (data_count > 0 && !seen_sections[BpSection.Data.code]) {
+			err.at(parser.decoder).MissingDataSection(data_count);
+		}
 		return fsm.finish();
 	}
 
@@ -71,18 +75,30 @@ class BinParser {
 					ReadClosureOf.new(module.globals.declared, parser.readGlobalDecl));
 			Export => readMultiple("exports", size, limits.max_num_exports,
 					ReadClosureWithArgOf.new(module.exports, StringSet.new, parser.readExportDecl));
-			Start =>
-				readStartSection();
+			Start => readStartSection();
 			Element => readMultiple("elements", size, limits.max_num_table_entries,
 					ReadClosureOf.new(module.elems, parser.readElemDecl));
-			Data => readMultiple("data", size, limits.max_num_data_segments,
-					ReadClosureOf.new(module.data, parser.readDataDecl));
+			DataCount => readDataCountSection();
+			Data => readDataSection(size);
 			_ => return err.at(d).InvalidSectionCode(kind.code);
 		}
 		var read = d.pos - start;
 		if (read < size) {
 			err.at(d).IncompleteSection(kind.code, read, size);
 		}
+	}
+	def readDataSection(size: u32) {
+		if (module.explicit_data_count >= 0) {
+			// manually check that number of data segments matches explicit data count
+			var pos = parser.decoder.pos;
+			var count = parser.decoder.read_u32leb();
+			if (count != module.explicit_data_count) {
+				return err.rel(parser.decoder, pos).DataCountMismatch(module.explicit_data_count, count);
+			}
+			parser.decoder.pos = pos;
+		}
+		readMultiple("data", size, limits.max_num_data_segments,
+				ReadClosureOf.new(module.data, parser.readDataDecl));
 	}
 	def beginCodeSection(abspos: int, count: u32) {
 		var kind = BpSection.Code;
@@ -132,6 +148,12 @@ class BinParser {
 			(func.sig.params.length > 0 || func.sig.results.length > 0)) {
 			err.rel(decoder, pt).IllegalStartFunctionType(func.sig);
 		}
+	}
+	def readDataCountSection() {
+		if (!extensions.BULK_MEMORY) err.at(parser.decoder).InvalidSectionCode(BpSection.DataCount.code);
+		var count = parser.readU32("data count", 0, limits.max_num_data_segments);
+		if (count < MAX_GROW_SIZE) module.data.grow(int.!(count));
+		module.explicit_data_count = int.!(count);
 	}
 
 	def decodeFunctionBody(index: u32, size: u32, d: Decoder) {
@@ -217,8 +239,8 @@ def renderTypecon(buf: StringBuilder, b: byte) -> StringBuilder {
 		BpTypecon.F32.code => s = "f32";
 		BpTypecon.F64.code => s = "f64";
 		BpTypecon.VEC128.code => s = "vec128";
-		BpTypecon.AnyFunc.code => s = "anyfunc";
-		BpTypecon.AnyRef.code => s = "anyref";
+		BpTypecon.FuncRef.code => s = "funcref";
+		BpTypecon.ExternRef.code => s = "externref";
 		BpTypecon.Function.code => s = "func";
 		BpTypecon.EmptyBlock.code => s = "empty";
 	}
@@ -241,7 +263,8 @@ def renderLimitFlags(buf: StringBuilder, b: byte) -> StringBuilder {
 }
 def EMPTY: Array<ValueType> = [];
 def FUNC_VEC128 = TypeDecl.Function(EMPTY, [ValueType.VEC128]);
-def FUNC_ANYREF = TypeDecl.Function(EMPTY, [ValueType.ANYREF]);
+def FUNC_FUNCREF = TypeDecl.Function(EMPTY, [ValueType.FUNCREF]);
+def FUNC_EXTERNREF = TypeDecl.Function(EMPTY, [ValueType.EXTERNREF]);
 
 // Contains common routines for the module parser and function body parser.
 class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
@@ -252,13 +275,13 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	def eof_set_flag(d: Decoder, pos: int, size: int, msg: string) {
 		eof = true;
 	}
-	def readTableIndex() -> int {
-		return readIndex("table index", module.tables).0;
+	def readTable() -> (int, TableDecl) {
+		return readIndex("table index", module.tables);
 	}
 	def readTableImm() -> int {
 		var pt = decoder.pos;
 		if (extensions.REFERENCE_TYPES) {
-			return readTableIndex();
+			return readTable().0;
 		} else {
 			var b = readByte("table index", StringBuilder.putd);
 			if (b != 0) err.rel(decoder, pt).ExpectedTableIndexZeroByte(b);
@@ -280,8 +303,17 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	def readFunc() -> (int, FunctionDecl) {
 		return readIndex("function index", module.functions);
 	}
+	def readTypeIndex() -> int {
+		return readAndCheckIndex("type index", module.types.usize()).1;
+	}
 	def readMemoryIndex() -> int {
-		return readIndex("memory index", module.memories).0;
+		return readAndCheckIndex("memory index", module.memories.usize()).1;
+	}
+	def readDataIndex() -> int {
+		return readAndCheckIndex("data index", u32.!(module.data.length)).1;
+	}
+	def readElemIndex() -> int {
+		return readAndCheckIndex("elem index", u32.!(module.elems.length)).1;
 	}
 	def readMemoryImm() -> int {
 		var pt = decoder.pos;
@@ -319,16 +351,27 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return (true, int.!(index));
 	}
 	def readValueType() -> ValueType {
-		var pt = decoder.pos, b = readByte("type constructor", renderTypecon);
+		var pt = decoder.pos, b = readByte("value type", renderTypecon);
 		match (b) {
 			BpTypecon.I32.code => return ValueType.I32;
 			BpTypecon.I64.code => return ValueType.I64;
 			BpTypecon.F32.code => return ValueType.F32;
 			BpTypecon.F64.code => return ValueType.F64;
 			BpTypecon.VEC128.code => return ValueType.VEC128;
-			BpTypecon.AnyRef.code => return ValueType.ANYREF;
+			BpTypecon.FuncRef.code => return ValueType.FUNCREF;
+			BpTypecon.ExternRef.code => return ValueType.EXTERNREF;
 		}
 		err.rel(decoder, pt).InvalidValueTypecon(b);
+		return ValueType.I32;
+	}
+	def readRefType(isTable: bool) -> ValueType {
+		var pt = decoder.pos, b = readByte("reftype", renderTypecon);
+		match (b) {
+			BpTypecon.FuncRef.code => return ValueType.FUNCREF;
+			BpTypecon.ExternRef.code => return ValueType.EXTERNREF;
+		}
+		if (isTable) err.rel(decoder, pt).IllegalTableElementType(b);
+		else err.rel(decoder, pt).InvalidRefTypecon(b);
 		return ValueType.I32;
 	}
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
@@ -392,7 +435,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.F32.code => return SigCache.v_f;
 			BpTypecon.F64.code => return SigCache.v_d;
 			BpTypecon.VEC128.code => return FUNC_VEC128;
-			BpTypecon.AnyRef.code => return FUNC_ANYREF;
+			BpTypecon.FuncRef.code => return FUNC_FUNCREF;
+			BpTypecon.ExternRef.code => return FUNC_EXTERNREF;
 		}
 		decoder.at(pt); // backup and try again as full signed LEB
 		var index = decoder.read_i32leb(), r = SigCache.v_v;
@@ -509,16 +553,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return (int.!(min), max, shared);
 	}
-	def readElemType() -> ElemType {
-		var pt = decoder.pos;
-		var b = readByte("element type", renderTypecon);
-		var et: ElemType;
-		match (b) {
-			BpTypecon.AnyFunc.code => et = ElemType.FuncRef;
-			BpTypecon.AnyRef.code => et = ElemType.AnyRef;
-			_ => err.rel(decoder, pt).IllegalTableElementType(b);
-		}
-		return et;
+	def readElemType() -> ValueType {
+		return readRefType(true);
 	}
 	def readI32Expr(quantity: string) -> InitExpr {
 		var pt = decoder.pos;
@@ -552,6 +588,10 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				var val = decoder.read_u64();
 				expr = InitExpr.F64(val);
 				vt = ValueType.F64;
+			}
+			Opcode.REF_NULL.code => {
+				vt = readRefType(false);
+				expr = InitExpr.Null(vt);
 			}
 			Opcode.GLOBAL_GET.code => {
 				var g = readGlobal();
@@ -680,7 +720,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				details = ExportDetails.Function(index);
 			}
 			BpImportExportKind.Table.code => {
-				var index = readTableIndex();
+				var index = readTable().0;
 				details = ExportDetails.Table(index);
 			}
 			BpImportExportKind.Memory.code => {
@@ -701,7 +741,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var active = true, table_index = 0, init_exprs = false;
 		if (extensions.BULK_MEMORY) {
 			if ((flags & 1) == 1) active = false;
-			if ((flags & 2) == 2) table_index = readTableIndex();
+			if ((flags & 2) == 2) table_index = readTable().0;
 			if ((flags & 4) == 4) init_exprs = true;
 		} else if (flags != 0) {
 			err.rel(decoder, pt).ExpectedElementsZeroByte(flags);
@@ -711,7 +751,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var offset = readI32Expr("elements offset");
 		var count = readU32("element count", 0, limits.max_num_table_entries);
 		var details: ElemDetails;
-		var elemType = if (table_index < module.tables.size(), module.tables[table_index].elemType());
+		var elemType = if (table_index < module.tables.size(), module.tables[table_index].elemtype);
 		if (init_exprs) { // init expressions
 			var array = Array<InitExpr>.new(int.!(count));
 			for (i < array.length) {
@@ -724,8 +764,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			}
 			details = ElemDetails.Exprs(array);
 		} else {  // function indices
-			if (elemType != ValueType.ANYFUNC) {
-				err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.ANYFUNC);
+			if (elemType != ValueType.FUNCREF) {
+				err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.FUNCREF);
 			}
 			var array = Array<int>.new(int.!(count));
 			for (i < array.length) {
