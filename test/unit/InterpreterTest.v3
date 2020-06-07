@@ -132,12 +132,18 @@ def Z = [
 	T("interp:ref.null", test_ref_null),
 	T("interp:ref.is_null", test_ref_is_null),
 	T("interp:ref.func", test_ref_func),
+	T("interp:memory.init", test_memory_init),
 	T("interp:data.drop", test_data_drop),
+	T("interp:memory.copy", test_memory_copy),
 	T("interp:memory.fill", test_memory_fill),
+	T("interp:table.init", test_table_init),
 	T("interp:elem.drop", test_elem_drop),
 	T("interp:table.get", test_table_get),
 	T("interp:table.set", test_table_set),
+	T("interp:table.copy", test_table_copy),
+	T("interp:table.grow", test_table_grow),
 	T("interp:table.size", test_table_size),
+	T("interp:table.fill", test_table_fill),
 
 	T_u_u(Opcode.I32_EQZ, [
 		(1, 0),
@@ -529,6 +535,23 @@ class InterpreterTester(t: Tester) extends ModuleBuilder {
 			var addr = int.!(offset) + i;
 			var got = data[addr];
 			if (expected[i] != got) return t.fail3("expected mem[%x] = %x, got %x", addr, expected[i], got);
+		}
+	}
+	def assert_ftable(args: Array<Value>, offset: u32, expected: Array<FunctionDecl>) {
+		var tr = run(args), instance = tr.0, r = tr.1;
+		checkNop(r);
+		var ftable = FunctionTable.!(instance.tables[0]);
+		for (i < expected.length) {
+			var addr = int.!(offset) + i;
+			var exp = expected[i];
+			var got = ftable.elems[addr];
+			if (exp == null) {
+				if (got != null) return t.fail1("expected table[%d] == null", addr);
+			} else {
+				if (!WasmFunction.?(got)) return t.fail2("expected table[%d] : WasmFunction%s ", addr, if(got == null, ", got null", ""));
+				var wgot = WasmFunction.!(got);
+				if (exp != wgot.decl) return t.fail3("expected table[%d] = #%d, got #%d", addr, expected[i].index, wgot.decl.index);
+			}
 		}
 	}
 	def assert_r(args: Array<Value>, expected: Result) {
@@ -1367,6 +1390,29 @@ def test_ref_func(i: InterpreterTester) {
 	i.assert_g(X, 0);
 }
 
+def test_memory_init(i: InterpreterTester) {
+	i.extensions |= Extension.BULK_MEMORY;
+	i.sig(SigCache.iii_v);
+	i.addMemory(1, 1);
+	i.addPassiveData([11, 22, 33, 44, 55]);
+	i.code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.LOCAL_GET.code, 2,
+		Opcode.MEMORY_INIT.prefix, Opcode.MEMORY_INIT.code, 0, 0
+	]);
+	i.assert_mem(uuu(0, 0, 5), 0, [11, 22, 33, 44, 55]);
+	i.assert_mem(uuu(0, 1, 3), 0, [22, 33, 44, 0]);
+	i.assert_mem(uuu(1, 2, 3), 0, [0, 33, 44, 55, 0]);
+	i.assert_trap(uuu(65533, 0, 4), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65535, 0, 2), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(1, 0, 6), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(1, 2, 5), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 4), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 0xF0), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 0xFFFFFFF0, 0xF0), TrapReason.MEM_OUT_OF_BOUNDS);
+}
+
 def test_data_drop(i: InterpreterTester) {
 	i.extensions |= Extension.BULK_MEMORY;
 	i.sig(SigCache.v_v);
@@ -1377,20 +1423,69 @@ def test_data_drop(i: InterpreterTester) {
 	if (instance.dropped_data[0] != true) i.t.fail("expected dropped data[0]");
 }
 
+def uuu(a: u32, b: u32, c: u32) -> Array<Value> {
+	return [Value.I32(a), Value.I32(b), Value.I32(c)];
+}
+
+def test_memory_copy(i: InterpreterTester) {
+	i.extensions |= Extension.BULK_MEMORY;
+	i.sig(SigCache.iii_v);
+	i.addMemory(1, 1);
+	var init: Array<byte> = [33, 44, 55];
+	i.addData(3, init);
+	i.code([Opcode.MEMORY_COPY.prefix, Opcode.MEMORY_COPY.code, 0, 0]);
+	i.assert_mem(uuu(0, 0, 0), 3, init);
+	i.assert_mem(uuu(0, 2, 5), 0, [0, 33, 44, 55, 0, 55, 0]);
+	i.assert_mem(uuu(7, 3, 3), 0, [0, 0, 0, 33, 44, 55, 0, 33, 44, 55]);
+	i.assert_mem(uuu(65533, 3, 3), 65533, [33, 44, 55]);
+	i.assert_trap(uuu(65533, 3, 4), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65535, 3, 2), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 65533, 4), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 65535, 2), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 4), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 0xF0), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 0xFFFFFFF0, 0xF0), TrapReason.MEM_OUT_OF_BOUNDS);
+}
+
+
 def test_memory_fill(i: InterpreterTester) {
 	i.extensions |= Extension.BULK_MEMORY;
 	i.sig(SigCache.iii_v);
 	i.addMemory(1, 1);
 	i.code([Opcode.MEMORY_FILL.prefix, Opcode.MEMORY_FILL.code, 0]);
-	i.assert_mem([Values.I32_0, Values.I32_0, Values.I32_0], 0, [0]);
-	i.assert_mem([Value.I32(3), Value.I32(77), Value.I32(2)], 0, [0, 0, 0, 77, 77, 0]);
-	i.assert_mem([Value.I32(4), Value.I32(99), Value.I32(4)], 0, [0, 0, 0, 0, 99, 99, 99, 99, 0]);
-	i.assert_mem([Value.I32(65536), Value.I32(99), Value.I32(0)], 0,[]);
-	i.assert_trap([Value.I32(65536), Value.I32(91), Value.I32(1)], TrapReason.MEM_OUT_OF_BOUNDS);
-	i.assert_trap([Value.I32(65535), Value.I32(92), Value.I32(2)], TrapReason.MEM_OUT_OF_BOUNDS);
-	i.assert_trap([Value.I32(65537), Value.I32(93), Value.I32(1)], TrapReason.MEM_OUT_OF_BOUNDS);
-	i.assert_trap([Value.I32(65537), Value.I32(94), Value.I32(0xFFFFFFF0)], TrapReason.MEM_OUT_OF_BOUNDS);
-	i.assert_trap([Value.I32(0xFFFFFFF0), Value.I32(95), Value.I32(0xF0)], TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_mem(uuu(0, 0, 0), 0, [0]);
+	i.assert_mem(uuu(3, 77, 2), 0, [0, 0, 0, 77, 77, 0]);
+	i.assert_mem(uuu(4, 99, 4), 0, [0, 0, 0, 0, 99, 99, 99, 99, 0]);
+	i.assert_mem(uuu(65536, 99, 0), 0,[]);
+	i.assert_trap(uuu(65536, 91, 1), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65535, 92, 2), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65537, 93, 1), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65537, 94, 0xFFFFFFF0), TrapReason.MEM_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 95, 0xF0), TrapReason.MEM_OUT_OF_BOUNDS);
+}
+
+def test_table_init(i: InterpreterTester) {
+	var f2 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	var f3 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	var f4 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	var f5 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	i.extensions |= Extension.BULK_MEMORY;
+	i.sig(SigCache.iii_v);
+	i.addTable(6, 0, null);
+	i.addPassiveElems([f2.0, f3.0, f4.0, f5.0]);
+	i.code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.LOCAL_GET.code, 2,
+		Opcode.TABLE_INIT.prefix, Opcode.TABLE_INIT.code, 0, 0
+	]);
+	i.assert_ftable(uuu(0, 0, 0), 0, []);
+	i.assert_ftable(uuu(0, 0, 1), 0, [f2.1]);
+	i.assert_ftable(uuu(2, 2, 1), 2, [f4.1]);
+	i.assert_ftable(uuu(0, 0, 4), 0, [f2.1, f3.1, f4.1, f5.1]);
+	i.assert_trap(uuu(0, 0, 5), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0, 1, 4), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 0, 4), TrapReason.TABLE_OUT_OF_BOUNDS);
 }
 
 def test_elem_drop(i: InterpreterTester) {
@@ -1431,10 +1526,85 @@ def test_table_set(i: InterpreterTester) {
 	i.assert_trap([Value.I32(3), gv1], TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
 }
 
+def test_table_copy(i: InterpreterTester) {
+	i.extensions |= Extension.REFERENCE_TYPES;
+	var f2 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	var f3 = i.addFunction(SigCache.v_v, [Opcode.END.code]);
+	i.addTable(6, 0, []);
+	i.addTable(3, 0, [0, f2.0, f3.0]);
+
+	i.sig(SigCache.iii_v);
+	i.code([Opcode.TABLE_COPY.prefix, Opcode.TABLE_COPY.code, 0, 1]);
+	i.assert_ftable(uuu(0, 0, 1), 0, [i.func, null, null]);
+	i.assert_ftable(uuu(1, 2, 1), 0, [null, f3.1, null]);
+	i.assert_ftable(uuu(3, 0, 3), 0, [null, null, null, i.func, f2.1, f3.1]);
+
+	i.assert_trap(uuu(65533, 3, 4), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(65535, 3, 2), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 65533, 4), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 65535, 2), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 4), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(0xFFFFFFF0, 3, 0xF0), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uuu(3, 0xFFFFFFF0, 0xF0), TrapReason.TABLE_OUT_OF_BOUNDS);
+}
+
+def test_table_grow(i: InterpreterTester) {
+	i.extensions |= Extension.REFERENCE_TYPES;
+	i.addTableWithMax(3, 5);
+	i.sig(TypeDecl.Function([ValueType.I32, ValueType.FUNCREF], SigCache.arr_i));
+	i.code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.TABLE_GROW.prefix, Opcode.TABLE_GROW.code, 0
+	]);
+	i.assert_r([Value.I32(1), Value.Null], Result.Value([Value.I32(3)]));
+	i.assert_r([Value.I32(2), Value.Null], Result.Value([Value.I32(3)]));
+	i.assert_r([Value.I32(3), Value.Null], Result.Value([Value.I32(0xFFFFFFFF)]));
+
+	i.sig(TypeDecl.Function([ValueType.I32, ValueType.FUNCREF], SigCache.arr_v));
+	i.code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.TABLE_GROW.prefix, Opcode.TABLE_GROW.code, 0,
+		Opcode.DROP.code
+	]);
+	var fv = Value.FuncRef(WasmFunction.new(null, i.func));
+	i.assert_ftable([Value.I32(1), fv], 0, [null, null, null, i.func]);
+	i.assert_ftable([Value.I32(2), fv], 0, [null, null, null, i.func, i.func]);
+}
+
 def test_table_size(i: InterpreterTester) {
 	i.extensions |= Extension.REFERENCE_TYPES;
 	i.addTable(3, 0, [0, 0, 0]);
 	i.sig(SigCache.v_i);
 	i.code([Opcode.TABLE_SIZE.prefix, Opcode.TABLE_SIZE.code, 0]);
 	i.assert_i(3);
+}
+
+def uvu(a: u32, b: Value, c: u32) -> Array<Value> {
+	return [Value.I32(a), b, Value.I32(c)];
+}
+
+def test_table_fill(i: InterpreterTester) {
+	i.extensions |= Extension.REFERENCE_TYPES;
+	i.sig(SigCache.iii_v);
+	i.addTable(6, 0, []);
+	i.code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.LOCAL_GET.code, 2,
+		Opcode.TABLE_FILL.prefix, Opcode.TABLE_FILL.code, 0
+	]);
+	var f1 = Value.FuncRef(WasmFunction.new(null, i.func));
+	i.assert_ftable(uvu(0, f1, 0), 0, [null]);
+	i.assert_ftable(uvu(1, f1, 1), 0, [null, i.func]);
+	i.assert_ftable(uvu(3, f1, 2), 0, [null, null, null, i.func, i.func]);
+	i.assert_ftable(uvu(4, f1, 2), 0, [null, null, null, null, i.func, i.func]);
+	i.assert_trap(uvu(5, f1, 2), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(6, f1, 1), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(65536, f1, 1), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(65535, f1, 2), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(65537, f1, 1), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(65537, f1, 0xFFFFFFF0), TrapReason.TABLE_OUT_OF_BOUNDS);
+	i.assert_trap(uvu(0xFFFFFFF0, f1, 0xF0), TrapReason.TABLE_OUT_OF_BOUNDS);
 }

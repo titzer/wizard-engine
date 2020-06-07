@@ -24,13 +24,57 @@ class WasmFunction(instance: Instance, decl: FunctionDecl) extends Function {
 }
 class Table(decl: TableDecl) extends Exportable {
 	var oom = false;
-	def grow(elems: int) -> int;
+	def grow(more: u32, val: Value) -> int;
+	def fill(dst_offset: u32, val: Value, size: u32) -> TrapReason;
+	def copyT(dst_offset: u32, src: Table, src_offset: u32, size: u32) -> TrapReason;
+	def copyE(instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> TrapReason;
 	def size() -> int;
+}
+def v2f(v: Value) -> Function {
+	return if(Value.FuncRef.?(v), Value.FuncRef.!(v).val);
+}
+def initFunc(instance: Instance, e: InitExpr) -> Function {
+	var val = instance.evalInitExpr(e);
+	return if(Value.FuncRef.?(val), Value.FuncRef.!(val).val);
 }
 class FunctionTable extends Table {
 	var elems: Array<Function>;
 	new(decl: TableDecl) super(decl) {
 		elems = Array.new(decl.initial);
+	}
+	def grow(more: u32, val: Value) -> int {
+		var total = i64.!(elems.length) + more;
+		if (total > EngineLimits.limit_table_size) return -1;
+		if (decl.maximum >= 0 && total > decl.maximum) return -1;
+		var prev = elems.length, nlength = int.!(total);
+		var nelems = Arrays.grow(elems, nlength);
+		var fv = v2f(val);
+		for (i = prev; i < nlength; i++) nelems[i] = fv;
+		elems = nelems;
+		return prev;
+	}
+	def fill(dst_offset: u32, val: Value, size: u32) -> TrapReason {
+		var i = Arrays.boundsCheck(elems, 0, dst_offset, size);
+		if (i < 0) return TrapReason.TABLE_OUT_OF_BOUNDS;
+		var f = v2f(val);
+		for (k < int.!(size)) elems[i + k] = f;
+		return TrapReason.NONE;
+	}
+	def copyT(dst_offset: u32, src: Table, src_offset: u32, size: u32) -> TrapReason {
+		var r: bool;
+		match (src) {
+			ft: FunctionTable => r = Arrays.safeCopy(elems, dst_offset, ft.elems, src_offset, size);
+			vt: ValueTable => r = Arrays.safeCopyF(elems, dst_offset, vt.elems, src_offset, size, v2f);
+		}
+		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
+	}
+	def copyE(instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> TrapReason {
+		var r: bool;
+		match (elem.details) {
+			FuncRefs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, instance.getFunction);
+			Exprs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, initFunc(instance, _));
+		}
+		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
 	}
 	def size() -> int { return elems.length; }
 }
@@ -38,6 +82,38 @@ class ValueTable extends Table {
 	var elems: Array<Value>;
 	new(decl: TableDecl) super(decl) {
 		elems = Array.new(decl.initial);
+	}
+	def grow(more: u32, val: Value) -> int {
+		var total = i64.!(elems.length) + more;
+		if (total > EngineLimits.limit_table_size) return -1;
+		if (decl.maximum >= 0 && total > decl.maximum) return -1;
+		var prev = elems.length, nlength = int.!(total);
+		var nelems = Arrays.grow(elems, nlength);
+		for (i = prev; i < nlength; i++) nelems[i] = val;
+		elems = nelems;
+		return prev;
+	}
+	def fill(dst_offset: u32, val: Value, size: u32) -> TrapReason {
+		var i = Arrays.boundsCheck(elems, 0, dst_offset, size);
+		if (i < 0) return TrapReason.TABLE_OUT_OF_BOUNDS;
+		for (k < int.!(size)) elems[i + k] = val;
+		return TrapReason.NONE;
+	}
+	def copyT(dst_offset: u32, src: Table, src_offset: u32, size: u32) -> TrapReason {
+		var r: bool;
+		match (src) {
+			ft: FunctionTable => r = Arrays.safeCopyF(elems, dst_offset, ft.elems, src_offset, size, Value.FuncRef);
+			vt: ValueTable => r = Arrays.safeCopy(elems, dst_offset, vt.elems, src_offset, size);
+		}
+		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
+	}
+	def copyE(instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> TrapReason {
+		var r: bool;
+		match (elem.details) {
+			FuncRefs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, instance.getFunctionAsVal);
+			Exprs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, instance.evalInitExpr);
+		}
+		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
 	}
 	def size() -> int { return elems.length; }
 }
@@ -63,8 +139,23 @@ class Instance(module: Module, imports: Array<Exportable>) {
 		}
 		return f;
 	}
+	def getFunctionAsVal(index: int) -> Value.FuncRef {
+		return Value.FuncRef(getFunction(index));
+	}
 	def getFunctions() -> Array<Function> {
 		return functions;
+	}
+	def evalInitExpr(init: InitExpr) -> Value {
+		match (init) {
+			I32(val) => return Value.I32(u32.!(val));
+			I64(val) => return Value.I64(u64.!(val));
+			F32(val) => return Value.F32(val);
+			F64(val) => return Value.F64(val);
+			Null(vtype) => return Value.Null;
+			Global(global_index, g) => {
+				return globals[global_index].value;
+			}
+		}
 	}
 }
 
@@ -119,7 +210,7 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 			var d = module.globals.declared[i];
 			var g = Global.new(d);
 			globals[global_index++] = g;
-			g.value = evalInitExpr(d.init);
+			g.value = instance.evalInitExpr(d.init);
 		}
 
 		// Bounds-check element and data segments.
@@ -131,7 +222,7 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		for (i < module.data.length) {
 			var d = module.data[i];
 			if (!d.active) continue;
-			var offset = Value.I32.!(evalInitExpr(d.offset)).val;
+			var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
 			if (!checkDataBounds(d)) return null;
 		}
 
@@ -223,18 +314,6 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		}
 		return global;
 	}
-	private def evalInitExpr(init: InitExpr) -> Value {
-		match (init) {
-			I32(val) => return Value.I32(u32.!(val));
-			I64(val) => return Value.I64(u64.!(val));
-			F32(val) => return Value.F32(val);
-			F64(val) => return Value.F64(val);
-			Null(vtype) => return Value.Null;
-			Global(global_index, g) => {
-				return instance.globals[global_index].value;
-			}
-		}
-	}
 	// Upon error, clear internal fields to prevent retaining garbage.
 	private def clear() {
 		for (i = module.memories.imported.length; i < instance.memories.length; i++) {
@@ -264,7 +343,7 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		return true;
 	}
 	private def checkElemBounds(e: ElemDecl) -> bool {
-		var offset = Value.I32.!(evalInitExpr(e.offset)).val;
+		var offset = Value.I32.!(instance.evalInitExpr(e.offset)).val;
 		var table = instance.tables[e.table_index];
 		match (e.details) {
 			FuncRefs(vals) => checkBounds(offset, vals.length, table.size());
@@ -273,14 +352,14 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		return err.ok();
 	}
 	private def checkDataBounds(d: DataDecl) -> bool {
-		var offset = Value.I32.!(evalInitExpr(d.offset)).val;
+		var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
 		var memory = instance.memories[d.mem_index];
 		var mlength = if(memory != null, memory.data.length);
 		checkBounds(offset, d.data.length, mlength);
 		return err.ok();
 	}
 	private def loadElems(e: ElemDecl) {
-		var offset = Value.I32.!(evalInitExpr(e.offset)).val;
+		var offset = Value.I32.!(instance.evalInitExpr(e.offset)).val;
 		var table = instance.tables[e.table_index];
 		match (e.details) {
 			FuncRefs(vals) => {
@@ -292,13 +371,13 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 			Exprs(vals) => {
 				var vt = ValueTable.!(table);
 				for (i < vals.length) {
-					vt.elems[i + int.!(offset)] = evalInitExpr(vals[i]);
+					vt.elems[i + int.!(offset)] = instance.evalInitExpr(vals[i]);
 				}
 			}
 		}
 	}
 	private def loadData(d: DataDecl) {
-		var offset = Value.I32.!(evalInitExpr(d.offset)).val;
+		var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
 		var memory = instance.memories[d.mem_index];
 		var mlength = if(memory != null, memory.data.length);
 		Arrays.copyInto(memory.data, int.!(offset), d.data, 0, d.data.length);
