@@ -69,6 +69,7 @@ class FunctionTable extends Table {
 		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
 	}
 	def copyE(instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> TrapReason {
+		if (elem == null) return TrapReason.TABLE_OUT_OF_BOUNDS;
 		var r: bool;
 		match (elem.details) {
 			FuncRefs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, instance.getFunction);
@@ -108,6 +109,7 @@ class ValueTable extends Table {
 		return if(r, TrapReason.NONE, TrapReason.TABLE_OUT_OF_BOUNDS);
 	}
 	def copyE(instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> TrapReason {
+		if (elem == null) return TrapReason.TABLE_OUT_OF_BOUNDS;
 		var r: bool;
 		match (elem.details) {
 			FuncRefs(vals) => r = Arrays.safeCopyF(elems, dst_offset, vals, src_offset, size, instance.getFunctionAsVal);
@@ -160,9 +162,10 @@ class Instance(module: Module, imports: Array<Exportable>) {
 }
 
 // Creates {Instance} objects, given a module and a list of imports.
-class Instantiator(module: Module, imports: Array<Exportable>) {
+class Instantiator(extensions: Extension.set, module: Module, imports: Array<Exportable>) {
 	private def instance = Instance.new(module, imports);
 	def err = WasmErrorGen.new(module.filename);
+	var trap_reason: TrapReason;
 	def run() -> Instance {
 		if (imports.length != module.imports.length) return fail("import count mismatch");
 
@@ -216,30 +219,49 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		// Bounds-check element and data segments.
 		for (i < module.elems.length) {
 			var e = module.elems[i];
-			if (!e.active) continue;
-			if (!checkElemBounds(e)) return null;
+			match (e.mode) {
+				Active(index, offset) => checkElemBounds(index, offset, e.details);
+				_ => ;
+			}
 		}
+		if (err.error()) return null;
 		for (i < module.data.length) {
 			var d = module.data[i];
-			if (!d.active) continue;
-			var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
-			if (!checkDataBounds(d)) return null;
+			match (d.mode) {
+				Active(index, offset) => checkDataBounds(index, offset, d.data.length);
+				_ => ;
+			}
 		}
+		if (err.error()) return null;
 
 		// Load element segments.
 		for (i < module.elems.length) {
 			var e = module.elems[i];
-			if (!e.active) continue;
-			loadElems(e);
-			instance.dropped_elems[i] = true;
+			match (e.mode) {
+				Passive => ;
+				Active(index, offset) => {
+					loadElems(index, offset, e.details);
+					instance.dropped_elems[i] = true;
+				}
+				Declarative => {
+					instance.dropped_elems[i] = true;
+				}
+			}
 		}
 
 		// Load data segments.
 		for (i < module.data.length) {
 			var d = module.data[i];
-			if (!d.active) continue;
-			loadData(d);
-			instance.dropped_data[i] = true;
+			match (d.mode) {
+				Passive => ;
+				Active(index, offset) => {
+					loadData(index, offset, d.data);
+					instance.dropped_data[i] = true;
+				}
+				Declarative => {
+					instance.dropped_data[i] = true;
+				}
+			}
 		}
 
 		// Organize exports
@@ -334,52 +356,51 @@ class Instantiator(module: Module, imports: Array<Exportable>) {
 		}
 		return true;
 	}
-	private def checkBounds(offset: u32, count: int, length: int) -> bool {
+	private def checkBounds(offset: u32, count: int, length: int, trap: TrapReason) -> bool {
 		var end = u64.!(offset) + u64.!(count);
 		if (end < offset || end > length) {
 			fail("out of bounds in initialization");
+			if (extensions.REFERENCE_TYPES) trap_reason = trap;
 			return false;
 		}
 		return true;
 	}
-	private def checkElemBounds(e: ElemDecl) -> bool {
-		var offset = Value.I32.!(instance.evalInitExpr(e.offset)).val;
-		var table = instance.tables[e.table_index];
-		match (e.details) {
-			FuncRefs(vals) => checkBounds(offset, vals.length, table.size());
-			Exprs(vals) => checkBounds(offset, vals.length, table.size());
+	private def checkElemBounds(index: int, offset: InitExpr, details: ElemDetails) {
+		var offset = Value.I32.!(instance.evalInitExpr(offset)).val;
+		var size = instance.tables[index].size();
+		match (details) {
+			FuncRefs(vals) => checkBounds(offset, vals.length, size, TrapReason.TABLE_OUT_OF_BOUNDS);
+			Exprs(vals) => checkBounds(offset, vals.length, size, TrapReason.TABLE_OUT_OF_BOUNDS);
 		}
-		return err.ok();
 	}
-	private def checkDataBounds(d: DataDecl) -> bool {
-		var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
-		var memory = instance.memories[d.mem_index];
+	private def checkDataBounds(index: int, offset: InitExpr, dlength: int) {
+		var offset = Value.I32.!(instance.evalInitExpr(offset)).val;
+		var memory = instance.memories[index];
 		var mlength = if(memory != null, memory.data.length);
-		checkBounds(offset, d.data.length, mlength);
-		return err.ok();
+		checkBounds(offset, dlength, mlength, TrapReason.MEM_OUT_OF_BOUNDS);
 	}
-	private def loadElems(e: ElemDecl) {
-		var offset = Value.I32.!(instance.evalInitExpr(e.offset)).val;
-		var table = instance.tables[e.table_index];
-		match (e.details) {
+	private def loadElems(index: int, offset: InitExpr, details: ElemDetails) {
+		var k = Values.v_i(instance.evalInitExpr(offset));
+		var table = instance.tables[index];
+		match (details) {
 			FuncRefs(vals) => {
 				var ft = FunctionTable.!(table);
 				for (i < vals.length) {
-					ft.elems[i + int.!(offset)] = instance.getFunction(vals[i]);
+					ft.elems[i + k] = instance.getFunction(vals[i]);
 				}
 			}
 			Exprs(vals) => {
 				var vt = ValueTable.!(table);
 				for (i < vals.length) {
-					vt.elems[i + int.!(offset)] = instance.evalInitExpr(vals[i]);
+					vt.elems[i + k] = instance.evalInitExpr(vals[i]);
 				}
 			}
 		}
 	}
-	private def loadData(d: DataDecl) {
-		var offset = Value.I32.!(instance.evalInitExpr(d.offset)).val;
-		var memory = instance.memories[d.mem_index];
+	private def loadData(index: int, offset: InitExpr, data: Array<byte>) {
+		var k = Values.v_i(instance.evalInitExpr(offset));
+		var memory = instance.memories[index];
 		var mlength = if(memory != null, memory.data.length);
-		Arrays.copyInto(memory.data, int.!(offset), d.data, 0, d.data.length);
+		Arrays.copyInto(memory.data, k, data, 0, data.length);
 	}
 }

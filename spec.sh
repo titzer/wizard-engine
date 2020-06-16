@@ -8,7 +8,15 @@ CORE_TEST=$WIZENG/core-test/bin/
 if [[ "$1" =~ "-trace" ]]; then
     # turn off the progress pipe in verbose mode
     let PROGRESS_PIPE=0
+    shift
 fi
+
+WIZENG_OPTS=
+while [[ "$1" =~ "-ext:" ]]; do
+    # turn off the progress pipe in verbose mode
+    WIZENG_OPTS="$WIZENG_OPTS $1"
+    shift
+done
 
 cd $CORE_TEST
 TESTS=$(ls *.bin.wast)
@@ -18,7 +26,7 @@ COUNT=$(echo $TESTS | awk '{print NF}')
 function run() {
 echo "##>${COUNT}"
 for t in $TESTS; do
-    $WIZENG/bin/spectest.$TEST_TARGET $t
+    $WIZENG/bin/spectest.$TEST_TARGET $WIZENG_OPTS $t
 done
 }
 

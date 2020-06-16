@@ -738,60 +738,124 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	def readElemDecl(index: int) -> ElemDecl {
 		var pt = decoder.pos;
 		var flags = readByte("data flags", renderNone);
-		var active = true, table_index = 0, init_exprs = false;
-		if (extensions.REFERENCE_TYPES) {
-			if ((flags & 1) == 1) active = false;
-			if ((flags & 2) == 2) table_index = readTable().0;
-			if ((flags & 4) == 4) init_exprs = true;
-		} else if (flags != 0) {
+		if (flags != 0 && !extensions.REFERENCE_TYPES) {
 			err.rel(decoder, pt).ExpectedElementsZeroByte(flags);
-		} else {
-			table_index = checkIndex(pt, "table", 0, module.tables.usize()).1;
+			return null;
 		}
-		var offset = readI32Expr("elements offset");
-		var count = readU32("element count", 0, limits.max_num_table_entries);
-		var details: ElemDetails;
-		var elemType = if (table_index < module.tables.size(), module.tables[table_index].elemtype);
-		if (init_exprs) { // init expressions
-			var array = Array<InitExpr>.new(int.!(count));
-			for (i < array.length) {
-				var pt = decoder.pos;
-				var t = readInitExpr("element");
-				if (!ValueTypes.isAssignable(t.1, elemType)) {
-					err.rel(decoder, pt).TypeMismatchInElemInit(elemType, t.1);
-				}
-				array[i] = t.0;
+		var mode: SegmentMode, details: ElemDetails;
+		match (flags) {
+			0 => {
+				var table_index = checkIndex(pt, "table", 0, module.tables.usize()).1;
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(table_index, offset);
+				details = readElemFuncIndexes(table_index);
 			}
-			details = ElemDetails.Exprs(array);
-		} else {  // function indices
+			1 => {
+				mode = SegmentMode.Passive;
+				readElemKind();
+				details = readElemFuncIndexes(int.max);
+			}
+			2 => {
+				var table_index = readTable().0;
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(table_index, offset);
+				details = readElemFuncIndexes(table_index);
+			}
+			3 => {
+				mode = SegmentMode.Declarative;
+				readElemKind();
+				details = readElemFuncIndexes(int.max);
+			}
+			4 => {
+				var table_index = checkIndex(pt, "table", 0, module.tables.usize()).1;
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(table_index, offset);
+				details = readElemInitExprs(ValueType.FUNCREF);
+			}
+			5 => {
+				mode = SegmentMode.Passive;
+				var vt = readRefType(false);
+				details = readElemInitExprs(vt);
+			}
+			6 => {
+				var table_index = readTable().0;
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(table_index, offset);
+				var vt = readRefType(false);
+				details = readElemInitExprs(vt);
+			}
+			7 => {
+				mode = SegmentMode.Declarative;
+				var vt = readRefType(false);
+				details = readElemInitExprs(vt);
+			}
+			_ => {
+				err.rel(decoder, pt).InvalidElemFlags(flags);
+			}
+		}
+		return ElemDecl.new(mode, details);
+	}
+	def readElemKind() {
+		var pt = decoder.pos;
+		var elem_kind = readByte("elem kind", renderNone);
+		if (elem_kind != 0) err.rel(decoder, pt).ExpectedElemKindZeroByte(elem_kind);
+	}
+	def readElemFuncIndexes(table_index: int) -> ElemDetails.FuncRefs {
+		var count = readU32("element count", 0, limits.max_num_table_entries);
+		if (table_index < module.tables.size()) {
+			var elemType = module.tables[table_index].elemtype;
 			if (elemType != ValueType.FUNCREF) {
 				err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.FUNCREF);
 			}
-			var array = Array<int>.new(int.!(count));
-			for (i < array.length) {
-				array[i] = readFunc().0;
-			}
-			details = ElemDetails.FuncRefs(array);
 		}
-		return ElemDecl.new(table_index, offset, details, active);
+		var array = Array<int>.new(int.!(count));
+		for (i < array.length) {
+			array[i] = readFunc().0;
+		}
+		return ElemDetails.FuncRefs(array);
+	}
+	def readElemInitExprs(elemType: ValueType) -> ElemDetails.Exprs {
+		var count = readU32("element count", 0, limits.max_num_table_entries);
+		var array = Array<InitExpr>.new(int.!(count));
+		for (i < array.length) {
+			var pt = decoder.pos;
+			var t = readInitExpr("element");
+			if (!ValueTypes.isAssignable(t.1, elemType)) {
+				err.rel(decoder, pt).TypeMismatchInElemInit(elemType, t.1);
+			}
+			array[i] = t.0;
+		}
+		return ElemDetails.Exprs(array);
 	}
 	def readDataDecl(index: int) -> DataDecl {
 		var pt = decoder.pos;
 		var flags = readByte("data flags", renderNone);
-		var active = true, mem_index = 0;
-		if (extensions.BULK_MEMORY) {
-			if ((flags & 1) == 1) {
-				active = false;
-				mem_index = readMemoryIndex();
-			}
-		} else if (flags != 0) {
+		if (flags != 0 && !extensions.REFERENCE_TYPES) {
 			err.rel(decoder, pt).ExpectedDataFlagsZeroByte(flags);
+			return null;
 		}
-		checkIndex(pt, "memory", u32.!(mem_index), module.memories.usize());
-		var offset = readI32Expr("data element offset");
+		var mode: SegmentMode;
+		match (flags) {
+			0 => {
+				var mem_index = checkIndex(pt, "memory", 0, module.memories.usize()).1;
+				var offset = readI32Expr("data element offset");
+				mode = SegmentMode.Active(mem_index, offset);
+			}
+			1 => {
+				mode = SegmentMode.Passive;
+			}
+			2 => {
+				var mem_index = readMemoryIndex();
+				var offset = readI32Expr("data element offset");
+				mode = SegmentMode.Active(mem_index, offset);
+			}
+			_ => {
+				err.rel(decoder, pt).InvalidDataFlags(flags);
+			}
+		}
 		var len = readU32("data segment size", 0, limits.max_data_segment_size);
 		var data = decoder.read_bytes(int.!(len));
-		return DataDecl.new(mem_index, offset, data, active);
+		return DataDecl.new(mode, data);
 	}
 	def traceBytes(pt: int, quantity: string) -> StringBuilder {
 		if (quantity == null) return trace;
