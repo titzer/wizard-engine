@@ -2,19 +2,25 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // The allowable types of any value in WebAssembly.
-enum ValueType {
-	I32,
-	I64,
-	F32,
-	F64,
-	VEC128, /* ext:simd */
-	FUNCREF,
-	EXTERNREF /* ext:reference-types */
-	/* ext:exception-handling case Exception() */
-	/* ext:typed-functions case Function() */
-	/* ext:gc case Ref() */
+type ValueType {
+	case I32;
+	case I64;
+	case F32;
+	case F64;
+	case VEC128;
+	case FUNCREF;
+	case EXTERNREF;
+	case Function(params: Array<ValueType>, results: Array<ValueType>);
+//	case Struct(fields: Array<(string, ValueType)>);
+//	case Array(elem: ValueType);
 }
-
+type TypeExpr {
+	case Type(v: ValueType);
+	case Param(details: TypeDecl.Imported);
+	case Function(params: Array<TypeExpr>, results: Array<TypeExpr>);
+//	case Struct(fields: Array<(string, TypeExpr)>);
+//	case Array(elem: TypeExpr);
+}
 // Utility functions associated with value types.
 component ValueTypes {
 	def render(buf: StringBuilder, t: ValueType) -> StringBuilder {
@@ -27,41 +33,104 @@ component ValueTypes {
 			VEC128 => s = "v128";
 			FUNCREF => s = "funcref";
 			EXTERNREF => s = "externref";
+			Function(p, r) => return renderPR(buf, p, r);
 		}
 		return buf.puts(s);
 	}
-	def isAssignable(from: ValueType, to: ValueType) -> bool {
+	def isAssignableTT(from: ValueType, to: ValueType) -> bool {
 		return from == to;
 	}
-	def isAssignableSig(from: TypeDecl.Function, to: TypeDecl.Function) -> bool {
-		if (from.params.length != to.params.length) return false;
-		if (from.results.length != to.results.length) return false;
-		for (i < from.params.length) {
-			var f = from.params[i], t = to.params[i];
-			if (!isAssignable(t, f)) return false; // contra-variant
+	def isAssignableEE(from: TypeExpr, to: TypeExpr) -> bool {
+		match (from) {
+			Type(f) => {
+				match (to) {
+					Type(t) => return isAssignableTT(f, t);
+					_ => ;
+				}
+			}
+			Param(fd) => {
+				match (to) {
+					Type(t) => return isAssignableFromConstraints(fd, to);
+					Param(td) => return fd == td || isAssignableFromConstraints(fd, to);
+					_ => ;
+				}
+			}
+			Function(fp, fr) => {
+				match (to) {
+					Type(t) => {
+						match (t) {
+							Function(tp, tr) => return co(fp, fr, tp, tr, isAssignableET, isAssignableTE);
+							_ => ;
+						}
+					}
+					Function(tp, tr) => return co(fp, fr, tp, tr, isAssignableEE, isAssignableEE);
+					_ => ;
+				}
+			}
 		}
-		for (i < from.results.length) {
-			var f = from.results[i], t = to.results[i];
-			if (!isAssignable(f, t)) return false; // co-variant
+		return false;
+/* with more powerful pattern-matching
+		match (from, to) {
+			Type(f), Type(t) => return isAssignableTT(f, t);
+			Param(fd), Type(t) => return isAssignableFromConstraints(fd, to);
+			Param(fd), Param(td) => return fd == td || isAssignableFromConstraints(fd, to);
+			Function(fp, fr), Type(Function(tp, tr))  => return co(fp, fr, tp, tr, isAssignableET, isAssignableTE);
+			Function(fp, fr), Function(tp, tr) => return co(fp, fr, tp, tr, isAssignableEE, isAssignableEE);
+			_, _ => return false;
 		}
-		return true;
+*/
 	}
-	def renderSig(buf: StringBuilder, t: TypeDecl.Function) -> StringBuilder {
-		buf.puts("(");
-		for (i < t.params.length) {
-			if (i > 0) buf.puts(", ");
-			render(buf, t.params[i]);
+	def isAssignableET(a: TypeExpr, b: ValueType) -> bool {
+		return isAssignableEE(a, TypeExpr.Type(b));
+	}
+	def isAssignableTE(a: ValueType, b: TypeExpr) -> bool {
+		return isAssignableEE(TypeExpr.Type(a), b);
+	}
+	def isAssignable = isAssignableTT;
+	def isAssignableFromConstraints(from: TypeDecl.Imported, to: TypeExpr) -> bool {
+		for (c in from.details.constraints) {
+			match (c) {
+				AssignTo(ce) => if (isAssignableEE(ce, to)) return true;
+				_ => ;
+			}
 		}
-		buf.puts(") -> (");
-		for (i < t.results.length) {
-			if (i > 0) buf.puts(", ");
-			render(buf, t.results[i]);
+		return false;
+	}
+	def isAssignableSig(from: ValueType.Function, to: ValueType.Function) -> bool {
+		return co(from.params, from.results, to.params, to.results, isAssignableTT, isAssignableTT);
+	}
+	def renderSig(buf: StringBuilder, t: ValueType.Function) -> StringBuilder {
+		return renderPR(buf, t.params, t.results);
+	}
+	def renderPR(buf: StringBuilder, p: Array<ValueType>, r: Array<ValueType>) -> StringBuilder {
+		buf.puts("[");
+		for (i < p.length) {
+			if (i > 0) buf.puts(" ");
+			render(buf, p[i]);
 		}
-		buf.puts(")");
+		buf.puts("] -> [");
+		for (i < r.length) {
+			if (i > 0) buf.puts(" ");
+			render(buf, r[i]);
+		}
+		buf.puts("]");
 		return buf;
 	}
 	def leastUpperBound(t: ValueType, f: ValueType) -> (bool, ValueType) {
 		if (t == f) return (true, t);
 		return (false, t);
+	}
+	def co<A, B>(fp: Array<A>, fr: Array<A>, tp: Array<B>, tr: Array<B>, l: (A, B) -> bool, r: (B, A) -> bool) -> bool {
+		if (fp.length != tp.length) return false;
+		if (fr.length != tr.length) return false;
+		for (i < fp.length) {
+			var f = fp[i], t = tp[i];
+			if (!r(t, f)) return false; // contra-variant
+		}
+		for (i < fr.length) {
+			var f = fr[i], t = tr[i];
+			if (!l(f, t)) return false; // co-variant
+		}
+		return true;
 	}
 }
