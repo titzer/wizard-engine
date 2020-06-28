@@ -5,6 +5,7 @@ all: bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
 
 clean:
 	rm -f bin/*
+	cp scripts/* bin/
 
 SRC=src/*.v3 src/*/*.v3
 TEST=test/*/*.v3
