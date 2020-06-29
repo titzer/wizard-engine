@@ -1,8 +1,16 @@
 #!/bin/bash
 
-WIZENG=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
+CYAN='[0;36m'
+RED='[0;31m'
+GREEN='[0;32m'
+NORM='[0;00m'
+
+if [ "$WIZENG_LOC" = "" ]; then
+    WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
+fi
 
 TEST_TARGET=jvm
+SPEC_ROOT=$WIZENG_LOC/wasm-spec
 
 WIZENG_OPTS=
 while [[ "$1" =~ ^\-.* ]]; do
@@ -16,14 +24,14 @@ done
 
 function run {
     BRANCH=$1
-    cd $WIZENG/wasm-spec/$BRANCH/test/core/bin/
+    cd $SPEC_ROOT/$BRANCH/test/core/bin/
     TESTS=$(ls *.bin.wast)
     COUNT=$(echo $TESTS | awk '{print NF}')
 
     # run unittests and pipe through progress program
     echo "##>${COUNT}"
     for t in $TESTS; do
-	$WIZENG/bin/spectest.$TEST_TARGET $WIZENG_OPTS $t
+	$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS $t
     done
 }
 
@@ -33,10 +41,10 @@ if [ "$BRANCHES" = "" ]; then
 fi
 
 for b in $BRANCHES; do
-    if [ ! -d "$WIZENG/wasm-spec/$b" ]; then
-	echo Spec branch \"$WIZENG/wasm-spec/$b\" does not exist.
+    if [ ! -d "$SPEC_ROOT/$b" ]; then
+	echo Spec branch \"$SPEC_ROOT/$b\" does not exist.
 	exit 1
     fi
-    echo Testing $b
-    run $b | tee /tmp/wizeng-spec-$b.out | progress
+    echo Testing ${CYAN}$SPEC_ROOT/$b${NORM}
+    run $b | tee /tmp/wizeng-spec-$b.out | progress tt
 done
