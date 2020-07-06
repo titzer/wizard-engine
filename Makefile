@@ -1,33 +1,25 @@
 # TODO: reenable native targets when floating point is supported
 #all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
 
-all: bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
+all: bin/unittest.jvm bin/spectest.jvm bin/wave.jvm
 
 clean:
 	rm -f bin/*
 	cp scripts/* bin/
 
-SRC=src/*.v3 src/*/*.v3
-TEST=test/*/*.v3
-SPEC=test/spec/*.v3
+ENGINE=src/engine/*.v3 src/util/*.v3
+UNITTEST=test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
+SPECTEST=test/spectest/*.v3 test/spectest.main.v3
+WAVE=src/wave/*.v3 src/wave.main.v3
 
-bin/wizeng.x86-linux: $(SRC)
-	v3c-x86-linux -fp -output=bin/ -program-name=wizeng.x86-linux -heap-size=512m $(SRC)
-
-bin/unittest.x86-linux: $(SRC) $(TEST)
-	v3c-x86-linux -fp -output=bin/ -program-name=unittest.x86-linux -heap-size=512m $(SRC) $(TEST)
-
-bin/spectest.x86-linux: $(SRC) $(TEST)
-	v3c-x86-linux -fp -output=bin/ -program-name=spectest.x86-linux -heap-size=512m $(SRC) $(SPEC)
-
-bin/wizeng.jvm: $(SRC)
-	v3c-jar -fp -output=bin/ -program-name=wizeng $(SRC)
-	mv bin/wizeng bin/wizeng.jvm
-
-bin/unittest.jvm: $(SRC) $(TEST)
-	v3c-jar -fp -output=bin/ -program-name=unittest $(SRC) $(TEST)
+bin/unittest.jvm: $(ENGINE) $(UNITTEST)
+	v3c-jar -fp -output=bin/ -heap-size=512m $(ENGINE) $(UNITTEST)
 	mv bin/unittest bin/unittest.jvm
 
-bin/spectest.jvm: $(SRC) $(TEST)
-	v3c-jar -fp -output=bin/ -program-name=spectest $(SRC) $(SPEC)
+bin/spectest.jvm: $(ENGINE) $(SPECTEST)
+	v3c-jar -fp -output=bin/ $(ENGINE) $(SPECTEST)
 	mv bin/spectest bin/spectest.jvm
+
+bin/wave.jvm: $(ENGINE) $(SPEC)
+	v3c-jar -fp -output=bin/ $(ENGINE) $(WAVE)
+	mv bin/wave bin/wave.jvm

@@ -11,8 +11,9 @@ fi
 
 echo Testing ${CYAN}unit${NORM}
 
-SRC=$(find $WIZENG_LOC/src -name '*.v3')
-TEST=$(find $WIZENG_LOC/test -name '*.v3')
+SRC="$WIZENG_LOC/src/*/*.v3"
+TEST="$WIZENG_LOC/test/*/*.v3"
+MAIN="$WIZENG_LOC/test/unittest.main.v3"
 LOG=/tmp/wizeng.unit.sh.log
 
 let PROGRESS_PIPE=1
@@ -41,7 +42,7 @@ fi
 
 # run unittests and pipe through progress program
 if [ $PROGRESS_PIPE = 1 ]; then
-    v3c -fp -run $SRC $TEST "$@" | tee $LOG | progress tt
+    v3c -fp -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tt
 else
-    v3c -fp $V3C_OPTS -run $SRC $TEST "$@"
+    v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@"
 fi
