@@ -3,6 +3,7 @@
 SCRIPT_LOC=$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)
 
 $SCRIPT_LOC/unit.sh
+$SCRIPT_LOC/wave.sh
 $SCRIPT_LOC/spec.sh
 $SCRIPT_LOC/spec.sh -ext:bulk-memory-operations bulk-memory-operations
 $SCRIPT_LOC/spec.sh -ext:bulk-memory-operations -ext:reference-types reference-types

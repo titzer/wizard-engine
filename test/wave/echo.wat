@@ -3,7 +3,7 @@
   (func $arg_copy (import "wave" "arg_copy") (param i32 i32 i32) (result i32))
   (func $fs_write (import "wave" "fs_write") (param i32 i32 i32) (result i32))
   
-  (memory (export "memory") 1)
+  (memory (export "mem") 1)
 
   (func (export "main") (param $argc i32) (result i32)
     (local $x i32)
