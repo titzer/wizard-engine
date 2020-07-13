@@ -13,7 +13,7 @@ SPECTEST=test/spectest/*.v3 test/spectest.main.v3
 WAVE=src/wave/*.v3 src/wave.main.v3
 
 bin/unittest.jvm: $(ENGINE) $(UNITTEST)
-	v3c-jar -fp -program-name=unittest -output=bin/ -heap-size=512m $(ENGINE) $(UNITTEST)
+	v3c-jar -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST)
 	mv bin/unittest bin/unittest.jvm
 
 bin/spectest.jvm: $(ENGINE) $(SPECTEST)
@@ -23,3 +23,12 @@ bin/spectest.jvm: $(ENGINE) $(SPECTEST)
 bin/wave.jvm: $(ENGINE) $(WAVE)
 	v3c-jar -fp -program-name=wave -output=bin/ $(ENGINE) $(WAVE)
 	mv bin/wave bin/wave.jvm
+
+bin/unittest.wasm: $(ENGINE) $(UNITTEST)
+	v3c-wave -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST)
+
+bin/spectest.wasm: $(ENGINE) $(SPECTEST)
+	v3c-wave -fp -program-name=spectest -output=bin/ $(ENGINE) $(SPECTEST)
+
+bin/wave.wasm: $(ENGINE) $(WAVE)
+	v3c-wave -fp -program-name=wave -output=bin/ $(ENGINE) $(WAVE)
