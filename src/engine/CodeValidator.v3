@@ -30,7 +30,28 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl_stack.clear();
 		val_stack.clear();
 		ctlxfer.reset(parser.decoder.pos);
-		setupLocals();
+
+		// setup params
+		locals.resize(0);
+		locals.puta(func.sig.params);
+		// read and initialize locals
+		var start = locals.length, max = limits.max_num_locals;
+		var dcount = parser.readU32("local decl count", 0, max);
+		for (i < dcount) {
+			var pt = parser.decoder.pos;
+			var count = parser.readU32("local count", 0, max);
+			var ltype = parser.readValueType();
+			if (!err.ok()) return reterr();
+			if (trace != null) traceLocals(count, ltype);
+			locals.putn(ltype, int.!(count));
+			var size = locals.length - start;
+			if (size > max) {
+				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
+				return reterr();
+			}
+		}
+		func.code.num_locals = locals.length;
+
 		opcode_pos = parser.decoder.pos;
 		pushControl(Opcode.UNREACHABLE.code, f.sig, 0);
 		validateCode();
@@ -39,30 +60,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		}
 		func.code.ctl_xfer = ctlxfer.extract();
 		if (err.ok()) return CodeValidatorResult.Ok;
-		else return CodeValidatorResult.Error(err.error_code, err.error_pos, err.error_msg);
+		return reterr();
 	}
-
-	def setupLocals() {
-		// setup params
-		locals.resize(0);
-		locals.puta(func.sig.params);
-		// read and initialize locals
-		var start = locals.length, max = limits.max_num_locals;
-		var d = parser.readU32("local decl count", 0, max);
-		for (i < d) {
-			var pt = parser.decoder.pos;
-			var count = parser.readU32("local count", 0, max);
-			if (!err.ok()) break;
-			var ltype = parser.readValueType();
-			if (trace != null) traceLocals(count, ltype);
-			locals.putn(ltype, int.!(count));
-			var size = locals.length - start;
-			if (size > max) {
-				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
-				break;
-			}
-		}
-		func.code.num_locals = locals.length;
+	def reterr() -> CodeValidatorResult.Error {
+		return CodeValidatorResult.Error(err.error_code, err.error_pos, err.error_msg);
 	}
 	def traceLocals(count: u32, ltype: ValueType) {
 		trace.put2("  locals %d: %q\n", count, ValueTypes.render(_, ltype));
@@ -210,27 +211,40 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					setUnreachable();
 				}
 				Opcode.CALL_REF.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var t = popAny();
-					if (!ValueType.Function.?(t)) return err_atpc().ExpectedFunctionTypeT(t);
-					var sig = ValueType.Function.!(t).sig;
-					checkSignature(sig);
+					match (t) {
+						RefFunc(sig) => checkSignature(sig);
+						RefNullFunc(sig) => checkSignature(sig);
+						_ => return err_atpc().ExpectedFunctionTypeT(t);
+					}
 				}
 				Opcode.RETURN_CALL_REF.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var t = popAny();
-					if (!ValueType.Function.?(t)) return err_atpc().ExpectedFunctionTypeT(t);
-					var sig = ValueType.Function.!(t).sig;
+					var sig: FuncSig;
+					match (t) {
+						RefFunc(s) => sig = s;
+						RefNullFunc(s) => sig = s;
+						_ => return err_atpc().ExpectedFunctionTypeT(t);
+					}
 					checkAndPopArgs(sig.params);
 					checkReturnSig(sig.results);
 					setUnreachable();
 				}
 				Opcode.FUNC_BIND.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var index = parser.decoder.read_u32leb();
 					var t = popAny();
-					if (!ValueType.Function.?(t)) return err_atpc().ExpectedFunctionTypeT(t);
-					var sig = ValueType.Function.!(t).sig;
+					var sig: FuncSig;
+					match (t) {
+						RefFunc(s) => sig = s;
+						RefNullFunc(s) => sig = s;
+						_ => return err_atpc().ExpectedFunctionTypeT(t);
+					}
 					if (index >= sig.params.length) return err_atpc().OobParamIndex(index, sig);
 					popE(sig.params[index]);
-					val_stack.push(ValueType.Function(sig.bindParam(index)));
+					val_stack.push(ValueType.RefFunc(sig.bindParam(index)));
 				}
 				Opcode.DROP.code => {
 					popAny();
@@ -360,20 +374,22 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (func == null) return;
 					if (!func.reffed) err_atpc().IllegalFuncRef(f.0);
 					var ftype = if(extensions.FUNCTION_REFERENCES,
-						ValueType.Function(func.sig),
+						ValueType.RefFunc(func.sig),
 						ValueType.FUNCREF);
 					val_stack.push(ftype);
 				}
 				Opcode.REF_AS_NON_NULL.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var t = popAny(), r: ValueType;
 					match (t) {
-						FUNCREF, EXTERNREF => r = t;
-						Function, Extern => r = t; // TODO: nonnull versions
+						FUNCREF, EXTERNREF, Extern => r = t;
+						RefNullFunc(sig) => r = ValueType.RefFunc(sig);
 						_ => err_atpc().ExpectedRefType(t);
 					}
 					val_stack.push(r);
 				}
 				Opcode.BR_ON_NULL.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
