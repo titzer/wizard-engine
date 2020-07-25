@@ -1,7 +1,7 @@
 # TODO: reenable native targets when floating point is supported
 #all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
 
-all: bin/unittest.jvm bin/spectest.jvm bin/wave.jvm bin/jawa.jvm
+all: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm
 
 clean:
 	rm -f bin/*
@@ -13,7 +13,7 @@ SPECTEST=test/spectest/*.v3 test/spectest.main.v3
 WAVE=src/wave/*.v3 src/wave.main.v3
 JAWA=src/jawa/*.v3 src/jawa.main.v3
 
-bin/unittest.jvm: $(ENGINE) $(UNITTEST)
+bin/unittest.jvm: $(ENGINE) $(UNITTEST) # TODO: dependencies on jawa
 	v3c-jar -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST)
 	mv bin/unittest bin/unittest.jvm
 
