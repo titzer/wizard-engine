@@ -24,6 +24,9 @@ class BinParser {
 	private var fsm: BpFsm;
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var total_module_size: int;
+	private var declared_func_count: u32;
+	private var func_body_cursor: int;
+	private var last_count: u32;
 
 	// Push new data into the parser from the specified range. The given
 	// array is not modified or retained by this call; internal copies of
@@ -37,7 +40,7 @@ class BinParser {
 	// Finish the decoding of the pushed bytes, returning a valid module
 	// upon success, or an error.
 	def finish() -> BinParserResult {
-		var func_count = module.functions.declared.length;
+		var func_count = declared_func_count;
 		if (func_count > 0 && !seen_sections[BpSection.Code.code]) {
 			err.at(parser.decoder).MissingCodeSection(func_count);
 		}
@@ -65,14 +68,17 @@ class BinParser {
 					ReadClosureOf.new(module.types, parser.readDefType));
 			Import => readMultiple("imports", size, limits.max_num_imports,
 					ReadClosureOf.new(module.imports, parser.readImportDecl));
-			Function => readMultiple("functions", size, limits.max_num_functions,
-					ReadClosureOf.new(module.functions.declared, parser.readFunctionDecl));
+			Function => {
+				readMultiple("functions", size, limits.max_num_functions,
+					ReadClosureOf.new(module.functions, parser.readFunctionDecl));
+				declared_func_count = last_count;
+			}
 			Table => readMultiple("tables", size, limits.max_num_tables,
-					ReadClosureOf.new(module.tables.declared, parser.readTableDecl));
+					ReadClosureOf.new(module.tables, parser.readTableDecl));
 			Memory => readMultiple("memories", size, limits.max_num_memories,
-					ReadClosureOf.new(module.memories.declared, parser.readMemoryDecl));
+					ReadClosureOf.new(module.memories, parser.readMemoryDecl));
 			Global => readMultiple("globals", size, limits.max_num_globals,
-					ReadClosureOf.new(module.globals.declared, parser.readGlobalDecl));
+					ReadClosureOf.new(module.globals, parser.readGlobalDecl));
 			Export => readMultiple("exports", size, limits.max_num_exports,
 					ReadClosureWithArgOf.new(module.exports, StringSet.new, parser.readExportDecl));
 			Start => readStartSection();
@@ -106,9 +112,9 @@ class BinParser {
 			return err.abs(abspos - 1).DuplicateSection(kind);
 		} else {
 			seen_sections[kind.code] = true;
-			var expected = module.functions.declared.length;
-			if (count != expected) {
-				err.abs(abspos).FuncCountMismatch(expected, count);
+			if (count != declared_func_count) {
+				// TODO: count >= remaining_func_count ?
+				err.abs(abspos).FuncCountMismatch(declared_func_count, count);
 			}
 		}
 	}
@@ -127,7 +133,7 @@ class BinParser {
 	def readMultiple(thing_name: string, size: u32,
 		max: u32, closure: ReadClosure) {
 		var decoder = parser.decoder;
-		var count = parser.readU32(thing_name, 0, max);
+		var count = last_count = parser.readU32(thing_name, 0, max);
 		closure.setCount(count);
 		if (!err.ok()) return;
 		for (index < int.!(count)) {
@@ -159,12 +165,17 @@ class BinParser {
 	def decodeFunctionBody(index: u32, size: u32, d: Decoder) {
 		var decoder = parser.decoder = d;
 		var start = decoder.pos;
-		var body = decoder.read_bytes(int.!(size));
-		if (index >= module.functions.declared.usize()) {
-			err.at(d).FuncCountMismatch(module.functions.declared.length, index);
-			return;
+		var f: FunctionDecl, i = func_body_cursor;
+		while (true) {
+			if (i >= module.functions.length) {
+				err.at(d).FuncCountMismatch(declared_func_count, index);
+				return;
+			}
+			f = module.functions[i++];
+			if (!f.imported) break;
 		}
-		var f = module.functions.declared[int.!(index)];
+		func_body_cursor = i;
+		var body = decoder.read_bytes(int.!(size));
 		decoder.pos = start;
 		f.code = FunctionCode.new(body);
 		if (!validate_code) return;
@@ -287,7 +298,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		} else {
 			var b = readByte("table index", StringBuilder.putd);
 			if (b != 0) err.rel(decoder, pt).ExpectedTableIndexZeroByte(b);
-			checkIndex(pt, "table", 0, module.tables.usize());
+			checkIndex(pt, "table", 0, module.tables.length);
 			return 0;
 		}
 	}
@@ -305,15 +316,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return readIndex("function", module.functions);
 	}
 	def readMemoryIndex() -> int {
-		return readAndCheckIndex("memory", module.memories.usize()).1;
+		return readAndCheckIndex("memory", module.memories.length).1;
 	}
 	def readDataIndex() -> int {
-		var max = u32.!(module.data.length), ex = module.explicit_data_count;
-		if (ex > max) max = u32.!(ex);
+		var max = module.data.length, ex = module.explicit_data_count;
+		if (ex > max) max = ex;
 		return readAndCheckIndex("data", max).1;
 	}
 	def readElem() -> (int, ElemDecl) {
-		var t = readAndCheckIndex("memory", u32.view(module.elems.length));
+		var t = readAndCheckIndex("memory", module.elems.length);
 		return if(t.0, (t.1, module.elems[t.1]), (-1, null));
 	}
 	def readElemIndex() -> int {
@@ -326,22 +337,22 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		} else {
 			var b = readByte("memory index", StringBuilder.putd);
 			if (b != 0) err.rel(decoder, pt).ExpectedMemoryIndexZeroByte(b);
-			checkIndex(pt, "memory", 0, module.memories.usize());
+			checkIndex(pt, "memory", 0, module.memories.length);
 			return 0;
 		}
 	}
 	def readGlobal() -> (int, GlobalDecl) {
 		return readIndex("global", module.globals);
 	}
-	def readIndex<T>(quantity: string, space: IndexSpace<T>) -> (int, T) {
-		var t = readAndCheckIndex(quantity, space.usize());
+	def readIndex<T>(quantity: string, space: Vector<T>) -> (int, T) {
+		var t = readAndCheckIndex(quantity, space.length);
 		return (t.1, if(t.0, space[t.1]));
 	}
 	def readIndexV<T>(quantity: string, space: Vector<T>) -> (int, T) {
-		var t = readAndCheckIndex(quantity, u32.!(space.length));
+		var t = readAndCheckIndex(quantity, space.length);
 		return (t.1, if(t.0, space[t.1]));
 	}
-	def readAndCheckIndex(quantity: string, max: u32) -> (bool, int) {
+	def readAndCheckIndex(quantity: string, max: int) -> (bool, int) {
 		var pt = decoder.pos;
 		var index = decoder.read_u32leb();
 		if (trace != null) {
@@ -351,9 +362,9 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return checkIndex(pt, quantity, index, max);
 	}
-	def checkIndex(pt: int, quantity: string, index: u32, max: u32) -> (bool, int) {
+	def checkIndex(pt: int, quantity: string, index: u32, max: int) -> (bool, int) {
 		if (index >= max) {
-			err.rel(decoder, pt).OobIndex(quantity, index, max);
+			err.rel(decoder, pt).OobIndex(quantity, index, u32.!(max));
 			return (false, int.!(index));
 		}
 		return (true, int.!(index));
@@ -383,7 +394,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.ImportedT.code => {
 				if (extensions.TYPE_IMPORTS) {
 					var pt = decoder.pos;
-					var t = readAndCheckIndex("typedecl", u32.!(module.types.length));
+					var t = readAndCheckIndex("typedecl", module.types.length);
 					if (t.0) {
 						match (module.types[t.1]) {
 							Imported(t) => return ValueType.Imported(t);
@@ -512,7 +523,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			mem_index = readMemoryIndex();
 			flags ^= 0x40;  // flip flag back
 		} else {
-			checkIndex(pt, "memory", 0, module.memories.usize());
+			checkIndex(pt, "memory", 0, module.memories.length);
 		}
 		var offset = readU32("memarg offset", 0, u32.max);
 		return (flags, mem_index, offset);
@@ -680,30 +691,30 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		match (kind) {
 			BpImportExportKind.Function.code => {
 				var sig = readSig();
-				var decl = FunctionDecl.new(module.functions.size(), sig.0, sig.1);
-				module.functions.imported.put(decl);
+				var decl = FunctionDecl.new(true, module.functions.length, sig.0, sig.1);
+				module.functions.put(decl);
 				details = ImportDetails.Function(decl);
 			}
 			BpImportExportKind.Table.code => {
 				checkMaxNumTables(pt);
 				var et = readElemType();
 				var l = readLimits("table", limits.max_table_size);
-				var decl = TableDecl.new(module.tables.size(), et, l.0, l.1);
-				module.tables.imported.put(decl);
+				var decl = TableDecl.new(module.tables.length, et, l.0, l.1);
+				module.tables.put(decl);
 				details = ImportDetails.Table(decl);
 			}
 			BpImportExportKind.Memory.code => {
 				checkMaxNumMemories(pt);
 				var l = readMemoryLimits("memory", limits.max_memory_pages);
-				var decl = MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
-				module.memories.imported.put(decl);
+				var decl = MemoryDecl.new(module.memories.length, l.0, l.1, l.2);
+				module.memories.put(decl);
 				details = ImportDetails.Memory(decl);
 			}
 			BpImportExportKind.Global.code => {
 				var t = readValueType();
 				var mut = readGlobalFlags();
-				var decl = GlobalDecl.new(module.globals.size(), t, mut, InitExpr.I32(0));
-				module.globals.imported.put(decl);
+				var decl = GlobalDecl.new(module.globals.length, t, mut, InitExpr.I32(0));
+				module.globals.put(decl);
 				details = ImportDetails.Global(decl);
 			}
 			BpImportExportKind.Type.code => {
@@ -732,18 +743,18 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	def readFunctionDecl(index: int) -> FunctionDecl {
 		var pt = decoder.pos;
 		var sig = readSig();
-		return FunctionDecl.new(module.functions.size(), sig.0, sig.1);
+		return FunctionDecl.new(false, module.functions.length, sig.0, sig.1);
 	}
 	def readTableDecl(index: int) -> TableDecl {
 		checkMaxNumTables(decoder.pos);
 		var et = readElemType();
 		var l = readLimits("table", limits.max_table_size);
-		return TableDecl.new(module.tables.size(), et, l.0, l.1);
+		return TableDecl.new(module.tables.length, et, l.0, l.1);
 	}
 	def readMemoryDecl(index: int) -> MemoryDecl {
 		checkMaxNumMemories(decoder.pos);
 		var l = readMemoryLimits("memory", limits.max_memory_pages);
-		return MemoryDecl.new(module.memories.size(), l.0, l.1, l.2);
+		return MemoryDecl.new(module.memories.length, l.0, l.1, l.2);
 	}
 	def readGlobalDecl(index: int) -> GlobalDecl {
 		var vt = readValueType();
@@ -753,7 +764,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		if (!ValueTypes.isAssignable(vti, vt)) {
 			err.at(decoder).TypeMismatchInGlobalInit(vt, vti);
 		}
-		return GlobalDecl.new(module.globals.size(), vt, mut, init.0);
+		return GlobalDecl.new(module.globals.length, vt, mut, init.0);
 	}
 	def readGlobalFlags() -> bool {
 		var pt = decoder.pos;
@@ -803,7 +814,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var vt: ValueType = ValueType.FUNCREF, mode: SegmentMode, details: ElemDetails;
 		match (flags) {
 			0 => {
-				var table_index = checkIndex(pt, "table", 0, module.tables.usize()).1;
+				var table_index = checkIndex(pt, "table", 0, module.tables.length).1;
 				var offset = readI32Expr("elements offset");
 				mode = SegmentMode.Active(table_index, offset);
 				details = readElemFuncIndexes(table_index);
@@ -826,7 +837,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				details = readElemFuncIndexes(int.max);
 			}
 			4 => {
-				var table_index = checkIndex(pt, "table", 0, module.tables.usize()).1;
+				var table_index = checkIndex(pt, "table", 0, module.tables.length).1;
 				var offset = readI32Expr("elements offset");
 				mode = SegmentMode.Active(table_index, offset);
 				details = readElemInitExprs(ValueType.FUNCREF);
@@ -861,7 +872,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	}
 	def readElemFuncIndexes(table_index: int) -> ElemDetails.FuncRefs {
 		var count = readU32("element count", 0, limits.max_num_table_entries);
-		if (table_index < module.tables.size()) {
+		if (table_index < module.tables.length) {
 			var elemType = module.tables[table_index].elemtype;
 			if (elemType != ValueType.FUNCREF) {
 				err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.FUNCREF);
@@ -898,7 +909,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var mode: SegmentMode;
 		match (flags) {
 			0 => {
-				var mem_index = checkIndex(pt, "memory", 0, module.memories.usize()).1;
+				var mem_index = checkIndex(pt, "memory", 0, module.memories.length).1;
 				var offset = readI32Expr("data element offset");
 				mode = SegmentMode.Active(mem_index, offset);
 			}
@@ -932,15 +943,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return trace;
 	}
 	def checkMaxNumTables(pt: int) {
-		var max = limits.max_num_tables, size = module.tables.usize();
+		var max = limits.max_num_tables, size = module.tables.length;
 		if (size >= max) {
-			err.rel(decoder, pt).QuantityExceededMaximum("total tables", size, max);
+			err.rel(decoder, pt).QuantityExceededMaximum("total tables", u32.!(size), max);
 		}
 	}
 	def checkMaxNumMemories(pt: int) {
-		var max = limits.max_num_memories, size = module.memories.usize();
+		var max = limits.max_num_memories, size = module.memories.length;
 		if (size >= max) {
-			err.rel(decoder, pt).QuantityExceededMaximum("total memories", size, max);
+			err.rel(decoder, pt).QuantityExceededMaximum("total memories", u32.!(size), max);
 		}
 	}
 
