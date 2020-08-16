@@ -5,7 +5,8 @@
 class CodeValidator(extensions: Extension.set, limits: Limits,
 		module: Module, err: WasmErrorGen) {
 	def parser = WasmParser.new(extensions, limits, module, err, null);
-	def locals = Vector<ValueType>.new();
+	var root = LocalsChunk.new(Vector.new(), null);
+	var locals: LocalsChunk;
 	def val_stack = Stack<ValueType>.new();
 	def ctl_stack = Stack<ControlEntry>.new();
 	def trace = if(Trace.verify, StringBuilder.new());
@@ -32,25 +33,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctlxfer.reset(parser.decoder.pos);
 
 		// setup params
-		locals.resize(0);
-		locals.puta(func.sig.params);
+		locals = root;
+		locals.vec.resize(0);
+		locals.vec.puta(func.sig.params);
 		// read and initialize locals
-		var start = locals.length, max = limits.max_num_locals;
-		var dcount = parser.readU32("local decl count", 0, max);
-		for (i < dcount) {
-			var pt = parser.decoder.pos;
-			var count = parser.readU32("local count", 0, max);
-			var ltype = parser.readValueType();
-			if (!err.ok()) return reterr();
-			if (trace != null) traceLocals(count, ltype);
-			locals.putn(ltype, int.!(count));
-			var size = locals.length - start;
-			if (size > max) {
-				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
-				return reterr();
-			}
-		}
-		func.code.num_locals = locals.length;
+		if (!readLocals(locals.vec)) return reterr();
+		func.code.num_locals = locals.vec.length;
 
 		opcode_pos = parser.decoder.pos;
 		pushControl(Opcode.UNREACHABLE.code, f.sig, 0);
@@ -61,6 +49,24 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		func.code.ctl_xfer = ctlxfer.extract();
 		if (err.ok()) return CodeValidatorResult.Ok;
 		return reterr();
+	}
+	def readLocals(vec: Vector<ValueType>) -> bool {
+		var start = vec.length, max = limits.max_num_locals;
+		var dcount = parser.readU32("local decl count", 0, max);
+		for (i < dcount) {
+			var pt = parser.decoder.pos;
+			var count = parser.readU32("local count", 0, max);
+			var ltype = parser.readValueType();
+			if (!err.ok()) return false;
+			if (trace != null) traceLocals(count, ltype);
+			vec.putn(ltype, int.!(count));
+			var size = vec.length - start;
+			if (size > max) {
+				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
+				return false;
+			}
+		}
+		return true;
 	}
 	def reterr() -> CodeValidatorResult.Error {
 		return CodeValidatorResult.Error(err.error_code, err.error_pos, err.error_msg);
@@ -137,6 +143,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						ctl_top.reachable = true;
 						pushTypes(ctl.sig.params);
 						checkArgsAndTransfer();
+						ctlxfer.bind(ctl, opcode_pos);
+					} else if (ctl.start_opcode == Opcode.LET.code) {
+						locals = locals.parent;
 						ctlxfer.bind(ctl, opcode_pos);
 					} else {
 						ctlxfer.bind(ctl, opcode_pos);
@@ -245,6 +254,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (index >= sig.params.length) return err_atpc().OobParamIndex(index, sig);
 					popE(sig.params[index]);
 					val_stack.push(ValueType.RefFunc(sig.bindParam(index)));
+				}
+				Opcode.LET.code => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
+					var sig = parser.readBlockType();
+					var vec = Vector<ValueType>.new(); // XXX: don't allocate a new vector?
+					readLocals(vec);
+					locals = LocalsChunk.new(vec, locals);
+					if (!err.ok()) return;
+					for (i < vec.length) popE(vec[i]);
+					checkArgsAndPushControl(opcode, sig);
 				}
 				Opcode.DROP.code => {
 					popAny();
@@ -663,11 +682,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		return result;
 	}
 	def getLocalType(index: u32) -> ValueType {
-		if (index >= locals.length) {
-			err_atpc().OobLocalIndex(index, locals.length);
-			return ValueType.I32;
+		for (c = locals; c != null; (index -= u32.view(c.vec.length), c = c.parent)) {
+			if (index < c.vec.length) return c.vec[int.view(index)];
 		}
-		return locals[int.!(index)];
+		err_atpc().OobLocalIndex(index, locals.vec.length); // TODO: wrong maximum
+		return ValueType.I32;
 	}
 	def traceStack(before: bool) {
 		if (before) trace.put1("    stack: %d| ", val_stack.top);
@@ -752,4 +771,6 @@ class CtlXferBuilder(trace: StringBuilder) {
 	def extract() -> Array<(u23, i23, u10, u23)> {
 		return if(entries.length > 0, entries.extract());
 	}
+}
+class LocalsChunk(vec: Vector<ValueType>, parent: LocalsChunk) {
 }
