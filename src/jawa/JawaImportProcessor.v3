@@ -2,36 +2,20 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def Stubs: JawaHostStubs; // configurability for stub generation
+def EMPTY: Array<byte> = [];
 
 // Processes a module's imports and supplies Jawa types, functions, and globals.
-class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module, result: Array<Exportable>) {
-	def decoder = Decoder.new([], error);
+class JawaImportProcessor extends ImportProcessor {
+	def env: JawaEnvironment;
 	def classDefs = Vector<JawaClassType>.new();
 	def interfaceDefs = Vector<JawaInterfaceType>.new();
 	def trace = if(Trace.jawa, StringBuilder.new());
-	var current_index = 0;
+	var decoder: Decoder;
 
-	// Main processing loop to decode and resolve imports.
-	def process() {
-		var imports = module.imports;
-		for (i < imports.length) {
-			current_index = i;
-			var imp = imports[i];
-			if (!Strings.equals("jawa", imp.modname)) continue; // not Jawa
-			if (trace != null) traceImport(imp);
-			if (result[i] != null) continue; // import already bound
-			var exp: Exportable;
-			match (imp.details) {
-				Function(decl) => exp = processFunction(imp.name, decl);
-				Global(decl) =>  exp = processGlobal(imp.name, decl);
-				Type(decl) =>  exp = processType(imp.name, decl);
-				Command => processCommand(imp.name);
-				_ => err1("invalid import of kind %s", imp.details.name);
-			}
-			if (error.error()) return;
-			result[i] = exp;
-		}
+	new(env: JawaEnvironment, binder: ImportBinder) super("jawa", binder) {
+		decoder = Decoder.new(EMPTY, binder.error);
 	}
+
 	def extractMainExport(instance: Instance) -> Function {
 		var module = instance.module;
 		var exports = module.exports;
@@ -45,6 +29,7 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		return null;
 	}
 	def processCommand(name: string) -> Exportable {
+		if (trace != null) traceImport(name);
 		if (name.length < 1) return err("empty command");
 		decoder.reset(name, 1, name.length - 1);
 		var opcode = name[0];
@@ -86,6 +71,7 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		return null;
 	}
 	def processFunction(name: string, decl: FuncDecl) -> Exportable {
+		if (trace != null) traceImport(name);
 		if (name.length < 1) return err("expected opcode for function import");
 		decoder.reset(name, 1, name.length - 1);
 		var opcode = name[0];
@@ -219,6 +205,7 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		return null;
 	}
 	def processGlobal(name: string, decl: GlobalDecl) -> Exportable {
+		if (trace != null) traceImport(name);
 		if (name.length < 1) return err("import of empty global");
 		decoder.reset(name, 1, name.length - 1);
 		var opcode = name[0];
@@ -241,6 +228,7 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		return null;
 	}
 	def processType(name: string, decl: ImportedType) -> Exportable {
+		if (trace != null) traceImport(name);
 		if (name.length < 1) return err("import of empty type");
 		decoder.reset(name, 1, name.length - 1);
 		var opcode = name[0];
@@ -372,7 +360,7 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		for (i < max) {
 			var b = decoder.read_u8();
 			if ((b & 0x80) != 0) {
-				error.at(decoder).set("Jawa int byte should not have upper bit set");
+				binder.error.at(decoder).set("Jawa int byte should not have upper bit set");
 				return 0;
 			}
 			result = result | (u32.!(b) << u5.!(shift));
@@ -462,14 +450,9 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		var i = read_ji4();
 		var msg_render: StringBuilder -> StringBuilder;
 		var type_index = int.view(i);
-		if (type_index >= module.types.length) {
-			msg_render = Strings.puts("out of bounds");
-		} else {
-			var t = module.types[type_index];
-			var e = result[t.import_index];
-			if (JawaType.?(e)) return JawaType.!(e); // success
-			msg_render = if(e == null, Strings.puts("<null>"), e.render);
-		}
+		var e = binder.getType(type_index);
+		if (JawaType.?(e)) return JawaType.!(e); // success
+		msg_render = if(e == null, Strings.puts("<null>"), e.render);
 		err(Strings.format3("expected jawa %s type, got %q @ module.types[%d]", kind, msg_render, type_index));
 		return null;
 	}
@@ -501,25 +484,20 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 	def read_method_ref() -> FuncDecl {
 		var i = read_ji4();
 		var func_index = int.view(i);
-		if (func_index >= module.functions.length) {
-			err1("expected function, got out of bounds @ module.functions[%d]", func_index);
-			return null;
-		} else {
-			// TODO: signature substitution
-			return module.functions[func_index];
-		}
+		var f = binder.getFunc(func_index);
+		// TODO: bounds check, signature check
+		return f;
 	}
 
 	// Tracing and error handling helpers
-	def traceImport(imp: ImportDecl) {
-		trace.put2("jawa import %s #%d:", imp.details.name, current_index);
-		var n = imp.name;
-		if (n.length > 0) {
-			var b = n[0], opname = JawaOpcodes.names[b];
+	def traceImport(name: string) {
+		trace.put2("jawa import %s #%d:", name, binder.import_pos);
+		if (name.length > 0) {
+			var b = name[0], opname = JawaOpcodes.names[b];
 			if (opname == null) opname = "invalid";
 			trace.put2(" %x (%s)", b, opname);
 		}
-		for (i = 1; i < n.length; i++) trace.put1(" %x", n[i]);
+		for (i = 1; i < name.length; i++) trace.put1(" %x", name[i]);
 		trace.ln();
 		trace.out(Trace.STDOUT);
 		trace.reset();
@@ -536,11 +514,11 @@ class JawaImportProcessor(error: ErrorGen, env: JawaEnvironment, module: Module,
 		return err("unimplemented");
 	}
 	def err(s: string) -> Exportable {
-		error.abs(current_index).set(s);
+		binder.error.abs(binder.import_pos).set(s);
 		return null;
 	}
 	def err1<T>(s: string, p: T) -> Exportable {
-		error.abs(current_index).set(Strings.format1(s, p));
+		binder.error.abs(binder.import_pos).set(Strings.format1(s, p));
 		return null;
 	}
 	def type_err(kind: string, got: JawaType, type_index: int) {

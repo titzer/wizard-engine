@@ -1,9 +1,12 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Extension point for import processing. An {ImportProcessor} lookups or materializes
+// an {Exportable} for a given name and import kind. It can use the {binder} as a
+// callback to access parts of the module that need polymorphic substitution.
 class ImportProcessor(name: string, binder: ImportBinder) {
 	new() {
-		binder.processors.put(this);
+		binder.processors.put(this); // install into binder's list of processors
 	}
 	def processCommand(name: string) -> Exportable { return null; }
 	def processFunction(name: string, decl: FuncDecl) -> Exportable { return null; }
@@ -13,17 +16,23 @@ class ImportProcessor(name: string, binder: ImportBinder) {
 	def processType(name: string, decl: ImportedType) -> Exportable { return null; }
 }
 
-class ImportBinder(module: Module, err: WasmErrorGen) {
+// Binding context and driver for import processing. Processes imports one by one, in
+// order, dispatching to the various {ImportProcessor}s to try to resolve imports.
+// Offers callbacks such as {getType()} and {getSig()} and {getFunc()} that perform
+// polymorphic type substitution.
+class ImportBinder(module: Module, error: WasmErrorGen) {
 	def bindings = Array<Exportable>.new(module.imports.length);
 	def processors = Vector<ImportProcessor>.new();
-	private def sigs = Array<FuncSig>.new(module.types.length);
-	private def funcs = Array<FuncDecl>.new(module.functions.length);
+	private def sigs = Array<FuncSig>.new(module.deftypes.length); // cached substituted sigs
+	private def funcs = Array<FuncDecl>.new(module.functions.length); // cached substituted funcs
 	def var import_pos: int;
 
+	// The main processing loop for all imports. Dispatches to various import processors.
 	def process() {
 		while (import_pos < bindings.length) {
 			var imp = module.imports[import_pos];
 			for (pi < processors.length) {
+				if (error.error()) break;
 				var p = processors[pi];
 				if (!Strings.equals(p.name, imp.modname)) continue;
 				var name = imp.name, exp: Exportable;
@@ -44,6 +53,7 @@ class ImportBinder(module: Module, err: WasmErrorGen) {
 		}
 	}
 
+	// Callbacks that perform polymorphic substitutions.
 	def getFunc(index: int) -> FuncDecl {
 		var func = funcs[index];
 		if (func == null) {
@@ -59,13 +69,21 @@ class ImportBinder(module: Module, err: WasmErrorGen) {
 	def getSig(index: int) -> FuncSig {
 		var sig = sigs[index];
 		if (sig == null) {
+			sig = DefType.Function.!(module.deftypes[index]).f;
 			sig = mapSig(sig);
 			sigs[index] = sig;
 		}
 		return sig;
 	}
+	def getType(index: int) -> Exportable {
+		if (index >= module.types.length) return null;
+		var t = module.types[index];
+		return bindings[t.import_index];
+	}
 
+	// Substitution utilities.
 	def mapSig(sig: FuncSig) -> FuncSig {
+		if (sig == null) return null;
 		var p = Arrays.map(sig.params, mapType);
 		var r = Arrays.map(sig.results, mapType);
 		return FuncSig.new(p, r);
@@ -74,18 +92,17 @@ class ImportBinder(module: Module, err: WasmErrorGen) {
 		match (t) {
 			RefFunc(sig) => return ValueType.RefFunc(mapSig(sig));
 			RefNullFunc(sig) => return ValueType.RefFunc(mapSig(sig));
-			Imported(it) => {
-				var xt = mapImportedType(it);
-				if (xt != null) return ValueType.Host(xt);
-				return ValueType.Imported(residual(it));
-			}
+			Imported(it) => return mapImportedType(it);
 			_ => return t;
 		}
 	}
-	def mapImportedType(it: ImportedType) -> HostType {
-		if (it.import_index >= import_pos) return null;
-		var r = bindings[it.import_index];
-		return if(HostType.?(r), HostType.!(r));
+	def mapImportedType(it: ImportedType) -> ValueType {
+		if (it.import_index >= import_pos) return ValueType.Imported(residual(it));
+		match (bindings[it.import_index]) {
+			x: HostType => return ValueType.Host(x);
+			x: ExportedValueType => return x.vt;
+			_ => return ValueType.Imported(residual(it));
+		}
 	}
 	def residual(it: ImportedType) -> ImportedType {
 		if (it.assignable.length == 0) return it;
