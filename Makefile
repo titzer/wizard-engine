@@ -13,8 +13,8 @@ SPECTEST=test/spectest/*.v3 test/spectest.main.v3
 WAVE=src/wave/*.v3 src/wave.main.v3
 JAWA=src/jawa/*.v3 src/jawa.main.v3
 
-bin/unittest.jvm: $(ENGINE) $(UNITTEST) # TODO: dependencies on jawa
-	v3c-jar -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST)
+bin/unittest.jvm: $(ENGINE) $(UNITTEST) $(JAWA) # TODO: dependencies on jawa
+	v3c-jar -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST) $(JAWA)
 	mv bin/unittest bin/unittest.jvm
 
 bin/spectest.jvm: $(ENGINE) $(SPECTEST)
