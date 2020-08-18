@@ -141,7 +141,7 @@ class BinParser {
 	def checkAndTrace(thing_name: string, i: int) -> bool {
 		if (err.error()) return false;
 		if (parser.trace != null) {
-			parser.trace.put2("==>%s #%d\n", thing_name, i).outln();
+			parser.trace.put2("==>%s #%d", thing_name, i).outln();
 		}
 		return true;
 	}
@@ -233,6 +233,8 @@ def renderTypecon(buf: StringBuilder, b: byte) -> StringBuilder {
 		BpTypecon.ExternRef.code => s = "externref";
 		BpTypecon.Function.code => s = "func";
 		BpTypecon.EmptyBlock.code => s = "empty";
+		BpTypecon.RefNullFuncT.code => s = "ref func";
+		BpTypecon.RefFuncT.code => s = "ref null func";
 	}
 	return buf.puts(s);
 }
@@ -385,9 +387,25 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		match (b) {
 			BpTypecon.FuncRef.code => return ValueType.FUNCREF;
 			BpTypecon.ExternRef.code => return ValueType.EXTERNREF;
+			BpTypecon.RefFuncT.code => {
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(readSig().1);
+			}
+			BpTypecon.RefNullFuncT.code => {
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readSig().1);
+			}
 		}
 		if (isTable) err.rel(decoder, pt).IllegalTableElementType(b);
 		else err.rel(decoder, pt).InvalidRefTypecon(b);
+		return ValueType.I32;
+	}
+	def readRefNullType() -> ValueType {
+		var pt = decoder.pos, b = decoder.peek_u8();
+		match (b) {
+			BpTypecon.FuncRef.code => { readByte("reftype", renderTypecon); return ValueType.FUNCREF; }
+			BpTypecon.ExternRef.code => { readByte("reftype", renderTypecon); return ValueType.EXTERNREF; }
+		}
+		if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readSig().1);
+		err.rel(decoder, pt).InvalidRefTypecon(byte.view(b));
 		return ValueType.I32;
 	}
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
@@ -424,7 +442,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			for (i = 0; i < count && i < max; i++) {
 				trace.put1("%c", toPrintableChar(decoder.data[pt + i]));
 			}
-			trace.puts("\"\n").outln();
+			trace.puts("\"").outln();
 		}
 		if (!Utf8.validate(str)) err.rel(decoder, pt).InvalidUtf8String();
 		return str;
@@ -434,7 +452,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var r = decoder.read_u8();
 		if (trace != null) {
 			traceBytes(pt, quantity);
-			trace.put2("%d (%q)\n", r, render(_, r)).outln();
+			trace.put2("%d (%q)", r, render(_, r)).outln();
 		}
 		return r;
 	}
@@ -449,6 +467,16 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.VEC128.code => return FUNC_VEC128;
 			BpTypecon.FuncRef.code => return FUNC_FUNCREF;
 			BpTypecon.ExternRef.code => return FUNC_EXTERNREF;
+			BpTypecon.RefFuncT.code => {
+				if (extensions.FUNCTION_REFERENCES) {
+					return FuncSig.new(SigCache.arr_v, [ValueType.RefFunc(readSig().1)]);
+				}
+			}
+			BpTypecon.RefNullFuncT.code => {
+				if (extensions.FUNCTION_REFERENCES) {
+					return FuncSig.new(SigCache.arr_v, [ValueType.RefNullFunc(readSig().1)]);
+				}
+			}
 		}
 		decoder.at(pt); // backup and try again as full signed LEB
 		var index = decoder.read_i32leb();
@@ -593,15 +621,22 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				vt = ValueType.F64;
 			}
 			Opcode.REF_NULL.code => {
-				vt = readRefType(false);
-				if (vt == ValueType.FUNCREF) expr = InitExpr.FuncRefNull;
-				else if (vt == ValueType.EXTERNREF) expr = InitExpr.ExternRefNull;
+				vt = readRefNullType();
+				match (vt) {
+					EXTERNREF => expr = InitExpr.ExternRefNull;
+					FUNCREF,
+					RefNullFunc => expr = InitExpr.FuncRefNull;
+					_ => ;
+				}
 			}
 			Opcode.REF_FUNC.code => {
 				var f = readFunc();
 				vt = ValueType.FUNCREF;
 				expr = InitExpr.FuncRef(f);
-				if (f.1 != null) f.1.reffed = true;
+				if (f.1 != null) {
+					f.1.reffed = true;
+					vt = ValueType.RefFunc(f.1.sig);
+				}
 			}
 			Opcode.GLOBAL_GET.code => {
 				var g = readGlobal();
@@ -838,8 +873,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var count = readU32("element count", 0, limits.max_num_table_entries);
 		if (table_index < module.tables.length) {
 			var elemType = module.tables[table_index].elemtype;
-			if (elemType != ValueType.FUNCREF) {
-				err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.FUNCREF);
+			match (elemType) {
+				FUNCREF => ; // TODO: type check
+				RefFunc(sig) => ; // TODO: type check
+				RefNullFunc(sig) => ; // TODO: type check
+				_ => err.at(decoder).TypeMismatchInElemInit(elemType, ValueType.FUNCREF);
 			}
 		}
 		var array = Array<int>.new(int.!(count));
@@ -997,7 +1035,7 @@ class BpFsm extends WasmParser {
 	private def advance() {
 		current_pos = decoder.pos;
 		if (trace != null) {
-			trace.put3("@+%d [%d bytes] BpFsm.state=%s\n", decoder.abs_pos(),
+			trace.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.abs_pos(),
 				decoder.available(), state.name).outln();
 		}
 		match (state) {
