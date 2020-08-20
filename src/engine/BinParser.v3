@@ -151,9 +151,11 @@ class BinParser {
 		var pt = decoder.pos;
 		var t = parser.readFunc(), index = t.0, func = t.1;
 		module.start_function = t.0;
-		if (func != null &&
-			(func.sig.params.length > 0 || func.sig.results.length > 0)) {
-			err.rel(decoder, pt).IllegalStartFunctionType(func.sig);
+		if (func != null) {
+			var sig = func.sig.funcsig;
+			if (sig.params.length > 0 || sig.results.length > 0) {
+				err.rel(decoder, pt).IllegalStartFunctionType(func.sig.funcsig);
+			}
 		}
 	}
 	def readDataCountSection() {
@@ -173,7 +175,7 @@ class BinParser {
 				return;
 			}
 			f = module.functions[i++];
-			if (!f.imported) break;
+			if (!f.imported()) break;
 		}
 		func_body_cursor = i;
 		var body = decoder.read_bytes(int.!(size));
@@ -275,18 +277,24 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return 0;
 		}
 	}
-	def readSig() -> (int, FuncSig) {
+	def readSig() -> (int, SigDecl) {
 		var pt = decoder.pos;
 		var r = readIndexV("signature", module.deftypes);
-		if (DefType.Function.?(r.1)) {
-			return (r.0, DefType.Function.!(r.1).f);
-		} else {
-			err.rel(decoder, pt).ExpectedFunctionType(r.0);
-			return (r.0, null);
+		match (r.1) {
+			x: SigDecl => return (r.0, SigDecl.!(r.1));
 		}
+		err.rel(decoder, pt).ExpectedFunctionType(r.0);
+		return (r.0, null);
+	}
+	def readFuncSig() -> FuncSig {
+		var sig = readSig().1;
+		return if(sig != null, sig.funcsig);
 	}
 	def readFunc() -> (int, FuncDecl) {
 		return readIndex("function", module.functions);
+	}
+	def readMemory() -> (int, MemoryDecl) {
+		return readIndex("memory", module.memories);
 	}
 	def readMemoryIndex() -> int {
 		return readAndCheckIndex("memory", module.memories.length).1;
@@ -358,10 +366,10 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				if (extensions.REFERENCE_TYPES) return ValueType.EXTERNREF;
 			}
 			BpTypecon.RefFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(readSig().1);
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(readFuncSig());
 			}
 			BpTypecon.RefNullFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readSig().1);
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readFuncSig());
 			}
 			BpTypecon.AbstractT.code => {
 				if (extensions.TYPE_IMPORTS) {
@@ -382,10 +390,10 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.FuncRef.code => return ValueType.FUNCREF;
 			BpTypecon.ExternRef.code => return ValueType.EXTERNREF;
 			BpTypecon.RefFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(readSig().1);
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(readFuncSig());
 			}
 			BpTypecon.RefNullFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readSig().1);
+				if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readFuncSig());
 			}
 		}
 		if (isTable) err.rel(decoder, pt).IllegalTableElementType(b);
@@ -398,7 +406,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.FuncRef.code => { readByte("reftype", renderTypecon); return ValueType.FUNCREF; }
 			BpTypecon.ExternRef.code => { readByte("reftype", renderTypecon); return ValueType.EXTERNREF; }
 		}
-		if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readSig().1);
+		if (extensions.FUNCTION_REFERENCES) return ValueType.RefNullFunc(readFuncSig());
 		err.rel(decoder, pt).InvalidRefTypecon(byte.view(b));
 		return ValueType.I32;
 	}
@@ -463,24 +471,24 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.ExternRef.code => return FUNC_EXTERNREF;
 			BpTypecon.RefFuncT.code => {
 				if (extensions.FUNCTION_REFERENCES) {
-					return FuncSig.new(SigCache.arr_v, [ValueType.RefFunc(readSig().1)]);
+					return FuncSig.new(SigCache.arr_v, [ValueType.RefFunc(readFuncSig())]);
 				}
 			}
 			BpTypecon.RefNullFuncT.code => {
 				if (extensions.FUNCTION_REFERENCES) {
-					return FuncSig.new(SigCache.arr_v, [ValueType.RefNullFunc(readSig().1)]);
+					return FuncSig.new(SigCache.arr_v, [ValueType.RefNullFunc(readFuncSig())]);
 				}
 			}
 		}
 		decoder.at(pt); // backup and try again as full signed LEB
 		var index = decoder.read_i32leb();
-		if (index < 0 || index >= module.deftypes.length) {
-			err.rel(decoder, pt).InvalidBlockType(index);
-			return SigCache.v_v;
+		if (index >= 0 && index < module.deftypes.length) {
+			match (module.deftypes[index]) {
+				x: SigDecl => return x.funcsig;
+			}
 		}
-		match (module.deftypes[index]) {
-			Function(f) => return f;
-		}
+		err.rel(decoder, pt).InvalidBlockType(index);
+		return SigCache.v_v;
 	}
 	def readLabel() -> u32 {
 		var depth = decoder.read_u32leb();
@@ -630,7 +638,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				expr = InitExpr.FuncRef(f);
 				if (f.1 != null) {
 					f.1.reffed = true;
-					vt = ValueType.RefFunc(f.1.sig);
+					vt = ValueType.RefFunc(f.1.sig.funcsig);
 				}
 			}
 			Opcode.GLOBAL_GET.code => {
@@ -658,8 +666,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		if (!err.ok()) return;
 		var rtypes = readValueTypes("result count", limits.max_num_func_results);
 		if (!err.ok()) return;
-		var d = DefType.Function(FuncSig.new(ptypes, rtypes));
-		module.deftypes.put(d);
+		var decl = SigDecl.new(FuncSig.new(ptypes, rtypes));
+		module.addDef(decl);
 	}
 	def readValueTypes(quantity: string, limit: u32) -> Array<ValueType> {
 		var count = readU32(quantity, 0, limit);
@@ -675,36 +683,27 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var field_name = readUtf8String("import field name");
 		var pt = decoder.pos;
 		var kind = readByte("import kind", renderImportKind);
-		var result: ImportDecl;
-		var details: ImportDetails;
+		var decl: Decl;
 		match (kind) {
 			BpImportExportKind.Function.code => {
-				var sig = readSig();
-				var decl = FuncDecl.new(true, module.functions.length, sig.0, sig.1);
-				module.functions.put(decl);
-				details = ImportDetails.Function(decl);
+				var sig = readSig().1;
+				decl = FuncDecl.new(sig);
 			}
 			BpImportExportKind.Table.code => {
 				checkMaxNumTables(pt);
 				var et = readElemType();
 				var l = readLimits("table", limits.max_table_size);
-				var decl = TableDecl.new(module.tables.length, et, l.0, l.1);
-				module.tables.put(decl);
-				details = ImportDetails.Table(decl);
+				decl = TableDecl.new(et, l.0, l.1);
 			}
 			BpImportExportKind.Memory.code => {
 				checkMaxNumMemories(pt);
 				var l = readMemoryLimits("memory", limits.max_memory_pages);
-				var decl = MemoryDecl.new(module.memories.length, l.0, l.1, l.2);
-				module.memories.put(decl);
-				details = ImportDetails.Memory(decl);
+				decl = MemoryDecl.new(l.0, l.1, l.2);
 			}
 			BpImportExportKind.Global.code => {
 				var t = readValueType();
 				var mut = readGlobalFlags();
-				var decl = GlobalDecl.new(module.globals.length, t, mut, InitExpr.I32(0));
-				module.globals.put(decl);
-				details = ImportDetails.Global(decl);
+				decl = GlobalDecl.new(t, mut, InitExpr.I32(0));
 			}
 			BpImportExportKind.Type.code => {
 				if (extensions.TYPE_IMPORTS) {
@@ -718,39 +717,36 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 						var t = readValueType();
 						vec.put(t);
 					}
-					var t = AbsType.new(index, module.abstypes.length, vec.extract());
-					module.abstypes.put(t);
-					details = ImportDetails.Type(t);
+					decl = AbsTypeDecl.new(vec.extract());
 				} else {
 					err.rel(decoder, pt).InvalidImportKind(kind);
 				}
 			}
 			BpImportExportKind.Command.code => {
-				details = ImportDetails.Command;
+				decl = ImportCommandDecl.new();
 			}
 			_ => err.rel(decoder, pt).InvalidImportKind(kind);
 		}
-		var d = ImportDecl.new(module_name, field_name, details);
-		module.imports.put(d);
+		module.addImport(module_name, field_name, decl);
 	}
 	def readFuncDecl(index: int) {
 		var pt = decoder.pos;
-		var sig = readSig();
-		var d = FuncDecl.new(false, module.functions.length, sig.0, sig.1);
-		module.functions.put(d);
+		var sig = readSig().1;
+		var decl = FuncDecl.new(sig);
+		module.addDef(decl);
 	}
 	def readTableDecl(index: int) {
 		checkMaxNumTables(decoder.pos);
 		var et = readElemType();
 		var l = readLimits("table", limits.max_table_size);
-		var d = TableDecl.new(module.tables.length, et, l.0, l.1);
-		module.tables.put(d);
+		var decl = TableDecl.new(et, l.0, l.1);
+		module.addDef(decl);
 	}
 	def readMemoryDecl(index: int) {
 		checkMaxNumMemories(decoder.pos);
 		var l = readMemoryLimits("memory", limits.max_memory_pages);
-		var d = MemoryDecl.new(module.memories.length, l.0, l.1, l.2);
-		module.memories.put(d);
+		var decl = MemoryDecl.new(l.0, l.1, l.2);
+		module.addDef(decl);
 	}
 	def readGlobalDecl(index: int) {
 		var vt = readValueType();
@@ -760,8 +756,8 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		if (!ValueTypes.isAssignable(vti, vt)) {
 			return err.at(decoder).TypeMismatchInGlobalInit(vt, vti);
 		}
-		var d = GlobalDecl.new(module.globals.length, vt, mut, init.0);
-		module.globals.put(d);
+		var decl = GlobalDecl.new(vt, mut, init.0);
+		module.addDef(decl);
 	}
 	def readGlobalFlags() -> bool {
 		var pt = decoder.pos;
@@ -779,28 +775,15 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		pt = decoder.pos;
 		var kind = readByte("export kind", renderImportKind);
-		var details: ExportDetails;
+		var decl: Decl;
 		match (kind) {
-			BpImportExportKind.Function.code => {
-				var index = readFunc().0;
-				details = ExportDetails.Function(index);
-			}
-			BpImportExportKind.Table.code => {
-				var index = readTable().0;
-				details = ExportDetails.Table(index);
-			}
-			BpImportExportKind.Memory.code => {
-				var index = readMemoryIndex();
-				details = ExportDetails.Memory(index);
-			}
-			BpImportExportKind.Global.code => {
-				var index = readGlobal().0;
-				details = ExportDetails.Global(index);
-			}
+			BpImportExportKind.Function.code => decl = readFunc().1;
+			BpImportExportKind.Table.code => decl = readTable().1;
+			BpImportExportKind.Memory.code => decl = readMemory().1;
+			BpImportExportKind.Global.code => decl = readGlobal().1;
 			_ => err.rel(decoder, pt).InvalidExportKind(kind);
 		}
-		var d = ExportDecl.new(name, details);
-		module.exports.put(d);
+		module.exports.put(name, decl);
 	}
 	def readElemDecl(index: int) {
 		var pt = decoder.pos;
