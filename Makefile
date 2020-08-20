@@ -37,3 +37,7 @@ bin/spectest.wasm: $(ENGINE) $(SPECTEST)
 
 bin/wave.wasm: $(ENGINE) $(WAVE)
 	v3c-wave -fp -program-name=wave -output=bin/ $(ENGINE) $(WAVE)
+
+bin/jawa.wasm: $(ENGINE) $(JAWA)
+	v3c-wave -fp -program-name=jawa -output=bin/ $(ENGINE) $(JAWA)
+
