@@ -1,0 +1,385 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Extension point for import processing. An {ImportProcessor} lookups or materializes
+// an {Exportable} for a given name and import kind. It can use the {binder} as a
+// callback to access parts of the module that need polymorphic substitution.
+class ImportProcessor(name: string, binder: ImportBinder) {
+	new() {
+		binder.processors.put(this); // install into binder's list of processors
+	}
+	def processCommand(name: string) -> Exportable { return null; }
+	def processAbsType(name: string, decl: AbsTypeDecl) -> Exportable { return null; }
+	def processFunction(name: string, decl: FuncDecl) -> Exportable { return null; }
+	def processTable(name: string, decl: TableDecl) -> Exportable { return null; }
+	def processMemory(name: string, decl: MemoryDecl) -> Exportable { return null; }
+	def processGlobal(name: string, decl: GlobalDecl) -> Exportable { return null; }
+}
+
+class ImportBinder(module: Module, error: WasmErrorGen) {
+	def processors = Vector<ImportProcessor>.new();
+	var import_pos: int;
+
+	def getAbsType(index: int) -> Exportable;
+	def getFuncDecl(index: int) -> FuncDecl;
+	def getFunction(index: int) -> Function;
+	def getSig(index: int) -> FuncSig;
+}
+
+// Creates {Instance} objects, given a module and a list of imports.
+class Instantiator extends ImportBinder {
+	def extensions: Extension.set;
+	def imports: Array<Exportable>;
+	private var instance: Instance;
+	var trap_reason: TrapReason;
+
+	new(extensions, module: Module, imports, error: WasmErrorGen) super(module, error) {
+		instance = Instance.new(module, imports);
+	}
+
+	def run() -> Instance {
+		for (j < module.decls.length) {
+			var d = module.decls[j];
+			if (d.imp != null) {  // imported declaration
+				var r = imports[d.imp.import_index];
+				match (d) {
+					decl: ImportCommandDecl => {
+						processImport(decl, ImportProcessor.processCommand);
+					}
+					decl: AbsTypeDecl => {
+						instance.abstypes[decl.abstype_index] = importAbsType(decl, r);
+					}
+					decl: FuncDecl => {
+						instance.functions[decl.func_index] = importFunction(decl, r);
+					}
+					decl: TableDecl => {
+						instance.tables[decl.table_index] = importTable(decl, r);
+					}
+					decl: MemoryDecl => {
+						instance.memories[decl.memory_index] = importMemory(decl, r);
+					}
+					decl: GlobalDecl => {
+						instance.globals[decl.global_index] = importGlobal(decl, r);
+					}
+					decl: EventDecl => ; // TODO: import event
+				}
+				continue;
+			}
+
+			match (d) { // non-imported declaration
+				decl: SigDecl => {
+					instance.sigs[decl.sig_index] = mapSig(decl.funcsig);
+				}
+				decl: StructDecl => {
+					// TODO: instantiate struct type
+				}
+				decl: ArrayDecl => {
+					// TODO: instantiate array type
+				}
+				decl: AbsTypeDecl => {
+					var t = ExportedValueType.new(ValueType.Abstract(decl));
+					instance.abstypes[decl.abstype_index] = t;
+				}
+				decl: FuncDecl => {
+					var i = decl.func_index;
+					var f = WasmFunction.new(instance, module.functions[i]);
+					instance.functions[i] = f;
+				}
+				decl: TableDecl => {
+					var t = if(decl.elemtype == ValueType.FUNCREF,
+						FunctionTable.new(decl),
+						ValueTable.new(decl));
+					if (t.oom) return fail("out of memory allocating table");
+					instance.tables[decl.table_index] = t;
+				}
+				decl: MemoryDecl => {
+					var i = decl.memory_index;
+					var m = Memory.new(module.memories[i]);
+					if (m.oom) return fail("out of memory allocating memory");
+					instance.memories[i] = m;
+				}
+				decl: GlobalDecl => {
+					var g = Global.new(decl);
+					instance.globals[decl.global_index] = g;
+					g.value = instance.evalInitExpr(decl.init);
+				}
+				decl: EventDecl => ; // TODO: instantiate event
+			}
+		}
+		if (!extensions.BULK_MEMORY) {
+			// Bounds-check element segments before performing any initialization.
+			for (i < module.elems.length) {
+				var e = module.elems[i];
+				match (e.mode) {
+					Active(index, offset) => checkElemBounds(index, offset, e.details);
+					_ => ;
+				}
+			}
+			if (error.error()) return null;
+
+			// Bounds-check any data segments before loading.
+			for (i < module.data.length) {
+				var d = module.data[i];
+				match (d.mode) {
+					Active(index, offset) => checkDataBounds(index, offset, d.data.length);
+					_ => ;
+				}
+			}
+			if (error.error()) return null;
+		}
+
+		// Load element segments.
+		for (i < module.elems.length) {
+			var e = module.elems[i];
+			match (e.mode) {
+				Passive => ;
+				Active(index, offset) => {
+					loadElems(index, offset, e);
+					instance.dropped_elems[i] = true;
+					if (error.error()) return null;
+				}
+				Declarative => {
+					instance.dropped_elems[i] = true;
+				}
+			}
+		}
+		// Load data segments.
+		for (i < module.data.length) {
+			var d = module.data[i];
+			match (d.mode) {
+				Passive => ;
+				Active(index, offset) => {
+					loadData(index, offset, d);
+					instance.dropped_data[i] = true;
+					if (error.error()) return null;
+				}
+				Declarative => {
+					instance.dropped_data[i] = true;
+				}
+			}
+		}
+
+		// Organize exports
+		var exports = instance.exports;
+		for (i < module.exports.length) {
+			exports[i] = getDecl(module.exports[i].1);
+		}
+
+		return instance;
+	}
+	def importAbsType(decl: AbsTypeDecl, r: Exportable) -> ExportedType {
+		if (r == null) r = processImport(decl, ImportProcessor.processAbsType(_, _, decl));
+		var xt: ExportedType, vt: ValueType;
+		match (r) {
+			x: HostType => { xt = x; vt = ValueType.Host(x); }
+			x: ExportedValueType => { xt = x; vt = x.vt; }
+			_ => fail("expected type");
+		}
+		for (c in decl.assignable) {
+			var ct = mapType(c);
+			if (!ValueTypes.isAssignable(vt, ct)) fail("type does not match constraint");
+		}
+		return xt;
+	}
+	def importFunction(decl: FuncDecl, r: Exportable) -> Function {
+		if (r == null) r = processImport(decl, ImportProcessor.processFunction(_, _, decl));
+		match (r) {
+			func: Function => {
+				var expected_sig = getFuncSig(decl.sig.sig_index);
+				if (!func.sig.isAssignableSig(expected_sig)) fail("function sig mismatch");
+				return func;
+			}
+		}
+		fail("expected function import");
+		return null;
+	}
+	def importTable(decl: TableDecl, r: Exportable) -> Table {
+		if (r == null) r = processImport(decl, ImportProcessor.processTable(_, _, decl));
+		match (r) {
+			table: Table => {
+				if (!checkLimits(table.decl.initial, table.decl.maximum, decl.initial, decl.maximum)) {
+					fail("table limits mismatch");
+				}
+				var expected_type = mapType(decl.elemtype);
+				var got_type = table.decl.elemtype;
+				if (got_type != expected_type) {  // TODO: proper equality check
+					fail("table element type mismatch");
+				}
+				return table;
+			}
+		}
+		fail("expected table import");
+		return null;
+	}
+	def importMemory(decl: MemoryDecl, r: Exportable) -> Memory {
+		if (r == null) r = processImport(decl, ImportProcessor.processMemory(_, _, decl));
+		match (r) {
+			memory: Memory => {
+				if (!checkLimits(memory.decl.initial, memory.decl.maximum, decl.initial, decl.maximum)) {
+					fail("memory limits mismatch");
+				}
+				if (memory.decl.shared != decl.shared) {
+					fail("memory sharing mismatch");
+				}
+				return memory;
+			}
+		}
+		fail("expected memory import");
+		return null;
+	}
+	def importGlobal(decl: GlobalDecl, r: Exportable) -> Global {
+		if (r == null) r = processImport(decl, ImportProcessor.processGlobal(_, _, decl));
+		match (r) {
+			global: Global => {
+				if (decl.mutable != global.decl.mutable) {
+					fail("global immutability mismatch");
+				}
+				var expected_type = mapType(decl.valtype);
+				var got_type = global.decl.valtype; // TODO
+				if (!ValueTypes.isAssignable(got_type, expected_type)) {
+					fail("global type mismatch");
+				}
+				if (!decl.mutable && !ValueTypes.isAssignable(got_type, expected_type)) {
+					fail("global type mismatch");
+				}
+				return global;
+			}
+		}
+		fail("expected global import");
+		return null;
+	}
+	def processImport(decl: Decl, f: (ImportProcessor, string) -> Exportable) -> Exportable {
+		import_pos = decl.imp.import_index;
+		var modname = decl.imp.module_name, fieldname = decl.imp.field_name;
+		for (i < processors.length) {
+			var p = processors[i];
+			if (Strings.equals(modname, p.name)) {
+				var r = f(p, fieldname);
+				if (r != null) {
+					imports[decl.imp.import_index] = r;
+					return r;
+				}
+			}
+		}
+		return null;
+	}
+
+	// Callbacks that perform polymorphic substitutions.
+	def getDecl(d: Decl) -> Exportable {
+		match (d) {
+			x: AbsTypeDecl => return instance.abstypes[x.abstype_index];
+			x: FuncDecl => return instance.functions[x.func_index];
+			x: TableDecl => return instance.tables[x.table_index];
+			x: MemoryDecl => return instance.memories[x.memory_index];
+			x: GlobalDecl => return instance.globals[x.global_index];
+		}
+		return null;
+	}
+	def getFuncDecl(func_index: int) -> FuncDecl {
+		var orig = module.functions[func_index];
+		var sig_decl = SigDecl.new(mapSig(orig.sig.funcsig));
+		sig_decl.sig_index = orig.sig.sig_index;
+		var func = FuncDecl.new(sig_decl);
+		func.func_index = func_index;
+		return func;
+	}
+	def getFunction(func_index: int) -> Function {
+		if (u32.view(func_index) >= instance.functions.length) return null;
+		return instance.functions[func_index];
+	}
+	def getFuncSig(sig_index: int) -> FuncSig {
+		if (u32.view(sig_index) >= instance.sigs.length) return null;
+		return instance.sigs[sig_index];
+	}
+	def getAbsType(abstype_index: int) -> ExportedType {
+		if (u32.view(abstype_index) >= instance.abstypes.length) return null;
+		return instance.abstypes[abstype_index];
+	}
+
+	// Substitution utilities.
+	def mapSig(sig: FuncSig) -> FuncSig {
+		if (sig == null) return null;
+		var p = Arrays.map(sig.params, mapType);
+		var r = Arrays.map(sig.results, mapType);
+		return FuncSig.new(p, r);
+	}
+	def mapType(t: ValueType) -> ValueType {
+		match (t) {
+			RefFunc(sig) => return ValueType.RefFunc(mapSig(sig));
+			RefNullFunc(sig) => return ValueType.RefFunc(mapSig(sig));
+			Abstract(it) => {
+				match (instance.abstypes[it.abstype_index]) {
+					x: HostType => return ValueType.Host(x);
+					x: ExportedValueType => return x.vt;
+					_ => return ValueType.Abstract(residual(it));
+				}
+			}
+			_ => return t;
+		}
+	}
+	def residual(it: AbsTypeDecl) -> AbsTypeDecl {
+		if (it.assignable.length == 0) return it;
+		var assignable = Arrays.map(it.assignable, mapType);
+		var nt = AbsTypeDecl.new(assignable);
+		nt.imp = it.imp;
+		nt.abstype_index = it.abstype_index;
+		return nt;
+	}
+
+	private def fail(msg: string) -> Instance {
+		error.error_msg = msg;
+		error.error_pos = 0;
+		return null;
+	}
+	private def checkLimits(fmin: u32, fmax: Max, tmin: u32, tmax: Max) -> bool {
+		if (fmin < tmin) return false;
+		match (tmax) {
+			None => return true;
+			Set(tmax_val) => match (fmax) {
+				None => return false;
+				Set(fmax_val) => return fmax_val <= tmax_val;
+			}
+		}
+	}
+	private def checkBounds(offset: u32, count: int, length: int, trap: TrapReason) -> bool {
+		var end = u64.!(offset) + u64.!(count);
+		if (end < offset || end > length) {
+			fail("out of bounds in initialization");
+			if (extensions.REFERENCE_TYPES || extensions.BULK_MEMORY) trap_reason = trap;
+			return false;
+		}
+		return true;
+	}
+	private def checkElemBounds(index: int, offset: InitExpr, details: ElemDetails) {
+		var offset = Value.I32.!(instance.evalInitExpr(offset)).val;
+		var size = instance.tables[index].size();
+		match (details) {
+			FuncRefs(vals) => checkBounds(offset, vals.length, size, TrapReason.TABLE_OUT_OF_BOUNDS);
+			Exprs(vals) => checkBounds(offset, vals.length, size, TrapReason.TABLE_OUT_OF_BOUNDS);
+		}
+	}
+	private def checkDataBounds(index: int, offset: InitExpr, dlength: int) {
+		var offset = Value.I32.!(instance.evalInitExpr(offset)).val;
+		var memory = instance.memories[index];
+		var mlength = if(memory != null, memory.data.length);
+		checkBounds(offset, dlength, mlength, TrapReason.MEM_OUT_OF_BOUNDS);
+	}
+	private def loadElems(index: int, offset: InitExpr, elems: ElemDecl) {
+		var dst_offset = Values.v_u(instance.evalInitExpr(offset));
+		var table = instance.tables[index];
+		var r = table.copyE(instance, dst_offset, elems, 0, u32.view(elems.details.length()));
+		if (r != TrapReason.NONE) {
+			fail("out of bounds in initialization");
+			trap_reason = r;
+		}
+	}
+	private def loadData(index: int, offset: InitExpr, ddecl: DataDecl) {
+		var dst_offset = Values.v_u(instance.evalInitExpr(offset));
+		var memory = instance.memories[index];
+		var r = memory.copyD(dst_offset, ddecl, 0, u32.view(ddecl.data.length));
+		if (r != TrapReason.NONE) {
+			fail("out of bounds in initialization");
+			trap_reason = r;
+		}
+	}
+}
