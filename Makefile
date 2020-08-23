@@ -29,8 +29,8 @@ bin/jawa.jvm: $(ENGINE) $(JAWA)
 	v3c-jar -fp -program-name=jawa -output=bin/ $(ENGINE) $(JAWA)
 	mv bin/jawa bin/jawa.jvm
 
-bin/unittest.wasm: $(ENGINE) $(UNITTEST)
-	v3c-wave -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST)
+bin/unittest.wasm: $(ENGINE) $(UNITTEST) $(JAWA) # TODO: dependencies on jawa
+	v3c-wave -fp -program-name=unittest -output=bin/ $(ENGINE) $(UNITTEST) $(JAWA)
 
 bin/spectest.wasm: $(ENGINE) $(SPECTEST)
 	v3c-wave -fp -program-name=spectest -output=bin/ $(ENGINE) $(SPECTEST)
