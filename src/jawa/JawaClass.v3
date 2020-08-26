@@ -1,7 +1,17 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-class JawaField(name: JawaString, index: int, typ: JawaType) {
+enum JawaFieldAttr(code: u16) {
+	PUBLIC(0x01),
+	PRIVATE(0x02),
+	PROTECTED(0x04),
+	FINAL(0x08),
+	VOLATILE(0x10),
+	TRANSIENT(0x20),
+	SYNTHETIC(0x40),
+	ENUM(0x80)
+}
+class JawaField(name: JawaString, attrs: JawaFieldAttr.set, index: int, typ: JawaType) {
 	def defaultValue() -> Value {
 		return JawaTypes.defaultValue(typ);
 	}
@@ -13,7 +23,21 @@ class JawaField(name: JawaString, index: int, typ: JawaType) {
 		return buf;
 	}
 }
-class JawaMethod(name: JawaString, params: Array<JawaType>, ret: JawaType, var impl: Function) {
+
+enum JawaMethodAttr(code: u16) {
+	PUBLIC(0x01),
+	PRIVATE(0x02),
+	PROTECTED(0x04),
+	FINAL(0x08),
+	SYNCHRONIZED(0x10),
+	BRIDGE(0x20),
+	VARARGS(0x40),
+	NATIVE(0x80),
+	ABSTRACT(0x100),
+	STRICT(0x200),
+	SYNTHETIC(0x400)
+}
+class JawaMethod(name: JawaString, attrs: JawaMethodAttr.set, params: Array<JawaType>, ret: JawaType, var impl: Function) {
 	var vtable_index = -1;
 	var itable_index = -1;
 	def sig(receiver: JawaType) -> FuncSig {
@@ -36,84 +60,118 @@ class JawaMethod(name: JawaString, params: Array<JawaType>, ret: JawaType, var i
 		ret.renderJ(buf);
 		return buf;
 	}
+	def override(pm: JawaMethod, err: ErrorGen) -> bool {
+		if (!name.equals(pm.name)) return false;
+		var mp = params, pmp = pm.params;
+		if (mp.length != pmp.length) return false;  // overloading
+		for (i < mp.length) {
+			if (mp[i] != pmp[i]) return false; // overloading
+		}
+		if (!ret.isAssignableToH(pm.ret)) {
+			err.abs(0).set(Strings.format1("cannot override return value in method %q", name.render));
+			return false;
+		}
+		return true;
+	}
 }
 
-// All built-in classes in Jawa.
-component JawaClasses {
-	def NO_INTERFACES: Array<JawaInterfaceType> = [];
+enum JawaClassAttr(code: u16) {
+	PUBLIC(0x01),
+	FINAL(0x02),
+	SUPER(0x04),
+	ABSTRACT(0x08),
+	SYNTHETIC(0x10),
+	ANNOTATION(0x20),
+	ENUM(0x40)
+}
+class JawaClassType extends JawaDeclType {
+	def parent: JawaClassType;
+	def attrs: JawaClassAttr.set;  // TODO
+	def interfaces: Array<JawaInterfaceType>;
+	var boilerplate: Array<Value>; 		// field values for newly created objects
+	var instanceFields: Array<JawaField>;
+	var instanceMethods: Array<JawaMethod>;
+	var staticFields: Array<JawaField>;
+	var staticMethods: Array<JawaMethod>;
+	var vtable: Array<JawaMethod>;				// virtual dispatch table
+	var itable: List<(JawaInterfaceType, Array<int>)>;	// interface dispatch table
+	var fields: Array<Value>;  		// static field values
 
-	def OBJECT = JawaClassType.new(JawaStrings.of("jawa/lang/Object"), null, NO_INTERFACES);
-	def STRING = JawaClassType.new(JawaStrings.of("jawa/lang/String"), OBJECT, NO_INTERFACES);
+	new(name: JawaString, parent, interfaces) super(name) { }
 
-	new() {
-		OBJECT.boilerplate = Values.NONE;
-		STRING.boilerplate = Values.NONE;
-		def NO_METHODS = Array<JawaMethod>.new(0);
-		def NO_FIELDS = Array<JawaField>.new(0);
-		OBJECT.instanceFields = OBJECT.staticFields = NO_FIELDS;
-		STRING.instanceFields = STRING.staticFields = NO_FIELDS;
-		OBJECT.instanceMethods = OBJECT.staticMethods = NO_METHODS;
-		STRING.instanceMethods = STRING.staticMethods = NO_METHODS;
-		OBJECT.vtable = [];
-		STRING.vtable = [];
+	def defined() -> bool {
+		return instanceFields != null;
 	}
-
-	def add(env: JawaEnvironment) {
-		env.add(OBJECT);
-		env.add(STRING);
+	def isAssignableTo(t: ValueType) -> bool {
+		match (t) {
+			Host(host) => return isAssignableToH(host);
+			EXTERNREF => return true;
+			_ => return false;
+		}
 	}
-	// Build vtable and itable for a class.
-	def buildIVTables(ct: JawaClassType, err: ErrorGen) {
+	def isAssignableToH(that: HostType) -> bool {
+		if (this == that) return true;
+		if (JawaInterfaceType.?(that)) return isAssignableToI(JawaInterfaceType.!(that));
+		if (JawaClassType.?(that)) {
+			for (t = this; t != null; t = t.parent) if (t == that) return true;
+		}
+		return false;
+	}
+	def isAssignableToI(that: JawaInterfaceType) -> bool {
+		for (i in interfaces) if (i.isAssignableToI(that)) return true;
+		return false;
+	}
+	def renderJ(buf: StringBuilder) -> StringBuilder {
+		return name.render(buf.putc('L')).putc(';');
+	}
+	// Build the {vtable} and {itable} for this class.
+	def buildTables(err: ErrorGen) {
+		if (vtable != null) return; // already built
 		var trace = if(Trace.jawa, TraceBuilder.new());
-		if (ct.parent == null) {
+		if (parent == null) {
 			if (trace != null) trace.put2("jawa vtable \"%q\", parent=null, %d entries",
-					ct.name.render, ct.instanceMethods.length)
+					name.render, instanceMethods.length)
 				.outln();
-			ct.vtable = Arrays.dup(ct.instanceMethods);
-			for (i < ct.vtable.length) ct.vtable[i].vtable_index = i;
-			buildITable(ct, err);
+			vtable = Arrays.dup(instanceMethods);
+			for (i < vtable.length) vtable[i].vtable_index = i;
+			for (i in interfaces) buildITableR(i, err);
 			return;
 		}
 		if (trace != null) trace.put3("jawa vtable \"%q\", parent=\"%q\", %d entries",
-				ct.name.render, ct.parent.name.render, ct.parent.vtable.length)
+				name.render, parent.name.render, parent.vtable.length)
 			.outln();
-		var vtable = Vector<JawaMethod>.new();
-		vtable.puta(ct.parent.vtable);
-		for (m in ct.instanceMethods) {
+		var vec = Vector<JawaMethod>.new();
+		vec.puta(parent.vtable);
+		for (m in instanceMethods) {
 			if (trace != null) trace.put1("  process \"%q\" ", m.name.render);
 			var found = false;
-			for (pm in ct.parent.vtable) {
+			for (pm in parent.vtable) {
 				if (!err.ok()) return;
-				if (override(m, pm, err)) {
+				if (m.override(pm, err)) {
 					m.vtable_index = pm.vtable_index;
-					vtable.set(m.vtable_index, m);
+					vec.set(m.vtable_index, m);
 					found = true;
 					if (trace != null) trace.put1("-> override @%d", m.vtable_index).outln();
 					break;
 				}
 			}
 			if (!found) {
-				m.vtable_index = vtable.length;
-				vtable.put(m);
+				m.vtable_index = vec.length;
+				vec.put(m);
 				if (trace != null) trace.put1("-> add @%d", m.vtable_index).outln();
 			}
 		}
-		ct.vtable = vtable.extract();
-		buildITable(ct, err);
+		vtable = vec.extract();
+		itable = if(parent != null, parent.itable);  // share itable list with parent
+		for (i in interfaces) buildITableR(i, err);
 	}
-	private def buildITable(ct: JawaClassType, err: ErrorGen) {
-		ct.itable = if(ct.parent != null, ct.parent.itable);  // share itable list with parent
-		for (i in ct.interfaces) { // add new interfaces for this class
-			buildITableR(ct, i, err);
-		}
-	}
-	private def buildITableR(ct: JawaClassType, i: JawaInterfaceType, err: ErrorGen) {
+	private def buildITableR(i: JawaInterfaceType, err: ErrorGen) {
 		var indexes = Array<int>.new(i.instanceMethods.length);
 		var found = false;
 		for (j < i.instanceMethods.length) {
 			var pm = i.instanceMethods[j];
-			for (m in ct.vtable) {
-				if (override(m, pm, err)) {
+			for (m in vtable) {
+				if (m.override(pm, err)) {
 					indexes[j] = m.vtable_index;
 					pm.itable_index = j;
 					found = true;
@@ -126,21 +184,41 @@ component JawaClasses {
 				return;
 			}
 		}
-		ct.itable = List.new((i, indexes), ct.itable);
+		itable = List.new((i, indexes), itable);
 
-		for (j in i.interfaces) buildITableR(ct, j, err);
+		for (j in i.interfaces) buildITableR(j, err);
 	}
-	def override(m: JawaMethod, pm: JawaMethod, err: ErrorGen) -> bool {
-		if (!m.name.equals(pm.name)) return false;
-		var mp = m.params, pmp = pm.params;
-		if (mp.length != pmp.length) return false;  // overloading
-		for (i < mp.length) {
-			if (mp[i] != pmp[i]) return false; // overloading
+}
+
+// Jawa interface types.
+class JawaInterfaceType extends JawaDeclType {
+	def interfaces: Array<JawaInterfaceType>;
+	var instanceMethods: Array<JawaMethod>;
+
+	new(name: JawaString, interfaces) super(name) { }
+
+	def defined() -> bool {
+		return instanceMethods != null;
+	}
+	def isAssignableTo(t: ValueType) -> bool {
+		match (t) {
+			Host(host) => return isAssignableToH(host);
+			EXTERNREF => return true;
+			_ => return false;
 		}
-		if (!m.ret.isAssignableToH(pm.ret)) {
-			err.abs(0).set(Strings.format1("cannot override return value in method %q", m.name.render));
-			return false;
-		}
-		return true;
+	}
+	def isAssignableToH(that: HostType) -> bool {
+		if (this == that) return true;
+		if (JawaInterfaceType.?(that)) return isAssignableToI(JawaInterfaceType.!(that));
+		if (JawaClassType.?(that)) return JawaClassType.!(that).parent == null; // jawa/lang/Object
+		return false;
+	}
+	def isAssignableToI(that: JawaInterfaceType) -> bool {
+		if (this == that) return true;
+		for (i in interfaces) if (i.isAssignableToI(that)) return true;
+		return false;
+	}
+	def renderJ(buf: StringBuilder) -> StringBuilder {
+		return name.render(buf.putc('L')).putc(';');
 	}
 }
