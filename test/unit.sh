@@ -24,7 +24,12 @@ if [[ "$1" =~ "-trace-calls=" ]]; then
     let PROGRESS_PIPE=0
 fi
 
-if [[ "$1" =~ "-trace" ]]; then
+if [[ "$1" =~ "--trace" ]]; then
+    # turn off the progress pipe in verbose mode
+    let PROGRESS_PIPE=0
+fi
+
+if [[ "$1" =~ "-t" ]]; then
     # turn off the progress pipe in verbose mode
     let PROGRESS_PIPE=0
 fi

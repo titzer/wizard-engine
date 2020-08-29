@@ -13,8 +13,13 @@ TEST_TARGET=jvm
 SPEC_ROOT=$WIZENG_LOC/wasm-spec
 
 WIZENG_OPTS=
+let PROGRESS_PIPE=1
 while [[ "$1" =~ ^\-.* ]]; do
-    if [[ "$1" =~ "\-trace" ]]; then
+    if [[ "$1" =~ "\--trace" ]]; then
+	# turn off the progress pipe in verbose mode
+	let PROGRESS_PIPE=0
+    fi
+    if [[ "$1" =~ "\-t" ]]; then
 	# turn off the progress pipe in verbose mode
 	let PROGRESS_PIPE=0
     fi
@@ -46,5 +51,9 @@ for b in $BRANCHES; do
 	exit 1
     fi
     echo Testing ${CYAN}$SPEC_ROOT/$b${NORM}
-    run $b | tee /tmp/wizeng-spec-$b.out | progress tt
+    if [ $PROGRESS_PIPE = 1 ]; then
+	run $b | tee /tmp/wizeng-spec-$b.out | progress tt
+    else
+	run $b | tee /tmp/wizeng-spec-$b.out
+    fi
 done
