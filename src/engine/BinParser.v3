@@ -65,8 +65,11 @@ class BinParser {
 		match (kind) {
 			Unknown => readCustomSection(size);
 			Type => {
+				var before = module.deftypes.length;
 				var count = parser.readU32("type count", 0, limits.max_num_types);
-				readLoop("type", count, WasmParser.readDefType);
+				var max_fw_index = u32.view(before) + count;
+				readLoop("type", count, WasmParser.readDefType(_, _, max_fw_index));
+				elimFwRefs(before);
 			}
 			Import => {
 				var count = parser.readU32("import count", 0, limits.max_num_imports);
@@ -113,6 +116,32 @@ class BinParser {
 		var read = d.pos - start;
 		if (read < size) {
 			err.at(d).IncompleteSection(kind.code, read, size);
+		}
+	}
+	def elimFwRefs(before: int) {
+		for (i = before; i < module.deftypes.length; i++) {
+			match(module.deftypes[i]) {
+				x: SigDecl => {
+					elimFwRefsInArray(x.funcsig.params);
+					elimFwRefsInArray(x.funcsig.results);
+				}
+				x: StructDecl => {
+					elimFwRefsInArray(x.field_types);
+				}
+				x: ArrayDecl => {
+					elimFwRefsInArray(x.elem_types);
+				}
+			}
+		}
+	}
+	def elimFwRefsInArray(vts: Array<ValueType>) {
+		for (i < vts.length) {
+			match (vts[i]) {
+				FwRef(nullable, index) => {
+					vts[i] = module.getRefType(nullable, int.view(index));
+				}
+				_ => ;
+			}
 		}
 	}
 	def beginCodeSection(abspos: int, count: u32) {
@@ -231,8 +260,17 @@ def renderTypecon(buf: StringBuilder, b: byte) -> StringBuilder {
 		BpTypecon.FuncRef.code => s = "funcref";
 		BpTypecon.ExternRef.code => s = "externref";
 		BpTypecon.EmptyBlock.code => s = "empty";
-		BpTypecon.RefNullFuncT.code => s = "ref null func";
-		BpTypecon.RefFuncT.code => s = "ref func";
+		BpTypecon.RefNullT.code => s = "ref null";
+		BpTypecon.RefT.code => s = "ref";
+	}
+	return buf.puts(s);
+}
+def renderTypeDecl(buf: StringBuilder, b: byte) -> StringBuilder {
+	var s = "unknown";
+	match (b) {
+		BpDefType.Function.code => s = "func";
+		BpDefType.Struct.code => s = "struct";
+		BpDefType.Array.code => s = "array";
 	}
 	return buf.puts(s);
 }
@@ -287,10 +325,6 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		err.rel(decoder, pt).ExpectedFunctionType(r.0);
 		return (r.0, null);
-	}
-	def readFuncSig() -> FuncSig {
-		var sig = readSig().1;
-		return if(sig != null, sig.funcsig);
 	}
 	def readFunc() -> (int, FuncDecl) {
 		return readIndex("function", module.functions);
@@ -354,35 +388,33 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return (true, int.!(index));
 	}
-	def readValueType() -> ValueType {
+	def readValueType(max_fw_index: u32) -> ValueType {
 		var pt = decoder.pos, b = readByte("value type", renderTypecon);
 		match (b) {
 			BpTypecon.I32.code => return ValueType.I32;
 			BpTypecon.I64.code => return ValueType.I64;
 			BpTypecon.F32.code => return ValueType.F32;
 			BpTypecon.F64.code => return ValueType.F64;
-			BpTypecon.VEC128.code => {
-				if (extensions.SIMD) return ValueType.VEC128;
+			BpTypecon.VEC128.code => if (extensions.SIMD) {
+				return ValueType.VEC128;
 			}
-			BpTypecon.FuncRef.code => {
-				if (extensions.REFERENCE_TYPES) return ValueType.FUNCREF;
+			BpTypecon.FuncRef.code => if (extensions.REFERENCE_TYPES) {
+				return ValueType.FUNCREF;
 			}
-			BpTypecon.ExternRef.code => {
-				if (extensions.REFERENCE_TYPES) return ValueType.EXTERNREF;
+			BpTypecon.ExternRef.code => if (extensions.REFERENCE_TYPES) {
+				return ValueType.EXTERNREF;
 			}
-			BpTypecon.RefFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(false, readFuncSig());
+			BpTypecon.RefT.code => if (extensions.FUNCTION_REFERENCES) {
+				return readRefTypeIndex(false, max_fw_index);
 			}
-			BpTypecon.RefNullFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(true, readFuncSig());
+			BpTypecon.RefNullT.code => if (extensions.FUNCTION_REFERENCES) {
+				return readRefTypeIndex(true, max_fw_index);
 			}
-			BpTypecon.AbstractT.code => {
-				if (extensions.TYPE_IMPORTS) {
-					var pt = decoder.pos;
-					var t = readIndex("type", module.abstypes);
-					if (t.1 != null) return ValueType.Abstract(t.1);
-					return ValueType.I32;
-				}
+			BpTypecon.AbstractT.code => if (extensions.TYPE_IMPORTS) {
+				var pt = decoder.pos;
+				var t = readIndex("type", module.abstypes);
+				if (t.1 != null) return ValueType.Abstract(t.1);
+				return ValueType.I32;
 			}
 		}
 
@@ -394,11 +426,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		match (b) {
 			BpTypecon.FuncRef.code => return ValueType.FUNCREF;
 			BpTypecon.ExternRef.code => return ValueType.EXTERNREF;
-			BpTypecon.RefFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(false, readFuncSig());
+			BpTypecon.RefT.code => if (extensions.FUNCTION_REFERENCES) {
+				return readRefTypeIndex(false, 0);
 			}
-			BpTypecon.RefNullFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(true, readFuncSig());
+			BpTypecon.RefNullT.code => if (extensions.FUNCTION_REFERENCES) {
+				return readRefTypeIndex(true, 0);
 			}
 		}
 		if (isTable) err.rel(decoder, pt).IllegalTableElementType(b);
@@ -408,12 +440,30 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	def readRefNullType() -> ValueType {
 		var pt = decoder.pos, b = decoder.peek_u8();
 		match (b) {
-			BpTypecon.FuncRef.code => { readByte("reftype", renderTypecon); return ValueType.FUNCREF; }
-			BpTypecon.ExternRef.code => { readByte("reftype", renderTypecon); return ValueType.EXTERNREF; }
+			BpTypecon.FuncRef.code => {
+				readByte("reftype", renderTypecon);
+				return ValueType.FUNCREF;
+			}
+			BpTypecon.ExternRef.code => {
+				readByte("reftype", renderTypecon);
+				return ValueType.EXTERNREF;
+			}
 		}
-		if (extensions.FUNCTION_REFERENCES) return ValueType.RefFunc(true, readFuncSig());
+		if (extensions.FUNCTION_REFERENCES) return readRefTypeIndex(true, 0);
 		err.rel(decoder, pt).InvalidRefTypecon(byte.view(b));
 		return ValueType.I32;
+	}
+	def readRefTypeIndex(nullable: bool, max_fw_index: u32) -> ValueType {
+		var pt = decoder.pos;
+		var index = readU32("type index", 0, u32.max);
+		var def_length = u32.view(module.deftypes.length);
+		if (index >= def_length) {
+			if (index < max_fw_index) return ValueType.FwRef(nullable, index);
+			if (max_fw_index > def_length) def_length = max_fw_index;
+			err.rel(decoder, pt).OobIndex("type index", index, def_length);
+			return ValueType.I32;
+		}
+		return module.getRefType(nullable, int.view(index));
 	}
 	def readU32(quantity: string, min: u32, max: u32) -> u32 {
 		var pt = decoder.pos;
@@ -474,23 +524,19 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			BpTypecon.VEC128.code => return FUNC_VEC128;
 			BpTypecon.FuncRef.code => return FUNC_FUNCREF;
 			BpTypecon.ExternRef.code => return FUNC_EXTERNREF;
-			BpTypecon.RefFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) {
-					return FuncSig.new(SigCache.arr_v, [ValueType.RefFunc(false, readFuncSig())]);
-				}
+			BpTypecon.RefT.code => if (extensions.FUNCTION_REFERENCES) {
+				var vt = readRefTypeIndex(false, 0);
+				return FuncSig.new(SigCache.arr_v, [vt]);
 			}
-			BpTypecon.RefNullFuncT.code => {
-				if (extensions.FUNCTION_REFERENCES) {
-					return FuncSig.new(SigCache.arr_v, [ValueType.RefFunc(true, readFuncSig())]);
-				}
+			BpTypecon.RefNullT.code => if (extensions.FUNCTION_REFERENCES) {
+				var vt = readRefTypeIndex(true, 0);
+				return FuncSig.new(SigCache.arr_v, [vt]);
 			}
-			BpTypecon.AbstractT.code => {
-				if (extensions.TYPE_IMPORTS) {
-					var pt = decoder.pos;
-					var t = readIndex("type", module.abstypes);
-					if (t.1 != null) return FuncSig.new(SigCache.arr_v, [ValueType.Abstract(t.1)]);
-					return SigCache.v_v;
-				}
+			BpTypecon.AbstractT.code => if (extensions.TYPE_IMPORTS) {
+				var pt = decoder.pos;
+				var t = readIndex("type", module.abstypes);
+				if (t.1 != null) return FuncSig.new(SigCache.arr_v, [ValueType.Abstract(t.1)]);
+				return SigCache.v_v;
 			}
 		}
 		decoder.at(pt); // backup and try again as full signed LEB
@@ -670,54 +716,49 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return (expr, vt);
 	}
-	def readDefType(index: int) {
+	def readDefType(index: int, max_fw_index: u32) {
 		var pt = decoder.pos;
-		var form = readByte("type constructor", renderTypecon);
-		match (form) {
+		var code = readByte("type decl code", renderTypeDecl);
+		var decl: Decl;
+		match (code) {
 			BpDefType.Function.code => {
 				pt = decoder.pos;
-				var ptypes = readValueTypes("param count", limits.max_num_func_params);
+				var ptypes = readValueTypes("param count", limits.max_num_func_params, max_fw_index);
 				if (!err.ok()) return;
-				var rtypes = readValueTypes("result count", limits.max_num_func_results);
+				var rtypes = readValueTypes("result count", limits.max_num_func_results, max_fw_index);
 				if (!err.ok()) return;
-				var decl = SigDecl.new(FuncSig.new(ptypes, rtypes));
-				module.addDef(decl);
-				return;
+				decl = SigDecl.new(FuncSig.new(ptypes, rtypes));
 			}
 			BpDefType.Struct.code => if (extensions.GC) {
 				var count = readU32("field count", 0, limits.max_num_struct_fields);
 				if (!err.ok()) return;
-				var ftypes = Array<FieldType>.new(int.!(count));
-				for (j < ftypes.length) ftypes[j] = readFieldType();
+				var field_types = Array<ValueType>.new(int.!(count));
+				var field_mut = Array<bool>.new(int.!(count));
+				for (j < field_types.length) {
+					field_types[j] = readValueType(max_fw_index);
+					field_mut[j] = readMutability();
+				}
 				if (!err.ok()) return;
-				var decl = StructDecl.new(ftypes);
-				module.addDef(decl);
-				return;
+				decl = StructDecl.new(field_types, field_mut);
 			}
 			BpDefType.Array.code => if (extensions.GC) {
-				var ftype = readFieldType();
+				var elem_type = readValueType(max_fw_index);
+				var elem_mut = readMutability();
 				if (!err.ok()) return;
-				var decl = ArrayDecl.new(ftype);
-				module.addDef(decl);
-				return;
+				decl = ArrayDecl.new([elem_type], [elem_mut]);
 			}
-			_ => ;
 		}
-		return err.rel(decoder, pt).ExpectedFunctionTypecon(form);
+		if (decl == null) err.rel(decoder, pt).InvalidTypeDeclCode(code);
+		else module.addDef(decl);
 	}
-	def readValueTypes(quantity: string, limit: u32) -> Array<ValueType> {
+	def readValueTypes(quantity: string, limit: u32, max_fw_index: u32) -> Array<ValueType> {
 		var count = readU32(quantity, 0, limit);
 		if (!err.ok()) return ValueTypes.NONE;
 		var types = Array<ValueType>.new(int.!(count));
 		for (j < types.length) {
-			types[j] = readValueType();
+			types[j] = readValueType(max_fw_index);
 		}
 		return types;
-	}
-	def readFieldType() -> FieldType {
-		var vt = readValueType();
-		var mut = readMutability();
-		return FieldType.new(vt, mut);
 	}
 	def readImportDecl(index: int) {
 		var module_name = readUtf8String("import module name");
@@ -750,12 +791,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				decl = MemoryDecl.new(l.0, l.1, l.2);
 			}
 			BpImportExportKind.Global.code => {
-				var t = readValueType();
+				var t = readValueType(0);
 				var mut = readMutability();
 				decl = GlobalDecl.new(t, mut, InitExpr.I32(0));
 			}
-			BpImportExportKind.AbsType.code => {
-				if (!extensions.TYPE_IMPORTS) return err.rel(decoder, pt).InvalidImportKind(kind);
+			BpImportExportKind.AbsType.code => if (extensions.TYPE_IMPORTS) {
 				var flags = decoder.read_u8();
 				var count = readU32("constraint count", 0, limits.max_num_type_constraints);
 				var vec = Vector<ValueType>.new();
@@ -763,18 +803,17 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 				for (i < count) {
 					var b = readByte("constraint type", renderNone);
 					if (b != 0) err.rel(decoder, pt).InvalidTypeConstraint(b);
-					var t = readValueType();
+					var t = readValueType(0);
 					vec.put(t);
 				}
 				decl = AbsTypeDecl.new(vec.extract());
 			}
-			BpImportExportKind.Command.code => {
-				if (!extensions.TYPE_IMPORTS) return err.rel(decoder, pt).InvalidImportKind(kind);
+			BpImportExportKind.Command.code => if (extensions.TYPE_IMPORTS) {
 				decl = ImportCommandDecl.new();
 			}
-			_ => err.rel(decoder, pt).InvalidImportKind(kind);
 		}
-		module.addImport(module_name, field_name, args, decl);
+		if (decl == null) err.rel(decoder, pt).InvalidImportKind(kind);
+		else module.addImport(module_name, field_name, args, decl);
 	}
 	def readFuncDecl(index: int) {
 		var pt = decoder.pos;
@@ -800,7 +839,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		module.addDef(decl);
 	}
 	def readGlobalDecl(index: int) {
-		var vt = readValueType();
+		var vt = readValueType(0);
 		var mut = readMutability();
 		var pos = decoder.pos;
 		var init = readInitExpr("global initializer"), vti = init.1;
