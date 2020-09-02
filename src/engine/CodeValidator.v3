@@ -37,7 +37,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		locals.vec.resize(0);
 		locals.vec.puta(sig.params);
 		// read and initialize locals
-		if (!readLocals(locals.vec)) return reterr();
+		if (!readLocals(locals.vec, false)) return reterr();
 		func.code.num_locals = locals.vec.length;
 
 		opcode_pos = parser.decoder.pos;
@@ -50,7 +50,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		if (err.ok()) return CodeValidatorResult.Ok;
 		return reterr();
 	}
-	def readLocals(vec: Vector<ValueType>) -> bool {
+	def readLocals(vec: Vector<ValueType>, inLet: bool) -> bool {
 		var start = vec.length, max = limits.max_num_locals;
 		var dcount = parser.readU32("local decl count", 0, max);
 		for (i < dcount) {
@@ -58,7 +58,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			var count = parser.readU32("local count", 0, max);
 			var pt2 = parser.decoder.pos;
 			var ltype = parser.readValueType(0);
-			if (!ValueTypes.hasDefaultValue(ltype)) {
+			if (!inLet && !ValueTypes.hasDefaultValue(ltype)) {
 				err.rel(parser.decoder, pt2).ExpectedTypeWithDefaultValue(ltype);
 			}
 			if (!err.ok()) return false;
@@ -223,51 +223,46 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				}
 				Opcode.CALL_REF.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
-					var t = popAny();
-					if (t.1) {
-						match (t.0) {
-							RefFunc(nullable, sig) => checkSignature(sig);
-							_ => return err_atpc().ExpectedFunctionTypeT(t.0);
-						}
-					}
+					var t = popAnyFunc();
+					if (t.1) checkSignature(t.0.sig);
 				}
 				Opcode.RETURN_CALL_REF.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
-					var t = popAny();
+					var t = popAnyFunc();
 					if (t.1) {
-						var sig: SigDecl;
-						match (t.0) {
-							RefFunc(nullable, s) => sig = s;
-							_ => return err_atpc().ExpectedFunctionTypeT(t.0);
-						}
-						checkAndPopArgs(sig.params);
-						checkReturnSig(sig.results);
+						checkAndPopArgs(t.0.sig.params);
+						checkReturnSig(t.0.sig.results);
 						setUnreachable();
 					}
 				}
 				Opcode.FUNC_BIND.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
-					var index = parser.decoder.read_u32leb();
-					var t = popAny();
+					var tsig = parser.readSig().1;
+					if (tsig == null) return;
+					var t = popAnyFunc();
 					if (t.1) {
-						var sig: SigDecl;
-						match (t.0) {
-							RefFunc(nullable, s) => sig = s;
-							_ => return err_atpc().ExpectedFunctionTypeT(t.0);
+						var fsig = t.0.sig;
+						var count = fsig.params.length - tsig.params.length;
+						if (count < 0) return err_atpc().ArityMismatchInFuncBind(tsig, fsig);
+						for (i < count) {
+							var pt = fsig.params[count - i - 1];
+							popE(pt);
 						}
-						if (index >= sig.params.length) return err_atpc().OobParamIndex(index, sig);
-						popE(sig.params[index]);
-						val_stack.push(ValueType.RefFunc(false, sig.bindParam(index)));
+						var residual = fsig.bindLeft(count);
+						if (!residual.isAssignableSig(tsig)) {
+							err_atpc().TypeMismatchInFuncBind(tsig, residual);
+						}
 					}
+					val_stack.push(ValueType.RefFunc(false, tsig));
 				}
 				Opcode.LET.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var sig = parser.readBlockType();
 					var vec = Vector<ValueType>.new(); // XXX: don't allocate a new vector?
-					readLocals(vec);
+					readLocals(vec, true);
 					locals = LocalsChunk.new(vec, locals);
 					if (!err.ok()) return;
-					for (i < vec.length) popE(vec[i]);
+					for (i < vec.length) popE(vec[vec.length - i - 1]);
 					checkArgsAndPushControl(opcode, sig);
 				}
 				Opcode.DROP.code => {
@@ -653,6 +648,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			return (ValueType.I32, false);
 		}
 		return (val_stack.pop(), true);
+	}
+	def popAnyFunc() -> (ValueType.RefFunc, bool) {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) err_atpc().EmptyValueStack();
+			return (ValueType.RefFunc(false, null), false);
+		}
+		var t = val_stack.pop();
+		if (ValueType.RefFunc.?(t)) return (ValueType.RefFunc.!(t), true);
+		err_atpc().ExpectedFunctionTypeT(t);
+		return (ValueType.RefFunc(false, null), false);
 	}
 	def pushTypes(r: Array<ValueType>) {
 		val_stack.pushA(r);
