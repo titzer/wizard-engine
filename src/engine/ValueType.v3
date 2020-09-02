@@ -8,6 +8,7 @@ type ValueType {
 	case F32;
 	case F64;
 	case VEC128;
+	case ANYREF;
 	case FUNCREF;
 	case EXTERNREF;
 	case RefFunc(nullable: bool, sig: SigDecl);
@@ -18,6 +19,9 @@ type ValueType {
 	case Host(host: HostType);
 
 	def render(buf: StringBuilder) -> StringBuilder {
+		return render2(null, buf);
+	}
+	def render2(seen: List<Decl>, buf: StringBuilder) -> StringBuilder {
 		var s: string;
 		match (this) {
 			I32 => s = "i32";
@@ -32,25 +36,26 @@ type ValueType {
 				else buf.puts("<null>");
 				return buf.puts(")");
 			}
+			ANYREF => s = "anyref";
 			FUNCREF => s = "funcref";
 			EXTERNREF => s = "externref";
 			RefFunc(nullable, sig) => {
 				buf.puts("(ref ");
 				if (nullable) buf.puts("null ");
-				if (sig != null) sig.render(buf);
+				if (sig != null) sig.render2(seen, buf);
 				else buf.puts("<null>");
 				return buf.puts(")");
 			}
-			RefStruct(nullable, fields) => {
+			RefStruct(nullable, struct) => {
 				buf.puts("(ref ");
 				if (nullable) buf.puts("null ");
-				buf.puts("struct"); // TODO
+				buf.put1("struct #%d", struct.struct_index);
 				return buf.puts(")");
 			}
-			RefArray(nullable, elem) => {
+			RefArray(nullable, array) => {
 				buf.puts("(ref ");
 				if (nullable) buf.puts("null ");
-				buf.puts("array"); // TODO
+				buf.put1("array #%d", array.array_index);
 				return buf.puts(")");
 			}
 			FwRef(nullable, index) => {
@@ -73,37 +78,25 @@ component ValueTypes {
 	}
 	def isRef(t: ValueType) -> bool {
 		match (t) {
-			FUNCREF, EXTERNREF, RefFunc, Host => return true;
+			FUNCREF, EXTERNREF, RefFunc, RefStruct, RefArray, Host => return true;
 			_ => return false;
 		}
 	}
 	def isAssignable(from: ValueType, to: ValueType) -> bool {
-		match (from) {
-			RefFunc(fnullable, fsig) => {
-				match (to) {
-					RefFunc(tnullable, tsig) => {
-						if (!tnullable && fnullable) return false;
-						return fsig != null && fsig.isAssignableSig(tsig);
-					}
-					FUNCREF => return true;
-					_ => return false;
-				}
-			}
-			Host(host) => {
-				return host != null && host.isAssignableTo(to);
-			}
-			Abstract(it) => {
-				return it != null && it.isAssignableTo(to);
-			}
-			_ => return from == to;
-		}
+		var c = TypeComparator.new();
+		var eq = c.compare(from, to);
+		return eq == TypeEquiv.EQUAL || eq == TypeEquiv.SUB;
 	}
 	def isEquivalent(x: ValueType, y: ValueType) -> bool {
-		return isAssignable(x, y) && isAssignable(y, x);
+		var c = TypeComparator.new();
+		var eq = c.compare(x, y);
+		return eq == TypeEquiv.EQUAL;
 	}
 	def hasDefaultValue(t: ValueType) -> bool {
 		match (t) {
 			RefFunc(nullable, sig) => return nullable;
+			RefStruct(nullable, struct) => return nullable;
+			RefArray(nullable, array) => return nullable;
 			_ => return true;
 		}
 	}
@@ -146,5 +139,162 @@ component ValueTypes {
 			r[i] = e.1;
 		}
 		return (true, r);
+	}
+}
+
+// Support for comparing recursive types. Computes the relation between
+// two types that may be mutually recursive, including subtyping between
+// structs, arrays, and functions.
+enum TypeEquiv {
+	UNRELATED,
+	SUPER,
+	EQUAL,
+	SUB
+}
+class TypeComparator {
+	private var stack: List<(Decl, Decl)>;
+	def compare(from: ValueType, to: ValueType) -> TypeEquiv {
+		if (from == to) return TypeEquiv.EQUAL;
+		match (from) {
+			EXTERNREF => match (to) {
+				ANYREF => return TypeEquiv.SUB;
+				_ => ;
+			}
+			FUNCREF => match (to) {
+				ANYREF => return TypeEquiv.SUB;
+				RefFunc => return TypeEquiv.SUPER;
+				_ => ;
+			}
+			ANYREF => match (to) {
+				EXTERNREF,
+				FUNCREF,
+				RefFunc,
+				RefStruct,
+				RefArray => return TypeEquiv.SUPER;
+				_ => ;
+			}
+			RefFunc(fnullable, fsig) => match (to) {
+				ANYREF, FUNCREF => return TypeEquiv.SUB;
+				RefFunc(tnullable, tsig) => {
+					var result = compareNullable(fnullable, tnullable);
+					if (push(fsig, tsig)) {
+						result = compareTypes(result, tsig.params, fsig.params);
+						result = compareTypes(result, fsig.results, tsig.results);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			RefStruct(fnullable, fstruct) => match (to) {
+				ANYREF => return TypeEquiv.SUB;
+				RefStruct(tnullable, tstruct) => {
+					var result = compareNullable(fnullable, tnullable);
+					if (push(fstruct, tstruct)) {
+						result = compareFields(result,
+							fstruct.field_types, fstruct.field_mut,
+							tstruct.field_types, tstruct.field_mut);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			RefArray(fnullable, farray) => match (to) {
+				ANYREF => return TypeEquiv.SUB;
+				RefArray(tnullable, tarray) => {
+					var result = compareNullable(fnullable, tnullable);
+					if (push(farray, tarray)) {
+						result = compareFields(result,
+							farray.elem_types, farray.elem_mut,
+							tarray.elem_types, tarray.elem_mut);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			Abstract(fabs) => match (to) {
+				Abstract(tabs) => {
+					if (fabs.isAssignableTo(to)) return TypeEquiv.SUB;
+					if (tabs.isAssignableTo(from)) return TypeEquiv.SUPER;
+					return TypeEquiv.UNRELATED;
+				}
+				_ => return if (fabs.isAssignableTo(to), TypeEquiv.SUB, TypeEquiv.UNRELATED);
+			}
+			Host(fhost) => match (to) {
+				Host(thost) => {
+					if (fhost.isAssignableTo(to)) return TypeEquiv.SUB;
+					if (thost.isAssignableTo(from)) return TypeEquiv.SUPER;
+					return TypeEquiv.UNRELATED;
+				}
+				_ => return if(fhost != null && fhost.isAssignableTo(to), TypeEquiv.SUB, TypeEquiv.UNRELATED);
+			}
+			_ => ;
+		}
+		// Left-hand side primitive, but right-hand side could still be abstract or host
+		match (to) {
+			Abstract(tabs) => if (tabs.isAssignableTo(from)) return TypeEquiv.SUPER;
+			Host(thost) => if (thost.isAssignableTo(from)) return TypeEquiv.SUPER;
+			_ => ;
+		}
+		return TypeEquiv.UNRELATED;
+	}
+	def compareTypes(eq: TypeEquiv, at: Array<ValueType>, bt: Array<ValueType>) -> TypeEquiv {
+		if (at.length != bt.length) return TypeEquiv.UNRELATED;
+		for (i < at.length) {
+			if (eq == TypeEquiv.UNRELATED) break;
+			var r = compare(at[i], bt[i]);
+			eq = combineEq(eq, r);
+		}
+		return eq;
+	}
+	def compareFields(eq: TypeEquiv, at: Array<ValueType>, am: Array<bool>, bt: Array<ValueType>, bm: Array<bool>) -> TypeEquiv {
+		var length = at.length;
+		if (length < bt.length) {
+			eq = combineEq(eq, TypeEquiv.SUPER);
+		} else if (length > bt.length) {
+			eq = combineEq(eq, TypeEquiv.SUB);
+			length = bt.length;
+		}
+
+		for (i < length) {
+			if (eq == TypeEquiv.UNRELATED) break;
+			var r = compare(at[i], bt[i]);
+			if (am[i]) {
+				if (r != TypeEquiv.EQUAL) return TypeEquiv.UNRELATED;
+				if (!bm[i]) return TypeEquiv.UNRELATED;
+			} else {
+				if (bm[i]) return TypeEquiv.UNRELATED;
+				eq = combineEq(eq, r);
+			}
+		}
+		return eq;
+	}
+	def compareNullable(f: bool, t: bool) -> TypeEquiv {
+		return if(f,
+			if(t, TypeEquiv.EQUAL, TypeEquiv.SUPER),
+			if(t, TypeEquiv.SUB, TypeEquiv.EQUAL));
+	}
+	def combineEq(a: TypeEquiv, b: TypeEquiv) -> TypeEquiv {
+		if (a == TypeEquiv.UNRELATED) return a;
+		match (b) {
+			UNRELATED => return TypeEquiv.UNRELATED;
+			SUPER => return if(a == TypeEquiv.SUB, TypeEquiv.UNRELATED, TypeEquiv.SUPER);
+			EQUAL => return a;
+			SUB => return if(a == TypeEquiv.SUPER, TypeEquiv.UNRELATED, TypeEquiv.SUB);
+		}
+	}
+	private def push(a: Decl, b: Decl) -> bool {
+		if (a == b) return false;  // identity; no need to push on stack
+		for (l = stack; l != null; l = l.tail) {
+			var sa = l.head.0, sb = l.head.1;
+			if (a == sa && b == sb) return false; // already on stack
+		}
+		stack = List.new((a, b), stack);
+		return true; // pushed onto stack
+	}
+	private def pop() {
+		if (stack != null) stack = stack.tail;
 	}
 }
