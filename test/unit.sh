@@ -24,6 +24,12 @@ if [[ "$1" =~ "-trace-calls=" ]]; then
     let PROGRESS_PIPE=0
 fi
 
+if [[ "$1" =~ "-fatal-calls=" ]]; then
+    V3C_OPTS="$1"
+    shift
+    let PROGRESS_PIPE=0
+fi
+
 if [[ "$1" =~ "--trace" ]]; then
     # turn off the progress pipe in verbose mode
     let PROGRESS_PIPE=0
