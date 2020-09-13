@@ -49,4 +49,4 @@ function run_tests() {
 
 }
 
-run_tests | progress tt
+run_tests | progress tti

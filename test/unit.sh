@@ -53,7 +53,7 @@ fi
 
 # run unittests and pipe through progress program
 if [ $PROGRESS_PIPE = 1 ]; then
-    v3c -fp -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tt
+    v3c -fp -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tti
 else
     v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@"
 fi

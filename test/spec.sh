@@ -52,7 +52,7 @@ for b in $BRANCHES; do
     fi
     echo Testing ${CYAN}$SPEC_ROOT/$b${NORM}
     if [ $PROGRESS_PIPE = 1 ]; then
-	run $b | tee /tmp/wizeng-spec-$b.out | progress tt
+	run $b | tee /tmp/wizeng-spec-$b.out | progress tti
     else
 	run $b | tee /tmp/wizeng-spec-$b.out
     fi
