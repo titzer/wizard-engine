@@ -1,0 +1,2 @@
+(module $foo
+  (func $bar))
