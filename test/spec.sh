@@ -50,7 +50,7 @@ for b in $BRANCHES; do
 	echo Spec branch \"$SPEC_ROOT/$b\" does not exist.
 	exit 1
     fi
-    echo Testing ${CYAN}$SPEC_ROOT/$b${NORM}
+    printf "Testing ${CYAN}$SPEC_ROOT/$b${NORM} | "
     if [ $PROGRESS_PIPE = 1 ]; then
 	run $b | tee /tmp/wizeng-spec-$b.out | progress tti
     else

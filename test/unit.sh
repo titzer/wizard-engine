@@ -9,7 +9,7 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-echo Testing ${CYAN}unit${NORM}
+printf "Testing ${CYAN}unit${NORM} | "
 
 SRC="$WIZENG_LOC/src/*/*.v3"
 TEST="$WIZENG_LOC/test/*/*.v3"

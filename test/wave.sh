@@ -9,7 +9,7 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-echo Testing ${CYAN}wave${NORM}
+printf "Testing ${CYAN}wave${NORM} | "
 
 cd $(dirname ${BASH_SOURCE[0]})/wave
 WAVE=$WIZENG_LOC/bin/wave.jvm
