@@ -17,15 +17,14 @@ MAIN="$WIZENG_LOC/test/unittest.main.v3"
 LOG=/tmp/wizeng.unit.sh.log
 
 let PROGRESS_PIPE=1
-V3C_OPTS=
 if [[ "$1" =~ "-trace-calls=" ]]; then
-    V3C_OPTS="$1"
+    V3C_OPTS="$1 $V3C_OPTS"
     shift
     let PROGRESS_PIPE=0
 fi
 
 if [[ "$1" =~ "-fatal-calls=" ]]; then
-    V3C_OPTS="$1"
+    V3C_OPTS="$1 $V3C_OPTS"
     shift
     let PROGRESS_PIPE=0
 fi
@@ -53,7 +52,7 @@ fi
 
 # run unittests and pipe through progress program
 if [ $PROGRESS_PIPE = 1 ]; then
-    v3c -fp -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tti
+    v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tti
 else
     v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@"
 fi
