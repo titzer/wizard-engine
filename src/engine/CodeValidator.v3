@@ -89,7 +89,6 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			if (trace != null) { traceOpcode(); traceStack(true); }
 			// FAST: Handle short operators (predictable direct branch)
 			if (Opcodes.attributes[opcode].SHORT_OP) {
-				// TODO(fast): combine signature read with isOperator() check
 				checkSignature(Opcodes.signatures[opcode]);
 				if (trace != null) traceStack(false);
 				continue;
@@ -253,7 +252,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 							err_atpc().TypeMismatchInFuncBind(tsig, residual);
 						}
 					}
-					val_stack.push(ValueType.RefFunc(false, tsig));
+					push(ValueType.RefFunc(false, tsig));
 				}
 				Opcode.LET.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
@@ -274,7 +273,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var rt = t.0;
 					if (!ValueTypes.isNumeric(rt)) err_atpc().IllegalSelectType(rt);
 					popE(rt);
-					val_stack.push(rt);
+					push(rt);
 				}
 				Opcode.SELECT_T.code => {
 					var at = parser.readValueTypes("select count", limits.max_num_select_results, 0);
@@ -287,7 +286,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				Opcode.LOCAL_GET.code => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
-					val_stack.push(t);
+					push(t);
 				}
 				Opcode.LOCAL_SET.code => {
 					var index = parser.readLocalIndex();
@@ -298,12 +297,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
 					popE(t);
-					val_stack.push(t);
+					push(t);
 				}
 				Opcode.GLOBAL_GET.code => {
 					var g = parser.readGlobal().1;
 					if (g == null) return;
-					val_stack.push(g.valtype);
+					push(g.valtype);
 				}
 				Opcode.GLOBAL_SET.code => {
 					var g = parser.readGlobal().1;
@@ -363,25 +362,25 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				}
 				Opcode.I32_CONST.code => {
 					parser.decoder.read_i32leb();
-					val_stack.push(ValueType.I32);
+					push(ValueType.I32);
 				}
 				Opcode.I64_CONST.code => {
 					parser.decoder.read_i64leb();
-					val_stack.push(ValueType.I64);
+					push(ValueType.I64);
 				}
 				Opcode.F32_CONST.code => {
 					parser.decoder.skip_bytes(4);
-					val_stack.push(ValueType.F32);
+					push(ValueType.F32);
 				}
 				Opcode.F64_CONST.code => {
 					parser.decoder.skip_bytes(8);
-					val_stack.push(ValueType.F64);
+					push(ValueType.F64);
 				}
 				Opcode.REF_NULL.code => {
 					if (!checkExtension(Extension.REFERENCE_TYPES, opcode)) return;
 					var t = parser.readRefNullType();
 					if (t == ValueType.EXTERNREF) t = ValueType.EXTERNREF_NULL;
-					val_stack.push(t);
+					push(t);
 				}
 				Opcode.REF_IS_NULL.code => {
 					if (!checkExtension(Extension.REFERENCE_TYPES, opcode)) return;
@@ -389,7 +388,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (t.1) {
 						if (!ValueTypes.isRef(t.0)) err_atpc().ExpectedRefType(t.0);
 					}
-					val_stack.push(ValueType.I32);
+					push(ValueType.I32);
 				}
 				Opcode.REF_FUNC.code => {
 					if (!checkExtension(Extension.REFERENCE_TYPES, opcode)) return;
@@ -399,7 +398,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var ftype = if(extensions.FUNCTION_REFERENCES,
 						ValueType.RefFunc(false, func.sig),
 						ValueType.FUNCREF);
-					val_stack.push(ftype);
+					push(ftype);
 				}
 				Opcode.REF_AS_NON_NULL.code => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
@@ -409,9 +408,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						match (rt) {
 							FUNCREF, EXTERNREF, Host, Abstract => ;
 							RefFunc(nullable, sig) => rt = ValueType.RefFunc(false, sig);
+							RefStruct(nullable, struct) => rt = ValueType.RefStruct(false, struct);
+							RefArray(nullable, array) => rt = ValueType.RefArray(false, array);
 							_ => err_atpc().ExpectedRefType(rt);
 						}
-						val_stack.push(rt);
+						push(rt);
 					}
 				}
 				Opcode.BR_ON_NULL.code => {
@@ -423,13 +424,110 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					if (t.1) {
 						var rt = t.0;
 						match (rt) {
-							EXTERNREF, FUNCREF => ;
+							EXTERNREF, FUNCREF, Host, Abstract => ;
 							RefFunc(nullable, sig) => rt = ValueType.RefFunc(false, sig);
+							RefStruct(nullable, struct) => rt = ValueType.RefStruct(false, struct);
+							RefArray(nullable, array) => rt = ValueType.RefArray(false, array);
 							_ => err_atpc().ExpectedRefType(rt);
 						}
 						ctlxfer.refS(target, opcode_pos, val_stack);
 						checkArgs(labelArgs(target));
-						val_stack.push(rt);
+						push(rt);
+					}
+				}
+				0xFB => {
+					var b2 = parser.decoder.read_u8();
+					if (!checkExtensionP(Extension.GC, opcode, b2)) return;
+					match (b2) {
+						Opcode.STRUCT_NEW.code => {
+							var st = parser.readStructType(false);
+							if (st.struct == null) return;
+							checkAndPopArgs(st.struct.field_types);
+							push(st);
+						}
+						Opcode.STRUCT_NEW_WITH_RTT.code => ; // TODO
+						Opcode.STRUCT_NEW_DEFAULT_WITH_RTT.code => {
+							var st = parser.readStructType(false);
+							if (st.struct == null) return;
+							if (!st.struct.defaultable) err_atpc().ExpectedDefaultableHeapType(st);
+							// TODO: pop RTT
+							push(st);
+						}
+						Opcode.STRUCT_GET.code => {
+							var st = parser.readStructType(false);
+							var index = parser.readFieldIndex(st.struct);
+							if (index < 0) return;
+							popE(st);
+							push(st.struct.field_types[index]);
+						}
+						Opcode.STRUCT_GET_S.code => ; // TODO: packed types
+						Opcode.STRUCT_GET_U.code => ; // TODO: packed types
+						Opcode.STRUCT_SET.code => {
+							var st = parser.readStructType(false);
+							var index = parser.readFieldIndex(st.struct);
+							if (index < 0) return;
+							if (!st.struct.field_mut[index]) {
+								err_atpc().IllegalAssignmentToImmutableField(st, u32.view(index));
+							}
+							popE(st.struct.field_types[index]);
+							popE(st);
+						}
+						Opcode.ARRAY_NEW.code => {
+							var at = parser.readArrayType(false);
+							if (at.array == null) return;
+							checkAndPopArgs(at.array.elem_types);
+							popE(ValueType.I32);
+							push(at);
+						}
+						Opcode.ARRAY_NEW_WITH_RTT.code => ; // TODO
+						Opcode.ARRAY_NEW_DEFAULT_WITH_RTT.code => {
+							var at = parser.readArrayType(false);
+							if (at.array == null) return;
+							if (!at.array.defaultable) err_atpc().ExpectedDefaultableHeapType(at);
+							// TODO: pop RTT
+							popE(ValueType.I32);
+							push(at);
+						}
+						Opcode.ARRAY_GET.code => {
+							var at = parser.readArrayType(false);
+							if (at.array == null) return;
+							popE(ValueType.I32);
+							popE(at);
+							for (et in at.array.elem_types) push(et);
+						}
+						Opcode.ARRAY_GET_S.code => ; // TODO: packed types
+						Opcode.ARRAY_GET_U.code => ; // TODO: packed types
+						Opcode.ARRAY_SET.code => {
+							var at = parser.readArrayType(false);
+							if (at.array == null) return;
+							for (et in at.array.elem_types) popE(et);
+							popE(ValueType.I32);
+							popE(at);
+						}
+						Opcode.ARRAY_LEN.code => {
+							var at = parser.readArrayType(false);
+							if (at.array == null) return;
+							popE(at);
+							push(ValueType.I32);
+						}
+						Opcode.I31_NEW.code => {
+							popE(ValueType.I32);
+							push(ValueTypes.I31REF);
+						}
+						Opcode.I31_GET_S.code => {
+							popE(ValueTypes.I31REF);
+							push(ValueType.I32);
+						}
+						Opcode.I31_GET_U.code => {
+							popE(ValueTypes.I31REF);
+							push(ValueType.I32);
+						}
+						Opcode.RTT_CANON.code => ; // TODO: rtt types
+						Opcode.RTT_SUB.code => ;  // TODO: rtt types
+						Opcode.REF_TEST.code => ; // TODO: rtt types
+						Opcode.REF_CAST.code => ; // TODO: rtt types
+						Opcode.BR_ON_CAST.code => ; // TODO: rtt types
+						_ => err_atpc().InvalidOpcode(opcode, b2);
 					}
 				}
 				0xFC => {
@@ -501,7 +599,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						Opcode.TABLE_SIZE.code => {
 							if (!checkExtensionP(Extension.REFERENCE_TYPES, opcode, b2)) return;
 							var index = parser.readTable().0;
-							val_stack.push(ValueType.I32);
+							push(ValueType.I32);
 						}
 						Opcode.TABLE_FILL.code => {
 							if (!checkExtensionP(Extension.REFERENCE_TYPES, opcode, b2)) return;
