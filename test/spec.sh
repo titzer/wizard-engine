@@ -9,7 +9,10 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-TEST_TARGET=jvm
+if [ "$TEST_TARGET" = "" ]; then
+    TEST_TARGET=jvm
+fi
+
 SPEC_ROOT=$WIZENG_LOC/wasm-spec
 
 WIZENG_OPTS=
