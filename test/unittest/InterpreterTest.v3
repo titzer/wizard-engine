@@ -161,6 +161,13 @@ def Z = [
 	T("struct.get", test_struct_get),
 	T("struct.get_su", test_struct_get_su),
 	T("struct.set", test_struct_set),
+	T("array.new", test_array_new),
+	T("array.new_with_rtt", test_array_new_with_rtt),
+	T("array.new_default_with_rtt", test_array_new_default_with_rtt),
+	T("array.get", test_array_get),
+	T("array.get_su", test_array_get_su),
+	T("array.set", test_array_set),
+	T("array.len", test_array_len),
 
 	T_u_u(Opcode.I32_EQZ, [
 		(1, 0),
@@ -590,30 +597,37 @@ class InterpreterTester(t: Tester) extends ModuleBuilder {
 		var r = run(args);
 		checkNop(r.1);
 	}
-	def assert_struct(got: Result, expected_struct: StructDecl, rtt: Value.Rtt, fields: Array<Value>) {
+	def assert_val1<V>(got: Result, kind: string) -> (bool, V) {
 		match (got) {
-			Value(vals) => {
-				var len = if(vals != null, vals.length);
-				if (len != 1) return t.fail1("expected 1 value, got %d value(s)", len);
+			Value(vals) => if (vals.length == 1) {
 				var v = vals[0];
-				if (!Value.HeapRef.?(v)) return t.fail1("expected struct, got %q", got.render);
-				var hr = Value.HeapRef.!(v);
-				if (!HeapStruct.?(hr.val)) return t.fail1("expected struct, got %q", got.render);
-				var obj = HeapStruct.!(hr.val);
-				if (obj.decl != expected_struct) return t.fail2("expected heap %q, got %q", expected_struct.render, obj.decl.render);
-				if (obj.rtt != rtt) return t.fail2("expected rtt %q, got %q", rtt.render, obj.rtt.render);
-				assert_vals(obj.vals, fields);
-				return;
+				if (V.?(v)) return (true, V.!(v));
 			}
 			_ => ;
 		}
-		t.fail1("expected struct object, got %q", got.render);
+		t.fail2("expected 1 %s value, got %q", kind, got.render);
+		var d: V;
+		return (false, d);
 	}
-	def assert_vals(got: Array<Value>, expected: Array<Value>) {
-		if (got.length != expected.length) return t.fail2("expected %d fields, got %d", expected.length, got.length);
-		for (i < expected.length) {
-			if (expected[i] != got[i]) return t.fail3("expected vals[%d] = %q, got %q", i, expected[i].render, got[i].render);
-		}
+	def assert_struct(got: Result, expected_struct: StructDecl, rtt: Value.Rtt, fields: Array<Value>) {
+		var r = assert_val1<Value.HeapRef>(got, "struct"), ok = r.0, hr = r.1;
+		if (!ok) return;
+		if (!HeapStruct.?(hr.val)) return t.fail1("expected struct, got %q", got.render);
+		var obj = HeapStruct.!(hr.val);
+		if (obj.decl != expected_struct) return t.fail2("expected heap %q, got %q",
+			expected_struct.render, obj.decl.render);
+		if (obj.rtt != rtt) return t.fail2("expected rtt %q, got %q", rtt.render, obj.rtt.render);
+		t.assertar("fields", fields, obj.vals, Value.render);
+	}
+	def assert_array(got: Result, expected_array: ArrayDecl, rtt: Value.Rtt, elems: Array<Value>) {
+		var r = assert_val1<Value.HeapRef>(got, "array"), ok = r.0, hr = r.1;
+		if (!ok) return;
+		if (!HeapArray.?(hr.val)) return t.fail1("expected array, got %q", got.render);
+		var obj = HeapArray.!(hr.val);
+		if (obj.decl != expected_array) return t.fail2("expected heap %q, got %q",
+			expected_array.render, obj.decl.render);
+		if (obj.rtt != rtt) return t.fail2("expected rtt %q, got %q", rtt.render, obj.rtt.render);
+		t.assertar("elements", elems, obj.vals, Value.render);
 	}
 	def checkNop(r: Result) {
 		match (r) {
@@ -1933,6 +1947,12 @@ def test_struct_get(t: InterpreterTester) {
 	}
 }
 
+def unpackI32(val: u32, packing: Packedness, signed: bool) -> u32 {
+	var shift: u5 = if(packing == Packedness.PACKED_I8, 24, 16);
+	val = val << shift;
+	return if(signed, u32.view(i32.view(val) >> shift), val >> shift);
+}
+
 def test_struct_get_su(t: InterpreterTester) {
 	t.extensions |= Extension.GC;
 	var st = t.newStruct([
@@ -1941,7 +1961,8 @@ def test_struct_get_su(t: InterpreterTester) {
 	]);
 	t.sig0([ValueType.RefStruct(false, st)], SigCache.arr_i);
 
-	var obj = HeapStruct.new(st, Values.RTT_ANYREF, [Value.I32(0x87), Value.I32(0x9765)]);
+	var vals: Array<u32> = [0x87, 0x9765];
+	var obj = HeapStruct.new(st, Values.RTT_ANYREF, [Value.I32(vals[0]), Value.I32(vals[1])]);
 	for (f < 2) {
 		var shift: u5 = if(f == 0, 24, 16);
 		for (opcode in [Opcode.STRUCT_GET_S, Opcode.STRUCT_GET_U]) {
@@ -1950,21 +1971,19 @@ def test_struct_get_su(t: InterpreterTester) {
 				opcode.prefix, opcode.code,
 				heapIndexByte(st), byte.view(f)
 			]);
-			var expected = if(opcode == Opcode.STRUCT_GET_S,
-				u32.view(Values.v_i(obj.vals[f]) << shift >> shift),
-				Values.v_u(obj.vals[f]) << shift >> shift);
+			var expected = unpackI32(vals[f], st.field_types[f].packing, opcode == Opcode.STRUCT_GET_S);
 			t.assert_req(t.run([Value.HeapRef(obj)]).1, u_r(expected));
 		}
 	}
 }
 
 def test_struct_set(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
 	var st = t.newStruct([
 		StorageType.new(ValueType.I32, Packedness.UNPACKED, true),
 		StorageType.new(ValueType.I32, Packedness.UNPACKED, true),
 		StorageType.new(ValueType.I32, Packedness.UNPACKED, true)
 	]);
-	t.extensions |= Extension.GC;
 	t.sig0([ValueType.RefStruct(false, st), ValueType.I32], SigCache.arr_v);
 	var obj = HeapStruct.new(st, Values.RTT_ANYREF, [Value.I32(99), Value.I32(98), Value.I32(97)]);
 	for (f < st.field_types.length) {
@@ -1979,7 +1998,174 @@ def test_struct_set(t: InterpreterTester) {
 			var got = t.run([Value.HeapRef(obj), Values.u_v(i)]).1;
 			t.assert_req(got, Result.Value([]));
 			prev[f] = Values.u_v(i);
-			t.assert_vals(obj.vals, prev);
+			t.t.assertar("fields", prev, obj.vals, Value.render);
 		}
 	}
+}
+
+def test_array_new(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.I32, Packedness.UNPACKED, true)
+	]);
+	t.sig0(SigCache.arr_i, [ValueType.RefArray(false, at)]);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.ARRAY_NEW.prefix, Opcode.ARRAY_NEW.code, heapIndexByte(at)
+	]);
+	for (i < 5u) {
+		var v = Value.I32(i);
+		var r = t.run([v]);
+		var expected = Array<Value>.new(int.view(i));
+		for (j < i) expected[j] = v;
+		t.assert_array(r.1, at, Values.RTT_ANYREF, expected);
+	}
+}
+
+def test_array_new_with_rtt(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.I64, Packedness.UNPACKED, true)
+	]);
+	t.sig0([ValueType.I32, ValueType.I64, ValueType.Rtt(1, at)], [ValueType.RefArray(false, at)]);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.LOCAL_GET.code, 2,
+		Opcode.ARRAY_NEW_WITH_RTT.prefix, Opcode.ARRAY_NEW_WITH_RTT.code, heapIndexByte(at)
+	]);
+	var rtt = Value.Rtt(at, []);
+	for (i < 5u) {
+		var v = Value.I64(i);
+		var r = t.run([Value.I32(i), v, rtt]);
+		var expected = Array<Value>.new(int.view(i));
+		for (j < i) expected[j] = v;
+		t.assert_array(r.1, at, rtt, expected);
+	}
+}
+
+def test_array_new_default_with_rtt(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.F32, Packedness.UNPACKED, true)
+	]);
+	t.sig0([ValueType.I32, ValueType.Rtt(1, at)], [ValueType.RefArray(false, at)]);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.ARRAY_NEW_DEFAULT_WITH_RTT.prefix, Opcode.ARRAY_NEW_DEFAULT_WITH_RTT.code, heapIndexByte(at)
+	]);
+	var rtt = Value.Rtt(at, []);
+	for (i < 5u) {
+		var r = t.run([Value.I32(i), rtt]);
+		var expected = Array<Value>.new(int.view(i));
+		for (j < i) expected[j] = Values.F32_0;
+		t.assert_array(r.1, at, rtt, expected);
+	}
+}
+
+def test_array_get(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.F64, Packedness.UNPACKED, true)
+	]);
+	t.sig0([ValueType.RefArray(false, at), ValueType.I32], SigCache.arr_d);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.ARRAY_GET.prefix, Opcode.ARRAY_GET.code, heapIndexByte(at)
+	]);
+	for (len < 5) {
+		var elems = Array<Value>.new(len);
+		var obj = Value.HeapRef(HeapArray.new(at, Values.RTT_ANYREF, elems));
+		for (j < len) elems[j] = Value.F64(0x99u + u32.view(len));
+
+		for (i < len) {
+			var r = t.run([obj, Value.I32(u32.view(i))]);
+			t.assert_req(r.1, Result.Value([elems[i]]));
+		}
+		t.assert_trap([obj, Value.I32(99)], TrapReason.ARRAY_INDEX_OOB);
+		t.assert_trap([obj, Value.I32(0x80000000u)], TrapReason.ARRAY_INDEX_OOB);
+		t.assert_trap([obj, Value.I32(u32.max)], TrapReason.ARRAY_INDEX_OOB);
+	}
+	t.assert_trap([Value.HeapRef(null), Values.I32_0], TrapReason.NULL_DEREF);
+}
+
+def test_array_get_su(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	for (packing in [Packedness.PACKED_I8, Packedness.PACKED_I16]) {
+		var at = t.newArray([
+			StorageType.new(ValueType.I32, packing, true)
+		]);
+
+		t.sig0([ValueType.RefArray(false, at), ValueType.I32], SigCache.arr_i);
+		for (opcode in [Opcode.ARRAY_GET_S, Opcode.ARRAY_GET_U]) {
+			t.codev([
+				Opcode.LOCAL_GET.code, 0,
+				Opcode.LOCAL_GET.code, 1,
+				opcode.prefix, opcode.code, heapIndexByte(at)
+			]);
+			for (len < 5) {
+				var elems = Array<Value>.new(len);
+				var obj = Value.HeapRef(HeapArray.new(at, Values.RTT_ANYREF, elems));
+				for (j < len) elems[j] = Value.I32(0xFF7Fu + u32.view(j));
+
+				for (i < len) {
+					var r = t.run([obj, Value.I32(u32.view(i))]);
+					var expected = unpackI32(Values.v_u(elems[i]), packing, opcode == Opcode.ARRAY_GET_S);
+					t.assert_req(r.1, Result.Value([Value.I32(expected)]));
+				}
+				t.assert_trap([obj, Value.I32(99)], TrapReason.ARRAY_INDEX_OOB);
+				t.assert_trap([obj, Value.I32(0x80000000u)], TrapReason.ARRAY_INDEX_OOB);
+				t.assert_trap([obj, Value.I32(u32.max)], TrapReason.ARRAY_INDEX_OOB);
+			}
+			t.assert_trap([Value.HeapRef(null), Values.I32_0], TrapReason.NULL_DEREF);
+		}
+	}
+}
+
+def test_array_set(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.F64, Packedness.UNPACKED, true)
+	]);
+	t.sig0([ValueType.RefArray(false, at), ValueType.I32, ValueType.F64], SigCache.arr_v);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.LOCAL_GET.code, 2,
+		Opcode.ARRAY_SET.prefix, Opcode.ARRAY_SET.code, heapIndexByte(at)
+	]);
+	var obj = HeapArray.new(at, Values.RTT_ANYREF, [Value.F64(0x99999), Value.F64(55)]);
+	var ref = Value.HeapRef(obj);
+	for (i < obj.vals.length) {
+		for (v in [366u, 2777u, 0x18776655u]) {
+			var prev = Arrays.dup(obj.vals);
+			var got = t.run([ref, Value.I32(u32.view(i)), Value.F64(v)]).1;
+			t.assert_req(got, Result.Value([]));
+			prev[i] = Value.F64(v);
+			t.t.assertar("elems", prev, obj.vals, Value.render);
+		}
+	}
+	t.assert_trap([ref, Value.I32(99), Values.F64_0], TrapReason.ARRAY_INDEX_OOB);
+	t.assert_trap([Value.HeapRef(null), Values.I32_0, Values.F64_0], TrapReason.NULL_DEREF);
+}
+
+def test_array_len(t: InterpreterTester) {
+	t.extensions |= Extension.GC;
+	var at = t.newArray([
+		StorageType.new(ValueType.F64, Packedness.UNPACKED, true)
+	]);
+	t.sig0([ValueType.RefArray(false, at)], SigCache.arr_i);
+	t.codev([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.ARRAY_LEN.prefix, Opcode.ARRAY_LEN.code, heapIndexByte(at)
+	]);
+	for (i < 5) {
+		var obj = Value.HeapRef(HeapArray.new(at, Values.RTT_ANYREF, Array<Value>.new(i)));
+		var r = t.run([obj]);
+		t.assert_req(r.1, i_r(i));
+	}
+	t.assert_trap([Value.HeapRef(null)], TrapReason.NULL_DEREF);
 }
