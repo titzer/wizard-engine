@@ -2,6 +2,7 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Implementation of the Jawa runtime using the GC extension to Wasm.
+def CLASS_HEADER_FIELDS = 1;
 class JawaGcRuntime extends JawaRuntime {
 	def arrayReps = HashMap<JawaArrayType, JawaGcRuntimeArrayRep>.new(JawaRefType.hash, JawaArrayType.==);
 	def classReps = HashMap<JawaClassType, JawaGcRuntimeClassRep>.new(JawaRefType.hash, JawaClassType.==);
@@ -78,14 +79,29 @@ class JawaGcRuntime extends JawaRuntime {
 		return Values.HEAPREF_NULL;
 	}
 	def newObject(ct: JawaClassType) -> Value {
-		var vt = toWasmClassType(ct), gcrep = classReps[ct]; 
+		var vt = toWasmClassType(ct), gcrep = classReps[ct];
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
 		obj.vals[0] = gcrep.metaObject;
+		Arrays.copyInto(obj.vals, CLASS_HEADER_FIELDS, ct.boilerplate, 0, ct.boilerplate.length);
 		return Value.HeapRef(obj);
+	}
+	def getField(obj: Value, i: int) -> Value {
+		var ref = HeapStruct.!(Value.HeapRef.!(obj).val);
+		return ref.vals[i + CLASS_HEADER_FIELDS];
+	}
+	def setField(obj: Value, i: int, v: Value) {
+		var ref = HeapStruct.!(Value.HeapRef.!(obj).val);
+		ref.vals[i + CLASS_HEADER_FIELDS] = v;
 	}
 	def newArray(at: JawaArrayType, length: int) -> Value {
 		var vt = toWasmArrayType(at);
 		var array = HeapArray.new(vt.array, Value.Rtt(vt.array, null), Array<Value>.new(length));
+		return Value.HeapRef(array);
+	}
+	def initArray<T>(at: JawaArrayType, vals: Array<T>, map: JawaPrimMappingOf<T>) -> Value {
+		var vt = toWasmArrayType(at);
+		var vals = Arrays.map(vals, map.box);
+		var array = HeapArray.new(vt.array, Value.Rtt(vt.array, null), vals);
 		return Value.HeapRef(array);
 	}
 	def getElem(arr: Value, i: int) -> Value {
@@ -122,7 +138,7 @@ class JawaGcRuntime extends JawaRuntime {
 			.local_get(0)
 			.local_get(1)
 			.array_get(vt.array);
-		return makeFunc(SigDecl.new([toWasmArrayType(at), ValueType.I32], [toWasmType(at.elem)]));
+		return makeFuncP([toWasmArrayType(at), ValueType.I32], [toWasmType(at.elem)]);
 	}
 //-------------------------------------------------------------------------------------------------
 	def AASTORE(at: JawaArrayType) -> WasmFunction {
@@ -132,28 +148,56 @@ class JawaGcRuntime extends JawaRuntime {
 			.local_get(1)
 			.local_get(2)
 			.array_set(vt.array);
-		return makeFunc(SigDecl.new([toWasmArrayType(at), ValueType.I32, toWasmType(at.elem)], SigCache.arr_v));
+		return makeFuncP([toWasmArrayType(at), ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
 	}
 //-------------------------------------------------------------------------------------------------
 	def TODO: Function;
-	def ACMPEQ() -> Function { return TODO; }
-	def ANEWARRAY(at: JawaArrayType) -> Function {
-		var vt = toWasmArrayType(at);
+	def ACMPEQ() -> Function {
+		var vt = toWasmClassType(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
-			.array_new(vt.array);
-		return makeFunc(SigDecl.new(SigCache.arr_i, [vt])); // TODO: rtt
+			.local_get(1)
+			.ref_eq(vt.struct);
+		return makeFuncP([vt, vt], SigCache.arr_i);
+	}
+	def ANEWARRAY(at: JawaArrayType) -> Function {
+		return NEWARRAY(at);
 	}
 	def ARRAYLENGTH(at: JawaArrayType) -> Function {
 		var vt = toWasmArrayType(at);
 		start0()
 			.local_get(0)
 			.array_len(vt.array);
-		return makeFunc(SigDecl.new([vt], SigCache.arr_i));
+		return makeFuncP([vt], SigCache.arr_i);
 	}
-	def NEWARRAY(at: JawaArrayType) -> Function { return TODO; }
-	def ALOAD<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function { return TODO; }
-	def ASTORE<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function { return TODO; }
+	def NEWARRAY(at: JawaArrayType) -> Function {
+		var vt = toWasmArrayType(at);
+		start0()
+			.local_get(0)
+			.array_new(vt.array);
+		return makeFuncP(SigCache.arr_i, [vt]); // TODO: rtt
+	}
+	def ALOAD<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function {
+		var vt = toWasmArrayType(at);
+		start0()
+			.local_get(0)
+			.local_get(1);
+		match (at.elem.kind) {
+			BYTE, SHORT => asm.array_get_s(vt.array);
+			CHAR => asm.array_get_u(vt.array);
+			_ => asm.array_get(vt.array);
+		}
+		return makeFuncP([vt, ValueType.I32], [toWasmType(at.elem)]);
+	}
+	def ASTORE<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function {
+		var vt = toWasmArrayType(at);
+		start0()
+			.local_get(0)
+			.local_get(1)
+			.local_get(2)
+			.array_set(vt.array);
+		return makeFuncP([vt, ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
+	}
 	def CHECKCAST(t: JawaRefType) -> Function { return TODO; }
 	def DCMPG() -> Function { return TODO; }
 	def DCMPL() -> Function { return TODO; }
@@ -161,19 +205,50 @@ class JawaGcRuntime extends JawaRuntime {
 	def FCMPG() -> Function { return TODO; }
 	def FCMPL() -> Function { return TODO; }
 	def FREM() -> Function { return TODO; }
-	def GETFIELD(ct: JawaClassType, f: JawaField) -> Function { return TODO; }
+	def GETFIELD(ct: JawaClassType, f: JawaField) -> Function {
+		var vt = toWasmClassType(ct);
+		start0()
+			.local_get(0)
+			.struct_get(vt.struct, f.index + CLASS_HEADER_FIELDS);
+		return makeFuncP([vt], [toWasmType(f.typ)]);
+	}
 	def GETSTATIC(ct: JawaClassType, f: JawaField) -> Function { return TODO; }
 	def INSTANCEOF(t: JawaRefType) -> Function { return TODO; }
 	def INVOKEINTERFACE(it: JawaInterfaceType, m: JawaMethod) -> Function { return TODO; }
 	def INVOKESPECIAL(ct: JawaClassType, m: JawaMethod) -> Function { return TODO; }
 	def INVOKESTATIC(ct: JawaClassType, m: JawaMethod) -> Function { return TODO; }
 	def INVOKEVIRTUAL(ct: JawaClassType, m: JawaMethod) -> Function { return TODO; }
-	def ISNULL() -> Function { return TODO; }
-	def MONITORENTER() -> Function { return TODO; }
-	def MONITOREXIT() -> Function { return TODO; }
+	def ISNULL() -> Function {
+		var vt = toWasmClassType(JawaLang.OBJECT);
+		start0()
+			.local_get(0)
+			.ref_is_null();
+		return makeFuncP([vt], SigCache.arr_i);
+	}
+	def MONITORENTER() -> Function {
+		var vt = toWasmClassType(JawaLang.OBJECT);
+		start0()
+			.local_get(0)
+			.struct_get(vt.struct, 0);  // trap on null
+		return makeFuncP([vt], SigCache.arr_v);
+	}
+	def MONITOREXIT() -> Function {
+		var vt = toWasmClassType(JawaLang.OBJECT);
+		start0()
+			.local_get(0)
+			.struct_get(vt.struct, 0);  // trap on null
+		return makeFuncP([vt], SigCache.arr_v); // nop
+	}
 	def MULTIANEWARRAY(dims: int, at: JawaArrayType) -> Function { return TODO; }
 	def NEW(ct: JawaClassType) -> Function { return TODO; }
-	def PUTFIELD(ct: JawaClassType, f: JawaField) -> Function { return TODO; }
+	def PUTFIELD(ct: JawaClassType, f: JawaField) -> Function {
+		var vt = toWasmClassType(ct);
+		start0()
+			.local_get(0)
+			.local_get(1)
+			.struct_set(vt.struct, f.index + CLASS_HEADER_FIELDS);
+		return makeFuncP([vt, toWasmType(f.typ)], SigCache.arr_v);
+	}
 	def PUTSTATIC(ct: JawaClassType, f: JawaField) -> Function { return TODO; }
 //-------------------------------------------------------------------------------------------------
 
@@ -181,10 +256,14 @@ class JawaGcRuntime extends JawaRuntime {
 		asm.resize(0);
 		return asm.put(0 /*locals*/);
 	}
+	def makeFuncP(params: Array<ValueType>, results: Array<ValueType>) -> WasmFunction {
+		return makeFunc(SigDecl.new(params, results));
+	}
 	def makeFunc(sig: SigDecl) -> WasmFunction {
 		comodule.addDecl(sig);
 		var func = FuncDecl.new(sig);
-		func.code = Code.new(asm.put(Opcode.END.code).extract()); // TODO: run verifier?
+		func.code = Code.new(asm.put(Opcode.END.code).extract()); // TODO: run CodeValidator
+		comodule.addDecl(func);
 		return WasmFunction.new(coinstance, func);
 	}
 }
@@ -204,11 +283,20 @@ class WasmGcAsm extends Vector<byte> {
 	def local_set(index: byte) -> this {
 		put(Opcode.LOCAL_SET.code).put(index);
 	}
-	def struct_get(decl: StructDecl, field: byte) -> this {
-		put(Opcode.STRUCT_GET.prefix).put(Opcode.STRUCT_GET.code).put_u32leb(decl.struct_index).put(field);
+	def struct_get(decl: StructDecl, field: int) -> this {
+		put(Opcode.STRUCT_GET.prefix).put(Opcode.STRUCT_GET.code).put_u32leb(decl.struct_index).put_u32leb(field);
+	}
+	def struct_set(decl: StructDecl, field: int) -> this {
+		put(Opcode.STRUCT_SET.prefix).put(Opcode.STRUCT_SET.code).put_u32leb(decl.struct_index).put_u32leb(field);
 	}
 	def array_get(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_GET.prefix).put(Opcode.ARRAY_GET.code).put_u32leb(decl.array_index);
+	}
+	def array_get_s(decl: ArrayDecl) -> this {
+		put(Opcode.ARRAY_GET_S.prefix).put(Opcode.ARRAY_GET_S.code).put_u32leb(decl.array_index);
+	}
+	def array_get_u(decl: ArrayDecl) -> this {
+		put(Opcode.ARRAY_GET_U.prefix).put(Opcode.ARRAY_GET_U.code).put_u32leb(decl.array_index);
 	}
 	def array_set(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_SET.prefix).put(Opcode.ARRAY_SET.code).put_u32leb(decl.array_index);
@@ -218,6 +306,12 @@ class WasmGcAsm extends Vector<byte> {
 	}
 	def array_len(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_LEN.prefix).put(Opcode.ARRAY_LEN.code).put_u32leb(decl.array_index);
+	}
+	def ref_eq(decl: StructDecl) -> this {
+		put(Opcode.REF_EQ.code).put_u32leb(decl.struct_index);
+	}
+	def ref_is_null() -> this {
+		put(Opcode.REF_IS_NULL.code);
 	}
 }
 
