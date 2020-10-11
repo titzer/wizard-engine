@@ -3,6 +3,7 @@
 
 // Implementation of the Jawa runtime using the GC extension to Wasm.
 def CLASS_HEADER_FIELDS = 1;
+def META_STRUCT_HEADER_FIELDS = 2;
 class JawaGcRuntime extends JawaRuntime {
 	def arrayReps = HashMap<JawaArrayType, JawaGcRuntimeArrayRep>.new(JawaRefType.hash, JawaArrayType.==);
 	def classReps = HashMap<JawaClassType, JawaGcRuntimeClassRep>.new(JawaRefType.hash, JawaClassType.==);
@@ -10,6 +11,7 @@ class JawaGcRuntime extends JawaRuntime {
 	def comodule = Module.new(null);
 	def reftypes = Vector<JawaRefType>.new(); // parallel mapping of deftype <-> jawa type
 	def coinstance = Instance.new(comodule, []);
+	var iTableStruct: StructDecl;
 
 	var asm = WasmGcAsm.new();
 
@@ -39,47 +41,97 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def toWasmClassType(ct: JawaClassType) -> ValueType.RefStruct {
 		var gcrep = classReps[ct];
-		if (gcrep == null) {
-			var metaStruct = StructDecl.new([]); // TODO: meta fields
-			comodule.addDecl(metaStruct);
-			var field_types = Array<StorageType>.new(1 + if(ct.instanceFields != null, ct.instanceFields.length));
-			var struct = StructDecl.new(field_types);
-			comodule.addDecl(struct);
-			reftypes.set(struct.struct_index, ct);
-			var rtt = Value.Rtt(struct, null);
-			classReps[ct] = gcrep = JawaGcRuntimeClassRep.new(metaStruct, struct, rtt);
-			gcrep.rtt_global = addGlobal(ValueType.Rtt(0, struct), false, rtt);
-			var staticFields = ct.staticFields;
-			if (staticFields != null && staticFields.length > 0) {
-				gcrep.staticFields = Array.new(staticFields.length);
-				for (i < staticFields.length) {
-					var f = staticFields[i], v = f.defaultValue();
-					gcrep.staticFields[i] = addGlobal(toWasmType(f.typ), true, v);
+		if (gcrep != null) return gcrep.valueType;
+
+		// Build struct before recursing on field/method types
+		var field_types = Array<StorageType>.new(
+			CLASS_HEADER_FIELDS + if(ct.instanceFields != null, ct.instanceFields.length));
+		var struct = newStruct(ct, field_types);
+
+		// Build meta struct
+		var meta_field_types = Array<StorageType>.new(
+			META_STRUCT_HEADER_FIELDS + if(ct.vtable != null, ct.vtable.length));
+		var metaStruct = newStruct(null, meta_field_types);
+
+		classReps[ct] = gcrep = JawaGcRuntimeClassRep.new(metaStruct, struct);
+
+		// Build rtt
+		if (ct.parent == null) {
+			gcrep.rtt = Value.Rtt(struct, Array<Value.Rtt>.new(1));
+			gcrep.rtt.supers[0] = gcrep.rtt;
+		} else {
+			var pt = toWasmClassType(ct.parent);
+			var prep = classReps[ct.parent];
+			gcrep.rtt = Values.subRtt(prep.rtt, struct);
+		}
+		gcrep.rtt_global = addGlobal(ValueType.Rtt(ct.depth, struct), false, gcrep.rtt);
+
+		// Finish meta struct
+		toWasmType(JawaLang.CLASS);
+		var jlcrep = classReps[JawaLang.CLASS];
+		meta_field_types[0] = StorageType.new(jlcrep.valueType, Packedness.UNPACKED, false);
+		meta_field_types[1] = StorageType.new(ValueType.RefStruct(true, getITableStruct()), Packedness.UNPACKED, false);
+		if (ct.vtable != null) {
+			for (i < ct.vtable.length) {
+				var m = ct.vtable[i];
+				var receiver = ct;
+				while (true) {  // find the highest parent that defined this method
+					var pt = receiver.parent;
+					if (pt == null || pt.vtable.length < i) break;
+					receiver = pt;
 				}
+				var sig = m.sig.sig(receiver, toWasmType);
+				meta_field_types[2 + i] = StorageType.new(
+					ValueType.RefFunc(false, sig), Packedness.UNPACKED, false);
 			}
-			var meta_field = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
-			var j = 0;
-			field_types[j++] = meta_field;
-			if (ct.instanceFields != null) {
-				for (f in ct.instanceFields) {
-					field_types[j++] = toStorageType(f.typ, true);
-				}
+		}
+
+		// Build static fields
+		var staticFields = ct.staticFields;
+		if (staticFields != null && staticFields.length > 0) {
+			gcrep.staticFields = Array.new(staticFields.length);
+			for (i < staticFields.length) {
+				var f = staticFields[i], v = f.defaultValue();
+				gcrep.staticFields[i] = addGlobal(toWasmType(f.typ), true, v);
+			}
+		}
+
+		// Finish field types of struct (recursively)
+		var meta_field = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
+		var j = 0;
+		field_types[j++] = meta_field;
+		if (ct.instanceFields != null) {
+			for (f in ct.instanceFields) {
+				field_types[j++] = toStorageType(f.typ, true);
 			}
 		}
 		return gcrep.valueType;
 	}
 	def toWasmInterfaceType(it: JawaInterfaceType) -> ValueType.RefStruct {
 		var gcrep = interfaceReps[it];
-		if (gcrep == null) {
-			var metaStruct = StructDecl.new([]); // TODO: meta fields
-			comodule.addDecl(metaStruct);
-			var metaField = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
-			var struct = StructDecl.new([metaField]);
-			comodule.addDecl(struct);
-			reftypes.set(struct.struct_index, it);
-			interfaceReps[it] = gcrep = JawaGcRuntimeInterfaceRep.new(metaStruct, struct);
-		}
+		if (gcrep != null) return gcrep.valueType;
+
+		// Build struct before recursing on field/method types
+		var struct = newStruct(it, Array<StorageType>.new(1));
+
+		// Build meta struct
+		var metaStruct = newStruct(null, []);
+		struct.field_types[0] = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
+		interfaceReps[it] = gcrep = JawaGcRuntimeInterfaceRep.new(metaStruct, struct);
 		return gcrep.valueType;
+	}
+	def newStruct(t: JawaRefType, field_types: Array<StorageType>) -> StructDecl {
+		var struct = StructDecl.new(field_types);
+		comodule.addDecl(struct);
+		if (t != null) reftypes.set(struct.struct_index, t);
+		return struct;
+	}
+	def getITableStruct() -> StructDecl {
+		if (iTableStruct != null) return iTableStruct;
+		iTableStruct = newStruct(null, Array<StorageType>.new(1));
+		iTableStruct.field_types[0] = StorageType.new(
+			ValueType.RefStruct(true, iTableStruct), Packedness.UNPACKED, true);
+		return iTableStruct;
 	}
 	def toExportedType(t: JawaRefType) -> ExportedType {
 		return ExportedValueType.new(t, toWasmType(t));
@@ -410,9 +462,10 @@ class JawaGcRuntimeArrayRep(array: ArrayDecl, rtt: Value.Rtt) {
 	def valueType = ValueType.RefArray(true, array);
 }
 
-class JawaGcRuntimeClassRep(metaStruct: StructDecl, struct: StructDecl, rtt: Value.Rtt) {
+class JawaGcRuntimeClassRep(metaStruct: StructDecl, struct: StructDecl) {
 	def valueType = ValueType.RefStruct(true, struct);
 	def metaObject = Value.HeapRef(null); // TODO
+	var rtt: Value.Rtt;
 	var rtt_global: GlobalDecl;
 	var staticFields: Array<GlobalDecl>;
 }
