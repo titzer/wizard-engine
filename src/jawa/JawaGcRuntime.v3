@@ -2,8 +2,10 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Implementation of the Jawa runtime using the GC extension to Wasm.
+def CLASS_META_FIELD = 0;
 def CLASS_HEADER_FIELDS = 1;
 def META_STRUCT_HEADER_FIELDS = 2;
+def ARRAY_STRUCT_ARRAY_FIELD = 1;
 class JawaGcRuntime extends JawaRuntime {
 	def arrayReps = HashMap<JawaArrayType, JawaGcRuntimeArrayRep>.new(JawaRefType.hash, JawaArrayType.==);
 	def classReps = HashMap<JawaClassType, JawaGcRuntimeClassRep>.new(JawaRefType.hash, JawaClassType.==);
@@ -19,57 +21,66 @@ class JawaGcRuntime extends JawaRuntime {
 
 	new() super(JawaGcStringLens.new(), JawaGcRefTypeClassObjectLens.new()) { }
 
-
 	def toWasmType(t: JawaType) -> ValueType {
 		match (t) {
 			x: JawaPrimType => return x.prim.valueType;
-			x: JawaArrayType => return toWasmArrayType(x);
-			x: JawaClassType => return toWasmClassType(x);
-			x: JawaInterfaceType => return toWasmInterfaceType(x);
+			x: JawaArrayType => return makeArrayRep(x).valueType;
+			x: JawaClassType => return makeClassRep(x).valueType;
+			x: JawaInterfaceType => return makeInterfaceRep(x).valueType;
 			_ => return ValueType.Host(t); // XXX: that's an error
 		}
 	}
-	def toWasmArrayType(at: JawaArrayType) -> ValueType.RefArray {
+	def makeArrayRep(at: JawaArrayType) -> JawaGcRuntimeArrayRep {
 		var gcrep = arrayReps[at];
-		if (gcrep == null) {
-			var array = ArrayDecl.new(Array.new(1));
-			comodule.addDecl(array);
-			reftypes.set(array.array_index, at);
-			var rtt = Value.Rtt(array, null);
-			arrayReps[at] = gcrep = JawaGcRuntimeArrayRep.new(array, rtt);
-			array.elem_types[0] = toStorageType(at.elem, true);
-		}
-		return gcrep.valueType;
+		if (gcrep != null) return gcrep;
+
+		// Build structs before recursing on field/method types
+		var parent = JawaLang.OBJECT;
+		var pair = newStructs(at, 1, parent.vtable.length),
+			struct = pair.1, metaStruct = pair.0;
+
+		var array = ArrayDecl.new(Array.new(1));
+		comodule.addDecl(array);
+		arrayReps[at] = gcrep = JawaGcRuntimeArrayRep.new(metaStruct, struct, array);
+
+		// Build rtt
+		var rtt = newRtt(parent, struct);
+		gcrep.rtt = rtt.1;
+		gcrep.rttGlobal = addGlobal(rtt.0, false, rtt.1);
+		var artt = newRtt(null, array);
+		gcrep.arrayRtt = artt.1;
+		gcrep.arrayRttGlobal = addGlobal(artt.0, false, artt.1);
+
+		// Finish struct fields
+		var field_types = struct.field_types;
+		var meta_field = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
+		var j = 0;
+		field_types[j++] = meta_field;
+		field_types[j++] = StorageType.new(ValueType.RefArray(false, array), Packedness.UNPACKED, false);
+
+		array.elem_types[0] = toStorageType(at.elem, true);
+		return gcrep;
 	}
-	def toWasmClassType(ct: JawaClassType) -> ValueType.RefStruct {
+	def makeClassRep(ct: JawaClassType) -> JawaGcRuntimeClassRep {
 		var gcrep = classReps[ct];
-		if (gcrep != null) return gcrep.valueType;
-		if (trace != null) trace.put1("JawaGcRuntime.toWasmClassType(%q)", ct.render).outln();
+		if (gcrep != null) return gcrep;
+		if (trace != null) trace.put1("JawaGcRuntime.makeClassRep(%q)", ct.render).outln();
 
 		// Build struct before recursing on field/method types
-		var field_types = Array<StorageType>.new(
-			CLASS_HEADER_FIELDS + if(ct.instanceFields != null, ct.instanceFields.length));
-		var struct = newStruct(ct, field_types);
-
-		// Build meta struct
-		var meta_field_types = Array<StorageType>.new(
-			META_STRUCT_HEADER_FIELDS + if(ct.vtable != null, ct.vtable.length));
-		var metaStruct = newStruct(null, meta_field_types);
+		var pair = newStructs(ct,
+			if(ct.instanceFields != null, ct.instanceFields.length),
+			if(ct.vtable != null, ct.vtable.length)), struct = pair.1, metaStruct = pair.0;
 
 		classReps[ct] = gcrep = JawaGcRuntimeClassRep.new(metaStruct, struct);
 
 		// Build rtt
-		if (ct.parent == null) {
-			gcrep.rtt = Value.Rtt(struct, Array<Value.Rtt>.new(1));
-			gcrep.rtt.supers[0] = gcrep.rtt;
-		} else {
-			var prep = makeClassRep(ct.parent);
-			gcrep.rtt = Values.subRtt(prep.rtt, struct);
-		}
-		gcrep.rtt_global = addGlobal(ValueType.Rtt(ct.depth, struct), false, gcrep.rtt);
+		var rtt = newRtt(ct.parent, struct);
+		gcrep.rtt = rtt.1;
+		gcrep.rttGlobal = addGlobal(rtt.0, false, rtt.1);
 
 		// Finish meta struct
 		var jlcrep = makeClassRep(JawaLang.CLASS);
+		var meta_field_types = metaStruct.field_types;
 		meta_field_types[0] = StorageType.new(jlcrep.valueType, Packedness.UNPACKED, false);
 		meta_field_types[1] = StorageType.new(ValueType.RefStruct(true, getITableStruct()), Packedness.UNPACKED, false);
 		if (ct.vtable != null) {
@@ -99,6 +110,7 @@ class JawaGcRuntime extends JawaRuntime {
 		}
 
 		// Finish field types of struct (recursively)
+		var field_types = struct.field_types;
 		var meta_field = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
 		var j = 0;
 		field_types[j++] = meta_field;
@@ -107,31 +119,49 @@ class JawaGcRuntime extends JawaRuntime {
 				field_types[j++] = toStorageType(f.typ, true);
 			}
 		}
-		return gcrep.valueType;
+		return gcrep;
 	}
-	def makeClassRep(ct: JawaClassType) -> JawaGcRuntimeClassRep {
-		toWasmClassType(ct);
-		return classReps[ct];
+	def newStructs(rt: JawaRefType, num_fields: int, num_meta_fields: int) -> (StructDecl, StructDecl) {
+		// Build struct before recursing on field/method types
+		var field_types = Array<StorageType>.new(CLASS_HEADER_FIELDS + num_fields);
+		var struct = newStruct(rt, field_types);
+
+		// Build meta struct
+		var meta_field_types = Array<StorageType>.new(META_STRUCT_HEADER_FIELDS + num_meta_fields);
+		var metaStruct = newStruct(null, meta_field_types);
+
+		return (metaStruct, struct);
 	}
-	def makeMetaObject(ct: JawaClassType) -> Value {
-		var gcrep = makeClassRep(ct);
-		if (gcrep.metaObject.val == null) {
-			var jlcrep = makeClassRep(JawaLang.CLASS);
-			var vals = Array<Value>.new(gcrep.metaStruct.field_types.length);
-			gcrep.metaObject = Value.HeapRef(HeapStruct.new(gcrep.metaStruct, jlcrep.rtt, vals));
-			var jlcobj = makeMetaObject(JawaLang.CLASS);
-			vals[0] = jlcobj;
-			if (ct.vtable != null) for (i < ct.vtable.length) {
-				var m = ct.vtable[i];
-				vals[META_STRUCT_HEADER_FIELDS + i] = Value.FuncRef(m.impl);
-			}
-			gcrep.metaObjectGlobal = addGlobal(ValueType.RefStruct(false, gcrep.metaStruct), false, gcrep.metaObject);
+	def newRtt(parent: JawaClassType, decl: HeapTypeDecl) -> (ValueType.Rtt, Value.Rtt) {
+		if (parent == null) {
+			var rtt = Value.Rtt(decl, Array<Value.Rtt>.new(1));
+			rtt.supers[0] = rtt;
+			return (ValueType.Rtt(0, decl), rtt);
+		} else {
+			var prep = makeClassRep(parent);
+			var rtt = Values.subRtt(prep.rtt, decl);
+			return (ValueType.Rtt(rtt.supers.length, decl), rtt);
 		}
+	}
+	def makeMetaObject(gcrep: JawaGcRuntimeHeapRep, vtable: Array<JawaMethod>) -> Value {
+		if (gcrep.metaObject.val != null) return gcrep.metaObject;
+
+		var jlcrep = makeClassRep(JawaLang.CLASS);
+		var vals = Array<Value>.new(gcrep.metaStruct.field_types.length);
+		gcrep.metaObject = Value.HeapRef(HeapStruct.new(gcrep.metaStruct, jlcrep.rtt, vals));
+		var jlcobj = makeMetaObject(jlcrep, JawaLang.CLASS.vtable);
+		vals[0] = jlcobj;  // all meta-objects have jlc as their metaobject, including itself
+		if (vtable != null) for (i < vtable.length) {
+			var m = vtable[i];
+			vals[META_STRUCT_HEADER_FIELDS + i] = Value.FuncRef(m.impl);
+		}
+		gcrep.metaObjectGlobal = addGlobal(ValueType.RefStruct(false, gcrep.metaStruct), false, gcrep.metaObject);
+
 		return gcrep.metaObject;
 	}
-	def toWasmInterfaceType(it: JawaInterfaceType) -> ValueType.RefStruct {
+	def makeInterfaceRep(it: JawaInterfaceType) -> JawaGcRuntimeInterfaceRep {
 		var gcrep = interfaceReps[it];
-		if (gcrep != null) return gcrep.valueType;
+		if (gcrep != null) return gcrep;
 
 		// Build struct before recursing on field/method types
 		var struct = newStruct(it, Array<StorageType>.new(1));
@@ -140,7 +170,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var metaStruct = newStruct(null, []);
 		struct.field_types[0] = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
 		interfaceReps[it] = gcrep = JawaGcRuntimeInterfaceRep.new(metaStruct, struct);
-		return gcrep.valueType;
+		return gcrep;
 	}
 	def newStruct(t: JawaRefType, field_types: Array<StorageType>) -> StructDecl {
 		var struct = StructDecl.new(field_types);
@@ -164,7 +194,7 @@ class JawaGcRuntime extends JawaRuntime {
 	def newObject(ct: JawaClassType) -> Value {
 		var gcrep = makeClassRep(ct);
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(ct);
+		obj.vals[0] = makeMetaObject(gcrep, ct.vtable);
 		Arrays.copyInto(obj.vals, CLASS_HEADER_FIELDS, ct.boilerplate, 0, ct.boilerplate.length);
 		return Value.HeapRef(obj);
 	}
@@ -185,26 +215,34 @@ class JawaGcRuntime extends JawaRuntime {
 		ref.vals[i + CLASS_HEADER_FIELDS] = v;
 	}
 	def newArray(at: JawaArrayType, length: int) -> Value {
-		var vt = toWasmArrayType(at);
-		var array = HeapArray.new(vt.array, Value.Rtt(vt.array, null), Array<Value>.new(length));
-		return Value.HeapRef(array);
+		var gcrep = makeArrayRep(at);
+		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, Array<Value>.new(length));
+		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
+		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
+		obj.vals[1] = Value.HeapRef(array);
+		return Value.HeapRef(obj);
 	}
 	def initArray<T>(at: JawaArrayType, vals: Array<T>, map: JawaPrimMappingOf<T>) -> Value {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		var vals = Arrays.map(vals, map.box);
-		var array = HeapArray.new(vt.array, Value.Rtt(vt.array, null), vals);
-		return Value.HeapRef(array);
+		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, vals);
+		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
+		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
+		obj.vals[1] = Value.HeapRef(array);
+		return Value.HeapRef(obj);
 	}
 	def getElem(arr: Value, i: int) -> Value {
-		var ref = HeapArray.!(Value.HeapRef.!(arr).val);
-		return ref.vals[i];
+		return toHeapArray(arr).vals[i];
 	}
 	def setElem(arr: Value, i: int, v: Value) {
-		var ref = HeapArray.!(Value.HeapRef.!(arr).val);
-		ref.vals[i] = v;
+		toHeapArray(arr).vals[i] = v;
 	}
 	def getLength(arr: Value) -> int {
-		return HeapArray.!(Value.HeapRef.!(arr).val).vals.length;
+		return toHeapArray(arr).vals.length;
+	}
+	private def toHeapArray(arr: Value) -> HeapArray {
+		var struct = HeapStruct.!(Value.HeapRef.!(arr).val);
+		return HeapArray.!(Value.HeapRef.!(struct.vals[ARRAY_STRUCT_ARRAY_FIELD]).val);
 	}
 	def getJawaType(v: Value) -> JawaType {
 		match (v) {
@@ -239,9 +277,9 @@ class JawaGcRuntime extends JawaRuntime {
 				}
 				vt = x.prim.valueType;
 			}
-			x: JawaArrayType => vt = toWasmArrayType(x);
-			x: JawaClassType => vt = toWasmClassType(x);
-			x: JawaInterfaceType => vt = toWasmInterfaceType(x);
+			x: JawaArrayType => vt = makeArrayRep(x).valueType;
+			x: JawaClassType => vt = makeClassRep(x).valueType;
+			x: JawaInterfaceType => vt = makeInterfaceRep(x).valueType;
 		}
 		return StorageType.new(vt, packing, mutable);
 	}
@@ -257,97 +295,101 @@ class JawaGcRuntime extends JawaRuntime {
 
 //-------------------------------------------------------------------------------------------------
 	def AALOAD(at: JawaArrayType) -> WasmFunction {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		start0()
 			.local_get(0)
+			.struct_get(gcrep.struct, ARRAY_STRUCT_ARRAY_FIELD)
 			.local_get(1)
-			.array_get(vt.array);
-		return makeFuncP([toWasmArrayType(at), ValueType.I32], [toWasmType(at.elem)]);
+			.array_get(gcrep.array);
+		return makeFuncP([gcrep.valueType, ValueType.I32], [toWasmType(at.elem)]);
 	}
 //-------------------------------------------------------------------------------------------------
 	def AASTORE(at: JawaArrayType) -> WasmFunction {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		start0()
 			.local_get(0)
+			.struct_get(gcrep.struct, ARRAY_STRUCT_ARRAY_FIELD)
 			.local_get(1)
 			.local_get(2)
-			.array_set(vt.array);
-		return makeFuncP([toWasmArrayType(at), ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
+			.array_set(gcrep.array);
+		return makeFuncP([gcrep.valueType, ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
 	}
 //-------------------------------------------------------------------------------------------------
 	def TODO: Function;
 	def ACMPEQ() -> Function {
-		var vt = toWasmClassType(JawaLang.OBJECT);
+		var gcrep = makeClassRep(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
 			.local_get(1)
 			.ref_eq();
-		return makeFuncP([vt, vt], SigCache.arr_i);
+		return makeFuncP([gcrep.valueType, gcrep.valueType], SigCache.arr_i);
 	}
 	def ANEWARRAY(at: JawaArrayType) -> Function {
 		return NEWARRAY(at);
 	}
 	def ARRAYLENGTH(at: JawaArrayType) -> Function {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		start0()
 			.local_get(0)
-			.array_len(vt.array);
-		return makeFuncP([vt], SigCache.arr_i);
+			.struct_get(gcrep.struct, ARRAY_STRUCT_ARRAY_FIELD)
+			.array_len(gcrep.array);
+		return makeFuncP([gcrep.valueType], SigCache.arr_i);
 	}
 	def NEWARRAY(at: JawaArrayType) -> Function {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
+		makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
 		start0()
+			.global_get(gcrep.metaObjectGlobal.global_index)
 			.local_get(0)
-			.array_new(vt.array);
-		return makeFuncP(SigCache.arr_i, [vt]); // TODO: rtt
+			.global_get(gcrep.arrayRttGlobal.global_index)
+			.array_new_default_with_rtt(gcrep.array)
+			.global_get(gcrep.rttGlobal.global_index)
+			.struct_new_with_rtt(gcrep.struct);
+		return makeFuncP(SigCache.arr_i, [gcrep.valueType]);
 	}
 	def ALOAD<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		start0()
 			.local_get(0)
+			.struct_get(gcrep.struct, ARRAY_STRUCT_ARRAY_FIELD)
 			.local_get(1);
 		match (at.elem.kind) {
-			BYTE, SHORT => asm.array_get_s(vt.array);
-			CHAR => asm.array_get_u(vt.array);
-			_ => asm.array_get(vt.array);
+			BYTE, SHORT => asm.array_get_s(gcrep.array);
+			CHAR => asm.array_get_u(gcrep.array);
+			_ => asm.array_get(gcrep.array);
 		}
-		return makeFuncP([vt, ValueType.I32], [toWasmType(at.elem)]);
+		return makeFuncP([gcrep.valueType, ValueType.I32], [toWasmType(at.elem)]);
 	}
 	def ASTORE<T>(at: JawaArrayType, map: JawaPrimMappingOf<T>) -> Function {
-		var vt = toWasmArrayType(at);
+		var gcrep = makeArrayRep(at);
 		start0()
 			.local_get(0)
+			.struct_get(gcrep.struct, ARRAY_STRUCT_ARRAY_FIELD)
 			.local_get(1)
 			.local_get(2)
-			.array_set(vt.array);
-		return makeFuncP([vt, ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
+			.array_set(gcrep.array);
+		return makeFuncP([gcrep.valueType, ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
 	}
 	def CHECKCAST(t: JawaRefType) -> Function {
+		var ot = makeClassRep(JawaLang.OBJECT);
+		var gcrep: JawaGcRuntimeHeapRep;
 		match (t) {
-			at: JawaArrayType => {
-				return TODO;
-			}
-			ct: JawaClassType => {
-				var ot = toWasmClassType(JawaLang.OBJECT);
-				var vt = toWasmClassType(ct);
-				var gcrep = makeClassRep(ct);
-				start0()
-					.local_get(0)
-					.ref_is_null()
-					.if_(vt)
-					.ref_null(vt.struct.struct_index)
-					.else_()
-					.local_get(0)
-					.global_get(gcrep.rtt_global.global_index)
-					.ref_cast(ot.struct.struct_index, vt.struct.struct_index)
-					.end();
-				return makeFuncPV([ot], [vt]);
-			}
-			it: JawaInterfaceType => {
-				return TODO;
-			}
+			at: JawaArrayType => gcrep = makeArrayRep(at);
+			ct: JawaClassType => gcrep = makeClassRep(ct);
+			it: JawaInterfaceType => return TODO;
+			_ => return TODO;
 		}
-		return null;
+		start0()
+			.local_get(0)
+			.ref_is_null()
+			.if_(gcrep.valueType)
+			.ref_null(gcrep.struct.struct_index)
+			.else_()
+			.local_get(0)
+			.global_get(gcrep.rttGlobal.global_index)
+			.ref_cast(ot.struct.struct_index, gcrep.struct.struct_index)
+			.end();
+		return makeFuncPV([ot.valueType], [gcrep.valueType]);
 	}
 	def DCMPG() -> Function { return TODO; }
 	def DCMPL() -> Function { return TODO; }
@@ -356,14 +398,14 @@ class JawaGcRuntime extends JawaRuntime {
 	def FCMPL() -> Function { return TODO; }
 	def FREM() -> Function { return TODO; }
 	def GETFIELD(ct: JawaClassType, f: JawaField) -> Function {
-		var vt = toWasmClassType(ct);
+		var gcrep = makeClassRep(ct);
 		start0()
 			.local_get(0)
-			.struct_get(vt.struct, f.index + CLASS_HEADER_FIELDS);
-		return makeFuncP([vt], [toWasmType(f.typ)]);
+			.struct_get(gcrep.struct, f.index + CLASS_HEADER_FIELDS);
+		return makeFuncP([gcrep.valueType], [toWasmType(f.typ)]);
 	}
 	def GETSTATIC(ct: JawaClassType, f: JawaField) -> Function {
-		var gcrep = classReps[ct];
+		var gcrep = makeClassRep(ct);
 		start0()
 			.global_get(gcrep.staticFields[f.index].global_index);
 		return makeFuncP(SigCache.arr_v, [toWasmType(f.typ)]);
@@ -374,14 +416,13 @@ class JawaGcRuntime extends JawaRuntime {
 				return TODO;
 			}
 			ct: JawaClassType => {
-				var ot = toWasmClassType(JawaLang.OBJECT);
-				var vt = toWasmClassType(ct);
-				var gcrep = classReps[ct];
+				var ot = makeClassRep(JawaLang.OBJECT);
+				var gcrep = makeClassRep(ct);
 				start0()
 					.local_get(0)
-					.global_get(gcrep.rtt_global.global_index)
-					.ref_test(ot.struct.struct_index, vt.struct.struct_index);
-				return makeFuncP([ot], SigCache.arr_i);
+					.global_get(gcrep.rttGlobal.global_index)
+					.ref_test(ot.struct.struct_index, gcrep.struct.struct_index);
+				return makeFuncP([ot.valueType], SigCache.arr_i);
 			}
 			it: JawaInterfaceType => {
 				return TODO;
@@ -393,10 +434,10 @@ class JawaGcRuntime extends JawaRuntime {
 		return TODO;
 	}
 	def INVOKESPECIAL(ct: JawaClassType, m: JawaMethod) -> Function {
-		var vt = toWasmClassType(JawaLang.OBJECT);
+		var gcrep = makeClassRep(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
-			.struct_get(vt.struct, 0)  // trap on null
+			.struct_get(gcrep.struct, 0)  // trap on null
 			.local_get(0);
 		for (i < m.sig.params.length) {
 			asm.local_get(i + 1);
@@ -411,8 +452,7 @@ class JawaGcRuntime extends JawaRuntime {
 		return m.impl;
 	}
 	def INVOKEVIRTUAL(ct: JawaClassType, m: JawaMethod) -> Function {
-		var vt = toWasmClassType(ct);
-		var gcrep = classReps[ct];
+		var gcrep = makeClassRep(ct);
 		start0();
 		for (i < m.sig.params.length) asm.local_get(i);
 		asm.local_get(0)
@@ -422,58 +462,57 @@ class JawaGcRuntime extends JawaRuntime {
 		return makeFunc(m.sig.sig(ct, toWasmType));
 	}
 	def ISNULL() -> Function {
-		var vt = toWasmClassType(JawaLang.OBJECT);
+		var gcrep = makeClassRep(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
 			.ref_is_null();
-		return makeFuncP([vt], SigCache.arr_i);
+		return makeFuncP([gcrep.valueType], SigCache.arr_i);
 	}
 	def MONITORENTER() -> Function {
-		var vt = toWasmClassType(JawaLang.OBJECT);
+		var gcrep = makeClassRep(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
-			.struct_get(vt.struct, 0);  // trap on null
-		return makeFuncP([vt], SigCache.arr_v);
+			.struct_get(gcrep.struct, 0);  // trap on null
+		return makeFuncP([gcrep.valueType], SigCache.arr_v);
 	}
 	def MONITOREXIT() -> Function {
-		var vt = toWasmClassType(JawaLang.OBJECT);
+		var gcrep = makeClassRep(JawaLang.OBJECT);
 		start0()
 			.local_get(0)
-			.struct_get(vt.struct, 0);  // trap on null
-		return makeFuncP([vt], SigCache.arr_v);
+			.struct_get(gcrep.struct, 0);  // trap on null
+		return makeFuncP([gcrep.valueType], SigCache.arr_v);
 	}
 	def MULTIANEWARRAY(dims: int, at: JawaArrayType) -> Function {
 		return TODO;
 	}
 	def NEW(ct: JawaClassType) -> Function {
-		var gcrep = classReps[ct];
-		var vt = toWasmClassType(ct);
-		makeMetaObject(ct);
+		var gcrep = makeClassRep(ct);
+		makeMetaObject(gcrep, ct.vtable);
 		// Declare globals that contain default values for fields
-		start().put_u32leb(vt.struct.field_types.length - 1); // # locals
-		for (i = 1; i < vt.struct.field_types.length; i++) {
-			asm.locals(1, vt.struct.field_types[i].val_type);
+		start().put_u32leb(gcrep.struct.field_types.length - 1); // # locals
+		for (i = 1; i < gcrep.struct.field_types.length; i++) {
+			asm.locals(1, gcrep.struct.field_types[i].val_type);
 		}
 		// Load the meta object
 		asm.global_get(gcrep.metaObjectGlobal.global_index);
-		for (i = 1; i < vt.struct.field_types.length; i++) {
+		for (i = 1; i < gcrep.struct.field_types.length; i++) {
 			asm.local_get(i - 1);
 		}
 		// Load the RTT
-		asm.global_get(gcrep.rtt_global.global_index)
-			.struct_new_with_rtt(vt.struct);
-		return makeFuncPV(SigCache.arr_v, [vt]);
+		asm.global_get(gcrep.rttGlobal.global_index)
+			.struct_new_with_rtt(gcrep.struct);
+		return makeFuncPV(SigCache.arr_v, [gcrep.valueType]);
 	}
 	def PUTFIELD(ct: JawaClassType, f: JawaField) -> Function {
-		var vt = toWasmClassType(ct);
+		var gcrep = makeClassRep(ct);
 		start0()
 			.local_get(0)
 			.local_get(1)
-			.struct_set(vt.struct, f.index + CLASS_HEADER_FIELDS);
-		return makeFuncP([vt, toWasmType(f.typ)], SigCache.arr_v);
+			.struct_set(gcrep.struct, f.index + CLASS_HEADER_FIELDS);
+		return makeFuncP([gcrep.valueType, toWasmType(f.typ)], SigCache.arr_v);
 	}
 	def PUTSTATIC(ct: JawaClassType, f: JawaField) -> Function {
-		var gcrep = classReps[ct];
+		var gcrep = makeClassRep(ct);
 		start0()
 			.local_get(0)
 			.global_set(gcrep.staticFields[f.index].global_index);
@@ -569,6 +608,10 @@ class WasmGcAsm extends Vector<byte> {
 	def array_new(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_NEW.prefix).put(Opcode.ARRAY_NEW.code).put_u32leb(decl.array_index);
 	}
+	def array_new_default_with_rtt(decl: ArrayDecl) -> this {
+		put(Opcode.ARRAY_NEW_DEFAULT_WITH_RTT.prefix)
+			.put(Opcode.ARRAY_NEW_DEFAULT_WITH_RTT.code).put_u32leb(decl.array_index);
+	}
 	def array_len(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_LEN.prefix).put(Opcode.ARRAY_LEN.code).put_u32leb(decl.array_index);
 	}
@@ -646,17 +689,26 @@ class JawaGcRefTypeClassObjectLens extends JawaWasmLens<JawaRefType, Value> {
 	}
 }
 
-class JawaGcRuntimeArrayRep(array: ArrayDecl, rtt: Value.Rtt) {
-	def valueType = ValueType.RefArray(true, array);
+class JawaGcRuntimeHeapRep(metaStruct: StructDecl, struct: StructDecl) {
+	var rtt: Value.Rtt;
+	var rttGlobal: GlobalDecl;
+	var metaObject: Value.HeapRef;
+	var metaObjectGlobal: GlobalDecl;
+	def valueType = ValueType.RefStruct(true, struct);
 }
 
-class JawaGcRuntimeClassRep(metaStruct: StructDecl, struct: StructDecl) {
-	def valueType = ValueType.RefStruct(true, struct);
-	var metaObject = Value.HeapRef(null);
-	var metaObjectGlobal: GlobalDecl;
-	var rtt: Value.Rtt;
-	var rtt_global: GlobalDecl;
+class JawaGcRuntimeArrayRep extends JawaGcRuntimeHeapRep {
+	def array: ArrayDecl;
+	var arrayRtt: Value.Rtt;
+	var arrayRttGlobal: GlobalDecl;
+
+	new(metaStruct: StructDecl, struct: StructDecl, array) super(metaStruct, struct) { }
+}
+
+class JawaGcRuntimeClassRep extends JawaGcRuntimeHeapRep {
 	var staticFields: Array<GlobalDecl>;
+
+	new(metaStruct: StructDecl, struct: StructDecl) super(metaStruct, struct) { }
 }
 
 class JawaGcRuntimeInterfaceRep(metaStruct: StructDecl, struct: StructDecl) {
