@@ -11,7 +11,9 @@ class JawaGcRuntime extends JawaRuntime {
 	def comodule = Module.new(null);
 	def reftypes = Vector<JawaRefType>.new(); // parallel mapping of deftype <-> jawa type
 	def coinstance = Instance.new(comodule, []);
+	def validator = CodeValidator.new(Jawa.ENGINE_EXTENSIONS, Jawa.ENGINE_LIMITS, comodule, WasmErrorGen.new(null));
 	var iTableStruct: StructDecl;
+	def trace = if(Trace.jawa, TraceBuilder.new());
 
 	var asm = WasmGcAsm.new();
 
@@ -42,6 +44,7 @@ class JawaGcRuntime extends JawaRuntime {
 	def toWasmClassType(ct: JawaClassType) -> ValueType.RefStruct {
 		var gcrep = classReps[ct];
 		if (gcrep != null) return gcrep.valueType;
+		if (trace != null) trace.put1("JawaGcRuntime.toWasmClassType(%q)", ct.render).outln();
 
 		// Build struct before recursing on field/method types
 		var field_types = Array<StorageType>.new(
@@ -235,7 +238,7 @@ class JawaGcRuntime extends JawaRuntime {
 		start0()
 			.local_get(0)
 			.local_get(1)
-			.ref_eq(vt.struct);
+			.ref_eq();
 		return makeFuncP([vt, vt], SigCache.arr_i);
 	}
 	def ANEWARRAY(at: JawaArrayType) -> Function {
@@ -276,7 +279,33 @@ class JawaGcRuntime extends JawaRuntime {
 			.array_set(vt.array);
 		return makeFuncP([vt, ValueType.I32, toWasmType(at.elem)], SigCache.arr_v);
 	}
-	def CHECKCAST(t: JawaRefType) -> Function { return TODO; }
+	def CHECKCAST(t: JawaRefType) -> Function {
+		match (t) {
+			at: JawaArrayType => {
+				return TODO;
+			}
+			ct: JawaClassType => {
+				var ot = toWasmClassType(JawaLang.OBJECT);
+				var vt = toWasmClassType(ct);
+				var gcrep = classReps[ct];
+				start0()
+					.local_get(0)
+					.ref_is_null()
+					.if_(vt)
+					.ref_null(vt.struct.struct_index)
+					.else_()
+					.local_get(0)
+					.global_get(gcrep.rtt_global.global_index)
+					.ref_cast(ot.struct.struct_index, vt.struct.struct_index)
+					.end_();
+				return makeFuncPV([ot], [vt]);
+			}
+			it: JawaInterfaceType => {
+				return TODO;
+			}
+		}
+		return null;
+	}
 	def DCMPG() -> Function { return TODO; }
 	def DCMPL() -> Function { return TODO; }
 	def DREM() -> Function { return TODO; }
@@ -296,7 +325,27 @@ class JawaGcRuntime extends JawaRuntime {
 			.global_get(gcrep.staticFields[f.index].global_index);
 		return makeFuncP(SigCache.arr_v, [toWasmType(f.typ)]);
 	}
-	def INSTANCEOF(t: JawaRefType) -> Function { return TODO; }
+	def INSTANCEOF(t: JawaRefType) -> Function {
+		match (t) {
+			at: JawaArrayType => {
+				return TODO;
+			}
+			ct: JawaClassType => {
+				var ot = toWasmClassType(JawaLang.OBJECT);
+				var vt = toWasmClassType(ct);
+				var gcrep = classReps[ct];
+				start0()
+					.local_get(0)
+					.global_get(gcrep.rtt_global.global_index)
+					.ref_test(ot.struct.struct_index, vt.struct.struct_index);
+				return makeFuncP([ot], SigCache.arr_i);
+			}
+			it: JawaInterfaceType => {
+				return TODO;
+			}
+		}
+		return null;
+	}
 	def INVOKEINTERFACE(it: JawaInterfaceType, m: JawaMethod) -> Function { return TODO; }
 	def INVOKESPECIAL(ct: JawaClassType, m: JawaMethod) -> Function {
 		var vt = toWasmClassType(JawaLang.OBJECT);
@@ -372,6 +421,17 @@ class JawaGcRuntime extends JawaRuntime {
 	def makeFuncP(params: Array<ValueType>, results: Array<ValueType>) -> WasmFunction {
 		return makeFunc(SigDecl.new(params, results));
 	}
+	def makeFuncPV(params: Array<ValueType>, results: Array<ValueType>) -> WasmFunction {
+		var f = makeFuncP(params, results);
+		var r = validator.validateFunc(f.decl); // XXX: don't make a decoder every time
+		match (r) {
+			Error(error, pc, msg) => {
+				System.error("JawaGcRuntimeError", Strings.format1("code validation failed: %s", msg));
+			}
+			_ => ;
+		}
+		return f;
+	}
 	def makeFunc(sig: SigDecl) -> WasmFunction {
 		comodule.addDecl(sig);
 		var func = FuncDecl.new(sig);
@@ -430,14 +490,57 @@ class WasmGcAsm extends Vector<byte> {
 	def array_len(decl: ArrayDecl) -> this {
 		put(Opcode.ARRAY_LEN.prefix).put(Opcode.ARRAY_LEN.code).put_u32leb(decl.array_index);
 	}
-	def ref_eq(decl: StructDecl) -> this {
-		put(Opcode.REF_EQ.code).put_u32leb(decl.struct_index);
+	def ref_eq() -> this {
+		put(Opcode.REF_EQ.code);
 	}
 	def ref_is_null() -> this {
 		put(Opcode.REF_IS_NULL.code);
 	}
+	def ref_cast(ft: int, tt: int) -> this {
+		put(Opcode.REF_CAST.prefix).put(Opcode.REF_CAST.code).put_u32leb(ft).put_u32leb(tt);
+	}
+	def ref_test(ft: int, tt: int) -> this {
+		put(Opcode.REF_TEST.prefix).put(Opcode.REF_TEST.code).put_u32leb(ft).put_u32leb(tt);
+	}
+	def ref_null(i: int) -> this {
+		put(Opcode.REF_NULL.code).put_u32leb(i);
+	}
 	def call_ref() -> this {
 		put(Opcode.CALL_REF.code);
+	}
+	def if_(t: ValueType) -> this {
+		put(Opcode.IF.code);
+		put_blockType(t);
+	}
+	def if0_(t: ValueType) -> this {
+		put(Opcode.IF.code);
+		put(BpTypecon.EmptyBlock.code);
+	}
+	def else_() -> this {
+		put(Opcode.ELSE.code);
+	}
+	def end_() -> this {
+		put(Opcode.END.code);
+	}
+	def put_blockType(t: ValueType) -> this {
+		match (t) {
+			I32 => put(BpTypecon.I32.code);
+			I64 => put(BpTypecon.I64.code);
+			F32 => put(BpTypecon.F32.code);
+			F64 => put(BpTypecon.F64.code);
+			VEC128 => put(BpTypecon.VEC128.code);
+			FUNCREF => put(BpTypecon.FUNCREF.code);
+			EXTERNREF => put(BpTypecon.EXTERNREF.code);
+			ANYREF => ; // TODO
+			I31REF => put(BpTypecon.I31REF.code);
+			RefFunc(nullable, sig) => put(if(nullable, BpTypecon.RefNullT.code, BpTypecon.RefT.code))
+				.put_u32leb(sig.sig_index);
+			RefStruct(nullable, struct) => put(if(nullable, BpTypecon.RefNullT.code, BpTypecon.RefT.code))
+				.put_u32leb(struct.struct_index);
+			RefArray(nullable, array) => put(if(nullable, BpTypecon.RefNullT.code, BpTypecon.RefT.code))
+				.put_u32leb(array.array_index);
+			_ => ; // TODO
+		}
 	}
 }
 
