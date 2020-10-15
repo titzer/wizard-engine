@@ -110,7 +110,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var jlcrep = makeClassRep(JawaLang.CLASS);
 		var meta_field_types = metaStruct.field_types;
 		meta_field_types[0] = StorageType.new(jlcrep.valueType, Packedness.UNPACKED, false);
-		meta_field_types[1] = StorageType.new(ValueType.RefStruct(true, getITableStruct()), Packedness.UNPACKED, false);
+		meta_field_types[1] = StorageType.new(ValueType.RefStruct(true, makeITableStruct()), Packedness.UNPACKED, false);
 		if (ct.vtable == null) return;
 		for (i < ct.vtable.length) {
 			var m = ct.vtable[i];
@@ -122,7 +122,7 @@ class JawaGcRuntime extends JawaRuntime {
 				receiver = pt;
 			}
 			var sig = m.sig.sig(receiver, toWasmType);
-			meta_field_types[2 + i] = StorageType.new(
+			meta_field_types[META_STRUCT_HEADER_FIELDS + i] = StorageType.new(
 				ValueType.RefFunc(false, sig), Packedness.UNPACKED, false);
 		}
 	}
@@ -148,18 +148,33 @@ class JawaGcRuntime extends JawaRuntime {
 			return (ValueType.Rtt(rtt.supers.length, decl), rtt);
 		}
 	}
-	def makeMetaObject(gcrep: JawaGcRuntimeHeapRep, vtable: Array<JawaMethod>) -> Value {
+	def makeMetaObject(gcrep: JawaGcRuntimeHeapRep, vtable: Array<JawaMethod>,
+			itable: List<(JawaInterfaceType, Array<int>)>) -> Value {
 		if (gcrep.metaObject.val != null) return gcrep.metaObject;
 
 		var jlcrep = makeClassRep(JawaLang.CLASS);
 		var vals = Array<Value>.new(gcrep.metaStruct.field_types.length);
 		gcrep.metaObject = Value.HeapRef(HeapStruct.new(gcrep.metaStruct, jlcrep.rtt, vals));
-		var jlcobj = makeMetaObject(jlcrep, JawaLang.CLASS.vtable);
+		var jlcobj = makeMetaObject(jlcrep, JawaLang.CLASS.vtable, JawaLang.CLASS.itable);
 		vals[0] = jlcobj;  // all meta-objects have jlc as their metaobject, including itself
 		if (vtable != null) for (i < vtable.length) {
 			var m = vtable[i];
 			vals[META_STRUCT_HEADER_FIELDS + i] = Value.FuncRef(m.impl);
 		}
+		// Build a list of interface dispatch tables
+		var itable_val: Value.HeapRef;
+		for (l = itable; l != null; l = l.tail) {
+			var irep = makeInterfaceRep(l.head.0);
+			var vals = Array<Value>.new(irep.itableStruct.field_types.length);
+			var istruct = HeapStruct.new(irep.itableStruct, irep.rtt, vals);
+			vals[0] = itable_val;
+			for (j < l.head.1.length) {
+				var m = vtable[l.head.1[j]];
+				vals[1 + j] = Value.FuncRef(m.impl);
+			}
+			itable_val = Value.HeapRef(istruct);
+		}
+		vals[1] = itable_val;
 		gcrep.metaObjectGlobal = addGlobal(ValueType.RefStruct(false, gcrep.metaStruct), false, gcrep.metaObject);
 
 		return gcrep.metaObject;
@@ -168,13 +183,29 @@ class JawaGcRuntime extends JawaRuntime {
 		var gcrep = interfaceReps[it];
 		if (gcrep != null) return gcrep;
 
-		// Build struct before recursing on field/method types
-		var struct = newStruct(it, Array<StorageType>.new(1));
+		// Reuse the struct and meta struct representations from jawa/lang/Object, since interfaces do not have fields.
+		var parent = JawaLang.OBJECT;
+		var jlorep = makeClassRep(parent);
+		var metaStruct = jlorep.metaStruct, struct = jlorep.struct;
 
-		// Build meta struct
-		var metaStruct = newStruct(null, []);
-		struct.field_types[0] = StorageType.new(ValueType.RefStruct(true, metaStruct), Packedness.UNPACKED, false);
-		interfaceReps[it] = gcrep = JawaGcRuntimeInterfaceRep.new(metaStruct, struct);
+		// Build the itable struct before recursing
+		var field_types = Array<StorageType>.new(1 + if (it.instanceMethods != null, it.instanceMethods.length));
+		var itable = newStruct(it, field_types);
+		interfaceReps[it] = gcrep = JawaGcRuntimeInterfaceRep.new(metaStruct, struct, itable);
+
+		// Create RTT for itable struct
+		var rtt = newRtt(null, itable);
+		gcrep.rtt = rtt.1;
+		gcrep.rttGlobal = addGlobal(rtt.0, false, rtt.1);
+
+		// Recursively build the itable fields (i.e. method slots).
+		field_types[0] = StorageType.new(ValueType.RefStruct(true, makeITableStruct()), Packedness.UNPACKED, false);
+		if (it.instanceMethods != null) for (i < it.instanceMethods.length) {
+			var m = it.instanceMethods[i];
+			var sig = m.sig.sig(parent, toWasmType);
+			field_types[1 + i] = StorageType.new(
+				ValueType.RefFunc(false, sig), Packedness.UNPACKED, false);
+		}
 		return gcrep;
 	}
 	def newStruct(t: JawaRefType, field_types: Array<StorageType>) -> StructDecl {
@@ -183,11 +214,11 @@ class JawaGcRuntime extends JawaRuntime {
 		if (t != null) reftypes.set(struct.struct_index, t);
 		return struct;
 	}
-	def getITableStruct() -> StructDecl {
+	def makeITableStruct() -> StructDecl {
 		if (iTableStruct != null) return iTableStruct;
 		iTableStruct = newStruct(null, Array<StorageType>.new(1));
 		iTableStruct.field_types[0] = StorageType.new(
-			ValueType.RefStruct(true, iTableStruct), Packedness.UNPACKED, true);
+			ValueType.RefStruct(true, iTableStruct), Packedness.UNPACKED, false);
 		return iTableStruct;
 	}
 	def toExportedType(t: JawaRefType) -> ExportedType {
@@ -199,7 +230,7 @@ class JawaGcRuntime extends JawaRuntime {
 	def newObject(ct: JawaClassType) -> Value {
 		var gcrep = makeClassRep(ct);
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, ct.vtable);
+		obj.vals[0] = makeMetaObject(gcrep, ct.vtable, ct.itable);
 		Arrays.copyInto(obj.vals, CLASS_HEADER_FIELDS, ct.boilerplate, 0, ct.boilerplate.length);
 		return Value.HeapRef(obj);
 	}
@@ -223,7 +254,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var gcrep = makeArrayRep(at);
 		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, Array<Value>.new(length));
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
+		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
 		obj.vals[1] = Value.HeapRef(array);
 		return Value.HeapRef(obj);
 	}
@@ -232,7 +263,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var vals = Arrays.map(vals, map.box);
 		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, vals);
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
+		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
 		obj.vals[1] = Value.HeapRef(array);
 		return Value.HeapRef(obj);
 	}
@@ -342,7 +373,7 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def NEWARRAY(at: JawaArrayType) -> Function {
 		var gcrep = makeArrayRep(at);
-		makeMetaObject(gcrep, JawaLang.OBJECT.vtable);
+		makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
 		start0()
 			.global_get(gcrep.metaObjectGlobal.global_index)
 			.local_get(0)
@@ -436,7 +467,26 @@ class JawaGcRuntime extends JawaRuntime {
 		return null;
 	}
 	def INVOKEINTERFACE(it: JawaInterfaceType, m: JawaMethod) -> Function {
-		return TODO;
+		var gcrep = makeInterfaceRep(it);
+		start0().local_get(0);  // load receiver and all args
+		for (i < m.sig.params.length) asm.local_get(1 + i);
+		var itable_struct = makeITableStruct(), itable_type = ValueType.RefStruct(true, itable_struct);
+		var funcSig = m.sig.sig(it, toWasmType);
+		var blockSig = SigDecl.new([itable_type], [ValueType.RefStruct(false, gcrep.itableStruct)]);
+		comodule.addDecl(blockSig);
+		asm.local_get(0) // load receiver for method lookup
+			.struct_get(gcrep.struct, 0) // metaobject ptr
+			.struct_get(gcrep.metaStruct, 1)  // itable list
+			.blocks(blockSig)
+			.loops(blockSig)
+			.global_get(gcrep.rttGlobal.global_index) // XXX: cache the RTT in a local variable
+			.br_on_cast(1, itable_struct.struct_index, gcrep.itableStruct.struct_index)
+			.br(0)
+			.end()
+			.end()
+			.struct_get(gcrep.itableStruct, 1 + m.itable_index)
+			./*XXX:return_*/call_ref();
+		return makeFuncPV(funcSig.params, funcSig.results);
 	}
 	def INVOKESPECIAL(ct: JawaClassType, m: JawaMethod) -> Function {
 		var gcrep = makeClassRep(JawaLang.OBJECT);
@@ -444,13 +494,11 @@ class JawaGcRuntime extends JawaRuntime {
 			.local_get(0)
 			.struct_get(gcrep.struct, 0)  // trap on null
 			.local_get(0);
-		for (i < m.sig.params.length) {
-			asm.local_get(i + 1);
-		}
+		for (i < m.sig.params.length) asm.local_get(i + 1);
 		var sig = m.sig.sig(ct, toWasmType);
 		var g = addGlobal(ValueType.RefFunc(false, sig), false, Value.FuncRef(m.impl)); // XXX: cache impl ref?
 		asm.global_get(g.global_index);
-		asm.call_ref();
+		asm./*XXX:return_*/call_ref();
 		return makeFunc(sig);
 	}
 	def INVOKESTATIC(ct: JawaClassType, m: JawaMethod) -> Function {
@@ -463,7 +511,7 @@ class JawaGcRuntime extends JawaRuntime {
 		asm.local_get(0)
 			.struct_get(gcrep.struct, 0)
 			.struct_get(gcrep.metaStruct, META_STRUCT_HEADER_FIELDS + m.vtable_index)
-			.call_ref();
+			./*XXX:return_*/call_ref();
 		return makeFunc(m.sig.sig(ct, toWasmType));
 	}
 	def ISNULL() -> Function {
@@ -492,7 +540,7 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def NEW(ct: JawaClassType) -> Function {
 		var gcrep = makeClassRep(ct);
-		makeMetaObject(gcrep, ct.vtable);
+		makeMetaObject(gcrep, ct.vtable, ct.itable);
 		// Declare globals that contain default values for fields
 		start().put_u32leb(gcrep.struct.field_types.length - 1); // # locals
 		for (i = 1; i < gcrep.struct.field_types.length; i++) {
@@ -638,8 +686,20 @@ class WasmGcAsm extends Vector<byte> {
 	def call_ref() -> this {
 		put(Opcode.CALL_REF.code);
 	}
+	def return_call_ref() -> this {
+		put(Opcode.RETURN_CALL_REF.code);
+	}
 	def loop0() -> this {
 		put(Opcode.LOOP.code);
+		put(BpTypecon.EmptyBlock.code);
+	}
+	def blocks(sig: SigDecl) -> this {
+		put(Opcode.BLOCK.code);
+		put_u32leb(sig.sig_index);
+	}
+	def loops(sig: SigDecl) -> this {
+		put(Opcode.LOOP.code);
+		put_u32leb(sig.sig_index);
 	}
 	def if_(t: ValueType) -> this {
 		put(Opcode.IF.code);
@@ -651,6 +711,16 @@ class WasmGcAsm extends Vector<byte> {
 	}
 	def else_() -> this {
 		put(Opcode.ELSE.code);
+	}
+	def br(depth: int) -> this {
+		put(Opcode.BR.code);
+		put_u32leb(depth);
+	}
+	def br_on_cast(depth: int, t1: int, t2: int) -> this {
+		put(Opcode.BR_ON_CAST.prefix).put(Opcode.BR_ON_CAST.code);
+		put_u32leb(depth);
+		put_u32leb(t1);
+		put_u32leb(t2);
 	}
 	def end() -> this {
 		put(Opcode.END.code);
@@ -716,6 +786,8 @@ class JawaGcRuntimeClassRep extends JawaGcRuntimeHeapRep {
 	new(metaStruct: StructDecl, struct: StructDecl) super(metaStruct, struct) { }
 }
 
-class JawaGcRuntimeInterfaceRep(metaStruct: StructDecl, struct: StructDecl) {
-	def valueType = ValueType.RefStruct(true, struct);
+class JawaGcRuntimeInterfaceRep  extends JawaGcRuntimeHeapRep {
+	def itableStruct: StructDecl;
+
+	new(metaStruct: StructDecl, struct: StructDecl, itableStruct) super(metaStruct, struct) { }
 }
