@@ -1,7 +1,7 @@
 # TODO: reenable native targets when floating point is supported
 #all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
 
-all: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm
+all: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux
 
 clean:
 	rm -f bin/*

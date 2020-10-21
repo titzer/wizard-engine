@@ -10,7 +10,7 @@ if [ "$WIZENG_LOC" = "" ]; then
 fi
 
 if [ "$TEST_TARGET" = "" ]; then
-    TEST_TARGET=jvm
+    TEST_TARGET=x86-linux
 fi
 
 SPEC_ROOT=$WIZENG_LOC/wasm-spec
