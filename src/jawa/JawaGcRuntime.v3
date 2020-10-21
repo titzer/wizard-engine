@@ -4,7 +4,7 @@
 // Implementation of the Jawa runtime using the GC extension to Wasm.
 def CLASS_META_FIELD = 0;
 def CLASS_HEADER_FIELDS = 1;
-def META_STRUCT_HEADER_FIELDS = 2;
+def META_STRUCT_HEADER_FIELDS = 3;
 def ARRAY_STRUCT_ARRAY_FIELD = 1;
 class JawaGcRuntime extends JawaRuntime {
 	def arrayReps = HashMap<JawaArrayType, JawaGcRuntimeArrayRep>.new(JawaRefType.hash, JawaArrayType.==);
@@ -19,7 +19,10 @@ class JawaGcRuntime extends JawaRuntime {
 
 	var asm = WasmAsm.new();
 
-	new() super(JawaGcStringLens.new(), JawaGcRefTypeClassObjectLens.new()) { }
+	new() super(JawaGcStringLens.new(), JawaGcRefTypeClassObjectLens.new()) {
+		JawaGcStringLens.!(stringRep).rt = this;
+		JawaGcRefTypeClassObjectLens.!(classRep).rt = this;
+	}
 
 	def toWasmType(t: JawaType) -> ValueType {
 		match (t) {
@@ -111,6 +114,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var meta_field_types = metaStruct.field_types;
 		meta_field_types[0] = StorageType.new(jlcrep.valueType, Packedness.UNPACKED, false);
 		meta_field_types[1] = StorageType.new(ValueType.RefStruct(true, makeITableStruct()), Packedness.UNPACKED, false);
+		meta_field_types[2] = StorageType.new(ValueType.EXTERNREF, Packedness.UNPACKED, false);
 		if (ct.vtable == null) return;
 		for (i < ct.vtable.length) {
 			var m = ct.vtable[i];
@@ -148,14 +152,32 @@ class JawaGcRuntime extends JawaRuntime {
 			return (ValueType.Rtt(rtt.supers.length, decl), rtt);
 		}
 	}
-	def makeMetaObject(gcrep: JawaGcRuntimeHeapRep, vtable: Array<JawaMethod>,
+	def makeArrayMetaObject(at: JawaArrayType, gcrep: JawaGcRuntimeHeapRep) -> Value {
+		if (gcrep.metaObject.val == null) {
+			makeMetaObject0(at, gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		}
+		return gcrep.metaObject;
+	}
+	def makeClassMetaObject(ct: JawaClassType, gcrep: JawaGcRuntimeHeapRep) -> Value {
+		if (gcrep.metaObject.val == null) {
+			makeMetaObject0(ct, gcrep, ct.vtable, ct.itable);
+		}
+		return gcrep.metaObject;
+	}
+	def makeInterfaceMetaObject(it: JawaInterfaceType, gcrep: JawaGcRuntimeHeapRep) -> Value {
+		if (gcrep.metaObject.val == null) {
+			makeMetaObject0(it, gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		}
+		return gcrep.metaObject;
+	}
+	def makeMetaObject0(jt: JawaRefType, gcrep: JawaGcRuntimeHeapRep, vtable: Array<JawaMethod>,
 			itable: List<(JawaInterfaceType, Array<int>)>) -> Value {
 		if (gcrep.metaObject.val != null) return gcrep.metaObject;
 
 		var jlcrep = makeClassRep(JawaLang.CLASS);
 		var vals = Array<Value>.new(gcrep.metaStruct.field_types.length);
 		gcrep.metaObject = Value.Ref(HeapStruct.new(gcrep.metaStruct, jlcrep.rtt, vals));
-		var jlcobj = makeMetaObject(jlcrep, JawaLang.CLASS.vtable, JawaLang.CLASS.itable);
+		var jlcobj = makeClassMetaObject(JawaLang.CLASS, jlcrep);
 		vals[0] = jlcobj;  // all meta-objects have jlc as their metaobject, including itself
 		if (vtable != null) for (i < vtable.length) {
 			var m = vtable[i];
@@ -175,6 +197,7 @@ class JawaGcRuntime extends JawaRuntime {
 			itable_val = Value.Ref(istruct);
 		}
 		vals[1] = itable_val;
+		vals[2] = Value.Ref(JawaClassObject.new(jt));
 		gcrep.metaObjectGlobal = addGlobal(ValueType.RefStruct(false, gcrep.metaStruct), false, gcrep.metaObject);
 
 		return gcrep.metaObject;
@@ -230,7 +253,7 @@ class JawaGcRuntime extends JawaRuntime {
 	def newObject(ct: JawaClassType) -> Value {
 		var gcrep = makeClassRep(ct);
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, ct.vtable, ct.itable);
+		obj.vals[0] = makeClassMetaObject(ct, gcrep);
 		Arrays.copyInto(obj.vals, CLASS_HEADER_FIELDS, ct.boilerplate, 0, ct.boilerplate.length);
 		return Value.Ref(obj);
 	}
@@ -254,7 +277,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var gcrep = makeArrayRep(at);
 		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, Array<Value>.new(length));
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		obj.vals[0] = makeArrayMetaObject(at, gcrep);
 		obj.vals[1] = Value.Ref(array);
 		return Value.Ref(obj);
 	}
@@ -263,7 +286,7 @@ class JawaGcRuntime extends JawaRuntime {
 		var vals = Arrays.map(vals, map.box);
 		var array = HeapArray.new(gcrep.array, gcrep.arrayRtt, vals);
 		var obj = HeapStruct.new(gcrep.struct, gcrep.rtt, Array<Value>.new(gcrep.struct.field_types.length));
-		obj.vals[0] = makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		obj.vals[0] = makeArrayMetaObject(at, gcrep);
 		obj.vals[1] = Value.Ref(array);
 		return Value.Ref(obj);
 	}
@@ -373,7 +396,7 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def NEWARRAY(at: JawaArrayType) -> Function {
 		var gcrep = makeArrayRep(at);
-		makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		makeArrayMetaObject(at, gcrep);
 		start0()
 			.global_get(gcrep.metaObjectGlobal.global_index)
 			.local_get(0)
@@ -624,7 +647,7 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def recursiveMakeArray(dims: int, at: JawaArrayType, tmps: Array<int>, pos: int) {
 		var gcrep = makeArrayRep(at);
-		makeMetaObject(gcrep, JawaLang.OBJECT.vtable, JawaLang.OBJECT.itable);
+		makeArrayMetaObject(at, gcrep);
 		// allocate array elements
 		var cnt_local = pos;
 		asm
@@ -663,7 +686,7 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def NEW(ct: JawaClassType) -> Function {
 		var gcrep = makeClassRep(ct);
-		makeMetaObject(gcrep, ct.vtable, ct.itable);
+		makeClassMetaObject(ct, gcrep);
 		// Declare globals that contain default values for fields
 		start().put_u32leb(gcrep.struct.field_types.length - 1); // # locals
 		for (i = 1; i < gcrep.struct.field_types.length; i++) {
@@ -724,6 +747,7 @@ class JawaGcRuntime extends JawaRuntime {
 }
 
 class JawaGcStringLens extends JawaWasmLens<JawaString, Value> {
+	var rt: JawaGcRuntime;
 	def toWasm(s: JawaString) -> Value {
 		return Values.REF_NULL; // TODO
 	}
@@ -732,11 +756,29 @@ class JawaGcStringLens extends JawaWasmLens<JawaString, Value> {
 	}
 }
 class JawaGcRefTypeClassObjectLens extends JawaWasmLens<JawaRefType, Value> {
-	def toWasm(ct: JawaRefType) -> Value {
-		return Values.REF_NULL; // TODO
+	var rt: JawaGcRuntime;
+	def toWasm(t: JawaRefType) -> Value {
+		var gcrep: JawaGcRuntimeHeapRep;
+		match (t) {
+			at: JawaArrayType => {
+				gcrep = rt.makeArrayRep(at);
+				rt.makeArrayMetaObject(at, gcrep);
+			}
+			ct: JawaClassType => {
+				gcrep = rt.makeClassRep(ct);
+				rt.makeClassMetaObject(ct, gcrep);
+			}
+			it: JawaInterfaceType => {
+				gcrep = rt.makeInterfaceRep(it);
+				rt.makeInterfaceMetaObject(it, gcrep);
+			}
+		}
+		return gcrep.metaObject;
 	}
 	def fromWasm(v: Value) -> JawaRefType {
-		return null; // TODO
+		var st = HeapStruct.!(Value.Ref.!(v).val);
+		var jt = JawaClassObject.!(Value.Ref.!(st.vals[2]).val);
+		return jt.rep;
 	}
 }
 
