@@ -408,13 +408,16 @@ class JawaGcRuntime extends JawaRuntime {
 	}
 	def CHECKCAST(t: JawaRefType) -> Function {
 		var ot = makeClassRep(JawaLang.OBJECT);
-		var gcrep: JawaGcRuntimeHeapRep;
+		var result: ValueType;
 		match (t) {
-			at: JawaArrayType => gcrep = makeArrayRep(at);
-			ct: JawaClassType => gcrep = makeClassRep(ct);
-			it: JawaInterfaceType => return TODO;
+			at: JawaArrayType => result = asmClassOrArrayCast(ot, makeArrayRep(at));
+			ct: JawaClassType => result = asmClassOrArrayCast(ot, makeClassRep(ct));
+			it: JawaInterfaceType => result = asmInterfaceCast(ot, makeInterfaceRep(it));
 			_ => return TODO;
 		}
+		return makeFuncP([ot.valueType], [result]);
+	}
+	def asmClassOrArrayCast(ot: JawaGcRuntimeClassRep, gcrep: JawaGcRuntimeHeapRep) -> ValueType {
 		start0()
 			.local_get(0)
 			.ref_is_null()
@@ -425,7 +428,43 @@ class JawaGcRuntime extends JawaRuntime {
 				.global_get(gcrep.rttGlobal.global_index)
 				.ref_cast(ot.struct.struct_index, gcrep.struct.struct_index)
 			.end();
-		return makeFuncP([ot.valueType], [gcrep.valueType]);
+		return gcrep.valueType;
+	}
+	def asmInterfaceCast(ot: JawaGcRuntimeClassRep, gcrep: JawaGcRuntimeInterfaceRep) -> ValueType {
+		var itable_struct = makeITableStruct(), itable_type = ValueType.RefStruct(true, itable_struct);
+		var blockSig = SigDecl.new([itable_type], [ValueType.RefStruct(false, gcrep.itableStruct)]);
+		comodule.addDecl(blockSig);
+
+		start0()
+			.block0()
+			.block0()
+				.local_get(0)
+				.br_on_null(0)
+
+			// itable search
+			.struct_get(gcrep.struct, 0) // read metaobject ptr
+			.struct_get(gcrep.metaStruct, 1)  // read itable list
+			.blocks(blockSig)
+				.loops(blockSig)
+					.br_on_null(3) // fell off list, fail
+					.global_get(gcrep.rttGlobal.global_index) // XXX: cache the RTT in a local variable
+					.br_on_cast(1, itable_struct.struct_index, gcrep.itableStruct.struct_index)
+					.struct_get(itable_struct, 0) // read next link in itable list
+					.br(0) // continue
+				.end()
+			.end()
+			.drop() // drop the successfully casted itable
+			.end()
+			// success
+			.local_get(0) // cast succeeded
+			.ret()
+			.end()
+
+			// fail
+			.ref_null(gcrep.struct.struct_index) // XXX: relying on failing cast of null
+			.global_get(ot.rttGlobal.global_index)
+			.ref_cast(ot.struct.struct_index, gcrep.struct.struct_index);
+		return gcrep.valueType;
 	}
 	def DCMPG() -> Function {
 		return xCMPy(Opcode.F64_GT, Opcode.F64_EQ, SigCache.dd_i);
@@ -502,17 +541,18 @@ class JawaGcRuntime extends JawaRuntime {
 		var itable_struct = makeITableStruct(), itable_type = ValueType.RefStruct(true, itable_struct);
 		var blockSig = SigDecl.new([itable_type], [ValueType.RefStruct(false, gcrep.itableStruct)]);
 		comodule.addDecl(blockSig);
-		asm.local_get(0) // load receiver for method lookup
-			.struct_get(gcrep.struct, 0) // metaobject ptr
-			.struct_get(gcrep.metaStruct, 1)  // itable list
+		asm.local_get(0) // load receiver for itable lookup
+			.struct_get(gcrep.struct, 0) // read metaobject ptr
+			.struct_get(gcrep.metaStruct, 1)  // read itable list
 			.blocks(blockSig)
 				.loops(blockSig)
 					.global_get(gcrep.rttGlobal.global_index) // XXX: cache the RTT in a local variable
 					.br_on_cast(1, itable_struct.struct_index, gcrep.itableStruct.struct_index)
-					.br(0)
+					.struct_get(itable_struct, 0) // read next link in itable list
+					.br(0) // continue
 				.end()
 			.end()
-			.struct_get(gcrep.itableStruct, 1 + m.itable_index)
+			.struct_get(gcrep.itableStruct, 1 + m.itable_index) // load method ref
 			./*XXX:return_*/call_ref();
 		return makeFuncS(m.sig.sig(it, toWasmType));
 	}
@@ -785,6 +825,10 @@ class WasmGcAsm extends Vector<byte> {
 		put(Opcode.LOOP.code);
 		put(BpTypecon.EmptyBlock.code);
 	}
+	def block0() -> this {
+		put(Opcode.BLOCK.code);
+		put(BpTypecon.EmptyBlock.code);
+	}
 	def blocks(sig: SigDecl) -> this {
 		put(Opcode.BLOCK.code);
 		put_u32leb(sig.sig_index);
@@ -821,11 +865,21 @@ class WasmGcAsm extends Vector<byte> {
 		put_u32leb(t1);
 		put_u32leb(t2);
 	}
+	def br_on_null(depth: int) -> this {
+		put(Opcode.BR_ON_NULL.code);
+		put_u32leb(depth);
+	}
 	def end() -> this {
 		put(Opcode.END.code);
 	}
 	def op(opcode: Opcode) -> this {
 		put(opcode.code);
+	}
+	def unreachable() -> this {
+		put(Opcode.UNREACHABLE.code);
+	}
+	def ret() -> this {
+		put(Opcode.RETURN.code);
 	}
 	def put_blockType(t: ValueType) -> this {
 		match (t) {
