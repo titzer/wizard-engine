@@ -3,9 +3,15 @@
 
 def EMPTY: Array<byte> = [];
 def ERROR = ErrorGen.new();
+def SYNTH_CODE = Code.new([
+	0, // no locals
+	InternalOpcode.START.code,
+	Opcode.END.code
+]);
 
 // Executes wasm code.
 class Interpreter {
+	def trace = if(Trace.interpreter, InstrTracer.new());
 	def val_stack = Stack<Value>.new();
 	def call_stack = Stack<Frame>.new();
 	def codeptr = CodePtr.new(EMPTY, ERROR);
@@ -16,7 +22,8 @@ class Interpreter {
 	var step_count: int;
 	var max_call_depth = 10000;
 	var limits = Limits.new();
-	def trace = if(Trace.interpreter, InstrTracer.new());
+
+	var entry: Function;
 
 	def reset() -> this {
 		frame = null;
@@ -32,17 +39,17 @@ class Interpreter {
 		return run(count, f, args);
 	}
 	def run(count: int, f: Function, args: Array<Value>) -> Result {
+		// Push arguments onto the stack
 		val_stack.resize(0);
 		if (args != null) for (a in args) val_stack.push(a);
+		// Push synthetic top frame onto the stack
+		entry = f;
+		var synth = FuncDecl.new(f.sig);
+		synth.code = SYNTH_CODE;
+		pushFrame(WasmFunction.new(null, synth));
+		// Begin execution
 		state = ExecState.RUNNING;
-		if (HostFunction.?(f)) {
-			doCallHostFunction(HostFunction.!(f));
-			if (call_stack.top > 0) loop(count);
-			if (state == ExecState.RUNNING) state = ExecState.FINISHED;
-		} else {
-			pushFrame(WasmFunction.!(f));
-			loop(count);
-		}
+		loop(1 + count);  // 1 instruction for the special START bytecode
 		return finish(f.sig.results.length);
 	}
 	def resume(count: int) -> Result {
@@ -584,6 +591,9 @@ class Interpreter {
 				pushz(a == b);
 			}
 
+			InternalOpcode.START.code => {
+				doCallFunction(entry);
+			}
 			InternalOpcode.BREAK.code => {
 				if (state == ExecState.BREAKPOINT) {
 					state = ExecState.RUNNING;
@@ -1007,11 +1017,33 @@ class Interpreter {
 		}
 		return null;
 	}
-	def doCallFunction(f: Function) {
-		match (f) {
-			hf: HostFunction => doCallHostFunction(hf);
-			wf: WasmFunction => pushFrame(wf);
-			_ => trap(TrapReason.FUNC_INVALID);
+	def doCallFunction(func: Function) {
+		while (true) {
+			match (func) {
+				wf: WasmFunction => return pushFrame(wf);
+				hf: HostFunction => {
+					var result = doInvokeHostFunction(hf);
+					match (result) {
+						Trap(reason) => return trap(reason);
+						Error(msg) => {
+							error_msg = msg;
+							return trap(TrapReason.ERROR);
+						}
+						Value0 => return;
+						Value1(val) => return val_stack.push(val);
+						ValueN(vals) => {
+							for (a in vals) val_stack.push(a);
+							return;
+						}
+						TailCall(f, args) => {
+							func = f;
+							for (e in args) val_stack.push(e);
+							continue; // execute a tail call to a new function
+						}
+					}
+				}
+				_ => return trap(TrapReason.FUNC_INVALID);
+			}
 		}
 	}
 	def doInvokeHostFunction(hf: HostFunction) -> HostResult {
@@ -1053,45 +1085,6 @@ class Interpreter {
 			}
 		}
 		return result;
-	}
-	def doCallHostFunction(hf: HostFunction) {
-		var result = doInvokeHostFunction(hf);
-		while (true) {
-			match (result) {
-				Trap(reason) => {
-					return trap(reason);
-				}
-				Error(msg) => {
-					error_msg = msg;
-					return trap(TrapReason.ERROR);
-				}
-				Value0 => {
-					return;
-				}
-				Value1(val) => {
-					val_stack.push(val);
-					return;
-				}
-				ValueN(vals) => {
-					for (a in vals) val_stack.push(a);
-					return;
-				}
-				TailCall(f, a) => {
-					if (HostFunction.?(f)) {
-						hf = HostFunction.!(f);
-						for (e in a) val_stack.push(e);
-						result = doInvokeHostFunction(hf);
-						continue;
-					} else if (WasmFunction.?(f)) {
-						for (e in a) val_stack.push(e);
-						pushFrame(WasmFunction.!(f));
-						return;
-					} else {
-						return trap(TrapReason.FUNC_INVALID);
-					}
-				}
-			}
-		}
 	}
 	def doTruncF32<T>(min: float, max: float, trunc: float -> T, push: T -> ()) {
 		var a = popf();
@@ -1151,7 +1144,8 @@ class Interpreter {
 	def traceStep() {
 		for (i < call_stack.top) trace.sp();
 		trace.put1("%x: ", codeptr.pos);
-		trace.putInstr(frame.func.instance.module, codeptr);
+		var module = if(frame.func.instance != null, frame.func.instance.module);
+		trace.putInstr(module, codeptr);
 		if (Trace.operands) {
 			for (i = frame.fp; i < val_stack.top; i++) {
 				var v = val_stack.elems[i];
