@@ -1,0 +1,293 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Demonstrates that the GC proposal can be poly-filled using the MetaLanguage capabilities.
+// ----- Opcodes -------------------------------------------------------------------------
+enum GcPfFuncOpcode(prefix: byte, code: byte, mnemonic: string) {
+	STRUCT_NEW			(0xFB, 0x00, "struct.new"),//, ImmSigs.STRUCTT, sig.none),
+	STRUCT_NEW_WITH_RTT		(0xFB, 0x01, "struct.new_with_rtt"),//, ImmSigs.STRUCTT, sig.none),
+	STRUCT_NEW_DEFAULT_WITH_RTT	(0xFB, 0x02, "struct.new_default_with_rtt"),//, ImmSigs.STRUCTT, sig.none),
+	STRUCT_GET			(0xFB, 0x03, "struct.get"),//, ImmSigs.STRUCTT_FIELD, sig.none),
+	STRUCT_GET_S			(0xFB, 0x04, "struct.get_s"),//, ImmSigs.STRUCTT_FIELD, sig.none),
+	STRUCT_GET_U			(0xFB, 0x05, "struct.get_u"),//, ImmSigs.STRUCTT_FIELD, sig.none),
+	STRUCT_SET			(0xFB, 0x06, "struct.set"),//, ImmSigs.STRUCTT_FIELD, sig.none),
+	ARRAY_NEW			(0xFB, 0x10, "array.new"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_NEW_WITH_RTT		(0xFB, 0x11, "array.new_with_rtt"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_NEW_DEFAULT_WITH_RTT	(0xFB, 0x12, "array.new_default_with_rtt"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_GET			(0xFB, 0x13, "array.get"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_GET_S			(0xFB, 0x14, "array.get_s"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_GET_U			(0xFB, 0x15, "array.get_u"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_SET			(0xFB, 0x16, "array.set"),//, ImmSigs.ARRAYT, sig.none),
+	ARRAY_LEN			(0xFB, 0x17, "array.len"),//, ImmSigs.ARRAYT, sig.none),
+	I31_NEW				(0xFB, 0x20, "i31.new"),//, ImmSigs.NONE, sig.none),
+	I31_GET_S			(0xFB, 0x21, "i31.get_s"),//, ImmSigs.NONE, sig.none),
+	I31_GET_U			(0xFB, 0x22, "i31.get_u"),//, ImmSigs.NONE, sig.none),
+	RTT_CANON			(0xFB, 0x30, "rtt.canon"),//, ImmSigs.HEAPT, sig.none),
+	RTT_SUB				(0xFB, 0x31, "rtt.sub"),//, ImmSigs.SUPER_HEAPT_HEAPT, sig.none),
+	REF_TEST			(0xFB, 0x40, "ref.test"),//, ImmSigs.HEAPT_HEAPT, sig.none),
+	REF_CAST			(0xFB, 0x41, "ref.cast"),//, ImmSigs.HEAPT_HEAPT, sig.none),
+	TRY_CAST			(0xFB, 0x42, "ref.try_cast"),//, ImmSigs.LABEL_HEAPT_HEAPT, sig.none),
+}
+enum GcPfTypeOpcode(code: byte) {
+	STRUCT(0x5f),
+	ARRAY(0x5e),
+	I31REF(0x6a),
+	RTT(0x69),
+}
+
+// ----- Types -------------------------------------------------------------------------
+enum GcPfPackedness { UNPACKED, PACKED_I8, PACKED_I16 }
+class GcPfFieldType(valueType: ValueType, packed: GcPfPackedness, mutable: bool) { }
+class GcPfStructType extends HostType {
+	var fields: Array<GcPfFieldType>;
+	var boilerplate: Array<Value>; // TODO: compute boilerplate
+	def isAssignableTo(t: ValueType) -> bool {
+		match (t) {
+			ANYREF, EXTERNREF => return true;
+			Host(host) => match (host) {
+				that: GcPfStructType => {
+					if (this == that) return true;
+					if (this.fields.length < that.fields.length) return false;
+					// TODO: structural comparison
+					return false;
+				}
+				_ => return false;
+			}
+			_ => return false;
+		}
+	}
+}
+class GcPfArrayType extends HostType {
+	var elems: Array<GcPfFieldType>;
+	var value: Value; // TODO: compute default value
+	def isAssignableTo(t: ValueType) -> bool {
+		match (t) {
+			ANYREF, EXTERNREF => return true;
+			Host(host) => match (host) {
+				that: GcPfArrayType => {
+					if (this == that) return true;
+					// TODO: element comparison
+					return false;
+				}
+				_ => return false;
+			}
+			_ => return false;
+		}
+	}
+}
+class GcPfRttType extends HostType {
+}
+
+// ----- Object representation ----------------------------------------------------------
+class GcPfObject(rtt: GcPfRttObject, vals: Array<Value>) extends HostObject {
+}
+class GcPfStructObject extends GcPfObject {
+	def decl: GcPfStructType;  // XXX: combine rtt and decl field
+	new(decl, rtt: GcPfRttObject, vals: Array<Value>) super(rtt, vals) { }
+}
+class GcPfArrayObject extends GcPfObject {
+	def decl: GcPfArrayType;  // XXX: combine rtt and decl field
+	new(decl, rtt: GcPfRttObject, vals: Array<Value>) super(rtt, vals) { }
+}
+class GcPfRttObject extends HostObject {
+	def host: HostType;
+	def var supers: Array<GcPfRttObject>;
+	new(host, prefix: Array<GcPfRttObject>) {
+		supers = Arrays.grow(prefix, prefix.length + 1);
+		supers[supers.length - 1] = this;
+	}
+}
+class GcPfI31(val: u31) extends HostObject {
+}
+
+// ----- Operations ---------------------------------------------------------------------
+def NULL_DEREF = HostResult.Trap(TrapReason.NULL_DEREF);
+def ARRAY_INDEX_OOB = HostResult.Trap(TrapReason.ARRAY_INDEX_OOB);
+def FAILED_CAST = HostResult.Trap(TrapReason.FAILED_CAST);
+def OOM = HostResult.Trap(TrapReason.OOM);
+def VOID = HostResult.Value(Values.NONE);
+def ZERO = HostResult.Value([Values.I32_0]);
+def ONE = HostResult.Value([Values.I32_1]);
+def MAX_ARRAY_LENGTH = 1000000; // TODO: make configurable
+
+def sx8(val: Value) -> Value { return Value.I32(u32.view(i8.view(Value.I32.!(val).val))); }
+def sx16(val: Value) -> Value { return Value.I32(u32.view(i16.view(Value.I32.!(val).val))); }
+def zx8(val: Value) -> Value { return Value.I32(u32.view(u8.view(Value.I32.!(val).val))); }
+def zx16(val: Value) -> Value { return Value.I32(u32.view(u16.view(Value.I32.!(val).val))); }
+
+//-----------------------------------------------------------------------------
+def eval_STRUCT_NEW(st: GcPfStructType, args: Array<Value>) -> HostResult {
+	var obj = GcPfStructObject.new(st, null, Arrays.dup(args));
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_STRUCT_NEW_WITH_RTT(st: GcPfStructType, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[args.length - 1]).val);
+	var obj = GcPfStructObject.new(st, rtt, Arrays.range(args, 0, args.length - 1));
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_STRUCT_NEW_DEFAULT_WITH_RTT(st: GcPfStructType, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[args.length - 1]).val);
+	var obj = GcPfStructObject.new(st, rtt, Arrays.dup(st.boilerplate));
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_STRUCT_GET(index: int, args: Array<Value>) -> HostResult {
+	var obj = GcPfStructObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	return HostResult.Value([obj.vals[index]]);
+}
+//-----------------------------------------------------------------------------
+def eval_STRUCT_GET_X(index: int, extend: Value -> Value, args: Array<Value>) -> HostResult {
+	var obj = GcPfStructObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	return HostResult.Value([extend(obj.vals[index])]);
+}
+//-----------------------------------------------------------------------------
+def eval_STRUCT_SET(index: int, args: Array<Value>) -> HostResult {
+	var obj = GcPfStructObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	obj.vals[index] = args[1];
+	return VOID;
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_NEW(at: GcPfArrayType, args: Array<Value>) -> HostResult {
+	var len = Values.v_u(args[1]);
+	if (len > MAX_ARRAY_LENGTH) return OOM;
+	var elems = Array<Value>.new(int.view(len));
+	var obj = GcPfArrayObject.new(at, null, elems);
+	var val = args[0];
+	for (i < elems.length) elems[i] = val;
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_NEW_WITH_RTT(at: GcPfArrayType, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[2]).val);
+	var len = Values.v_u(args[1]);
+	if (len > MAX_ARRAY_LENGTH) return OOM;
+	var elems = Array<Value>.new(int.view(len));
+	var obj = GcPfArrayObject.new(at, rtt, elems);
+	var val = args[0];
+	for (i < elems.length) elems[i] = val;
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_NEW_DEFAULT_WITH_RTT(at: GcPfArrayType, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[1]).val);
+	var len = Values.v_u(args[0]);
+	if (len > MAX_ARRAY_LENGTH) return OOM;
+	var elems = Array<Value>.new(int.view(len));
+	var obj = GcPfArrayObject.new(at, rtt, elems);
+	var val = at.value;
+	for (i < elems.length) elems[i] = val;
+	return HostResult.Value([Value.Ref(obj)]);
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_GET(args: Array<Value>) -> HostResult {
+	var obj = GcPfArrayObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	var index = Values.v_u(args[1]);
+	if (index >= obj.vals.length) return ARRAY_INDEX_OOB;
+	return HostResult.Value([obj.vals[index]]);
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_GET_X(extend: Value -> Value, args: Array<Value>) -> HostResult {
+	var obj = GcPfArrayObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	var index = Values.v_u(args[1]);
+	if (index >= obj.vals.length) return ARRAY_INDEX_OOB;
+	return HostResult.Value([extend(obj.vals[index])]);
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_SET(args: Array<Value>) -> HostResult {
+	var obj = GcPfArrayObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	var index = Values.v_u(args[1]);
+	if (index >= obj.vals.length) return ARRAY_INDEX_OOB;
+	obj.vals[index] = args[2];
+	return VOID;
+}
+//-----------------------------------------------------------------------------
+def eval_ARRAY_LEN(args: Array<Value>) -> HostResult {
+	var obj = GcPfArrayObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return NULL_DEREF;
+	return HostResult.Value([Value.I32(u32.view(obj.vals.length))]);
+}
+//-----------------------------------------------------------------------------
+def eval_I31_NEW(args: Array<Value>) -> HostResult {
+	var val = u31.view(Values.v_u(args[0]));
+	return HostResult.Value([Value.Ref(GcPfI31.new(val))]);
+}
+//-----------------------------------------------------------------------------
+def eval_I31_GET_S(args: Array<Value>) -> HostResult {
+	var obj = GcPfI31.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return ZERO;
+	var val = Values.i_v(i31.view(obj.val));
+	return HostResult.Value([val]);
+}
+//-----------------------------------------------------------------------------
+def eval_I31_GET_U(args: Array<Value>) -> HostResult {
+	var obj = GcPfI31.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return ZERO;
+	return HostResult.Value([Values.u_v(obj.val)]);
+}
+//-----------------------------------------------------------------------------
+def eval_RTT_CANON(ht: HostType, args: Array<Value>) -> HostResult; // TODO
+//-----------------------------------------------------------------------------
+def eval_RTT_SUB(depth: int, ht: HostType, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[0]).val);
+	var nrtt = GcPfRttObject.new(ht, rtt.supers);
+	return HostResult.Value([Value.Ref(nrtt)]);
+}
+//-----------------------------------------------------------------------------
+def eval_REF_TEST(depth: int, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[1]).val);
+	var obj = GcPfObject.!(Value.Ref.!(args[0]).val);
+	if (obj == null) return ZERO;
+	if (obj.rtt == null) return ZERO;
+	if (obj.rtt.supers.length < depth) return ZERO;
+	return if(obj.rtt.supers[depth] == rtt, ONE, ZERO);
+}
+//-----------------------------------------------------------------------------
+def eval_REF_CAST(depth: int, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[1]).val);
+	var val = args[0];
+	var obj = GcPfObject.!(Value.Ref.!(val).val);
+	if (obj == null) return ZERO;
+	if (obj.rtt == null) return ZERO;
+	if (obj.rtt.supers.length < depth) return ZERO;
+	return if(obj.rtt.supers[depth] == rtt, HostResult.Value([val]), FAILED_CAST);
+}
+//-----------------------------------------------------------------------------
+def eval_TRY_CAST(depth: int, args: Array<Value>) -> HostResult {
+	var rtt = GcPfRttObject.!(Value.Ref.!(args[1]).val);
+	var val = args[0];
+	var obj = GcPfObject.!(Value.Ref.!(val).val);
+	if (obj == null) return ZERO;
+	if (obj.rtt == null) return ZERO;
+	if (obj.rtt.supers.length < depth) return ZERO;
+	var ok = obj.rtt.supers[depth] == rtt;
+	return if (ok,
+		HostResult.Value([val, Values.I32_1]),
+		HostResult.Value([Values.REF_NULL, Values.I32_0]));
+}
+
+// ----- Decoding / import processing ---------------------------------------------------
+def EMPTY: Array<byte> = [];
+class GcPfProcessor(error: ErrorGen) extends ImportProcessor("wasm-gc-polyfill") {
+	def decoder = Decoder.new(EMPTY, error);
+
+	def preprocess(module: Module) {
+	}
+
+	def processCommand(name: string, args: Array<Exportable>) -> Exportable {
+		return null;
+	}
+	def processFunction(name: string, args: Array<Exportable>, decl: FuncDecl) -> Exportable {
+		return null;
+	}
+	def processAbsType(name: string, args: Array<Exportable>, decl: AbsTypeDecl) -> Exportable {
+		return null;
+	}
+}
