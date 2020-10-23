@@ -1,31 +1,25 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def EMPTY: Array<byte> = [];
-def ERROR = ErrorGen.new();
-def SYNTH_CODE = Code.new([
-	0, // no locals
-	InternalOpcode.START.code,
-	Opcode.END.code
-]);
-
 // Executes wasm code.
 class Interpreter {
 	def trace = if(Trace.interpreter, InstrTracer.new());
-	def val_stack = Stack<Value>.new();
-	def call_stack = Stack<Frame>.new();
-	def codeptr = CodePtr.new(EMPTY, ERROR);
-	var frame: Frame;	// cache of top-of-stack
-	var state: ExecState;
-	var trap_reason: TrapReason;
-	var error_msg: string;
-	var step_count: int;
-	var max_call_depth = 10000;
-	var limits = Limits.new();
+	def val_stack = Stack<Value>.new();   // XXX: inline value stack array and top
+	def call_stack = Stack<Frame>.new();  // XXX: inline call stack array and top
+	def codeptr = CodePtr.new(null, IGNORED_ERRORGEN);
+	var frame: Frame;			// cached of top-of-stack frame
+	var state: ExecState;			// current execution state
+	var trap_reason: TrapReason;		// trap reason, if any
+	var error_msg: string;			// error message associated with trap
+	var step_count: int;			// total number of steps executed
+	var limits = Limits.new();		// limits on execution/memory
+	var entry: Function;			// entrypoint function from {run()}
 
-	var entry: Function;
-
-	def reset() -> this {
+	// Reset the interpreter state and run the function {f} on the arguments {args}.
+	// Limits the execution to maximum {count} bytecodes. If {count < 0}, run
+	// until exhausting, trap, or break.
+	def run(count: int, f: Function, args: Array<Value>) -> Result {
+		// Reset interpreter state
 		frame = null;
 		state = ExecState.STOPPED;
 		trap_reason = TrapReason.NONE;
@@ -33,12 +27,6 @@ class Interpreter {
 		step_count = 0;
 		val_stack.top = 0;
 		call_stack.top = 0;
-	}
-	def rerun(count: int, f: Function, args: Array<Value>) -> Result {
-		reset();
-		return run(count, f, args);
-	}
-	def run(count: int, f: Function, args: Array<Value>) -> Result {
 		// Push arguments onto the stack
 		val_stack.resize(0);
 		if (args != null) for (a in args) val_stack.push(a);
@@ -52,6 +40,7 @@ class Interpreter {
 		loop(1 + count);  // 1 instruction for the special START bytecode
 		return finish(f.sig.results.length);
 	}
+	// Resume a stopped execution (e.g. after a breakpoint).
 	def resume(count: int) -> Result {
 		var results = if(call_stack.top > 0, call_stack.elems[0].func.sig.results.length);
 		match (state) {
@@ -63,6 +52,7 @@ class Interpreter {
 		loop(count);
 		return finish(results);
 	}
+
 	def finish(results: int) -> Result {
 		match (state) {
 			FINISHED => return Result.Value(popN(results));
@@ -72,9 +62,8 @@ class Interpreter {
 		}
 		return Result.Break;
 	}
-
 	def pushFrame(f: WasmFunction) {
-		if (call_stack.top >= max_call_depth) {
+		if (call_stack.top >= limits.max_call_depth) {
 			return trap(TrapReason.STACK_OVERFLOW);
 		}
 		if (trace != null) traceFrame(f);
@@ -474,7 +463,6 @@ class Interpreter {
 			Opcode.I64_ROTL.code => do_ww_w(ExecUtil.I64_ROTL);
 			Opcode.I64_ROTR.code => do_ww_w(ExecUtil.I64_ROTR);
 
-			// F32 arithmetic
 			Opcode.F32_ABS.code => do_f_f(float.abs);
 			Opcode.F32_NEG.code => do_f_f(ExecUtil.fneg);
 			Opcode.F32_CEIL.code => do_f_f(ExecUtil.fceil);
@@ -490,7 +478,6 @@ class Interpreter {
 			Opcode.F32_MAX.code => do_ff_f(ExecUtil.fmax);
 			Opcode.F32_COPYSIGN.code => do_ff_f(ExecUtil.fcopysign);
 
-			// F64 arithmetic
 			Opcode.F64_ABS.code => do_d_d(double.abs);
 			Opcode.F64_NEG.code => do_d_d(ExecUtil.dneg);
 			Opcode.F64_CEIL.code => do_d_d(ExecUtil.dceil);
@@ -550,7 +537,9 @@ class Interpreter {
 					v = Values.FUNCREF_NULL;
 				} else if (index == i7.view(BpTypecon.EXTERNREF.code)) {
 					v = Values.REF_NULL;
-				} else { // TODO: anyref
+				} else if (index == i7.view(BpTypecon.ANYREF.code)) {
+					v = Values.REF_NULL;
+				} else {
 					var decl = frame.func.instance.module.heaptypes[index];
 					match (decl) {
 						x: SigDecl => v = Values.FUNCREF_NULL;
@@ -605,6 +594,7 @@ class Interpreter {
 					return -1;
 				}
 			}
+
 			0xFB => {
 				var b2 = codeptr.read_u8();
 				match (b2) {
@@ -626,7 +616,7 @@ class Interpreter {
 						var struct = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
 						var rtt = Value.Rtt.!(pop());
 						var fields = Array<Value>.new(struct.field_types.length);
-						for (i < fields.length) fields[i] = Values.default(struct.field_types[i].val_type);
+						for (i < fields.length) fields[i] = Values.default(struct.field_types[i].valtype);
 						push(Value.Ref(HeapStruct.new(struct, rtt, fields)));
 					}
 					Opcode.STRUCT_GET.code => {
@@ -700,7 +690,7 @@ class Interpreter {
 							trap(TrapReason.OOM);
 						} else {
 							var length = int.view(len);
-							var elem = Values.default(array.elem_types[0].val_type);
+							var elem = Values.default(array.elem_types[0].valtype);
 							var vals = Array<Value>.new(length);
 							for (i < vals.length) vals[i] = elem;
 							push(Value.Ref(HeapArray.new(array, rtt, vals)));
@@ -895,22 +885,23 @@ class Interpreter {
 	}
 	def unhandled(opcode: byte) {
 		if (Opcodes.attributes[opcode].VALID) {
-			trap(TrapReason.UNIMPLEMENTED);
+			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
 		} else if (Opcodes.attributes[opcode].PREFIX &&
 			Opcodes.find(opcode, codeptr.read_u8()) != Opcode.UNREACHABLE) {
-			trap(TrapReason.UNIMPLEMENTED);
+			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
 		} else {
 			error("invalid opcode");
 		}
 	}
 	def unhandled2(opcode: byte, b2: byte) {
 		if (Opcodes.find(opcode, b2) != Opcode.UNREACHABLE) {
-			trap(TrapReason.UNIMPLEMENTED);
+			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
 		} else {
 			error("invalid opcode");
 		}
 	}
 	def doLoad<RT, VT, T>(load: (Memory, u32, u32) -> (TrapReason, RT), box: T -> Value) {
+		// XXX: factor load/store logic for better polymorphic specialization
 		var flags = codeptr.read_u8();
 		var mem_index = if((flags & BpConstants.MEMARG_INDEX_FLAG) != 0, codeptr.read_u32leb());
 		var offset = codeptr.read_u32leb();
@@ -921,6 +912,7 @@ class Interpreter {
 		else push(box(T.!(VT.!(t.1))));
 	}
 	def doStore<VT, T>(store: (Memory, u32, u32, VT) -> TrapReason, unbox: Value -> T) {
+		// XXX: factor load/store logic for better polymorphic specialization
 		var flags = codeptr.read_u8();
 		var mem_index = if((flags & BpConstants.MEMARG_INDEX_FLAG) != 0, codeptr.read_u32leb());
 		var offset = codeptr.read_u32leb();
@@ -931,7 +923,7 @@ class Interpreter {
 		if (t != TrapReason.NONE) trap(t);
 	}
 	def doBranch(pc: int) -> int {
-		var t = findCtlXfer(pc);
+		var t = findCtlXfer(pc); // XXX: use extended pc instead of table lookup
 		if (t.0 == null) {
 			error("control transfer not found");
 			return pc;
@@ -944,7 +936,7 @@ class Interpreter {
 		return pc + pc_delta;
 	}
 	def doSwitch(pc: int, key: u32) -> int {
-		var t = findCtlXfer(pc);
+		var t = findCtlXfer(pc); // XXX: use extended pc instead of table lookup
 		if (t.0 == null) {
 			error("control transfer not found");
 			return pc;
@@ -970,11 +962,10 @@ class Interpreter {
 		copyVals(count, frame.fp);
 		call_stack.pop();
 		frame = call_stack.peek();
-		if (frame == null) {
+		if (frame == null) {  // popped top frame, finished execution
 			state = ExecState.FINISHED;
 			codeptr.reset(null, 0, 0);
-		} else {
-			// Advance past caller's call instruction.
+		} else { // advance past caller's call instruction
 			var code = frame.func.decl.code.code;
 			codeptr.reset(code, frame.pc, code.length - frame.pc);
 			var opcode = codeptr.read_u8();
@@ -1008,6 +999,7 @@ class Interpreter {
 					trap(TrapReason.FUNC_INVALID);
 					return null;
 				}
+				// TODO: signature check here is exact, and expensive
 				var sig = SigDecl.!(frame.func.instance.module.heaptypes[int.!(sig_index)]);
 				if (f.sig.isAssignableSig(sig)) return f; // success
 
@@ -1018,7 +1010,7 @@ class Interpreter {
 		return null;
 	}
 	def doCallFunction(func: Function) {
-		while (true) {
+		while (true) {  // host function may tail-call another function
 			match (func) {
 				wf: WasmFunction => return pushFrame(wf);
 				hf: HostFunction => {
@@ -1143,7 +1135,7 @@ class Interpreter {
 	}
 	def traceStep() {
 		for (i < call_stack.top) trace.sp();
-		trace.put1("%x: ", codeptr.pos);
+		trace.put1("+%d: ", codeptr.pos);  // XXX: fixed with decimal offset
 		var module = if(frame.func.instance != null, frame.func.instance.module);
 		trace.putInstr(module, codeptr);
 		if (Trace.operands) {
@@ -1273,6 +1265,8 @@ class Interpreter {
 		}
 	}
 }
+
+// Internal execution states of the interpreter.
 enum ExecState {
 	STOPPED,	// execution has not yet begun
 	RUNNING,	// currently running
@@ -1281,11 +1275,39 @@ enum ExecState {
 	TIMEOUT,	// execution timed out
 	TRAPPED		// execution encountered a trap
 }
+
+// Internal representation of execution frames.
 class Frame {
 	var func: WasmFunction;
 	var fp: int;
 	var pc: int;
 }
+
+// Reasons a WebAssembly execution has trapped.
+enum TrapReason {
+	NONE,
+	UNREACHABLE,
+	MEM_OUT_OF_BOUNDS,
+	UNALIGNED_ACCESS,
+	DIV_BY_ZERO,
+	DIV_UNREPRESENTABLE,
+	REM_BY_ZERO,
+	FLOAT_UNREPRESENTABLE,
+	FUNC_INVALID,
+	FUNC_SIG_MISMATCH,
+	DATA_SEGMENT_DROPPED,
+	ELEM_SEGMENT_DROPPED,
+	TABLE_OUT_OF_BOUNDS,
+	TABLE_INDEX_OUT_OF_BOUNDS,
+	STACK_OVERFLOW,
+	NULL_DEREF,
+	UNIMPLEMENTED,
+	ARRAY_INDEX_OOB,
+	OOM,
+	FAILED_CAST,
+	ERROR
+}
+
 type Result {
 	case Break {}
 	case Value(vals: Array<Value>) {}
@@ -1321,6 +1343,15 @@ type Result {
 		return buf;
 	}
 }
+
+def IGNORED_ERRORGEN = ErrorGen.new();
+def SYNTH_CODE = Code.new([
+	0, // no locals
+	InternalOpcode.START.code,
+	Opcode.END.code
+]);
+
+// Execution utilities for the interpreter.
 component ExecUtil {
 	def fwBoundCall(f: Function, args1: Array<Value>, args2: Array<Value>) -> HostResult {
 		var al = args1.length, args = Array<Value>.new(al + args2.length);
