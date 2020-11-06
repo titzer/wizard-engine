@@ -31,14 +31,25 @@ enum GcPfFuncOpcode(prefix: byte, code: byte, mnemonic: string) {
 
 // ----- Types -------------------------------------------------------------------------
 enum GcPfTypeOpcode(code: byte) {
-	STRUCT(0x5f),
-	ARRAY(0x5e),
+	DECL_STRUCT(0x5f),
+	DECL_ARRAY(0x5e),
 	I31REF(0x6a),
-	RTT(0x69),
+	DECL_RTT(0x69),
+	REF_NONNULL(0x6B)
 }
 enum GcPfPackedness { UNPACKED, PACKED_I8, PACKED_I16 }
-class GcPfFieldType(valueType: ValueType, packed: GcPfPackedness, mutable: bool) { }
-class GcPfStructType extends HostType {
+class GcPfFieldType(valueType: ValueType, packed: GcPfPackedness, mutable: bool) {
+	var index: int;
+}
+class GcPfDataType extends HostType {
+	def rttType(depth: int) -> GcPfRttType {
+		var rtt = GcPfRttType.new();
+		rtt.decl = this;
+		rtt.depth = depth;
+		return rtt;
+	}
+}
+class GcPfStructType extends GcPfDataType {
 	var fields: Array<GcPfFieldType>;
 	var boilerplate: Array<Value>; // TODO: compute boilerplate
 	def isAssignableTo(t: ValueType) -> bool {
@@ -57,7 +68,7 @@ class GcPfStructType extends HostType {
 		}
 	}
 }
-class GcPfArrayType extends HostType {
+class GcPfArrayType extends GcPfDataType {
 	var elems: Array<GcPfFieldType>;
 	var value: Value; // TODO: compute default value
 	def isAssignableTo(t: ValueType) -> bool {
@@ -75,8 +86,13 @@ class GcPfArrayType extends HostType {
 		}
 	}
 }
-class GcPfRttType extends HostType {
+class GcPfRttType extends GcPfDataType {
+	var decl: GcPfDataType;
+	var depth: int;
 }
+class GcPfI31RefType extends GcPfDataType {
+}
+def I31_TYPE = GcPfI31RefType.new();
 
 // ----- Object representation ----------------------------------------------------------
 class GcPfObject(rtt: GcPfRttObject, vals: Array<Value>) extends HostObject {
@@ -90,7 +106,7 @@ class GcPfArrayObject extends GcPfObject {
 	new(decl, rtt: GcPfRttObject, vals: Array<Value>) super(rtt, vals) { }
 }
 class GcPfRttObject extends HostObject {
-	def host: HostType;
+	def host: GcPfDataType;
 	def var supers: Array<GcPfRttObject>;
 	new(host, prefix: Array<GcPfRttObject>) {
 		supers = Arrays.grow(prefix, prefix.length + 1);
@@ -230,11 +246,11 @@ def eval_I31_GET_U(a: Value) -> HostResult {
 	return HostResult.Value1(Values.u_v(obj.val));
 }
 //-----------------------------------------------------------------------------
-def eval_RTT_CANON(ht: HostType, args: Array<Value>) -> HostResult; // TODO
+def eval_RTT_CANON(ht: GcPfDataType, v: void) -> HostResult; // TODO
 //-----------------------------------------------------------------------------
-def eval_RTT_SUB(depth: int, ht: HostType, r: Value) -> HostResult {
+def eval_RTT_SUB(depth: int, ht: GcPfDataType, r: Value) -> HostResult {
 	var rtt = GcPfRttObject.!(Value.Ref.!(r).val);
-	var nrtt = GcPfRttObject.new(ht, rtt.supers);
+	var nrtt = GcPfRttObject.new(ht, rtt.supers); // TODO: allocate up to depth
 	return HostResult.Value1(Value.Ref(nrtt));
 }
 //-----------------------------------------------------------------------------
@@ -271,17 +287,240 @@ def eval_TRY_CAST(depth: int, a: Value, r: Value) -> HostResult {
 // ----- Decoding / import processing ---------------------------------------------------
 class GcPfProcessor(error: ErrorGen) extends ImportProcessor("wasm-gc-polyfill") {
 	def decoder = Decoder.new(null, error);
+	var gctypes = Vector<GcPfDataType>.new();
+	var import_args: Array<Exportable>;
+	var import_arg_index: int;
+	var import_pos = -1;
 
 	def preprocess(module: Module) {
+		gctypes.resize(module.abstypes.length);
+		for (i < module.imports.length) {
+			var decl = module.imports[i];
+			if (!Strings.equals("wasm-gc-polyfill", decl.imp.module_name)) continue;
+			match (decl) {
+				x: AbsTypeDecl => {
+					var name = decl.imp.field_name;
+					setImportArgDecls(name, decl.imp.args);
+					var t = preprocessAbsType(name);
+					gctypes[x.abstype_index] = t;
+				}
+			}
+		}
 	}
 
-	def processCommand(name: string, args: Array<Exportable>) -> Exportable {
+	// Tracing and error handling helpers
+	def setImportArgDecls(name: string, args: Array<Decl>) {
+		this.import_args = Array.new(args.length);
+		this.import_arg_index = 0;
+		this.import_pos++;
+		for (i < args.length) {
+			match (args[i]) {
+				x: AbsTypeDecl => {
+					var t: GcPfDataType;
+					if (x.abstype_index <= gctypes.length) t = gctypes[x.abstype_index];
+					import_args[i] = ExportedValueType.new(t, ValueType.Abstract(x));
+				}
+			}
+		}
+	}
+	def preprocessAbsType(name: string) -> GcPfDataType {
+		if (name.length < 1) return err1("import of empty type", ());
+		decoder.reset(name, 1, name.length - 1);
+		var opcode = name[0];
+		match (opcode) {
+			GcPfTypeOpcode.DECL_STRUCT.code => return null;
+			GcPfTypeOpcode.DECL_ARRAY.code => return null;
+			GcPfTypeOpcode.DECL_RTT.code => {
+				var rtt = GcPfRttType.new();
+				rtt.depth = read_int();
+				rtt.decl = read_data_type();
+				return rtt;
+			}
+			GcPfTypeOpcode.I31REF.code => return I31_TYPE;
+			GcPfTypeOpcode.REF_NONNULL.code => {
+				var decl = read_data_type();
+				// TODO;
+			}
+		}
 		return null;
 	}
+
 	def processFunction(name: string, args: Array<Exportable>, decl: FuncDecl) -> Exportable {
+		if (name.length < 1) return err1("import of empty type", ());
+		decoder.reset(name, 1, name.length - 1);
+		var opcode = name[0];
+		match (opcode) {
+			GcPfFuncOpcode.STRUCT_NEW.code => {
+				var struct = read_struct_type();
+				if (struct == null) return null;
+				var sig: SigDecl; // TODO
+				return HostFunctionN.new(GcPfFuncOpcode.STRUCT_NEW.name,
+					sig, eval_STRUCT_NEW(struct, _));
+			}
+			GcPfFuncOpcode.STRUCT_NEW_WITH_RTT.code	=> {
+				var struct = read_struct_type();
+				if (struct == null) return null;
+				var sig: SigDecl; // TODO
+				return HostFunctionN.new(GcPfFuncOpcode.STRUCT_NEW_WITH_RTT.name,
+					sig, eval_STRUCT_NEW_WITH_RTT(struct, _));
+			}
+			GcPfFuncOpcode.STRUCT_NEW_DEFAULT_WITH_RTT.code	=> {
+				var struct = read_struct_type(), rtt = struct.rttType(-1);
+				if (struct == null) return null;
+				var sig = SigDecl.new(hta(rtt), hta(struct));
+				return HostFunction1.new(GcPfFuncOpcode.STRUCT_NEW_DEFAULT_WITH_RTT.name,
+					sig, eval_STRUCT_NEW_DEFAULT_WITH_RTT(struct, _));
+			}
+			GcPfFuncOpcode.STRUCT_GET.code => {
+				var struct = read_struct_type(), field = read_field(struct);
+				if (field == null) return null;
+				var sig = SigDecl.new(hta(struct), [field.valueType]);
+				return HostFunction1.new(GcPfFuncOpcode.STRUCT_GET.name,
+					sig, eval_STRUCT_GET(field.index, _));
+			}
+			GcPfFuncOpcode.STRUCT_GET_S.code => {
+				var struct = read_struct_type(), field = read_field(struct);
+				if (field == null) return null;
+				// TODO: check packedness
+				var sig = SigDecl.new(hta(struct), [field.valueType]);
+				var extend: Value -> Value; // TODO
+				return HostFunction1.new(GcPfFuncOpcode.STRUCT_GET_S.name,
+					sig, eval_STRUCT_GET_X(field.index, extend, _));
+			}
+			GcPfFuncOpcode.STRUCT_GET_U.code => {
+				var struct = read_struct_type(), field = read_field(struct);
+				if (field == null) return null;
+				// TODO: check packedness, proper extension func
+				var sig = SigDecl.new(hta(struct), [field.valueType]);
+				var extend: Value -> Value; // TODO
+				return HostFunction1.new(GcPfFuncOpcode.STRUCT_GET_U.name,
+					sig, eval_STRUCT_GET_X(field.index, extend, _));
+			}
+			GcPfFuncOpcode.STRUCT_SET.code => {
+				var struct = read_struct_type(), field = read_field(struct);
+				if (field == null) return null;
+				var sig = SigDecl.new(hta(struct), [field.valueType]);
+				return HostFunction2.new(GcPfFuncOpcode.STRUCT_SET.name,
+					sig, eval_STRUCT_SET(field.index, _, _));
+			}
+			GcPfFuncOpcode.ARRAY_NEW.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+			}
+			GcPfFuncOpcode.ARRAY_NEW_WITH_RTT.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+			}
+			GcPfFuncOpcode.ARRAY_NEW_DEFAULT_WITH_RTT.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+			}
+			GcPfFuncOpcode.ARRAY_GET.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+				var sig = SigDecl.new([ValueType.Host(array), ValueType.I32],
+					[array.elems[0].valueType]);
+				return HostFunction2.new(GcPfFuncOpcode.ARRAY_GET_S.name,
+					sig, eval_ARRAY_GET);
+			}
+			GcPfFuncOpcode.ARRAY_GET_S.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+				var sig = SigDecl.new([ValueType.Host(array), ValueType.I32],
+					[array.elems[0].valueType]);
+				var extend: Value -> Value; // TODO
+				return HostFunction2.new(GcPfFuncOpcode.ARRAY_GET_S.name,
+					sig, eval_ARRAY_GET_X(extend, _, _));
+			}
+			GcPfFuncOpcode.ARRAY_GET_U.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+				var sig = SigDecl.new([ValueType.Host(array), ValueType.I32],
+					[array.elems[0].valueType]);
+				var extend: Value -> Value; // TODO
+				return HostFunction2.new(GcPfFuncOpcode.ARRAY_GET_U.name,
+					sig, eval_ARRAY_GET_X(extend, _, _));
+			}
+			GcPfFuncOpcode.ARRAY_SET.code => {
+				var array = read_array_type();
+				if (array == null) return null;
+				var sig = SigDecl.new([ValueType.Host(array), ValueType.I32,
+					array.elems[0].valueType], SigCache.arr_v);
+				return HostFunction3.new(GcPfFuncOpcode.ARRAY_SET.name,
+					sig, eval_ARRAY_SET);
+			}
+			GcPfFuncOpcode.ARRAY_LEN.code => {
+				var array = read_array_type();
+				var sig = SigDecl.new(hta(array), SigCache.arr_i);
+				return HostFunction1.new(GcPfFuncOpcode.ARRAY_LEN.name,
+					sig, eval_ARRAY_LEN);
+			}
+			GcPfFuncOpcode.I31_NEW.code => {
+				var sig = SigDecl.new(SigCache.arr_i, hta(I31_TYPE));
+				return HostFunction1.new(GcPfFuncOpcode.I31_NEW.name,
+					sig, eval_I31_NEW);
+			}
+			GcPfFuncOpcode.I31_GET_S.code => {
+				var sig = SigDecl.new(hta(I31_TYPE), SigCache.arr_i);
+				return HostFunction1.new(GcPfFuncOpcode.I31_GET_S.name,
+					sig, eval_I31_GET_S);
+			}
+			GcPfFuncOpcode.I31_GET_U.code => {
+				var sig = SigDecl.new(hta(I31_TYPE), SigCache.arr_i);
+				return HostFunction1.new(GcPfFuncOpcode.I31_GET_U.name,
+					sig, eval_I31_GET_U);
+			}
+			GcPfFuncOpcode.RTT_CANON.code => {
+				var rtt = read_rtt_type();
+				var sig = SigDecl.new(SigCache.arr_v, hta(rtt));
+				return HostFunction0.new(GcPfFuncOpcode.RTT_CANON.name,
+					sig, eval_RTT_CANON(rtt, _));
+			}
+			GcPfFuncOpcode.RTT_SUB.code => {
+				var rtt1 = read_rtt_type(), rtt2 = read_rtt_type();
+				var sig = SigDecl.new(hta(rtt1), hta(rtt2));
+				return HostFunction1.new(GcPfFuncOpcode.RTT_SUB.name,
+					sig, eval_RTT_SUB(rtt2.depth, rtt2, _));
+			}
+			GcPfFuncOpcode.REF_TEST.code => {
+				var data = read_data_type();
+				var rtt = read_rtt_type();
+				var sig = SigDecl.new(hta(data), SigCache.arr_i);
+				return HostFunction2.new(GcPfFuncOpcode.REF_TEST.name,
+					sig, eval_REF_TEST(rtt.depth, _, _));
+			}
+			GcPfFuncOpcode.REF_CAST.code => {
+				var data = read_data_type();
+				var rtt = read_rtt_type();
+				var sig = SigDecl.new(hta(data), hta(rtt.decl));
+				return HostFunction2.new(GcPfFuncOpcode.REF_CAST.name,
+					sig, eval_REF_CAST(rtt.depth, _, _));
+			}
+			GcPfFuncOpcode.TRY_CAST.code => {
+				var data = read_data_type();
+				var rtt = read_rtt_type();
+				var sig = SigDecl.new(hta(data), [ValueType.Host(rtt.decl), ValueType.I32]);
+				return HostFunction2.new(GcPfFuncOpcode.TRY_CAST.name,
+					sig, eval_TRY_CAST(rtt.depth, _, _));
+			}
+		}
 		return null;
 	}
+	def hta(ht: HostType) -> Array<ValueType> {
+		return [ValueType.Host(ht)];
+	}
+	def read_data_type() -> GcPfDataType; // TODO
+	def read_struct_type() -> GcPfStructType; // TODO
+	def read_array_type() -> GcPfArrayType; // TODO
+	def read_rtt_type() -> GcPfRttType; // TODO
+	def read_field(t: GcPfStructType) -> GcPfFieldType; // TODO
+	def read_int() -> int; // TODO
 	def processAbsType(name: string, args: Array<Exportable>, decl: AbsTypeDecl) -> Exportable {
-		return null;
+		return gctypes[decl.abstype_index];
+	}
+	def err1<T, R>(s: string, p: T) -> R {
+		error.abs(import_pos).set(Strings.format1(s, p));
+		var d: R;
+		return d;
 	}
 }
