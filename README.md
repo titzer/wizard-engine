@@ -38,26 +38,36 @@ Because Wizard is written in Virgil, it runs on all the targets that Virgil curr
 
 In fact, because Wizard can itself be compiled to Wasm, it fully self-hosts!
 
-## Implementation ##
+## Design and Implementation ##
 
-Wizard has primarily focused on flexibility and readability.
-As opposed to engines focused on performance and written in more verbose languages, the core engine is just a few thousand lines of code.
-It currently has only one execution tier: a low-overhead interpreter.
+To understand Wizard, you'll have to learn Virgil, a fast and lightweight programming language.
+But learning Virgil is easy, and you can pick it up in no time!
+Wizard is implemented entirely in Virgil, with no supporting code in other languages.
+
+Wizard is small!
+Its architecture is focused on flexibility and readability.
+As opposed to engines focused on performance (and sadly losing on readability due to verbosity), the core engine is just a few thousand lines of code.
+It currently has only one execution tier: an easy-to-read and fast interpreter.
+The interpreter is designed to execute Wasm binary code directly, both for simplicity (no code rewriting) and low memory overhead (~10% additional supporting data structures).
 A three tier architecture (interpreter, baseline compiler, and optimizing compiler) is planned.
 
 Wizard compiles to a very small binary of just a few hundred kilobytes.
 Development with Wizard is very quick turnaround, as a full production build takes less than a second, and of course, it can run under Virgil's interpreter, too.
 
+Because Wizard is implemented in a garbage-collected language, it can implement the Wasm GC proposal (and other extensions) without a complex undertaking, instead just relying on the host language's garbage collector.
+
 ## Documentation ##
 
 The most up-to-date documentation is, as always, the implementation in this repository!
+
+See the [Design](Design.md) for a closer look at Wizard's internals.
 
 ### Research Projects
 
 Currently, Wizard supports two closely related research projects:
 
- * Generalized import system, a Wasm extension for expressing source-level constructs in Wasm
- * Jawa, a Java virtual machine runtime system implementation using the generalized import sytsem
+ * Generalized import system: a Wasm extension for expressing source-level constructs in Wasm
+ * Jawa: a Java virtual machine runtime system implementation using the generalized import sytsem
 
 ## License
 
