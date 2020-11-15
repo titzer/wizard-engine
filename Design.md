@@ -36,5 +36,5 @@ Rather than optimize for performance for a specific set of Wasm features _now_, 
 * [Host](src/engine/Host.v3) - Contains the base declarations for all host-provided functionality, e.g. for an embedding.
 * [Errors](src/engine/WasmErrorGen.v3) - Contains all the logic for the many kinds of errors that can be produced by an engine when decoding, validating, or instantiating a Wasm module.
   This separation allows the mainline code of decoding, validation, and instantiation to be kept tidy.
-* [Extensions](src/engine/Extensions.v3) - Contains an enumeration of all the extensions that can be individually enabled for the engine.
+* [Extensions](src/engine/Extension.v3) - Contains an enumeration of all the extensions that can be individually enabled for the engine.
 * [SpecTest](test/spectest) - Contains a parser for the .bin.wast format in which specification tests are expressed, along with an interpreter capable of running them.
