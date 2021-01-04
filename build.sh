@@ -9,7 +9,30 @@ if [ "$#" -lt 2 ]; then
     exit_usage
 fi
 
-ENGINE="src/engine/*.v3 src/util/*.v3"
+CUR_V3C=$(which v3c)
+
+if [ ! -x "$CUR_V3C" ]; then
+    echo "Virgil compiler (v3c) not found in PATH"
+    exit 1
+fi
+
+if [ "$VIRGIL_LIB_UTIL" = "" ]; then
+    if [ "$VIRGIL_LOC" = "" ]; then
+	VIRGIL_LIB_UTIL=$(dirname $CUR_V3C)/../lib/util/
+    else
+	VIRGIL_LIB_UTIL=${VIRGIL_LOC}/lib/util
+    fi
+fi
+
+if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
+    echo "Virgil utility code not found (searched $VIRGIL_LIB_UTIL)."
+    echo "Please set either: "
+    echo "  VIRGIL_LOC, to the root of your Virgil installation"
+    echo "  VIRGIL_LIB_UTIL, to point directly to these utilities"
+    exit 1
+fi
+    
+ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB_UTIL/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WAVE="src/wave/*.v3 src/wave.main.v3"

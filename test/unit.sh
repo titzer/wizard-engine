@@ -11,7 +11,31 @@ fi
 
 printf "Testing ${CYAN}unit${NORM} | "
 
-SRC="$WIZENG_LOC/src/*/*.v3"
+# TODO: factor out utility-finding code
+CUR_V3C=$(which v3c)
+
+if [ ! -x "$CUR_V3C" ]; then
+    echo "Virgil compiler (v3c) not found in PATH"
+    exit 1
+fi
+
+if [ "$VIRGIL_LIB_UTIL" = "" ]; then
+    if [ "$VIRGIL_LOC" = "" ]; then
+	VIRGIL_LIB_UTIL=$(dirname $CUR_V3C)/../lib/util/
+    else
+	VIRGIL_LIB_UTIL=${VIRGIL_LOC}/lib/util
+    fi
+fi
+
+if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
+    echo "Virgil utility code not found (searched $VIRGIL_LIB_UTIL)."
+    echo "Please set either: "
+    echo "  VIRGIL_LOC, to the root of your Virgil installation"
+    echo "  VIRGIL_LIB_UTIL, to point directly to these utilities"
+    exit 1
+fi
+    
+SRC="$WIZENG_LOC/src/*/*.v3 $VIRGIL_LIB_UTIL/*.v3"
 TEST="$WIZENG_LOC/test/*/*.v3"
 MAIN="$WIZENG_LOC/test/unittest.main.v3"
 LOG=/tmp/wizeng.unit.sh.log
