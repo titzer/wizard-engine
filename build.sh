@@ -46,19 +46,24 @@ PROGRAMS["unittest"]="$ENGINE $UNITTEST $JAWA"
 
 declare -A BUILD=()
 BUILD["x86-linux"]="build_x86_linux"
+BUILD["x86-64-linux"]="build_x86_64_linux"
 BUILD["jvm"]="build_jvm"
 BUILD["wave"]="build_wave"
 
 function build_x86_linux() {
-    v3c-x86-linux -heap-size=512m $V3C_OPTS -fp -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
+    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
+}
+
+function build_x86_64_linux() {
+    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
 }
 
 function build_jvm() {
-    v3c-jar $V3C_OPTS -fp -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.jvm
+    v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.jvm
 }
 
 function build_wave() {
-    v3c-wave -heap-size=512m $V3C_OPTS -fp -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.wave
+    v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.wave
 }
 
 PROGRAM=$1

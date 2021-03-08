@@ -52,3 +52,15 @@ bin/wave.x86-linux: $(WAVE)
 bin/jawa.x86-linux: $(JAWA)
 	./build.sh jawa x86-linux
 
+# x86-64-linux targets
+bin/unittest.x86-64-linux: $(UNITTEST)
+	./build.sh unittest x86-64-linux
+
+bin/spectest.x86-64-linux: $(SPECTEST)
+	./build.sh spectest x86-64-linux
+
+bin/wave.x86-64-linux: $(WAVE)
+	./build.sh wave x86-64-linux
+
+bin/jawa.x86-64-linux: $(JAWA)
+	./build.sh jawa x86-64-linux
