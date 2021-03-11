@@ -1,0 +1,194 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A Wasm memory implemented using mmap/mprotect.
+class X86_64Memory extends Memory {
+	var mmap: X86_64UnmapFinalizer;
+	var start: Pointer;
+	var limit: Pointer;
+	var end: Pointer;
+
+	new(decl: MemoryDecl) super(decl) {
+		var bytes = u64.!(decl.initial) << PAGE_SHIFT;
+		if (bytes > int.max || decl.initial > GlobalLimits.limit_memory_pages) {
+			oom = true;
+		} else {
+			// Reserve memory, unmapped, inaccessible
+			start = reserveMemoryRange();
+			if (start == Pointer.NULL) {
+				oom = true; // fail out of memory
+				return;
+			}
+			end = start + long.view(EIGHT_GB);
+			limit = start + long.view(bytes);
+			// Register finalizer for cleanup
+			mmap = X86_64UnmapFinalizer.new(start, end);
+			RiGc.registerFinalizer(this, mmap.deallocate);
+			// adjust permissions on guard region pages
+			var rw = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
+			var r = Linux.syscall(LinuxConst.SYS_mprotect, (start, bytes, rw));
+			if (r.0 != 0) {
+				deallocate();
+				oom = true;
+				return;
+			}
+		}
+	}
+	def size() -> u32 {
+		return u32.view((limit - start) >> PAGE_SHIFT);
+	}
+	def length() -> u64 {
+		return u64.view(limit - start);
+	}
+	def deallocate() {
+		mmap.deallocate();
+		start = limit = end = Pointer.NULL;
+	}
+	def grow(pages: u32) -> int {
+		var current = u64.!(size());
+		if (pages == 0) return int.!(current); // degenerate case
+		var nsize = current + pages;
+		if (nsize > decl.maximum.min(MAX_PAGES)) return -1; // exceeded maximum
+		// adjust permissions on guard region pages
+		var rw = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
+		var bytes = i64.view(pages) << PAGE_SHIFT;
+		var r = Linux.syscall(LinuxConst.SYS_mprotect, (limit, bytes, rw));
+		if (r.0 == 0) {
+			limit += bytes;
+			return int.!(current);
+		}
+		return -1;
+	}
+	def read1(offset: u32, index: u32) -> (TrapReason, u8) {
+		var i = boundsCheck(offset, index, 1);
+		if (i < 0) return (TrapReason.MEM_OUT_OF_BOUNDS, 0);
+		var val = (start + i).load<u8>();
+		return (TrapReason.NONE, val);
+	}
+	def read_u16(offset: u32, index: u32) -> (TrapReason, u16) {
+		var i = boundsCheck(offset, index, 2);
+		if (i < 0) return (TrapReason.MEM_OUT_OF_BOUNDS, 0);
+		var val = (start + i).load<u16>();
+		return (TrapReason.NONE, val);
+	}
+	def read_u32(offset: u32, index: u32) -> (TrapReason, u32) {
+		var i = boundsCheck(offset, index, 4);
+		if (i < 0) return (TrapReason.MEM_OUT_OF_BOUNDS, 0);
+		var val = (start + i).load<u32>();
+		return (TrapReason.NONE, val);
+	}
+	def read_u64(offset: u32, index: u32) -> (TrapReason, u64) {
+		var i = boundsCheck(offset, index, 8);
+		if (i < 0) return (TrapReason.MEM_OUT_OF_BOUNDS, 0);
+		var val = (start + i).load<u64>();
+		return (TrapReason.NONE, val);
+	}
+	def write_u8(offset: u32, index: u32, val: u8) -> TrapReason {
+		var i = boundsCheck(offset, index, 8);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		(start + i).store<u8>(val);
+		return TrapReason.NONE;
+	}
+	def write_u16(offset: u32, index: u32, val: u16) -> TrapReason {
+		var i = boundsCheck(offset, index, 2);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		(start + i).store<u16>(val);
+		return TrapReason.NONE;
+	}
+	def write_u32(offset: u32, index: u32, val: u32) -> TrapReason {
+		var i = boundsCheck(offset, index, 4);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		(start + i).store<u32>(val);
+		return TrapReason.NONE;
+	}
+	def write_u64(offset: u32, index: u32, val: u64) -> TrapReason {
+		var i = boundsCheck(offset, index, 8);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		(start + i).store<u64>(val);
+		return TrapReason.NONE;
+	}
+	def extract(offset: u32, len: u32) -> Array<byte> {
+		var i = boundsCheck(0, offset, len);
+		if (i < 0) return null;
+		var r = Array<byte>.new(int.view(len));
+		for (j < len) r[j] = (start + i + j).load<u8>(); // XXX: word-by-word copy
+		return r;
+	}
+	def copyD(dst_offset: u32, ddecl: DataDecl, src_offset: u32, size: u32) -> TrapReason {
+		var d = if(ddecl != null, ddecl.data);
+		var i = boundsCheck(0, src_offset, size);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		var j = boundsCheck(0, dst_offset, size);
+		if (j < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		memcopy(start + j, start + i, size);
+		return TrapReason.NONE;
+	}
+	def fill(dest: u32, val: u8, size: u32) -> TrapReason {
+		var i = boundsCheck(0, dest, size);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		var p = start + i, e = p + size;
+		if (size >= 8) {
+			var val64: u64 = val;
+			val64 = (val64 << 8) | val64;
+			val64 = (val64 << 16) | val64;
+			val64 = (val64 << 32) | val64;
+			var ea = e + -(size & 0x7);
+			while (p < ea) {
+				p.store<u64>(val64); // word-by-word fill
+				p += 8;
+			}
+		}
+		while (p < e) {
+			p.store<u8>(val); // byte-by-byte fill
+			p++;
+		}
+		return TrapReason.NONE;
+	}
+	def copyM(dst_offset: u32, src: Memory, src_offset: u32, size: u32) -> TrapReason {
+		if (src == null) return TrapReason.MEM_OUT_OF_BOUNDS;
+		var that = X86_64Memory.!(src);
+		var i = that.boundsCheck(0, src_offset, size);
+		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		var j = this.boundsCheck(0, dst_offset, size);
+		if (j < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		memcopy(this.start + j, that.start + i, size);
+		return TrapReason.NONE;
+	}
+	private def memcopy(p: Pointer, q: Pointer, size: u32) {
+		var end = p + size;
+		if (size >= 8) {
+			var ea = end + -(size & 0x7);
+			while (p < ea) {
+				p.store<u64>(q.load<u64>()); // word-by-word copy
+				p += 8;
+				q += 8;
+			}
+		}
+		while (p < end) {
+			p.store<u8>(q.load<u8>());
+			p++;
+			q++;
+		}
+	}
+}
+def PAGE_SIZE = 65536u;
+def PAGE_SHIFT: u5 = 16;
+def EIGHT_GB = 8uL * 1024u * 1024u * 1024u;
+def MAX_PAGES = 65536u;
+
+// A closure that deallocates mapped memory upon finalization.
+class X86_64UnmapFinalizer(var start: Pointer, var end: Pointer) {
+	def deallocate() {
+		if (start == Pointer.NULL) return; // already deallocated
+		Linux.syscall(LinuxConst.SYS_munmap, (start, end - start));
+		start = end = Pointer.NULL;
+	}
+}
+
+def reserveMemoryRange() -> Pointer {
+	var prot = LinuxConst.PROT_NONE;
+	var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
+	var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, EIGHT_GB, prot, flags, 0, 0));
+	if (r.0 == -1) return Pointer.NULL;
+	return Pointer.NULL + r.0;
+}

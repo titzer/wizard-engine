@@ -33,6 +33,8 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
 fi
     
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB_UTIL/*.v3"
+TARGET_V3="src/engine/v3/*.v3"
+TARGET_X86_64="src/engine/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WAVE="src/wave/*.v3 src/wave.main.v3"
@@ -51,19 +53,19 @@ BUILD["jvm"]="build_jvm"
 BUILD["wave"]="build_wave"
 
 function build_x86_linux() {
-    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
+    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
 }
 
 function build_x86_64_linux() {
-    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
+    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
 }
 
 function build_jvm() {
-    v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.jvm
+    v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.jvm
 }
 
 function build_wave() {
-    v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ && mv bin/$PROGRAM bin/$PROGRAM.wave
+    v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.wave
 }
 
 PROGRAM=$1

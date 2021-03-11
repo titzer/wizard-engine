@@ -35,7 +35,7 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
     exit 1
 fi
     
-SRC="$WIZENG_LOC/src/*/*.v3 $VIRGIL_LIB_UTIL/*.v3"
+SRC="$WIZENG_LOC/src/*/*.v3 $WIZENG_LOC/src/engine/v3/*.v3 $VIRGIL_LIB_UTIL/*.v3"
 TEST="$WIZENG_LOC/test/*/*.v3"
 MAIN="$WIZENG_LOC/test/unittest.main.v3"
 LOG=/tmp/wizeng.unit.sh.log

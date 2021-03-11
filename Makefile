@@ -1,13 +1,10 @@
-# TODO: reenable native targets when floating point is supported
-#all: bin/wizeng.x86-linux bin/unittest.x86-linux bin/spectest.x86-linux bin/wizeng.jvm bin/unittest.jvm bin/spectest.jvm
-
 all: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux
 
 clean:
 	rm -f bin/*
 	cp scripts/* bin/
 
-ENGINE=src/engine/*.v3 src/util/*.v3
+ENGINE=src/engine/*.v3 src/engine/*/*.v3 src/util/*.v3
 WAVE=$(ENGINE) src/wave/*.v3 src/wave.main.v3
 JAWA=$(ENGINE) src/jawa/*.v3 src/jawa.main.v3
 SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
