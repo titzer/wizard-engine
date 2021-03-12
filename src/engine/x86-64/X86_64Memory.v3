@@ -10,7 +10,7 @@ class X86_64Memory extends Memory {
 
 	new(decl: MemoryDecl) super(decl) {
 		var bytes = u64.!(decl.initial) << PAGE_SHIFT;
-		if (bytes > int.max || decl.initial > GlobalLimits.limit_memory_pages) {
+		if (bytes > int.max || decl.initial > Target.limit_memory_pages) {
 			oom = true;
 		} else {
 			// Reserve memory, unmapped, inaccessible
@@ -48,7 +48,7 @@ class X86_64Memory extends Memory {
 		var current = u64.!(size());
 		if (pages == 0) return int.!(current); // degenerate case
 		var nsize = current + pages;
-		if (nsize > decl.maximum.min(MAX_PAGES)) return -1; // exceeded maximum
+		if (nsize > decl.maximum.min(Target.limit_memory_pages)) return -1; // exceeded maximum
 		// adjust permissions on guard region pages
 		var rw = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
 		var bytes = i64.view(pages) << PAGE_SHIFT;
@@ -116,11 +116,13 @@ class X86_64Memory extends Memory {
 	}
 	def copyD(dst_offset: u32, ddecl: DataDecl, src_offset: u32, size: u32) -> TrapReason {
 		var d = if(ddecl != null, ddecl.data);
-		var i = boundsCheck(0, src_offset, size);
+		var i = boundsCheck(0, dst_offset, size);
 		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
-		var j = boundsCheck(0, dst_offset, size);
+		var j = ArrayUtil.boundsCheck(ddecl.data, src_offset, 0, size);
 		if (j < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
-		memcopy(start + j, start + i, size);
+		for (k < size) {
+			(start + i + k).store<u8>(ddecl.data[u32.view(j) + k]);
+		}
 		return TrapReason.NONE;
 	}
 	def fill(dest: u32, val: u8, size: u32) -> TrapReason {
@@ -132,7 +134,7 @@ class X86_64Memory extends Memory {
 			val64 = (val64 << 8) | val64;
 			val64 = (val64 << 16) | val64;
 			val64 = (val64 << 32) | val64;
-			var ea = e + -(size & 0x7);
+			var ea = e + -(long.view(size) & 0x7);
 			while (p < ea) {
 				p.store<u64>(val64); // word-by-word fill
 				p += 8;
@@ -147,17 +149,28 @@ class X86_64Memory extends Memory {
 	def copyM(dst_offset: u32, src: Memory, src_offset: u32, size: u32) -> TrapReason {
 		if (src == null) return TrapReason.MEM_OUT_OF_BOUNDS;
 		var that = X86_64Memory.!(src);
-		var i = that.boundsCheck(0, src_offset, size);
+		var i = this.boundsCheck(0, dst_offset, size);
 		if (i < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
-		var j = this.boundsCheck(0, dst_offset, size);
+		var j = that.boundsCheck(0, src_offset, size);
 		if (j < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
-		memcopy(this.start + j, that.start + i, size);
+		if (this == that && i > j) { // potentially overlapping, copy in reverse
+			var s = this.start + i;
+			var p = this.start + (i + size - 1u);
+			var q = that.start + (j + size - 1u);
+			while (p >= s) {
+				p.store<u8>(q.load<u8>());
+				p += -1;
+				q += -1;
+			}
+		} else {
+			memcopy(this.start + i, that.start + j, size);
+		}
 		return TrapReason.NONE;
 	}
 	private def memcopy(p: Pointer, q: Pointer, size: u32) {
 		var end = p + size;
-		if (size >= 8) {
-			var ea = end + -(size & 0x7);
+		if (size >= 8 && u64.view(q - p) >= 8) {
+			var ea = end + -(long.view(size) & 0x7);
 			while (p < ea) {
 				p.store<u64>(q.load<u64>()); // word-by-word copy
 				p += 8;
@@ -174,7 +187,6 @@ class X86_64Memory extends Memory {
 def PAGE_SIZE = 65536u;
 def PAGE_SHIFT: u5 = 16;
 def EIGHT_GB = 8uL * 1024u * 1024u * 1024u;
-def MAX_PAGES = 65536u;
 
 // A closure that deallocates mapped memory upon finalization.
 class X86_64UnmapFinalizer(var start: Pointer, var end: Pointer) {

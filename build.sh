@@ -57,7 +57,7 @@ function build_x86_linux() {
 }
 
 function build_x86_64_linux() {
-    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
+    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
 }
 
 function build_jvm() {
