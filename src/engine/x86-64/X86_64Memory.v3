@@ -2,8 +2,9 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // A Wasm memory implemented using mmap/mprotect.
+// XXX: factor out as a native 64-bit memory with guard regions.
 class X86_64Memory extends Memory {
-	var mmap: X86_64UnmapFinalizer;
+	var mapping: Mapping;
 	var start: Pointer;
 	var limit: Pointer;
 	var end: Pointer;
@@ -14,20 +15,16 @@ class X86_64Memory extends Memory {
 			oom = true;
 		} else {
 			// Reserve memory, unmapped, inaccessible
-			start = reserveMemoryRange();
-			if (start == Pointer.NULL) {
+			mapping = Mmap.reserve(EIGHT_GB, Mmap.PROT_NONE);
+			if (mapping == null) {
 				oom = true; // fail out of memory
 				return;
 			}
-			end = start + long.view(EIGHT_GB);
+			start = mapping.range.start;
+			end = mapping.range.end;
 			limit = start + long.view(bytes);
-			// Register finalizer for cleanup
-			mmap = X86_64UnmapFinalizer.new(start, end);
-			RiGc.registerFinalizer(this, mmap.deallocate);
 			// adjust permissions on guard region pages
-			var rw = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
-			var r = Linux.syscall(LinuxConst.SYS_mprotect, (start, bytes, rw));
-			if (r.0 != 0) {
+			if (!Mmap.protect(start, bytes, Mmap.PROT_READ | Mmap.PROT_WRITE)) {
 				deallocate();
 				oom = true;
 				return;
@@ -41,7 +38,8 @@ class X86_64Memory extends Memory {
 		return u64.view(limit - start);
 	}
 	def deallocate() {
-		mmap.deallocate();
+		mapping.range.unmap();
+		mapping = null;
 		start = limit = end = Pointer.NULL;
 	}
 	def grow(pages: u32) -> int {
@@ -50,14 +48,10 @@ class X86_64Memory extends Memory {
 		var nsize = current + pages;
 		if (nsize > decl.maximum.min(Target.limit_memory_pages)) return -1; // exceeded maximum
 		// adjust permissions on guard region pages
-		var rw = LinuxConst.PROT_READ | LinuxConst.PROT_WRITE;
-		var bytes = i64.view(pages) << PAGE_SHIFT;
-		var r = Linux.syscall(LinuxConst.SYS_mprotect, (limit, bytes, rw));
-		if (r.0 == 0) {
-			limit += bytes;
-			return int.!(current);
-		}
-		return -1;
+		var bytes = u64.view(pages) << PAGE_SHIFT;
+		if (!Mmap.protect(limit, bytes, Mmap.PROT_READ | Mmap.PROT_WRITE)) return -1;
+		limit += i64.view(bytes);
+		return int.!(current);
 	}
 	def read1(offset: u32, index: u32) -> (TrapReason, u8) {
 		var i = boundsCheck(offset, index, 1);
@@ -187,20 +181,3 @@ class X86_64Memory extends Memory {
 def PAGE_SIZE = 65536u;
 def PAGE_SHIFT: u5 = 16;
 def EIGHT_GB = 8uL * 1024u * 1024u * 1024u;
-
-// A closure that deallocates mapped memory upon finalization.
-class X86_64UnmapFinalizer(var start: Pointer, var end: Pointer) {
-	def deallocate() {
-		if (start == Pointer.NULL) return; // already deallocated
-		Linux.syscall(LinuxConst.SYS_munmap, (start, end - start));
-		start = end = Pointer.NULL;
-	}
-}
-
-def reserveMemoryRange() -> Pointer {
-	var prot = LinuxConst.PROT_NONE;
-	var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
-	var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, EIGHT_GB, prot, flags, 0, 0));
-	if (r.0 == -1) return Pointer.NULL;
-	return Pointer.NULL + r.0;
-}

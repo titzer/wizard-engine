@@ -16,25 +16,25 @@ if [ ! -x "$CUR_V3C" ]; then
     exit 1
 fi
 
-if [ "$VIRGIL_LIB_UTIL" = "" ]; then
+if [ "$VIRGIL_LIB" = "" ]; then
     if [ "$VIRGIL_LOC" = "" ]; then
-	VIRGIL_LIB_UTIL=$(dirname $CUR_V3C)/../lib/util/
+	VIRGIL_LIB=$(dirname $CUR_V3C)/../lib/
     else
-	VIRGIL_LIB_UTIL=${VIRGIL_LOC}/lib/util
+	VIRGIL_LIB=${VIRGIL_LOC}/lib/
     fi
 fi
 
-if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
-    echo "Virgil utility code not found (searched $VIRGIL_LIB_UTIL)."
+if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
+    echo "Virgil library code not found (searched $VIRGIL_LIB)."
     echo "Please set either: "
     echo "  VIRGIL_LOC, to the root of your Virgil installation"
-    echo "  VIRGIL_LIB_UTIL, to point directly to these utilities"
+    echo "  VIRGIL_LIB, to point directly to root of the library"
     exit 1
 fi
     
-ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB_UTIL/*.v3"
+ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
-TARGET_X86_64="src/engine/x86-64/*.v3"
+TARGET_X86_64="src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WAVE="src/wave/*.v3 src/wave.main.v3"
