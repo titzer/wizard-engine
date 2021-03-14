@@ -9,8 +9,6 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-printf "Testing ${CYAN}unit${NORM} | "
-
 # TODO: factor out utility-finding code
 CUR_V3C=$(which v3c)
 
@@ -34,11 +32,20 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
     echo "  VIRGIL_LIB_UTIL, to point directly to these utilities"
     exit 1
 fi
-    
-SRC="$WIZENG_LOC/src/*/*.v3 $WIZENG_LOC/src/engine/v3/*.v3 $VIRGIL_LIB_UTIL/*.v3"
-TEST="$WIZENG_LOC/test/*/*.v3"
-MAIN="$WIZENG_LOC/test/unittest.main.v3"
-LOG=/tmp/wizeng.unit.sh.log
+
+
+if [ "$1" = "x86-linux" ]; then
+    target=$1
+    shift
+elif [ "$1" = "x86-64-linux" ]; then
+    target=$1
+    shift
+elif [ "$1" = "jvm" ]; then
+    target=$1
+    shift
+else
+    target=int
+fi
 
 let PROGRESS_PIPE=1
 if [[ "$1" =~ "-trace-calls=" ]]; then
@@ -69,14 +76,28 @@ if [[ "$1" = "-fatal" ]]; then
 fi
 
 # Typecheck and verify wizeng first, printing out compile errors
-v3c -fp $SRC $TEST
-if [ "$?" != 0 ]; then
-    exit 1
+if [ "$target" = int ]; then
+    SRC="$WIZENG_LOC/src/*/*.v3 $WIZENG_LOC/src/engine/v3/*.v3 $VIRGIL_LIB_UTIL/*.v3"
+    TEST="$WIZENG_LOC/test/*/*.v3"
+    MAIN="$WIZENG_LOC/test/unittest.main.v3"
+    v3c -fp $SRC $TEST
+    if [ "$?" != 0 ]; then
+        exit 1
+    fi
+    cmd="v3c $V3C_OPTS -run $SRC $TEST $MAIN"
+else
+    make bin/unittest.$target
+    if [ "$?" != 0 ]; then
+        exit 1
+    fi
+    cmd="bin/unittest.$target"
 fi
 
+printf "Testing ${CYAN}unit${NORM} | "
 # run unittests and pipe through progress program
+LOG=/tmp/wizeng.unit.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then
-    v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@" | tee $LOG | progress tti
+    $cmd "$@" | tee $LOG | progress tti
 else
-    v3c -fp $V3C_OPTS -run $SRC $TEST $MAIN "$@"
+    $cmd "$@"
 fi
