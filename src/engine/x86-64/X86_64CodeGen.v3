@@ -1,65 +1,319 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Code generator for X86-64, including the fast interpreter and baseline JIT.
-class X86_64CodeGen {
-	def w = DataWriter.new();
-	def asm = X86_64Assemblers.create64(w);
-
-	def genInterpreter() -> InterpreterCode {
-		// Map some executable memory for the interpreter.
-		var mapping = Mmap.reserve(4096, Mmap.PROT_READ | Mmap.PROT_WRITE |  Mmap.PROT_EXEC);
-		if (mapping == null) return null;
-		var ic = InterpreterCode.new(mapping);
-		genInterpreterEntry(ic);
-		genDispatchTable(ic);
-		genOpcodeHandlers(ic);
-		// copy code from Datawriter into memory range
-		var p = mapping.range.start;
-		for (i < w.pos) {
-			p.store<u8>(w.data[i]);
-			p++;
-		}
-		return ic;
-	}
-	def genInterpreterEntry(ic: InterpreterCode) {
-		asm.movd_r_i(Regs.V3_RET_GPR, ExecState.TRAPPED.tag);
-		asm.ret();
-	}
-	def genDispatchTable(ic: InterpreterCode) {
-	}
-	def genOpcodeHandlers(ic: InterpreterCode) {
-	}
+def R: X86_64Regs, G = X86_64Regs.GPRs;
+// Configuration of live variables for the intepreter and baseline compiler.
+enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool) {
+	INTERPRETER	(0, 	null,	0,	false),	// interpreter object
+	MEM0_BASE	(-1,	R.R10,	8,	true),	// base of memory #0
+	TABLE0_BASE	(-1,	R.R11,	16,	true),	// base of table #0
+	VFP		(2,	R.R11,	24,	false),	// value stack frame pointer
+	VSP		(3,	R.RSI,	32,	false),	// value stack stack pointer
+	XIP		(-1,	R.RBX,	40,	false),	// extended instruction pointer
+	IP		(1,	R.RAX,	48,	false),	// instruction pointer
+	FUNC		(-1,	R.R12,	56,	true),	// FuncDecl
+	INSTANCE	(-1,	R.RDI,	64,	true)	// Instance
 }
 
-// The interpreter and baseline variables that are held in registers
-enum IVar(gpr: X86_64Gpr, frameOffset: int, baseline: bool) {
-	MEM0_BASE	(X86_64Regs.R10,	0,	true),
-	TABLE0_BASE	(X86_64Regs.R11,	8,	true),
-	VFP		(X86_64Regs.R11,	16,	false),
-	VSP		(X86_64Regs.RSI,	24,	false),
-	XIP		(X86_64Regs.RBX,	32,	false),
-	IP		(X86_64Regs.RAX,	40,	false),
-	FUNC		(X86_64Regs.R12,	48,	true),
-	INSTANCE	(X86_64Regs.RDI,	56,	true),
-}
+// Register configuration and shorthand for codegen.
+component I {
+	def V3_PARAM_GPRS = [R.RDI, R.RSI, R.RDX, R.RCX, R.R8, R.R9]; 			// System-V
+	def V3_RET_GPRS = [R.RAX, R.RDX, R.RCX, R.RSI]; 				// System-V + 2
 
-// Register configuration and calling convention for execution tiers.
-component Regs {
-	def V3_RET_GPR = X86_64Regs.RAX;
+	def INTERPRETER_GPRS = filterGprs(isTrue);	// allocatable interpreter registers
+	def BASELINE_GPRS = filterGprs(IVar.baseline);	// allocatable baseline registers
 
-	def BASELINE_GPRS = computeBaselineGprs(); // allocatable baseline registers
 
-	def computeBaselineGprs() -> Array<X86_64Gpr> {
-		var gprs = X86_64Regs.GPRs;
+	def filterGprs(cond: IVar -> bool) -> Array<X86_64Gpr> {
+		var gprs = G;
 		var used = Array<bool>.new(gprs.length);
 		for (v in IVar) {
-			if (v.baseline) used[v.gpr.regnum] = true;
+			if (v.gpr != null && cond(v)) used[v.gpr.regnum] = true;
 		}
 		var v = Vector<X86_64Gpr>.new().grow(gprs.length);
 		for (i < gprs.length) {
 			if (!used[i]) v.put(gprs[i]);
 		}
 		return v.extract();
+	}
+	def isTrue(v: IVar) -> bool {
+		return true;
+	}
+
+	// Shorthand for individual registers and addresses.
+	def ip = R.RAX;
+	def ip_ptr = ip.indirect();
+	def vsp = R.RSI;
+	def vsp_ptr = vsp.indirect();
+	def vsp_ptr2 = vsp.plus(PTR_SIZE);
+	def r0 = I.INTERPRETER_GPRS[0];
+	def r1 = I.INTERPRETER_GPRS[1];
+	def r2 = I.INTERPRETER_GPRS[2];
+	def scratch = R.RBP;
+}
+
+def PTR_SIZE = Pointer.SIZE;
+def SLOT_SIZE = 2 * Pointer.SIZE;
+// Code generator for X86-64, including the fast interpreter and baseline JIT.
+class X86_64CodeGen {
+	def w = DataWriter.new();
+	def asm = X86_64Assemblers.create64(w);
+	def frameSize = IVar.INSTANCE.frameOffset + PTR_SIZE;
+
+	var threadedDispatch = false;
+
+	new() { asm.patcher = asm.d.patcher = Patcher.new(w); }
+
+	def genInterpreter() -> InterpreterCode {
+		// Map some executable memory for the interpreter.
+		var mapping = Mmap.reserve(4096, Mmap.PROT_READ | Mmap.PROT_WRITE |  Mmap.PROT_EXEC);
+		if (mapping == null) return null;
+		var ic = InterpreterCode.new(mapping);
+		// Reserve space for a 2x256-entry signed-offset dispatch table.
+		asm.w.align(2);
+		ic.dispatchTable.offset = asm.pos();
+		asm.w.skipN(256 * 2);
+		// Then the interpreter entry
+		genInterpreterEntry(ic);
+		// Then opcode handlers
+		genOpcodeHandlers(ic);
+		// Generate out-of-line code
+		genOutOfLineLEBs(ic);
+		// Finished. Copy code from Datawriter into memory range.
+		var p = mapping.range.start;
+		w.atEnd();
+		for (i < w.pos) {
+			p.store<u8>(w.data[i]);
+			p++;
+		}
+		// Write-protect the executable code for security and debugging
+		Mmap.protect(mapping.range.start, mapping.range.size(), Mmap.PROT_READ | Mmap.PROT_EXEC);
+		return ic;
+	}
+
+	def genInterpreterEntry(ic: InterpreterCode) {
+		// Generate code that can be entered directly from V3.
+		ic.v3EntryOffset = w.atEnd().pos;
+		// Allocate and initialize interpreter stack frame from incoming V3 params.
+		asm.q.sub_r_i(R.RSP, frameSize);
+		for (iv in IVar) {
+			if (iv.entryParam < 0) asm.movq_m_i(R.RSP.plus(iv.frameOffset), 0);
+			else asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+		}
+		// Move vals into correct registers.
+		for (iv in [IVar.IP, IVar.VSP, IVar.VFP]) {
+			asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
+		}
+
+		ic.callEntryOffset = w.pos;
+		// Decode locals and initialize them. (XXX: special-case 0 locals)
+		var countGpr = I.r0;
+		genReadUleb32(ic, countGpr, I.ip, I.scratch);
+		var start = X86_64Label.new(), done = X86_64Label.new();
+		// gen: if (count != 0) do
+		asm.d.cmp_r_i(countGpr, 0);
+		asm.jc_rel_near(X86_64Conds.Z, done);
+		asm.bind(start);
+		// gen: var num = read_uleb32()
+		var numGpr = I.r1;
+		genReadUleb32(ic, numGpr, I.ip, I.scratch);
+		// gen: var type = read_sleb32();
+		var typeGpr = I.r2;
+		genReadSleb32(ic, typeGpr, I.ip, I.scratch);
+
+		// TODO: for RefNullT, AbstractT, skip additional ULEB
+
+		// gen: if(num != 0) do
+		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
+		asm.d.cmp_r_i(numGpr, 0);
+		asm.jc_rel_near(X86_64Conds.Z, done2);
+		asm.bind(start2);
+		asm.movq_m_r(I.vsp_ptr, typeGpr);	// *(sp) = type
+		asm.movq_m_i(I.vsp_ptr2, 0);		// *(sp + 8) = 0
+		asm.add_r_i(I.vsp, SLOT_SIZE);		// sp += 16
+		// gen: while (--num != 0)
+		asm.d.dec_r(numGpr);
+		asm.jc_rel_near(X86_64Conds.NZ, start2);
+
+		// gen: while (--count != 0)
+		asm.d.dec_r(countGpr);
+		asm.jc_rel_near(X86_64Conds.NZ, start);
+		asm.bind(done);
+
+		// execute first instruction
+		ic.firstDispatchOffset = w.atEnd().pos;
+		genDispatch(ic);
+	}
+
+	// Generate all the opcode handlers.
+	def genOpcodeHandlers(ic: InterpreterCode) {
+		// Generate the default handler and initialize the table
+		var pos = w.atEnd().pos;
+		genDefaultOpcodeHandler(ic);
+		for (i < 256) patchDispatchTable(ic, i, pos);
+
+		// Generate handlers for all short opcodes
+		for (opcode in Opcode) {  // XXX: order opcodes by frequency
+			if (opcode.prefix != 0) continue;
+			var pos = w.atEnd().pos;
+			// try to generate the handler for the opcode
+			if (genOpcodeHandler(opcode)) {
+				patchDispatchTable(ic, opcode.code, pos);
+				if (threadedDispatch) {
+					genDispatch(ic); // generates inline copy of dispatch
+				} else {
+					asm.jmp_rel(ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
+				}
+			}
+		}
+	}
+
+	// Generate code for a unknown / unimplemented bytecode.
+	def genDefaultOpcodeHandler(ic: InterpreterCode) {
+		genAbruptReturn(ExecState.TRAPPED, TrapReason.UNIMPLEMENTED);
+	}
+
+	// Generate the code of a single opcode.
+	def genOpcodeHandler(opcode: Opcode) -> bool {
+		match (opcode) {
+			UNREACHABLE => {
+				genAbruptReturn(ExecState.TRAPPED, TrapReason.UNREACHABLE);
+			}
+			NOP => {
+				// nothing to do
+			}
+			END => {
+				// Deallocate frame and return to calling code.
+				// TODO: check end of code condition from func.code.code.length
+				asm.q.add_r_i(R.RSP, frameSize);
+				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+				asm.ret();
+			}
+			DROP => {
+				asm.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			F32_CONST => {
+				asm.movd_r_m(I.r0, I.ip_ptr);
+				asm.add_r_i(I.ip, 4);
+				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.F32.code));
+				asm.movq_m_r(I.vsp_ptr2, I.r0);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
+			}
+			F64_CONST => {
+				asm.movq_r_m(I.r0, I.ip_ptr);
+				asm.add_r_i(I.ip, 8);
+				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.F64.code));
+				asm.movq_m_r(I.vsp_ptr2, I.r0);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
+			}
+			_ => return false;
+		}
+		return true;
+	}
+	def genAbruptReturn(state: ExecState, reason: TrapReason) {
+		asm.q.add_r_i(R.RSP, frameSize);
+		asm.movd_r_i(I.V3_RET_GPRS[0], state.tag);
+		asm.movd_r_i(I.V3_RET_GPRS[1], reason.tag);
+		asm.ret();
+	}
+
+	// Generate a read of a 32-bit unsigned LEB.
+	def genReadUleb32(ic: InterpreterCode, dest: X86_64Gpr, ptr: X86_64Gpr, scratch: X86_64Gpr) {
+		var ool_leb = OutOfLineLEB.new(dest);
+		ic.oolULeb32Sites.put(ool_leb);
+		var asm = this.asm.d;
+		asm.movbzx_r_m(dest, ptr.indirect());	// load first byte
+		asm.q.inc_r(ptr);			// increment pointer
+		asm.test_r_i(dest, 0x80);		// test most-significant bit
+		asm.jc_rel_addr(X86_64Conds.NZ, ool_leb);
+		ool_leb.retOffset = asm.pos();
+	}
+	// Generate a read of a 32-bit signed LEB.
+	def genReadSleb32(ic: InterpreterCode, ptr: X86_64Gpr, dest: X86_64Gpr, scratch: X86_64Gpr) {
+		var ool_leb = OutOfLineLEB.new(dest);
+		ic.oolSLeb32Sites.put(ool_leb);
+		var asm = this.asm.d;
+		asm.movbzx_r_m(dest, ptr.indirect());	// load first byte
+		asm.q.inc_r(ptr);			// increment pointer
+		asm.test_r_i(dest, 0x80);		// test most-significant bit
+		asm.jc_rel_addr(X86_64Conds.NZ, ool_leb);
+		asm.shl_r_i(dest, u5.view(32 - 7));	// 7-bit sign-extend
+		asm.sar_r_i(dest, u5.view(32 - 7));
+		ool_leb.retOffset = asm.pos();
+	}
+	// Generate code which skips over an LEB.
+	def genSkipLeb(ptr: X86_64Gpr, scratch: X86_64Gpr) {
+		var more = X86_64Label.new();
+		asm.bind(more);
+		asm.movbzx_r_m(scratch, ptr.indirect());	// load first byte
+		asm.q.inc_r(ptr);				// increment pointer
+		asm.test_r_i(scratch, 0x80);			// test most-significant bit
+		asm.jc_rel_near(X86_64Conds.NZ, more);
+	}
+	// Generate a load of the next bytecode and a dispatch through the dispatch table.
+	def genDispatch(ic: InterpreterCode) {
+		var opcode = I.r0;
+		var base = I.r1;
+		asm.movbsx_r_m(opcode, I.ip_ptr);
+		asm.inc_r(I.ip);
+		asm.lea(base, ic.dispatchTable); // RIP-relative LEA
+		asm.movwsx_r_m(opcode, X86_64Addr.new(base, opcode, 2, 0)); // load 16-bit offset
+		asm.add_r_r(base, opcode);
+		asm.ijmp_r(base);
+	}
+	// Patch the dispatch table for the given opcode to go to the given position.
+	def patchDispatchTable(ic: InterpreterCode, opcode: int, pos: int) {
+		var offset = pos - ic.dispatchTable.offset;
+		w.at(ic.dispatchTable.offset + 2 * opcode).put_b16(offset);
+		w.atEnd();
+	}
+	// Generate the out-of-line LEB decoding code.
+	def genOutOfLineLEBs(ic: InterpreterCode) {
+		for (i < ic.oolULeb32Sites.length) {
+			var o = ic.oolULeb32Sites[i];
+			var pos = w.atEnd().pos;
+			w.at(o.pos).put_b32(pos - (o.pos + o.delta));
+			// TODO: gen code
+		}
+		ic.oolULeb32Sites = null;
+		for (i < ic.oolSLeb32Sites.length) {
+			var o = ic.oolSLeb32Sites[i];
+			var pos = w.atEnd().pos;
+			w.at(o.pos).put_b32(pos - (o.pos + o.delta));
+			// TODO: gen code
+		}
+		ic.oolSLeb32Sites = null;
+	}
+}
+
+// Assembler patching support for out-of-line LEBs and the dispatch table.
+def ABS_MARKER = 0x55443322;
+def REL_MARKER = 0x44332211;
+class OutOfLineLEB(dest: X86_64Gpr) extends X86_64Addr {
+	var retOffset: int; // where OOB code should "return"
+	var pos: int = -1;
+	var delta: int;
+
+	new() super(null, null, 1, REL_MARKER) { }
+}
+class DispatchTableRef extends X86_64Addr {
+	var offset: int = -1;
+
+	new() super(null, null, 1, REL_MARKER) { }
+}
+class Patcher(w: DataWriter) extends X86_64AddrPatcher {
+	new() super(ABS_MARKER, REL_MARKER) { }
+	def recordRel32(pos: int, delta: int, addr: X86_64Addr) {
+		match (addr) {
+			x: OutOfLineLEB => {
+				x.pos = pos;
+				x.delta = delta;
+			}
+			x: DispatchTableRef => {
+				if (x.offset < 0) System.error("InterpreterGen", "dispatch table not fixed");
+				w.at(pos).put_b32(x.offset - (pos + delta));
+				w.atEnd();
+			}
+		}
 	}
 }
