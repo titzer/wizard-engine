@@ -7,12 +7,13 @@ enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool) {
 	INTERPRETER	(0, 	null,	0,	false),	// interpreter object
 	MEM0_BASE	(-1,	R.R10,	8,	true),	// base of memory #0
 	TABLE0_BASE	(-1,	R.R11,	16,	true),	// base of table #0
-	VFP		(2,	R.R11,	24,	false),	// value stack frame pointer
-	VSP		(3,	R.RSI,	32,	false),	// value stack stack pointer
+	VFP		(3,	R.R11,	24,	false),	// value stack frame pointer
+	VSP		(4,	R.RSI,	32,	false),	// value stack stack pointer
 	XIP		(-1,	R.RBX,	40,	false),	// extended instruction pointer
 	IP		(1,	R.RAX,	48,	false),	// instruction pointer
-	FUNC		(-1,	R.R12,	56,	true),	// FuncDecl
-	INSTANCE	(-1,	R.RDI,	64,	true)	// Instance
+	EIP		(2,	R.R13,	56,	false),	// instruction pointer
+	FUNC		(-1,	R.R12,	64,	true),	// FuncDecl
+	INSTANCE	(-1,	R.RDI,	72,	true)	// Instance
 }
 
 // Register configuration and shorthand for codegen.
@@ -27,6 +28,7 @@ component I {
 	def filterGprs(cond: IVar -> bool) -> Array<X86_64Gpr> {
 		var gprs = G;
 		var used = Array<bool>.new(gprs.length);
+		used[X86_64Regs.RSP.regnum] = true;
 		for (v in IVar) {
 			if (v.gpr != null && cond(v)) used[v.gpr.regnum] = true;
 		}
@@ -42,6 +44,7 @@ component I {
 
 	// Shorthand for individual registers and addresses.
 	def ip = R.RAX;
+	def eip = R.R13;
 	def ip_ptr = ip.indirect();
 	def vsp = R.RSI;
 	def vsp_ptr = vsp.indirect();
@@ -54,6 +57,7 @@ component I {
 
 def PTR_SIZE = Pointer.SIZE;
 def SLOT_SIZE = 2 * Pointer.SIZE;
+def SLOT_SIZE_LOG = u6.view(4);
 // Code generator for X86-64, including the fast interpreter and baseline JIT.
 class X86_64CodeGen {
 	def w = DataWriter.new();
@@ -71,14 +75,16 @@ class X86_64CodeGen {
 		var ic = InterpreterCode.new(mapping);
 		// Reserve space for a 2x256-entry signed-offset dispatch table.
 		asm.w.align(2);
-		ic.dispatchTable.offset = asm.pos();
+		ic.dispatchTable.offset = w.pos;
 		asm.w.skipN(256 * 2);
 		// Then the interpreter entry
 		genInterpreterEntry(ic);
 		// Then opcode handlers
 		genOpcodeHandlers(ic);
+		ic.handlerEndOffset = w.pos;
 		// Generate out-of-line code
 		genOutOfLineLEBs(ic);
+		ic.codeEndOffset = w.atEnd().pos;
 		// Finished. Copy code from Datawriter into memory range.
 		var p = mapping.range.start;
 		w.atEnd();
@@ -101,7 +107,7 @@ class X86_64CodeGen {
 			else asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
 		}
 		// Move vals into correct registers.
-		for (iv in [IVar.IP, IVar.VSP, IVar.VFP]) {
+		for (iv in [IVar.IP, IVar.EIP, IVar.VSP, IVar.VFP]) {
 			asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
 		}
 
@@ -157,7 +163,7 @@ class X86_64CodeGen {
 			if (opcode.prefix != 0) continue;
 			var pos = w.atEnd().pos;
 			// try to generate the handler for the opcode
-			if (genOpcodeHandler(opcode)) {
+			if (genOpcodeHandler(ic, opcode)) {
 				patchDispatchTable(ic, opcode.code, pos);
 				if (threadedDispatch) {
 					genDispatch(ic); // generates inline copy of dispatch
@@ -174,7 +180,7 @@ class X86_64CodeGen {
 	}
 
 	// Generate the code of a single opcode.
-	def genOpcodeHandler(opcode: Opcode) -> bool {
+	def genOpcodeHandler(ic: InterpreterCode, opcode: Opcode) -> bool {
 		match (opcode) {
 			UNREACHABLE => {
 				genAbruptReturn(ExecState.TRAPPED, TrapReason.UNREACHABLE);
@@ -183,14 +189,26 @@ class X86_64CodeGen {
 				// nothing to do
 			}
 			END => {
+				var cont = X86_64Label.new();
+				asm.q.cmp_r_r(I.ip, I.eip);
+				asm.jc_rel_near(X86_64Conds.L, cont); // XXX: branch to dispatch
 				// Deallocate frame and return to calling code.
-				// TODO: check end of code condition from func.code.code.length
 				asm.q.add_r_i(R.RSP, frameSize);
 				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
 				asm.ret();
+				asm.bind(cont);
 			}
 			DROP => {
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			LOCAL_GET => {
+				genReadUleb32(ic, I.r0, I.ip, I.scratch);
+				asm.d.shl_r_i(I.r0, SLOT_SIZE_LOG);
+				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 0));
+				asm.movq_m_r(I.vsp_ptr, I.r1);
+				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 8));
+				asm.movq_m_r(I.vsp_ptr2, I.r1);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
 			F32_CONST => {
 				asm.movd_r_m(I.r0, I.ip_ptr);
@@ -229,7 +247,7 @@ class X86_64CodeGen {
 		ool_leb.retOffset = asm.pos();
 	}
 	// Generate a read of a 32-bit signed LEB.
-	def genReadSleb32(ic: InterpreterCode, ptr: X86_64Gpr, dest: X86_64Gpr, scratch: X86_64Gpr) {
+	def genReadSleb32(ic: InterpreterCode, dest: X86_64Gpr, ptr: X86_64Gpr, scratch: X86_64Gpr) {
 		var ool_leb = OutOfLineLEB.new(dest);
 		ic.oolSLeb32Sites.put(ool_leb);
 		var asm = this.asm.d;
