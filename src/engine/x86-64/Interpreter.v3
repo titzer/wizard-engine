@@ -26,7 +26,6 @@ class X86_64FastInterpreter extends Interpreter {
 	def valueStack = ValueStack.new();
 	var asmEntry: (/*ip: */ Pointer, /*eip: */ Pointer, /*fp: */ Pointer, /*sp: */ Pointer) -> (ExecState, TrapReason);
 
-
 	new() {
 		if (interpreterCode == null) {
 			var gen = X86_64CodeGen.new();
@@ -97,8 +96,8 @@ class X86_64FastInterpreter extends Interpreter {
 	}
 }
 
-// Implements a value stack using raw (Pointer) memory, with explicit tags.
-// TODO: need custom scan extension for V3 garbage collector.
+// Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
+// TODO: need custom scan extension for V3 garbage collector for reference values.
 class ValueStack {
 	def mapping = Mmap.reserve(DEFAULT_STACK_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var sp: Pointer;
@@ -109,40 +108,15 @@ class ValueStack {
 	}
 	def push(v: Value) {
 		match (v) {
-			Ref(obj) => {
-				sp.store<i64>(i7.view(BpTypecon.RefNullT.code));
-				(sp + Pointer.SIZE).store(obj);
-			}
-			FuncRef(func) => {
-				sp.store<i64>(i7.view(BpTypecon.FUNCREF.code));
-				(sp + Pointer.SIZE).store(func);
-			}
-			Rtt(heaptype, supers) => {
-				sp.store<i64>(i7.view(BpTypecon.Rtt.code));
-				(sp + Pointer.SIZE).store(v);
-			}
-			I31(val) => {
-				sp.store<i64>(i7.view(BpTypecon.I31REF.code));
-				(sp + Pointer.SIZE).store(u64.view(val));
-			}
-			I32(val) => {
-				sp.store<i64>(i7.view(BpTypecon.I32.code));
-				(sp + Pointer.SIZE).store(u64.view(val));
-			}
-			I64(val) => {
-				sp.store<i64>(i7.view(BpTypecon.I64.code));
-				(sp + Pointer.SIZE).store(u64.view(val));
-			}
-			F32(bits) => {
-				sp.store<i64>(i7.view(BpTypecon.F32.code));
-				(sp + Pointer.SIZE).store(u64.view(bits));
-			}
-			F64(bits) => {
-				sp.store<i64>(i7.view(BpTypecon.F64.code));
-				(sp + Pointer.SIZE).store(u64.view(bits));
-			}
+			Ref(obj) => pushPair(BpTypecon.RefNullT.code, obj);
+			FuncRef(func) => pushPair(BpTypecon.FUNCREF.code, func);
+			Rtt(heaptype, supers) => pushPair(BpTypecon.Rtt.code, v);
+			I31(val) => pushPair(BpTypecon.I31REF.code, u64.view(val));
+			I32(val) => pushPair(BpTypecon.I32.code, u64.view(val));
+			I64(val) => pushPair(BpTypecon.I64.code, u64.view(val));
+			F32(bits) => pushPair(BpTypecon.F32.code, u64.view(bits));
+			F64(bits) => pushPair(BpTypecon.F64.code, u64.view(bits));
 		}
-		sp += Pointer.SIZE * 2;
 	}
 	def pop(t: ValueType) -> Value {
 		match (t) {
@@ -157,48 +131,56 @@ class ValueStack {
 			EXTERNREF_NULL,
 			ANYREF => return Value.Ref(popObject());
 			I31REF => {
-				var tag = (sp + -(Pointer.SIZE * 2)).load<i64>();
-				if (tag == i7.view(BpTypecon.I31REF.code)) return Value.I31(u31.view(popb32(BpTypecon.I31REF.code)));
+				if (peekTag() == BpTypecon.I31REF.code) return Value.I31(u31.view(popb32(BpTypecon.I31REF.code)));
 				else return Value.Ref(popObject());
 			}
 			RefFunc,
 			FUNCREF => return Value.FuncRef(popFunction());
 			Rtt => return popRtt();
-			VEC128 => fatal("unexpected vector type");
-			FwRef => fatal("unexpected FwRef type");
-			Abstract => fatal("unexpected abstract type");
+			_ => fatal(Strings.format1("unexpected type: %s", t.name));
 		}
-		return Value.Ref(null); // TODO
+		return Value.Ref(null);
 	}
 	def popb32(tag: byte) -> u32 {
+		checkTag(tag);
 		sp += -(2 * Pointer.SIZE);
-		var got = sp.load<i64>();
-		if (got != i7.view(tag)) fatal("expected primitive");
 		return (sp + Pointer.SIZE).load<u32>();
 	}
 	def popb64(tag: byte) -> u64 {
+		checkTag(tag);
 		sp += -(2 * Pointer.SIZE);
-		var got = sp.load<i64>();
-		if (got != i7.view(tag)) fatal("expected primitive");
 		return (sp + Pointer.SIZE).load<u64>();
 	}
 	def popObject() -> Object {
+		checkTag(0); // TODO: many valid tags for objects
 		sp += -(2 * Pointer.SIZE);
-		var got = sp.load<i64>();
-		if (got != 0) fatal("expected reference"); // TODO
 		return (sp + Pointer.SIZE).load<Object>();
 	}
 	def popFunction() -> Function {
+		checkTag(BpTypecon.FUNCREF.code);
 		sp += -(2 * Pointer.SIZE);
-		var tag = sp.load<i64>();
-		if (tag != 0) fatal("expected reference"); // TODO
 		return (sp + Pointer.SIZE).load<Function>();
 	}
 	def popRtt() -> Value.Rtt {
+		checkTag(BpTypecon.Rtt.code);
 		sp += -(2 * Pointer.SIZE);
-		var got = sp.load<i64>();
-		if (got != i7.view(BpTypecon.Rtt.code)) fatal("expected RTT"); // TODO
 		return (sp + Pointer.SIZE).load<Value.Rtt>();
+	}
+	def checkTag(tag: byte) -> byte {
+		var got = peekTag();
+		if (got == tag) return tag;
+		var buf = StringBuilder.new();
+		buf.put2("value stack tag mismatch, expected: %x, got %x", tag, got);
+		fatal(buf.toString());
+		return tag;
+	}
+	def peekTag() -> byte {
+		return (sp + -(Pointer.SIZE * 2)).load<u8>() & '\x7F';
+	}
+	def pushPair<T>(tag: byte, bits: T) {
+		sp.store<u8>(tag);
+		(sp + Pointer.SIZE).store(bits);
+		sp += (2 * Pointer.SIZE);
 	}
 }
 
