@@ -1,4 +1,4 @@
-all: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux
+all: TAGS bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux
 
 clean:
 	rm -f bin/*
@@ -9,6 +9,9 @@ WAVE=$(ENGINE) src/wave/*.v3 src/wave.main.v3
 JAWA=$(ENGINE) src/jawa/*.v3 src/jawa.main.v3
 SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
+
+TAGS: $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST)
+	vctags -e $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST)
 
 # JVM targets
 bin/unittest.jvm: $(UNITTEST)
