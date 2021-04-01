@@ -4,14 +4,15 @@
 def R: X86_64Regs, G = X86_64Regs.GPRs;
 // Configuration of live variables for the intepreter and baseline compiler.
 enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool) {
-	INTERPRETER	(0, 	null,	0,	false),	// interpreter object
+	INTERPRETER	(0, 	null,	0,	false),	// Interpreter object
+	WFUNC		(1, 	null,	0,	false),	// WasmFunction object
 	MEM0_BASE	(-1,	R.R10,	8,	true),	// base of memory #0
 	TABLE0_BASE	(-1,	R.R11,	16,	true),	// base of table #0
-	VFP		(3,	R.R11,	24,	false),	// value stack frame pointer
-	VSP		(4,	R.RSI,	32,	false),	// value stack stack pointer
+	VFP		(2,	R.R11,	24,	false),	// value stack frame pointer
+	VSP		(3,	R.RSI,	32,	false),	// value stack stack pointer
 	XIP		(-1,	R.RBX,	40,	false),	// extended instruction pointer
-	IP		(1,	R.RAX,	48,	false),	// instruction pointer
-	EIP		(2,	R.R13,	56,	false),	// instruction pointer
+	IP		(-1,	R.RAX,	48,	false),	// instruction pointer
+	EIP		(-1,	R.R13,	56,	false),	// instruction pointer
 	FUNC		(-1,	R.R12,	64,	true),	// FuncDecl
 	INSTANCE	(-1,	R.RDI,	72,	true)	// Instance
 }
@@ -28,7 +29,7 @@ component I {
 	def filterGprs(cond: IVar -> bool) -> Array<X86_64Gpr> {
 		var gprs = G;
 		var used = Array<bool>.new(gprs.length);
-		used[X86_64Regs.RSP.regnum] = true;
+		used[R.RSP.regnum] = true;
 		for (v in IVar) {
 			if (v.gpr != null && cond(v)) used[v.gpr.regnum] = true;
 		}
@@ -49,9 +50,12 @@ component I {
 	def vsp = R.RSI;
 	def vsp_ptr = vsp.indirect();
 	def vsp_ptr2 = vsp.plus(PTR_SIZE);
+	def vsp_ptr_m1 = vsp.plus(-PTR_SIZE);
+	def vsp_ptr_m3 = vsp.plus(-PTR_SIZE - SLOT_SIZE);
 	def r0 = I.INTERPRETER_GPRS[0];
 	def r1 = I.INTERPRETER_GPRS[1];
 	def r2 = I.INTERPRETER_GPRS[2];
+	def xmm0 = X86_64Regs.XMM0;
 	def scratch = R.RBP;
 }
 
@@ -63,6 +67,7 @@ class X86_64CodeGen {
 	def w = DataWriter.new();
 	def asm = X86_64Assemblers.create64(w);
 	def frameSize = IVar.INSTANCE.frameOffset + PTR_SIZE;
+	def offsets = V3Offsets.new();
 
 	var threadedDispatch = false;
 
@@ -102,12 +107,38 @@ class X86_64CodeGen {
 		ic.v3EntryOffset = w.atEnd().pos;
 		// Allocate and initialize interpreter stack frame from incoming V3 params.
 		asm.q.sub_r_i(R.RSP, frameSize);
-		for (iv in IVar) {
-			if (iv.entryParam < 0) asm.movq_m_i(R.RSP.plus(iv.frameOffset), 0);
-			else asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
-		}
+
+		var iv: IVar;
+
+		// Spill interpreter object
+		iv = IVar.INTERPRETER;
+		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+		// Spill vfp (value frame pointer)
+		iv = IVar.VFP;
+		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+		// Spill vsp (value stack pointer);
+		iv = IVar.VSP;
+		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+
+		// Load wf.instance, wf.decl and spill
+		var wfReg = I.V3_PARAM_GPRS[IVar.WFUNC.entryParam];
+		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_instance));
+		asm.movq_m_r(R.RSP.plus(IVar.INSTANCE.frameOffset), I.scratch);
+		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_decl));
+		asm.movq_m_r(R.RSP.plus(IVar.FUNC.frameOffset), I.scratch);
+
+		// Load &func.code.code[0] into IP
+		asm.movq_r_m(I.scratch, X86_64Addr.new(I.scratch, null, 1, offsets.FuncDecl_code));
+		asm.movq_r_m(I.scratch, X86_64Addr.new(I.scratch, null, 1, offsets.Code_code));
+		asm.lea(IVar.IP.gpr, X86_64Addr.new(I.scratch, null, 1, offsets.Array_contents));
+		asm.movq_m_r(R.RSP.plus(IVar.IP.frameOffset), IVar.IP.gpr);
+		// Load IP + code.length into EIP
+		asm.movd_r_m(IVar.EIP.gpr, X86_64Addr.new(I.scratch, null, 1, offsets.Array_length));
+		asm.q.add_r_r(IVar.EIP.gpr, IVar.IP.gpr);
+		asm.movq_m_r(R.RSP.plus(IVar.EIP.frameOffset), IVar.EIP.gpr);
+
 		// Move vals into correct registers.
-		for (iv in [IVar.IP, IVar.EIP, IVar.VSP, IVar.VFP]) {
+		for (iv in [IVar.VSP, IVar.VFP, IVar.FUNC]) {
 			asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
 		}
 
@@ -169,14 +200,24 @@ class X86_64CodeGen {
 			if (opcode.prefix != 0) continue;
 			var pos = w.atEnd().pos;
 			// try to generate the handler for the opcode
-			if (genOpcodeHandler(ic, opcode)) {
-				patchDispatchTable(ic, opcode.code, pos);
-				if (threadedDispatch) {
-					genDispatch(ic); // generates inline copy of dispatch
-				} else {
-					asm.jmp_rel(ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
+			var result = genOpcodeHandler(ic, opcode);
+			match (result) {
+				UNHANDLED => ; // already points to default handler
+				HANDLED => {
+					patchDispatchTable(ic, opcode.code, pos);
+					if (threadedDispatch) {
+						genDispatch(ic); // generates inline copy of dispatch
+					} else {
+						asm.jmp_rel(ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
+					}
+				}
+				END => {
+					patchDispatchTable(ic, opcode.code, pos);
 				}
 			}
+		}
+		if (ic.returnSequenceOffset != 0) {
+			patchDispatchTable(ic, Opcode.RETURN.code, ic.returnSequenceOffset);
 		}
 	}
 
@@ -186,23 +227,51 @@ class X86_64CodeGen {
 	}
 
 	// Generate the code of a single opcode.
-	def genOpcodeHandler(ic: InterpreterCode, opcode: Opcode) -> bool {
+	def genOpcodeHandler(ic: InterpreterCode, opcode: Opcode) -> HandlerGenResult {
 		match (opcode) {
 			UNREACHABLE => {
 				genAbruptReturn(ExecState.TRAPPED, TrapReason.UNREACHABLE);
+				return HandlerGenResult.END;
 			}
 			NOP => {
 				// nothing to do
 			}
+			BLOCK, LOOP, TRY => {
+				// XXX: block, loop, and try can share a handler
+				genSkipLeb(I.ip, I.scratch);
+			}
 			END => {
-				var cont = X86_64Label.new();
 				asm.q.cmp_r_r(I.ip, I.eip);
-				asm.jc_rel_near(X86_64Conds.L, cont); // XXX: branch to dispatch
-				// Deallocate frame and return to calling code.
+				asm.jc_rel(X86_64Conds.L, ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
+				ic.returnSequenceOffset = w.pos; // Opcode.RETURN is patched to jump directly to here.
+				// Load return count from func.sig.results.length
+				var tmp = IVar.FUNC.gpr;
+				asm.movd_r_m(tmp, X86_64Addr.new(IVar.FUNC.gpr, null, 1, offsets.FuncDecl_sig));
+				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_results));
+				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
+				var done = X86_64Label.new();
+				// Copy return value(s) from VSP to VFP.
+				asm.cmp_r_i(tmp, 0);
+				asm.jc_rel_near(X86_64Conds.Z, done);
+				asm.d.shl_r_i(tmp, SLOT_SIZE_LOG);
+				asm.q.sub_r_r(IVar.VSP.gpr, tmp);
+				var loop = X86_64Label.new();
+				// loop until tmp == 0, copying stack slots down to frame pointer.
+				// XXX: use rep movsq with rcx, rsi and rdi?
+				asm.bind(loop);
+				asm.movdqu_s_m(I.xmm0, X86_64Addr.new(IVar.VSP.gpr, tmp, 1, - SLOT_SIZE));
+				asm.movdqu_m_s(X86_64Addr.new(IVar.VFP.gpr, tmp, 1, - SLOT_SIZE), I.xmm0);
+				asm.q.sub_r_i(tmp, SLOT_SIZE);
+				asm.jc_rel_near(X86_64Conds.NZ, loop);
+				asm.bind(done);
+				// Deallocate interpreter frame and return to calling code.
 				asm.q.add_r_i(R.RSP, frameSize);
 				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
 				asm.ret();
-				asm.bind(cont);
+				return HandlerGenResult.END;
+			}
+			RETURN => {
+				return HandlerGenResult.END; // patched manually
 			}
 			DROP => {
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
@@ -210,10 +279,8 @@ class X86_64CodeGen {
 			LOCAL_GET => {
 				genReadUleb32(ic, I.r0, I.ip, I.scratch);
 				asm.d.shl_r_i(I.r0, SLOT_SIZE_LOG);
-				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 0));
-				asm.movq_m_r(I.vsp_ptr, I.r1);
-				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 8));
-				asm.movq_m_r(I.vsp_ptr2, I.r1);
+				asm.movdqu_s_m(I.xmm0, X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 0));
+				asm.movdqu_m_s(I.vsp_ptr, I.xmm0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
 			LOCAL_SET => {
@@ -229,6 +296,12 @@ class X86_64CodeGen {
 				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VSP.gpr, null, 1, 8 - SLOT_SIZE));
 				asm.movq_m_r(X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 8), I.r1);
 			}
+			I32_CONST => {
+				genReadSleb32_inline(ic, I.r1, I.ip, I.scratch); // TODO: r0 == ecx, which is overwritten
+				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
+				asm.movq_m_r(I.vsp_ptr2, I.r1);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
+			}
 			F32_CONST => {
 				asm.movd_r_m(I.r0, I.ip_ptr);
 				asm.add_r_i(I.ip, 4);
@@ -243,9 +316,67 @@ class X86_64CodeGen {
 				asm.movq_m_r(I.vsp_ptr2, I.r0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			_ => return false;
+			I32_CLZ => {
+				asm.d.bsr_r_m(I.r0, I.vsp_ptr_m1); // TODO: check ZF for == 0
+				asm.movd_m_r(I.vsp_ptr_m1, I.r0);
+			}
+			I32_CTZ => {
+				asm.d.bsf_r_m(I.r0, I.vsp_ptr_m1); // TODO: check ZF for == 0
+				asm.movd_m_r(I.vsp_ptr_m1, I.r0);
+			}
+			I32_POPCNT => {
+				asm.d.popcnt_r_m(I.r0, I.vsp_ptr_m1);
+				asm.movd_m_r(I.vsp_ptr_m1, I.r0);
+			}
+			I32_ADD => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.add_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_SUB => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.sub_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_MUL => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.imul_r_m(I.r0, I.vsp_ptr_m3);
+				asm.movd_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_AND => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.and_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_OR => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.or_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_XOR => {
+				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
+				asm.d.xor_m_r(I.vsp_ptr_m3, I.r0);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_SHL => {
+				asm.movd_r_m(R.RCX, I.vsp_ptr_m1);
+				asm.d.shl_m_cl(I.vsp_ptr_m3);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_SHR_S => {
+				asm.movd_r_m(R.RCX, I.vsp_ptr_m1);
+				asm.d.sar_m_cl(I.vsp_ptr_m3);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			I32_SHR_U => {
+				asm.movd_r_m(R.RCX, I.vsp_ptr_m1);
+				asm.d.shr_m_cl(I.vsp_ptr_m3);
+				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
+			}
+			_ => return HandlerGenResult.UNHANDLED;
 		}
-		return true;
+		return HandlerGenResult.HANDLED;
 	}
 	def genAbruptReturn(state: ExecState, reason: TrapReason) {
 		asm.q.add_r_i(R.RSP, frameSize);
@@ -266,17 +397,31 @@ class X86_64CodeGen {
 		ool_leb.retOffset = asm.pos();
 	}
 	// Generate a read of a 32-bit signed LEB.
-	def genReadSleb32(ic: InterpreterCode, dest: X86_64Gpr, ptr: X86_64Gpr, scratch: X86_64Gpr) {
-		var ool_leb = OutOfLineLEB.new(dest);
-		ic.oolSLeb32Sites.put(ool_leb);
-		var asm = this.asm.d;
-		asm.movbzx_r_m(dest, ptr.indirect());	// load first byte
-		asm.q.inc_r(ptr);			// increment pointer
-		asm.test_r_i(dest, 0x80);		// test most-significant bit
-		asm.jc_rel_addr(X86_64Conds.NZ, ool_leb);
-		asm.shl_r_i(dest, u5.view(32 - 7));	// 7-bit sign-extend
-		asm.sar_r_i(dest, u5.view(32 - 7));
-		ool_leb.retOffset = asm.pos();
+	def genReadSleb32_inline(ic: InterpreterCode, dest: X86_64Gpr, ptr: X86_64Gpr, scratch: X86_64Gpr) {
+		var done = X86_64Label.new(), sext = X86_64Label.new(), loop = X86_64Label.new();
+		asm.movd_r_i(R.RCX, 0);
+		asm.movd_r_i(dest, 0);
+
+		asm.bind(loop);
+		asm.movbzx_r_m(scratch, ptr.indirect());	// load byte
+		asm.q.inc_r(ptr);				// increment pointer
+		asm.d.test_r_i(scratch, 0x80);			// test most-significant bit
+		asm.jc_rel_near(X86_64Conds.Z, sext);		// break if not set
+		asm.d.and_r_i(scratch, 0x7F);			// mask off upper bit
+		asm.d.shl_r_cl(scratch);			// shift byte into correct bit pos
+		asm.d.or_r_r(dest, scratch);			// merge byte into val
+		asm.d.add_r_i(R.RCX, 7);				// compute next bit pos
+		asm.jmp_rel_near(loop);				// loop
+
+		asm.bind(sext);
+		asm.d.shl_r_cl(scratch);			// shift byte into correct bit pos
+		asm.d.or_r_r(dest, scratch);			// merge byte into val
+		asm.d.sub_r_i(R.RCX, 25);				// compute 32 - shift
+		asm.d.neg_r(R.RCX);
+		asm.jc_rel_near(X86_64Conds.S, done);		// if shift > 32, done
+		asm.d.shl_r_cl(dest);				// sign extension
+		asm.d.sar_r_cl(dest);
+		asm.bind(done);
 	}
 	// Generate code which skips over an LEB.
 	def genSkipLeb(ptr: X86_64Gpr, scratch: X86_64Gpr) {
@@ -322,6 +467,7 @@ class X86_64CodeGen {
 		ic.oolSLeb32Sites = null;
 	}
 }
+enum HandlerGenResult { UNHANDLED, HANDLED, END }
 
 // Assembler patching support for out-of-line LEBs and the dispatch table.
 def ABS_MARKER = 0x55443322;

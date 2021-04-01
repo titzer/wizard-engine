@@ -5,13 +5,14 @@ clean:
 	cp scripts/* bin/
 
 ENGINE=src/engine/*.v3 src/engine/*/*.v3 src/util/*.v3
+X86_64=src/engine/x86-64/*.v3
 WAVE=$(ENGINE) src/wave/*.v3 src/wave.main.v3
 JAWA=$(ENGINE) src/jawa/*.v3 src/jawa.main.v3
 SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
 
-TAGS: $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST)
-	vctags -e $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST)
+TAGS: $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST) $(X86_64)
+	vctags -e $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST) $(X86_64)
 
 # JVM targets
 bin/unittest.jvm: $(UNITTEST)
