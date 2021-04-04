@@ -61,6 +61,28 @@ component I {
 	def scratch = R.RBP;
 }
 
+class InterpreterCode(mapping: Mapping) {
+	var v3EntryOffset: int;
+	var callEntryOffset: int;
+	var firstDispatchOffset: int;
+	var callOffset: int;
+	var oobMemoryHandlerOffset: int;
+	var divZeroHandlerOffset: int;
+	var stackOverflowHandlerOffset: int;
+	var codeEndOffset: int;
+	
+	var handlerEndOffset: int;
+	var handler_RETURN: int;
+	var handler_END: int;
+	var handler_BLOCK: int;
+	var handler_UNIMPLEMENTED: int;
+	var handler_INVALID: int;
+
+	var dispatchTable = DispatchTableRef.new();
+	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
+	var oolSLeb32Sites = Vector<OutOfLineLEB>.new();
+}
+
 def PTR_SIZE = Pointer.SIZE;
 def SLOT_SIZE = 2 * Pointer.SIZE;
 def SLOT_SIZE_LOG = u6.view(4);
@@ -215,13 +237,13 @@ class X86_64CodeGen {
 						asm.jmp_rel(ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
 					}
 				}
+				Offset(off) => {
+					patchDispatchTable(ic, opcode.code, off);
+				}
 				END => {
 					patchDispatchTable(ic, opcode.code, pos);
 				}
 			}
-		}
-		if (ic.returnSequenceOffset != 0) {
-			patchDispatchTable(ic, Opcode.RETURN.code, ic.returnSequenceOffset);
 		}
 	}
 
@@ -241,13 +263,21 @@ class X86_64CodeGen {
 				// nothing to do
 			}
 			BLOCK, LOOP, TRY => {
-				// XXX: block, loop, and try can share a handler
-				genSkipLeb(I.ip, I.scratch);
+				if (ic.handler_BLOCK == 0) {
+					ic.handler_BLOCK = w.pos;
+					genSkipLeb(I.ip, I.scratch);
+				}
+				return HandlerGenResult.Offset(ic.handler_BLOCK);
 			}
-			END => {
+			END, RETURN => {
+				if (ic.handler_END != 0) {
+					return HandlerGenResult.Offset(if(opcode == Opcode.END, ic.handler_END, ic.handler_RETURN));
+				}
+				ic.handler_END = w.pos;
 				asm.q.cmp_r_r(I.ip, I.eip);
 				asm.jc_rel(C.L, ic.firstDispatchOffset - w.atEnd().pos); // jump to dispatch (loop)
-				ic.returnSequenceOffset = w.pos; // Opcode.RETURN is patched to jump directly to here.
+				ic.handler_RETURN = w.pos;
+
 				// Load return count from func.sig.results.length
 				var tmp = IVar.FUNC.gpr;
 				asm.movd_r_m(tmp, X86_64Addr.new(IVar.FUNC.gpr, null, 1, offsets.FuncDecl_sig));
@@ -272,10 +302,7 @@ class X86_64CodeGen {
 				asm.q.add_r_i(R.RSP, frameSize);
 				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
 				asm.ret();
-				return HandlerGenResult.END;
-			}
-			RETURN => {
-				return HandlerGenResult.END; // patched manually
+				return HandlerGenResult.Offset(if(opcode == Opcode.END, ic.handler_END, ic.handler_RETURN));
 			}
 			DROP => {
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
@@ -377,22 +404,22 @@ class X86_64CodeGen {
 				asm.d.popcnt_r_m(I.r0, I.vsp_ptr_m1);
 				asm.movd_m_r(I.vsp_ptr_m1, I.r0);
 			}
-			I32_ADD => genBinop32_m_r(asm.d.add_m_r);
-			I32_SUB => genBinop32_m_r(asm.d.sub_m_r);
+			I32_ADD => genBinopI32_m_r(asm.d.add_m_r);
+			I32_SUB => genBinopI32_m_r(asm.d.sub_m_r);
 			I32_MUL => {
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.d.imul_r_m(I.r0, I.vsp_ptr_m3);
 				asm.movd_m_r(I.vsp_ptr_m3, I.r0);
 				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 			}
-			I32_AND => genBinop32_m_r(asm.d.and_m_r);
-			I32_OR => genBinop32_m_r(asm.d.or_m_r);
-			I32_XOR => genBinop32_m_r(asm.d.xor_m_r);
-			I32_SHL => genBinop32_m_cl(asm.d.shl_m_cl);
-			I32_SHR_S => genBinop32_m_cl(asm.d.sar_m_cl);
-			I32_SHR_U => genBinop32_m_cl(asm.d.shr_m_cl);
-			I32_ROTL => genBinop32_m_cl(asm.d.rol_m_cl);
-			I32_ROTR => genBinop32_m_cl(asm.d.ror_m_cl);
+			I32_AND => genBinopI32_m_r(asm.d.and_m_r);
+			I32_OR => genBinopI32_m_r(asm.d.or_m_r);
+			I32_XOR => genBinopI32_m_r(asm.d.xor_m_r);
+			I32_SHL => genBinopI32_m_cl(asm.d.shl_m_cl);
+			I32_SHR_S => genBinopI32_m_cl(asm.d.sar_m_cl);
+			I32_SHR_U => genBinopI32_m_cl(asm.d.shr_m_cl);
+			I32_ROTL => genBinopI32_m_cl(asm.d.rol_m_cl);
+			I32_ROTR => genBinopI32_m_cl(asm.d.ror_m_cl);
 
 			I64_CLZ => {
 				asm.movq_r_i(I.r1, -1);
@@ -412,22 +439,22 @@ class X86_64CodeGen {
 				asm.q.popcnt_r_m(I.r0, I.vsp_ptr_m1);
 				asm.movq_m_r(I.vsp_ptr_m1, I.r0);
 			}
-			I64_ADD => genBinop64_m_r(asm.q.add_m_r);
-			I64_SUB => genBinop64_m_r(asm.q.sub_m_r);
+			I64_ADD => genBinopI64_m_r(asm.q.add_m_r);
+			I64_SUB => genBinopI64_m_r(asm.q.sub_m_r);
 			I64_MUL => {
 				asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 				asm.q.imul_r_m(I.r0, I.vsp_ptr_m3);
 				asm.movq_m_r(I.vsp_ptr_m3, I.r0);
 				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 			}
-			I64_AND => genBinop64_m_r(asm.q.and_m_r);
-			I64_OR => genBinop64_m_r(asm.q.or_m_r);
-			I64_XOR => genBinop64_m_r(asm.q.xor_m_r);
-			I64_SHL => genBinop64_m_cl(asm.q.shl_m_cl);
-			I64_SHR_S => genBinop64_m_cl(asm.q.sar_m_cl);
-			I64_SHR_U => genBinop64_m_cl(asm.q.shr_m_cl);
-			I64_ROTL => genBinop64_m_cl(asm.q.rol_m_cl);
-			I64_ROTR => genBinop64_m_cl(asm.q.ror_m_cl);
+			I64_AND => genBinopI64_m_r(asm.q.and_m_r);
+			I64_OR => genBinopI64_m_r(asm.q.or_m_r);
+			I64_XOR => genBinopI64_m_r(asm.q.xor_m_r);
+			I64_SHL => genBinopI64_m_cl(asm.q.shl_m_cl);
+			I64_SHR_S => genBinopI64_m_cl(asm.q.sar_m_cl);
+			I64_SHR_U => genBinopI64_m_cl(asm.q.shr_m_cl);
+			I64_ROTL => genBinopI64_m_cl(asm.q.rol_m_cl);
+			I64_ROTR => genBinopI64_m_cl(asm.q.ror_m_cl);
 			F32_ADD => {
 				asm.movss_s_m(I.xmm0, I.vsp_ptr_m3);
 				asm.addss_s_m(I.xmm0, I.vsp_ptr_m1);
@@ -515,22 +542,22 @@ class X86_64CodeGen {
 		}
 		return HandlerGenResult.HANDLED;
 	}
-	def genBinop32_m_r(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+	def genBinopI32_m_r(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
 		asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 		gen(I.vsp_ptr_m3, I.r0);
 		asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 	}
-	def genBinop32_m_cl(gen: X86_64Addr -> X86_64Assembler) {
+	def genBinopI32_m_cl(gen: X86_64Addr -> X86_64Assembler) {
 		asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 		gen(I.vsp_ptr_m3);
 		asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 	}
-	def genBinop64_m_r(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+	def genBinopI64_m_r(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
 		asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 		gen(I.vsp_ptr_m3, I.r0);
 		asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 	}
-	def genBinop64_m_cl(gen: X86_64Addr -> X86_64Assembler) {
+	def genBinopI64_m_cl(gen: X86_64Addr -> X86_64Assembler) {
 		asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 		gen(I.vsp_ptr_m3);
 		asm.q.sub_r_i(I.vsp, SLOT_SIZE);
@@ -668,7 +695,12 @@ class X86_64CodeGen {
 		ic.oolSLeb32Sites = null;
 	}
 }
-enum HandlerGenResult { UNHANDLED, HANDLED, END }
+type HandlerGenResult {
+	case UNHANDLED;
+	case HANDLED;
+	case Offset(off: int);
+	case END;
+}
 
 // Assembler patching support for out-of-line LEBs and the dispatch table.
 def ABS_MARKER = 0x55443322;
