@@ -2,6 +2,56 @@
 // See LICENSE for details of Apache 2.0 license.
 
 var interpreterCode: InterpreterCode;
+def genInterpreterCode() -> InterpreterCode {
+	var gen = X86_64CodeGen.new();
+	var ic = gen.genInterpreter();
+	if (ic == null) fatal("failed to generate interpreter");
+	if (Trace.interpreter) {
+		var buf = TraceBuilder.new();
+		var start = ic.mapping.range.start - Pointer.NULL;
+		buf.put2("Generated asm interpreter @ (0x%x ... 0x%x)\n",
+			start,
+			(ic.mapping.range.end - Pointer.NULL));
+		buf.put1("\tv3 entry     = 0x%x\n", start + ic.v3EntryOffset);
+		buf.put1("\tcall entry   = 0x%x\n", start + ic.callEntryOffset);
+		buf.put1("\tdispatch     = 0x%x\n", start + ic.firstDispatchOffset);
+		buf.put1("\thandlers end = 0x%x\n", start + ic.handlerEndOffset);
+		buf.put1("\tcode end     = 0x%x\n", start + ic.codeEndOffset);
+		buf.put1("\toob mem      = 0x%x\n", start + ic.oobMemoryHandlerOffset);
+		buf.put1("\tdivzero      = 0x%x\n", start + ic.divZeroHandlerOffset);
+		buf.outln();
+	}
+	RiRuntime.userSignalHandler = handleSignal;
+	return interpreterCode = ic;
+}
+// Signal-handling for traps
+def ucontext_rip_offset = 168;
+def ucontext_rsp_offset = 160;
+def SIGFPE  = 8;
+def SIGBUS  = 10;
+def SIGSEGV = 11;
+def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
+	var pip = ucontext + ucontext_rip_offset;
+	var ip = pip.load<Pointer>();
+	var r = interpreterCode.mapping.range;
+	if (!r.contains(ip)) return false;
+	if (Trace.interpreter) {
+		TraceBuilder.new().put2("  !signal in interpreter %d @ 0x%x", signum, ip - Pointer.NULL).outln();
+	}
+	match (signum) {
+		SIGFPE => {
+			// presume divide/modulus by zero
+			pip.store<Pointer>(r.start + interpreterCode.divZeroHandlerOffset);
+			return true;
+		}
+		SIGBUS, SIGSEGV => {
+			// TODO: distinguish OOB from stack overflow, from interpreter crash
+			pip.store<Pointer>(r.start + interpreterCode.oobMemoryHandlerOffset);
+			return true;
+		}
+	}
+	return true;
+}
 
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
 class X86_64FastInterpreter extends Interpreter {
@@ -9,25 +59,7 @@ class X86_64FastInterpreter extends Interpreter {
 	var asmEntry: (/*wf: */ WasmFunction,/*fp: */ Pointer, /*sp: */ Pointer) -> (ExecState, TrapReason);
 
 	new() {
-		if (interpreterCode == null) {
-			var gen = X86_64CodeGen.new();
-			var ic = gen.genInterpreter();
-			if (ic == null) fatal("failed to generate interpreter");
-			interpreterCode = ic;
-			if (Trace.interpreter) {
-				var buf = TraceBuilder.new();
-				var start = interpreterCode.mapping.range.start - Pointer.NULL;
-				buf.put2("Generated asm interpreter @ (0x%x ... 0x%x)\n",
-					start,
-					(interpreterCode.mapping.range.end - Pointer.NULL));
-				buf.put1("\tv3 entry     = 0x%x\n", start + ic.v3EntryOffset);
-				buf.put1("\tcall entry   = 0x%x\n", start + ic.callEntryOffset);
-				buf.put1("\tdispatch     = 0x%x\n", start + ic.firstDispatchOffset);
-				buf.put1("\thandlers end = 0x%x\n", start + ic.handlerEndOffset);
-				buf.put1("\tcode end     = 0x%x\n", start + ic.codeEndOffset);
-				buf.outln();
-			}
-		}
+		if (interpreterCode == null) interpreterCode = genInterpreterCode();
 		asmEntry = CiRuntime.forgeClosure<
 			X86_64FastInterpreter,
 				(/*wf: */ WasmFunction,
