@@ -7,13 +7,13 @@ enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mut
 	INTERPRETER	(0, 	null,	0,	false,	false),	// Interpreter object
 	WFUNC		(1, 	null,	0,	false,	false),	// WasmFunction object
 	MEM0_BASE	(-1,	R.R10,	8,	true,	false),	// base of memory #0
-	VFP		(2,	R.R11,	24,	false,	false),	// value stack frame pointer
-	VSP		(3,	R.RSI,	32,	false,	true),	// value stack stack pointer
-	XIP		(-1,	R.RBX,	40,	false,	true),	// extended instruction pointer
-	IP		(-1,	R.RAX,	48,	false,	true),	// instruction pointer
-	EIP		(-1,	R.R13,	56,	false,	false),	// instruction pointer
-	FUNC_DECL	(-1,	R.R12,	64,	true,	false),	// FuncDecl
-	INSTANCE	(-1,	R.RDI,	72,	true,	false)	// Instance
+	VFP		(-1,	R.R11,	16,	false,	false),	// value stack frame pointer
+	VSP		(2,	R.RSI,	24,	false,	true),	// value stack stack pointer
+	XIP		(-1,	R.RBX,	32,	false,	true),	// extended instruction pointer
+	IP		(-1,	R.RAX,	40,	false,	true),	// instruction pointer
+	EIP		(-1,	R.R13,	48,	false,	false),	// instruction pointer
+	FUNC_DECL	(-1,	R.R12,	56,	true,	false),	// FuncDecl
+	INSTANCE	(-1,	R.RDI,	64,	true,	false)	// Instance
 }
 
 // Register configuration and shorthand for codegen.
@@ -149,39 +149,46 @@ class X86_64CodeGen {
 		// Spill interpreter object
 		iv = IVar.INTERPRETER;
 		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
-		// Spill vfp (value frame pointer)
-		iv = IVar.VFP;
-		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
-		// Spill vsp (value stack pointer);
+		// Spill VSP (value stack pointer);
 		iv = IVar.VSP;
 		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
 
 		// Load wf.instance, wf.decl and spill
-		var wfReg = I.V3_PARAM_GPRS[IVar.WFUNC.entryParam];
-		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_instance));
-		asm.movq_m_r(R.RSP.plus(IVar.INSTANCE.frameOffset), I.scratch);
-		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_decl));
-		asm.movq_m_r(R.RSP.plus(IVar.FUNC_DECL.frameOffset), I.scratch);
+		var tmp = I.scratch;
+		asm.movq_r_r(tmp, I.V3_PARAM_GPRS[IVar.WFUNC.entryParam]);
+		asm.movq_r_m(IVar.INSTANCE.gpr, X86_64Addr.new(tmp, null, 1, offsets.WasmFunction_instance));
+		saveIVar(IVar.INSTANCE);
+		asm.movq_r_m(IVar.FUNC_DECL.gpr, X86_64Addr.new(tmp, null, 1, offsets.WasmFunction_decl));
+		saveIVar(IVar.FUNC_DECL);
+
+		// Compute VFP = VSP - func.sig.params.length
+		asm.movq_r_m(tmp, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
+		asm.movq_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_params));
+		asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
+		asm.q.shl_r_i(tmp, SLOT_SIZE_LOG);
+		restoreIVar(IVar.VSP);
+		asm.movq_r_r(IVar.VFP.gpr, IVar.VSP.gpr);
+		asm.q.sub_r_r(IVar.VFP.gpr, tmp);
+		saveIVar(IVar.VFP);
 
 		// Load &func.code.code[0] into IP
 		var codeReg = I.r0;
-		asm.movq_r_m(codeReg, X86_64Addr.new(I.scratch, null, 1, offsets.FuncDecl_code));
-		asm.movq_r_m(I.scratch, X86_64Addr.new(codeReg, null, 1, offsets.Code_code));
-		asm.lea(IVar.IP.gpr, X86_64Addr.new(I.scratch, null, 1, offsets.Array_contents));
-		asm.movq_m_r(R.RSP.plus(IVar.IP.frameOffset), IVar.IP.gpr);
+		asm.movq_r_m(codeReg, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_code));
+		asm.movq_r_m(tmp, X86_64Addr.new(codeReg, null, 1, offsets.Code_code));
+		asm.lea(IVar.IP.gpr, X86_64Addr.new(tmp, null, 1, offsets.Array_contents));
+		saveIVar(IVar.IP);
 		// Load IP + code.length into EIP
-		asm.movd_r_m(IVar.EIP.gpr, X86_64Addr.new(I.scratch, null, 1, offsets.Array_length));
+		asm.movd_r_m(IVar.EIP.gpr, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
 		asm.q.add_r_r(IVar.EIP.gpr, IVar.IP.gpr);
-		asm.movq_m_r(R.RSP.plus(IVar.EIP.frameOffset), IVar.EIP.gpr);
+		saveIVar(IVar.EIP);
 		// Load &func.code.xcode[0] into XIP
-		asm.movq_r_m(I.scratch, X86_64Addr.new(codeReg, null, 1, offsets.Code_xcode));
-		asm.lea(IVar.XIP.gpr, X86_64Addr.new(I.scratch, null, 1, offsets.Array_contents));
-		asm.movq_m_r(R.RSP.plus(IVar.XIP.frameOffset), IVar.XIP.gpr);
+		asm.movq_r_m(tmp, X86_64Addr.new(codeReg, null, 1, offsets.Code_xcode));
+		asm.lea(IVar.XIP.gpr, X86_64Addr.new(tmp, null, 1, offsets.Array_contents));
+		saveIVar(IVar.XIP);
 
 		// Load instance.memories[0].start into MEM0_BASE
 		var mem0 = IVar.MEM0_BASE.gpr;
-		asm.movq_r_m(mem0, R.RSP.plus(IVar.INSTANCE.frameOffset));
-		asm.movq_r_m(mem0, X86_64Addr.new(mem0, null, 1, offsets.Instance_memories));
+		asm.movq_r_m(mem0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_memories));
 		var no_mem = X86_64Label.new();
 		asm.movd_r_m(I.r0, X86_64Addr.new(mem0, null, 1, offsets.Array_length)); // XXX: always have a memories[0].start to avoid a branch?
 		asm.d.cmp_r_i(I.r0, 0);
@@ -189,12 +196,7 @@ class X86_64CodeGen {
 		asm.movq_r_m(mem0, X86_64Addr.new(mem0, null, 1, offsets.Array_contents));
 		asm.movq_r_m(mem0, X86_64Addr.new(mem0, null, 1, offsets.X86_64Memory_start));
 		asm.bind(no_mem);
-		asm.movq_m_r(R.RSP.plus(IVar.MEM0_BASE.frameOffset), mem0);
-
-		// Move vals into correct registers.
-		for (iv in [IVar.VSP, IVar.VFP, IVar.FUNC_DECL, IVar.INSTANCE]) {
-			asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
-		}
+		saveIVar(IVar.MEM0_BASE);
 
 		ic.callEntryOffset = w.pos;
 		// Decode locals and initialize them. (XXX: special-case 0 locals)
@@ -350,8 +352,8 @@ class X86_64CodeGen {
 
 				// Load return count from func.sig.results.length
 				var tmp = IVar.FUNC_DECL.gpr;
-				asm.movd_r_m(tmp, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
-				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_results));
+				asm.movq_r_m(tmp, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
+				asm.movq_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_results));
 				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
 				var done = X86_64Label.new();
 				// Copy return value(s) from VSP to VFP.
