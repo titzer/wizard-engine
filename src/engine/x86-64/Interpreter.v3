@@ -2,9 +2,9 @@
 // See LICENSE for details of Apache 2.0 license.
 
 var interpreterCode: InterpreterCode;
-def genInterpreterCode() -> InterpreterCode {
+def genInterpreterCode(i: InterpreterCallbacks) -> InterpreterCode {
 	var gen = X86_64CodeGen.new();
-	var ic = gen.genInterpreter();
+	var ic = gen.genInterpreter(i);
 	if (ic == null) fatal("failed to generate interpreter");
 	if (Trace.interpreter) {
 		var buf = TraceBuilder.new();
@@ -53,13 +53,17 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 	return true;
 }
 
+class InterpreterCallbacks(i: X86_64FastInterpreter) {
+	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (Function, Pointer, Pointer), (ExecState, TrapReason)>(i.callHost).0;
+}
+
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
 class X86_64FastInterpreter extends Interpreter {
 	def valueStack = ValueStack.new();
 	var asmEntry: (/*wf: */ WasmFunction,/*fp: */ Pointer, /*sp: */ Pointer) -> (ExecState, TrapReason);
 
 	new() {
-		if (interpreterCode == null) interpreterCode = genInterpreterCode();
+		if (interpreterCode == null) interpreterCode = genInterpreterCode(InterpreterCallbacks.new(this));
 		asmEntry = CiRuntime.forgeClosure<
 			X86_64FastInterpreter,
 				(/*wf: */ WasmFunction,
@@ -106,6 +110,54 @@ class X86_64FastInterpreter extends Interpreter {
 		for (i = r.length - 1; i >= 0; i--) r[i] = valueStack.pop(rt[i]);
 		return Result.Value(r);
 	}
+	def callHost(f: Function, vfp: Pointer, vsp: Pointer) -> (ExecState, TrapReason) {
+		var r: HostResult;
+		var prevSp = valueStack.sp;
+		valueStack.sp = vsp;
+		match (f) {
+			hf: HostFunction0 => {
+				r = hf.invoke0();
+			}
+			hf: HostFunction1 => {
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				r = hf.invoke1(a0);
+			}
+			hf: HostFunction2 => {
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				r = hf.invoke2(a0, a1);
+			}
+			hf: HostFunction3 => {
+				var a2 = valueStack.pop(hf.sig.params[2]);
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				r = hf.invoke3(a0, a1, a2);
+			}
+			hf: HostFunctionN => {
+				var aN = valueStack.popN(hf.sig.params);
+				r = hf.invokeN(aN);
+			}
+			_ => fatal("call to non-host function");
+
+		}
+		valueStack.sp = vfp;
+		match (r) {
+			Trap(reason) => return (ExecState.TRAPPED, reason);
+			Error(msg) => {
+				error_msg = msg;
+				return (ExecState.TRAPPED, TrapReason.ERROR);
+			}
+			Value0 => ; // do nothing
+			Value1(val) => valueStack.push(val);
+			ValueN(vals) => {
+				for (a in vals) val_stack.push(a);
+			}
+			TailCall(f, args) => {
+				fatal("host tail call");
+			}
+		}
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
 }
 
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
@@ -128,6 +180,14 @@ class ValueStack {
 			F32(bits) => pushPair(BpTypecon.F32.code, u64.view(bits));
 			F64(bits) => pushPair(BpTypecon.F64.code, u64.view(bits));
 		}
+	}
+	def popN(t: Array<ValueType>) -> Array<Value> {
+		var r = Array<Value>.new(t.length);
+		for (i < t.length) {
+			var j = r.length - i - 1;
+			r[j] = pop(t[j]);
+		}
+		return r;
 	}
 	def pop(t: ValueType) -> Value {
 		match (t) {

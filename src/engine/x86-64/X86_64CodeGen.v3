@@ -7,13 +7,12 @@ enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mut
 	INTERPRETER	(0, 	null,	0,	false,	false),	// Interpreter object
 	WFUNC		(1, 	null,	0,	false,	false),	// WasmFunction object
 	MEM0_BASE	(-1,	R.R10,	8,	true,	false),	// base of memory #0
-	TABLE0_BASE	(-1,	R.R11,	16,	true,	false),	// base of table #0
 	VFP		(2,	R.R11,	24,	false,	false),	// value stack frame pointer
 	VSP		(3,	R.RSI,	32,	false,	true),	// value stack stack pointer
 	XIP		(-1,	R.RBX,	40,	false,	true),	// extended instruction pointer
 	IP		(-1,	R.RAX,	48,	false,	true),	// instruction pointer
 	EIP		(-1,	R.R13,	56,	false,	false),	// instruction pointer
-	FUNC		(-1,	R.R12,	64,	true,	false),	// FuncDecl
+	FUNC_DECL	(-1,	R.R12,	64,	true,	false),	// FuncDecl
 	INSTANCE	(-1,	R.RDI,	72,	true,	false)	// Instance
 }
 
@@ -79,7 +78,9 @@ class InterpreterCode(mapping: Mapping) {
 	var handler_UNIMPLEMENTED: int;
 	var handler_INVALID: int;
 
-	var dispatchTable = DispatchTableRef.new();
+	var callReentryRef: IcCodeRef;
+	var callHostRef: IcCodeRef;
+	var dispatchTableRef: IcCodeRef;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
 	var oolSLeb32Sites = Vector<OutOfLineLEB>.new();
 }
@@ -99,15 +100,18 @@ class X86_64CodeGen {
 
 	new() { asm.patcher = asm.d.patcher = Patcher.new(w); }
 
-	def genInterpreter() -> InterpreterCode {
+	def genInterpreter(callbacks: InterpreterCallbacks) -> InterpreterCode {
 		// Map some executable memory for the interpreter.
 		def SIZE = 8192u;
 		var mapping = Mmap.reserve(SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE |  Mmap.PROT_EXEC);
 		if (mapping == null) return null;
 		ic = InterpreterCode.new(mapping);
+		// Write pointers to interpreter callbacks.
+		ic.callHostRef = IcCodeRef.new(w.pos);
+		w.put_b64(callbacks.callHost - Pointer.NULL);
 		// Reserve space for a 2x256-entry signed-offset dispatch table.
 		asm.w.align(2);
-		ic.dispatchTable.offset = w.pos;
+		ic.dispatchTableRef = IcCodeRef.new(w.pos);
 		asm.w.skipN(256 * 2);
 		// Then the interpreter entry
 		genInterpreterEntry();
@@ -135,6 +139,8 @@ class X86_64CodeGen {
 	def genInterpreterEntry() {
 		// Generate code that can be entered directly from V3.
 		ic.v3EntryOffset = w.atEnd().pos;
+		ic.callReentryRef = IcCodeRef.new(w.pos); // XXX: factor out some of reentry code
+
 		// Allocate and initialize interpreter stack frame from incoming V3 params.
 		asm.q.sub_r_i(R.RSP, frameSize);
 
@@ -155,7 +161,7 @@ class X86_64CodeGen {
 		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_instance));
 		asm.movq_m_r(R.RSP.plus(IVar.INSTANCE.frameOffset), I.scratch);
 		asm.movq_r_m(I.scratch, X86_64Addr.new(wfReg, null, 1, offsets.WasmFunction_decl));
-		asm.movq_m_r(R.RSP.plus(IVar.FUNC.frameOffset), I.scratch);
+		asm.movq_m_r(R.RSP.plus(IVar.FUNC_DECL.frameOffset), I.scratch);
 
 		// Load &func.code.code[0] into IP
 		var codeReg = I.r0;
@@ -186,7 +192,7 @@ class X86_64CodeGen {
 		asm.movq_m_r(R.RSP.plus(IVar.MEM0_BASE.frameOffset), mem0);
 
 		// Move vals into correct registers.
-		for (iv in [IVar.VSP, IVar.VFP, IVar.FUNC, IVar.INSTANCE]) {
+		for (iv in [IVar.VSP, IVar.VFP, IVar.FUNC_DECL, IVar.INSTANCE]) {
 			asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
 		}
 
@@ -343,8 +349,8 @@ class X86_64CodeGen {
 				ic.handler_RETURN = w.pos;
 
 				// Load return count from func.sig.results.length
-				var tmp = IVar.FUNC.gpr;
-				asm.movd_r_m(tmp, X86_64Addr.new(IVar.FUNC.gpr, null, 1, offsets.FuncDecl_sig));
+				var tmp = IVar.FUNC_DECL.gpr;
+				asm.movd_r_m(tmp, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
 				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_results));
 				asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
 				var done = X86_64Label.new();
@@ -367,6 +373,42 @@ class X86_64CodeGen {
 				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
 				asm.ret();
 				return HandlerGenResult.Offset(if(opcode == Opcode.END, ic.handler_END, ic.handler_RETURN));
+			}
+			CALL => {
+				if (true) return HandlerGenResult.UNHANDLED;
+				// XXX: save ip prior to call for stack traces?
+				genReadUleb32(I.r1); // TODO: r0 == ecx, which is overwritten
+
+				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
+				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.WFUNC.gpr, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+
+				// XXX: share dispatch/return sequence between call and indirect call
+				saveIVar(IVar.IP);
+				saveIVar(IVar.XIP);
+				saveIVar(IVar.EIP);
+				var call_host = X86_64Label.new();
+				asm.d.cmp_m_i(X86_64Addr.new(I.r1, null, 1, 0), offsets.WasmFunction_typeId);
+				asm.jc_rel_near(C.Z, call_host);
+
+				// WasmFunction: call into interpreter reentry
+				// TODO: compute VFP from VSP - wf.sig.params.length
+				asm.callr_addr(ic.callReentryRef);
+
+				restoreIVar(IVar.IP);
+				restoreIVar(IVar.XIP);
+				restoreIVar(IVar.EIP);
+				restoreIVar(IVar.INSTANCE);
+				restoreIVar(IVar.FUNC_DECL);
+				restoreIVar(IVar.MEM0_BASE);
+				restoreIVar(IVar.VFP);
+				// TODO: check exec state and possibly return abruptly or handle exception
+				genDispatchOrJumpToDispatch();
+
+				// HostFunction: call into interpreter callback to enter into V3 code
+				asm.bind(call_host);
+				asm.icall_m(ic.callHostRef);
+				// yyy spill
+				return HandlerGenResult.END;
 			}
 			DROP => {
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
@@ -851,6 +893,12 @@ class X86_64CodeGen {
 		}
 		return HandlerGenResult.HANDLED;
 	}
+	def saveIVar(iv: IVar) {
+		asm.movq_m_r(R.RSP.plus(iv.frameOffset), iv.gpr);
+	}
+	def restoreIVar(iv: IVar) {
+		asm.movq_r_m(iv.gpr, R.RSP.plus(iv.frameOffset));
+	}
 	def saveReg(r: X86_64Gpr) {
 		for (iv in IVar) {
 			if (iv.gpr == r) {
@@ -923,9 +971,9 @@ class X86_64CodeGen {
 		asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 	}
 	def genAbruptReturn(state: ExecState, reason: TrapReason) {
-		asm.q.add_r_i(R.RSP, frameSize);
 		asm.movd_r_i(I.V3_RET_GPRS[0], state.tag);
 		asm.movd_r_i(I.V3_RET_GPRS[1], reason.tag);
+		asm.q.add_r_i(R.RSP, frameSize);
 		asm.ret();
 	}
 	def genCtlXfer(pop: bool) {
@@ -1047,15 +1095,15 @@ class X86_64CodeGen {
 		var base = I.r1;
 		asm.movbzx_r_m(opcode, I.ip_ptr);
 		asm.inc_r(I.ip);
-		asm.lea(base, ic.dispatchTable); // RIP-relative LEA
+		asm.lea(base, ic.dispatchTableRef); // RIP-relative LEA
 		asm.movwsx_r_m(opcode, X86_64Addr.new(base, opcode, 2, 0)); // load 16-bit offset
 		asm.add_r_r(base, opcode);
 		asm.ijmp_r(base);
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
 	def patchDispatchTable(opcode: int, pos: int) {
-		var offset = pos - ic.dispatchTable.offset;
-		w.at(ic.dispatchTable.offset + 2 * opcode).put_b16(offset);
+		var offset = pos - ic.dispatchTableRef.offset;
+		w.at(ic.dispatchTableRef.offset + 2 * opcode).put_b16(offset);
 		w.atEnd();
 	}
 	// Generate the out-of-line LEB decoding code.
@@ -1102,9 +1150,7 @@ class OutOfLineLEB(dest: X86_64Gpr) extends X86_64Addr {
 
 	new() super(null, null, 1, REL_MARKER) { }
 }
-class DispatchTableRef extends X86_64Addr {
-	var offset: int = -1;
-
+class IcCodeRef(var offset: int) extends X86_64Addr {
 	new() super(null, null, 1, REL_MARKER) { }
 }
 class Patcher(w: DataWriter) extends X86_64AddrPatcher {
@@ -1115,8 +1161,8 @@ class Patcher(w: DataWriter) extends X86_64AddrPatcher {
 				x.pos = pos;
 				x.delta = delta;
 			}
-			x: DispatchTableRef => {
-				if (x.offset < 0) System.error("InterpreterGen", "dispatch table not fixed");
+			x: IcCodeRef => {
+				if (x.offset < 0) System.error("InterpreterGen", "unbound forward code ref");
 				w.at(pos).put_b32(x.offset - (pos + delta));
 				w.atEnd();
 			}
