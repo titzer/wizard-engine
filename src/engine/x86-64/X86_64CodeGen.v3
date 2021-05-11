@@ -137,36 +137,53 @@ class X86_64CodeGen {
 	}
 
 	def genInterpreterEntry() {
-		// Generate code that can be entered directly from V3.
-		ic.v3EntryOffset = w.atEnd().pos;
-		ic.callReentryRef = IcCodeRef.new(w.pos); // XXX: factor out some of reentry code
-
-		// Allocate and initialize interpreter stack frame from incoming V3 params.
-		asm.q.sub_r_i(R.RSP, frameSize);
-
-		var iv: IVar;
-
-		// Spill interpreter object
-		iv = IVar.INTERPRETER;
-		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
-		// Spill VSP (value stack pointer);
-		iv = IVar.VSP;
-		asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
-
-		// Load wf.instance, wf.decl and spill
+		var shared_entry = X86_64Label.new();
 		var tmp = I.scratch;
-		asm.movq_r_r(tmp, I.V3_PARAM_GPRS[IVar.WFUNC.entryParam]);
+		{ // Entrypoint for calls coming from V3
+			ic.v3EntryOffset = w.atEnd().pos;
+
+			// Allocate and initialize interpreter stack frame from incoming V3 params.
+			asm.q.sub_r_i(R.RSP, frameSize);
+
+			var iv: IVar;
+			// Spill interpreter object
+			iv = IVar.INTERPRETER;
+			asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+			// Spill VSP (value stack pointer)
+			iv = IVar.VSP;
+			asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+			// move WasmFunction into tmp
+			asm.movq_r_r(tmp, I.V3_PARAM_GPRS[IVar.WFUNC.entryParam]);
+			restoreIVar(IVar.VSP);
+			asm.jmp_rel_near(shared_entry);
+		}
+
+		{ // Re-entry for calls within the interpreter itself
+			ic.callReentryRef = IcCodeRef.new(w.pos);
+			// Load and respill interpreter onto new stack frame
+			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
+			// Allocate actual stack frame
+			asm.q.sub_r_i(R.RSP, frameSize);
+			// Re-spill interpreter object
+			asm.movq_m_r(R.RSP.plus(IVar.INTERPRETER.frameOffset), tmp);
+			// Spill the (valid) stack pointer
+			saveIVar(IVar.VSP);
+			// WasmFunction is in r1 for interpreter reentry
+			asm.movq_r_r(tmp, I.r1);
+		}
+
+		asm.bind(shared_entry);
+		// Load wf.instance, wf.decl and spill
 		asm.movq_r_m(IVar.INSTANCE.gpr, X86_64Addr.new(tmp, null, 1, offsets.WasmFunction_instance));
 		saveIVar(IVar.INSTANCE);
 		asm.movq_r_m(IVar.FUNC_DECL.gpr, X86_64Addr.new(tmp, null, 1, offsets.WasmFunction_decl));
 		saveIVar(IVar.FUNC_DECL);
 
-		// Compute VFP = VSP - func.sig.params.length
+		// Compute VFP = VSP - func.sig.params.length * SLOT_SIZE
 		asm.movq_r_m(tmp, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
 		asm.movq_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.SigDecl_params));
 		asm.movd_r_m(tmp, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
 		asm.q.shl_r_i(tmp, SLOT_SIZE_LOG);
-		restoreIVar(IVar.VSP);
 		asm.movq_r_r(IVar.VFP.gpr, IVar.VSP.gpr);
 		asm.q.sub_r_r(IVar.VFP.gpr, tmp);
 		saveIVar(IVar.VFP);
@@ -360,6 +377,7 @@ class X86_64CodeGen {
 				asm.cmp_r_i(tmp, 0);
 				asm.jc_rel_near(C.Z, done);
 				asm.d.shl_r_i(tmp, SLOT_SIZE_LOG);
+				asm.q.lea(I.r1, X86_64Addr.new(IVar.VFP.gpr, tmp, 1, 0));
 				asm.q.sub_r_r(IVar.VSP.gpr, tmp);
 				var loop = X86_64Label.new();
 				// loop until tmp == 0, copying stack slots down to frame pointer.
@@ -373,16 +391,26 @@ class X86_64CodeGen {
 				// Deallocate interpreter frame and return to calling code.
 				asm.q.add_r_i(R.RSP, frameSize);
 				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+				asm.movq_r_r(IVar.VSP.gpr, I.r1);  // set VSP to end of values
 				asm.ret();
+
+				/* TODO: use string copy instructions?
+				asm.std();
+				asm.d.shl_r_i(R.RCX, u6.!(SLOT_SIZE / 4));
+				asm.q.sub_r_r(R.RSI, tmp);
+				asm.repne();
+				asm.movsd();
+				asm.movq_r_r(IVar.VSP.gpr, R.RDI);
+				*/
+
 				return HandlerGenResult.Offset(if(opcode == Opcode.END, ic.handler_END, ic.handler_RETURN));
 			}
 			CALL => {
-				if (true) return HandlerGenResult.UNHANDLED;
 				// XXX: save ip prior to call for stack traces?
 				genReadUleb32(I.r1); // TODO: r0 == ecx, which is overwritten
 
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.WFUNC.gpr, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+				asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
 
 				// XXX: share dispatch/return sequence between call and indirect call
 				saveIVar(IVar.IP);
@@ -390,10 +418,9 @@ class X86_64CodeGen {
 				saveIVar(IVar.EIP);
 				var call_host = X86_64Label.new();
 				asm.d.cmp_m_i(X86_64Addr.new(I.r1, null, 1, 0), offsets.WasmFunction_typeId);
-				asm.jc_rel_near(C.Z, call_host);
+				asm.jc_rel_near(C.NZ, call_host);
 
 				// WasmFunction: call into interpreter reentry
-				// TODO: compute VFP from VSP - wf.sig.params.length
 				asm.callr_addr(ic.callReentryRef);
 
 				restoreIVar(IVar.IP);
