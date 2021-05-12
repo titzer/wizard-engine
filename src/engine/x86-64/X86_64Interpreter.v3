@@ -284,7 +284,6 @@ component I {
 	def INTERPRETER_GPRS = filterGprs(isTrue);	// allocatable interpreter registers
 	def BASELINE_GPRS = filterGprs(IVar.baseline);	// allocatable baseline registers
 
-
 	def filterGprs(cond: IVar -> bool) -> Array<X86_64Gpr> {
 		var gprs = G;
 		var used = Array<bool>.new(gprs.length);
@@ -317,6 +316,7 @@ component I {
 	def r0 = I.INTERPRETER_GPRS[0];
 	def r1 = I.INTERPRETER_GPRS[1];
 	def r2 = I.INTERPRETER_GPRS[2];
+	def r3 = I.INTERPRETER_GPRS[3];
 	def xmm0 = X86_64Regs.XMM0;
 	def scratch = R.RBP;
 }
@@ -344,6 +344,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	var handler_INVALID: int;
 	var firstDispatchOffset: int;
 	var callEntryOffset: int;
+	var callFunctionOffset: int;
 	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
@@ -678,7 +679,8 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
 				asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
 
-				// XXX: share dispatch/return sequence between call and indirect call
+				// call indirection jumps here
+				callFunctionOffset = w.pos;
 				saveIVar(IVar.IP);
 				saveIVar(IVar.XIP);
 				saveIVar(IVar.EIP);
@@ -702,7 +704,44 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				// HostFunction: call into interpreter callback to enter into V3 code
 				asm.bind(call_host);
 				asm.icall_m(callHostRef);
-				// yyy spill
+				return HandlerGenResult.END;
+			}
+			CALL_INDIRECT => {
+				// XXX: save ip prior to call for stack traces?
+				var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
+				genReadUleb32(sig_index);
+				genReadUleb32(table_index);
+
+				asm.sub_r_i(I.vsp, SLOT_SIZE);
+				asm.movd_r_m(func_index, I.vsp_ptr_p1);
+
+				var trap_oob = X86_64Label.new(), trap_sig_mismatch = X86_64Label.new();
+
+				var tmp = I.r3;
+				// load instance.sig_ids[sig_index] into sig_index
+				asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_sig_ids));
+				asm.movd_r_m(sig_index, X86_64Addr.new(tmp, sig_index, offsets.INT_SIZE, offsets.Array_contents));
+				// Bounds-check table.ids[func_index]
+				asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
+				var table = table_index;
+				asm.movq_r_m(table, X86_64Addr.new(tmp, table_index, offsets.REF_SIZE, offsets.Array_contents));
+				asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_ids));
+				asm.d.cmp_r_m(func_index, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
+				asm.jc_rel_near(C.NC, trap_oob);
+				// Check table.ids[func_index] == sig_index
+				asm.d.cmp_r_m(sig_index, X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents));
+				asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+				// Load table.funcs[func_index] into r1 and jump to calling sequence
+				asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_funcs));
+				asm.movq_r_m(I.r1, X86_64Addr.new(tmp, func_index, offsets.REF_SIZE, offsets.Array_contents));
+				asm.jmp_rel(callFunctionOffset - w.pos);
+				// XXX: move traps for call indirect out-of-line
+				asm.bind(trap_oob);
+				genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_INVALID);
+				asm.bind(trap_sig_mismatch);
+				asm.d.cmp_m_i(X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
+				asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
+				genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_SIG_MISMATCH);
 				return HandlerGenResult.END;
 			}
 			DROP => {
