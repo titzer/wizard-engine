@@ -58,7 +58,8 @@ class X86_64Interpreter extends Interpreter {
 		for (i = r.length - 1; i >= 0; i--) r[i] = valueStack.pop(rt[i]);
 		return Result.Value(r);
 	}
-	def callHost(f: Function, vfp: Pointer, vsp: Pointer) -> (ExecState, TrapReason) {
+	// callback to call into host functions
+	def callHost(f: Function, vsp: Pointer) -> (ExecState, TrapReason) {
 		var r: HostResult;
 		var prevSp = valueStack.sp;
 		valueStack.sp = vsp;
@@ -88,7 +89,6 @@ class X86_64Interpreter extends Interpreter {
 			_ => fatal("call to non-host function");
 
 		}
-		valueStack.sp = vfp;
 		match (r) {
 			Trap(reason) => return (ExecState.TRAPPED, reason);
 			Error(msg) => {
@@ -105,6 +105,19 @@ class X86_64Interpreter extends Interpreter {
 			}
 		}
 		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	// callback to get a global variable's value
+	def globalGet(instance: Instance, index: u32, vsp: Pointer) {
+		var val = instance.globals[index].value;
+		valueStack.sp = vsp;
+		valueStack.push(val);
+	}
+	// callback to set a global variable's value
+	def globalSet(instance: Instance, index: u32, vsp: Pointer) {
+		valueStack.sp = vsp;
+		var g = instance.globals[index];
+		var val = valueStack.pop(g.valtype);
+		g.value = val;
 	}
 }
 
@@ -144,7 +157,9 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 }
 
 class InterpreterCallbacks(i: X86_64Interpreter) {
-	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (Function, Pointer, Pointer), (ExecState, TrapReason)>(i.callHost).0;
+	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (Function, Pointer), (ExecState, TrapReason)>(i.callHost).0;
+	def globalGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalGet).0;
+	def globalSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalSet).0;
 }
 
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
@@ -343,12 +358,15 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	var handler_UNIMPLEMENTED: int;
 	var handler_INVALID: int;
 	var firstDispatchOffset: int;
+	var dispatchJmpOffset: int;
 	var callEntryOffset: int;
 	var callFunctionOffset: int;
 	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
 	var callHostRef: IcCodeRef;
+	var globalGetRef: IcCodeRef;
+	var globalSetRef: IcCodeRef;
 	var dispatchTableRef: IcCodeRef;
 
 	new() { asm.patcher = asm.d.patcher = Patcher.new(w); }
@@ -362,6 +380,10 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		// Write pointers to interpreter callbacks.
 		callHostRef = IcCodeRef.new(w.pos);
 		w.put_b64(callbacks.callHost - Pointer.NULL);
+		globalGetRef = IcCodeRef.new(w.pos);
+		w.put_b64(callbacks.globalGet - Pointer.NULL);
+		globalSetRef = IcCodeRef.new(w.pos);
+		w.put_b64(callbacks.globalSet - Pointer.NULL);
 		// Reserve space for a 2x256-entry signed-offset dispatch table.
 		asm.w.align(2);
 		dispatchTableRef = IcCodeRef.new(w.pos);
@@ -398,6 +420,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 			buf.put1("\tcode end     = 0x%x\n", start + codeEndOffset);
 			buf.put1("\toob mem      = 0x%x\n", start + ic.oobMemoryHandlerOffset);
 			buf.put1("\tdivzero      = 0x%x\n", start + ic.divZeroHandlerOffset);
+			buf.put1("break *0x%x\n", start + dispatchJmpOffset);
 			buf.outln();
 		}
 		return ic;
@@ -428,7 +451,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		{ // Re-entry for calls within the interpreter itself
 			callReentryRef = IcCodeRef.new(w.pos);
 			// Load and respill interpreter onto new stack frame
-			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
+			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset)); // TODO: account for additional return address
 			// Allocate actual stack frame
 			asm.q.sub_r_i(R.RSP, frameSize);
 			// Re-spill interpreter object
@@ -679,31 +702,25 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
 				asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
 
-				// call indirection jumps here
+				// call_indirect jumps here
 				callFunctionOffset = w.pos;
-				saveIVar(IVar.IP);
-				saveIVar(IVar.XIP);
-				saveIVar(IVar.EIP);
+				saveCallerIVars(false);
 				var call_host = X86_64Label.new();
 				asm.d.cmp_m_i(X86_64Addr.new(I.r1, null, 1, 0), offsets.WasmFunction_typeId);
 				asm.jc_rel_near(C.NZ, call_host);
 
 				// WasmFunction: call into interpreter reentry
 				asm.callr_addr(callReentryRef);
-
-				restoreIVar(IVar.IP);
-				restoreIVar(IVar.XIP);
-				restoreIVar(IVar.EIP);
-				restoreIVar(IVar.INSTANCE);
-				restoreIVar(IVar.FUNC_DECL);
-				restoreIVar(IVar.MEM0_BASE);
-				restoreIVar(IVar.VFP);
-				// TODO: check exec state and possibly return abruptly or handle exception
+				genExecStateCheck();
+				restoreCallerIVars(false);
 				genDispatchOrJumpToDispatch();
 
 				// HostFunction: call into interpreter callback to enter into V3 code
 				asm.bind(call_host);
-				asm.icall_m(callHostRef);
+				saveIVar(IVar.VSP);
+				callV3(callHostRef, [I.r1, I.vsp]);
+				genExecStateCheck();
+				restoreCallerIVars(true); // TODO: adjust VSP properly
 				return HandlerGenResult.END;
 			}
 			CALL_INDIRECT => {
@@ -805,6 +822,20 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.d.shl_r_i(I.r0, SLOT_SIZE_LOG);
 				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VSP.gpr, null, 1, 8 - SLOT_SIZE));
 				asm.movq_m_r(X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 8), I.r1);
+			}
+			GLOBAL_GET => {
+				genReadUleb32(I.r0);
+				saveCallerIVars(true);
+				callV3(globalGetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				restoreCallerIVars(true);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
+			}
+			GLOBAL_SET => {
+				genReadUleb32(I.r0);
+				saveCallerIVars(true);
+				callV3(globalSetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				restoreCallerIVars(true);
+				asm.sub_r_i(I.vsp, SLOT_SIZE);
 			}
 			I32_LOAD => genLoad(BpTypecon.I32.code, asm.movd_r_m);
 			I64_LOAD => genLoad(BpTypecon.I64.code, asm.movq_r_m);
@@ -1247,6 +1278,52 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		}
 		return HandlerGenResult.HANDLED;
 	}
+	def genExecStateCheck() {
+		// TODO: abrupt return if execstate != FINISHED
+	}
+	def saveCallerIVars(vsp: bool) {
+		saveIVar(IVar.IP);
+		saveIVar(IVar.XIP);
+		if (vsp) saveIVar(IVar.VSP);
+	}
+	def restoreCallerIVars(vsp: bool) {
+		restoreIVar(IVar.IP);
+		restoreIVar(IVar.XIP);
+		restoreIVar(IVar.EIP);
+		restoreIVar(IVar.INSTANCE);
+		restoreIVar(IVar.FUNC_DECL);
+		restoreIVar(IVar.MEM0_BASE);
+		restoreIVar(IVar.VFP);
+		if (vsp) restoreIVar(IVar.VSP);
+	}
+	def callV3(ref: IcCodeRef, regs: Array<X86_64Gpr>) {
+		// Generate parallel moves from args into param gprs; assume each src register used only once
+		var dst = Array<X86_64Gpr>.new(G.length);
+		for (i < regs.length) {
+			var sreg = regs[i];
+			var dreg = I.V3_PARAM_GPRS[i + 1];
+			if (sreg != dreg) dst[sreg.regnum] = dreg;
+		}
+		var stk = Array<i8>.new(G.length);
+		for (i < dst.length) orderMoves(dst, stk, i);
+		// load interpreter into first arg register
+		asm.movq_r_m(I.V3_PARAM_GPRS[0], R.RSP.plus(IVar.INTERPRETER.frameOffset));
+		asm.icall_m(ref);
+	}
+	def orderMoves(dst: Array<X86_64Gpr>, stk: Array<i8>, i: int) {
+		var dreg = dst[i];
+		if (dreg == null) return;		// no moves here
+		if (stk[i] > 0) return;			// this node already done
+		stk[i] = -1;				// mark as on stack
+		if (stk[dreg.regnum] < 0) {		// destination on stack => cycle
+			asm.movq_r_r(I.scratch, dreg);	// save destination first
+			stk[dreg.regnum] = -2;		// mark as cycle
+		} else {
+			orderMoves(dst, stk, dreg.regnum);	// recurse on destination
+		}
+		asm.movq_r_r(dreg, if(stk[i] == -2, I.scratch, G[i]));	// emit post-order move
+		stk[i] = 1;				// mark as done
+	}
 	def updateTagOnTopOfStack(tag: byte) {
 		asm.movq_m_i(I.vsp_ptr_m2, tag);
 	}
@@ -1455,6 +1532,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		asm.lea(base, dispatchTableRef); // RIP-relative LEA
 		asm.movwsx_r_m(opcode, X86_64Addr.new(base, opcode, 2, 0)); // load 16-bit offset
 		asm.add_r_r(base, opcode);
+		dispatchJmpOffset = w.pos;
 		asm.ijmp_r(base);
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
