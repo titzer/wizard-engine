@@ -119,6 +119,26 @@ class X86_64Interpreter extends Interpreter {
 		var val = valueStack.pop(g.valtype);
 		g.value = val;
 	}
+	// callback to get a table element's value
+	def tableGet(instance: Instance, index: u32, vsp: Pointer) -> (ExecState, TrapReason) {
+		var table = instance.tables[index];
+		valueStack.sp = vsp;
+		var elem = Values.v_i(valueStack.pop(ValueType.I32));
+		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
+		var val = table.elems[elem];
+		valueStack.push(val);
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	// callback to set a table element's value
+	def tableSet(instance: Instance, index: u32, vsp: Pointer) -> (ExecState, TrapReason) {
+		var table = instance.tables[index];
+		valueStack.sp = vsp;
+		var val = valueStack.pop(table.elemtype);
+		var elem = Values.v_i(valueStack.pop(ValueType.I32));
+		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
+		table.elems[elem] = val;
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
 }
 
 // Size constants
@@ -160,6 +180,8 @@ class InterpreterCallbacks(i: X86_64Interpreter) {
 	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (Function, Pointer), (ExecState, TrapReason)>(i.callHost).0;
 	def globalGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalGet).0;
 	def globalSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalSet).0;
+	def tableGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), (ExecState, TrapReason)>(i.tableGet).0;
+	def tableSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), (ExecState, TrapReason)>(i.tableSet).0;
 }
 
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
@@ -365,8 +387,11 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
 	var callHostRef: IcCodeRef;
+	var abruptRetRef: IcCodeRef;
 	var globalGetRef: IcCodeRef;
 	var globalSetRef: IcCodeRef;
+	var tableGetRef: IcCodeRef;
+	var tableSetRef: IcCodeRef;
 	var dispatchTableRef: IcCodeRef;
 
 	new() { asm.patcher = asm.d.patcher = Patcher.new(w); }
@@ -384,6 +409,10 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		w.put_b64(callbacks.globalGet - Pointer.NULL);
 		globalSetRef = IcCodeRef.new(w.pos);
 		w.put_b64(callbacks.globalSet - Pointer.NULL);
+		tableGetRef = IcCodeRef.new(w.pos);
+		w.put_b64(callbacks.tableGet - Pointer.NULL);
+		tableSetRef = IcCodeRef.new(w.pos);
+		w.put_b64(callbacks.tableSet - Pointer.NULL);
 		// Reserve space for a 2x256-entry signed-offset dispatch table.
 		asm.w.align(2);
 		dispatchTableRef = IcCodeRef.new(w.pos);
@@ -837,6 +866,21 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				restoreCallerIVars(true);
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
 			}
+			TABLE_GET => {
+				genReadUleb32(I.r0);
+				saveCallerIVars(true);
+				callV3(tableGetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				genExecStateCheck();
+				restoreCallerIVars(true);
+			}
+			TABLE_SET => {
+				genReadUleb32(I.r0);
+				saveCallerIVars(true);
+				callV3(tableSetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				genExecStateCheck();
+				restoreCallerIVars(true);
+				asm.sub_r_i(I.vsp, SLOT_SIZE * 2);
+			}
 			I32_LOAD => genLoad(BpTypecon.I32.code, asm.movd_r_m);
 			I64_LOAD => genLoad(BpTypecon.I64.code, asm.movq_r_m);
 			F32_LOAD => genLoad(BpTypecon.F32.code, asm.movd_r_m);
@@ -1279,7 +1323,8 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		return HandlerGenResult.HANDLED;
 	}
 	def genExecStateCheck() {
-		// TODO: abrupt return if execstate != FINISHED
+		asm.cmpb_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+		asm.jc_rel_addr(C.NZ, abruptRetRef);
 	}
 	def saveCallerIVars(vsp: bool) {
 		saveIVar(IVar.IP);
@@ -1407,6 +1452,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	def genAbruptReturn(state: ExecState, reason: TrapReason) {
 		asm.movd_r_i(I.V3_RET_GPRS[0], state.tag);
 		asm.movd_r_i(I.V3_RET_GPRS[1], reason.tag);
+		abruptRetRef = IcCodeRef.new(w.pos);
 		asm.q.add_r_i(R.RSP, frameSize);
 		asm.ret();
 	}
