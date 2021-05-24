@@ -21,93 +21,114 @@ class X86_64Interpreter extends Interpreter {
 	}
 
 	def run(count: int, f: Function, args: Array<Value>) -> Result {
-		if (!WasmFunction.?(f)) return Result.Trap(TrapReason.ERROR);
-		var wf = WasmFunction.!(f);
 		// Unpack arguments into value stack format.
 		var fp = valueStack.sp;
 		if (args != null) for (v in args) valueStack.push(v);
 
-		// Invoke native (asm) entry.
-		if (Trace.interpreter) {
-			var buf = TraceBuilder.new();
-			buf.put2("X86_64Interpreter.asmEntry(wf=0x%x, sp=0x%x)",
-				Pointer.atObject(wf) - Pointer.NULL, valueStack.sp - Pointer.NULL);
-			buf.outln();
-		}
-		var state = invoke(wf, valueStack.sp);
-
-		// Unpack result(s).
+		// Call the main loop with handles tail calls.
+		var state = runWithTailCalls(f);
+		
+		// Unpack state into interpreter result.
 		match (state.0) {
 			STOPPED,
 			RUNNING => return Result.Trap(TrapReason.UNIMPLEMENTED);
 			TRAPPED => return Result.Trap(state.1);
 			BREAKPOINT => return Result.Break;
-			FINISHED => {
-				valueStack.sp = fp + (wf.sig.results.length * SLOT_SIZE);
-				return popResult(f.sig);
-			}
+			FINISHED => return popResult(f.sig);
 			TIMEOUT => return Result.Break;
 		}
 	}
-	def invoke(wf: WasmFunction, sp: Pointer) -> (ExecState, TrapReason) {
+	private def runWithTailCalls(f: Function) -> (ExecState, TrapReason) {
+		var state = (ExecState.FINISHED, TrapReason.NONE);
+		while (true) { // handle repeated tail calls
+			var result: HostResult;
+			match (f) {
+				wf: WasmFunction => {
+					var sp = valueStack.sp;
+					state = invoke(wf, sp);
+					if (state.0 == ExecState.FINISHED) {
+						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * SLOT_SIZE);
+					}
+					break;
+				}
+				hf: HostFunction0 => {
+					if (trace != null) traceCallHostFunction(hf);
+					result = hf.invoke0();
+				}
+				hf: HostFunction1 => {
+					if (trace != null) traceCallHostFunction(hf);
+					var a0 = valueStack.pop(hf.sig.params[0]);
+					result = hf.invoke1(a0);
+				}
+				hf: HostFunction2 => {
+					if (trace != null) traceCallHostFunction(hf);
+					var a1 = valueStack.pop(hf.sig.params[1]);
+					var a0 = valueStack.pop(hf.sig.params[0]);
+					result = hf.invoke2(a0, a1);
+				}
+				hf: HostFunction3 => {
+					if (trace != null) traceCallHostFunction(hf);
+					var a2 = valueStack.pop(hf.sig.params[2]);
+					var a1 = valueStack.pop(hf.sig.params[1]);
+					var a0 = valueStack.pop(hf.sig.params[0]);
+					result = hf.invoke3(a0, a1, a2);
+				}
+				hf: HostFunctionN => {
+					if (trace != null) traceCallHostFunction(hf);
+					var aN = valueStack.popN(hf.sig.params);
+					result = hf.invokeN(aN);
+				}
+			}
+			match (result) {
+				Trap(reason) => {
+					state = (ExecState.TRAPPED, reason);
+					break;
+				}
+				Error(msg) => {
+					state = (ExecState.TRAPPED, TrapReason.ERROR);
+					error_msg = msg;
+					break;
+				}
+				Value0 => {
+					break;
+				}
+				Value1(val) => {
+					valueStack.push(val);
+					break;
+				}
+				ValueN(vals) => {
+					for (a in vals) valueStack.push(a);
+					break;
+				}
+				TailCall(target, args) => {
+					for (a in args) valueStack.push(a);
+					f = target;
+					continue; // continue with next tail call
+				}
+			}
+		}
+		return state;
+	}
+	private def invoke(wf: WasmFunction, sp: Pointer) -> (ExecState, TrapReason) {
+		if (trace != null) {
+			trace.put2("X86_64Interpreter.asmEntry(wf=0x%x, sp=0x%x)",
+				Pointer.atObject(wf) - Pointer.NULL, sp - Pointer.NULL);
+			trace.outln();
+		}
 		return asmEntry(wf, sp);
 	}
-	def popResult(sig: SigDecl) -> Result {
+	private def popResult(sig: SigDecl) -> Result {
 		var rt = sig.results;
 		var r = Array<Value>.new(rt.length);
 		for (i = r.length - 1; i >= 0; i--) r[i] = valueStack.pop(rt[i]);
 		return Result.Value(r);
 	}
 	// callback to call into host functions
-	def callHost(f: HostFunction, vspp: Pointer) -> (ExecState, TrapReason) {
-		if (trace != null) traceCallHostFunction(f);
-		var r: HostResult;
+	def callHost(f: Function, vspp: Pointer) -> (ExecState, TrapReason) {
 		valueStack.sp = vspp.load<Pointer>();
-		match (f) {
-			hf: HostFunction0 => {
-				r = hf.invoke0();
-			}
-			hf: HostFunction1 => {
-				var a0 = valueStack.pop(hf.sig.params[0]);
-				r = hf.invoke1(a0);
-			}
-			hf: HostFunction2 => {
-				var a1 = valueStack.pop(hf.sig.params[1]);
-				var a0 = valueStack.pop(hf.sig.params[0]);
-				r = hf.invoke2(a0, a1);
-			}
-			hf: HostFunction3 => {
-				var a2 = valueStack.pop(hf.sig.params[2]);
-				var a1 = valueStack.pop(hf.sig.params[1]);
-				var a0 = valueStack.pop(hf.sig.params[0]);
-				r = hf.invoke3(a0, a1, a2);
-			}
-			hf: HostFunctionN => {
-				var aN = valueStack.popN(hf.sig.params);
-				r = hf.invokeN(aN);
-			}
-			_ => fatal("call to non-host function");
-		}
+		var state = runWithTailCalls(f);
 		vspp.store<Pointer>(valueStack.sp);
-		match (r) {
-			Trap(reason) => return (ExecState.TRAPPED, reason);
-			Error(msg) => {
-				error_msg = msg;
-				return (ExecState.TRAPPED, TrapReason.ERROR);
-			}
-			Value0 => ; // do nothing
-			Value1(val) => valueStack.push(val);
-			ValueN(vals) => {
-				for (a in vals) val_stack.push(a);
-			}
-			TailCall(f, args) => {
-				error_msg = "unimplemented host tail call";
-				return (ExecState.TRAPPED, TrapReason.ERROR);
-//TODO				fatal("host tail call");
-			}
-		}
-		vspp.store<Pointer>(valueStack.sp);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		return state;
 	}
 	// callback to grow a memory
 	def memoryGrow(instance: Instance, index: u32, vspp: Pointer) {
@@ -291,12 +312,12 @@ class ValueStack {
 		return tag;
 	}
 	def peekTag() -> byte {
-		return (sp + -(Pointer.SIZE * 2)).load<u8>() & '\x7F';
+		return (sp + -(SLOT_SIZE)).load<u8>() & '\x7F';
 	}
 	def pushPair<T>(tag: byte, bits: T) {
 		sp.store<u8>(tag);
 		(sp + Pointer.SIZE).store(bits);
-		sp += (SLOT_SIZE);
+		sp += SLOT_SIZE;
 	}
 }
 
