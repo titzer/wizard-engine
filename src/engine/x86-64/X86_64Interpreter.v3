@@ -59,10 +59,10 @@ class X86_64Interpreter extends Interpreter {
 		return Result.Value(r);
 	}
 	// callback to call into host functions
-	def callHost(f: Function, vsp: Pointer) -> (ExecState, TrapReason) {
+	def callHost(f: HostFunction, vspp: Pointer) -> (ExecState, TrapReason) {
+		if (trace != null) traceCallHostFunction(f);
 		var r: HostResult;
-		var prevSp = valueStack.sp;
-		valueStack.sp = vsp;
+		valueStack.sp = vspp.load<Pointer>();
 		match (f) {
 			hf: HostFunction0 => {
 				r = hf.invoke0();
@@ -87,8 +87,8 @@ class X86_64Interpreter extends Interpreter {
 				r = hf.invokeN(aN);
 			}
 			_ => fatal("call to non-host function");
-
 		}
+		vspp.store<Pointer>(valueStack.sp);
 		match (r) {
 			Trap(reason) => return (ExecState.TRAPPED, reason);
 			Error(msg) => {
@@ -101,50 +101,58 @@ class X86_64Interpreter extends Interpreter {
 				for (a in vals) val_stack.push(a);
 			}
 			TailCall(f, args) => {
-				fatal("host tail call");
+				error_msg = "unimplemented host tail call";
+				return (ExecState.TRAPPED, TrapReason.ERROR);
+//TODO				fatal("host tail call");
 			}
 		}
+		vspp.store<Pointer>(valueStack.sp);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
 	// callback to grow a memory
-	def memoryGrow(instance: Instance, index: u32, vsp: Pointer) {
+	def memoryGrow(instance: Instance, index: u32, vspp: Pointer) {
 		var memory = instance.memories[index];
-		valueStack.sp = vsp;
+		valueStack.sp = vspp.load<Pointer>();
 		var pages = Values.v_u(valueStack.pop(ValueType.I32));
 		var result = memory.grow(pages);
 		valueStack.push(Values.i_v(result));
+		vspp.store<Pointer>(valueStack.sp);
 	}
 	// callback to get a global variable's value
-	def globalGet(instance: Instance, index: u32, vsp: Pointer) {
+	def globalGet(instance: Instance, index: u32, vspp: Pointer) {
 		var val = instance.globals[index].value;
-		valueStack.sp = vsp;
+		valueStack.sp = vspp.load<Pointer>();
 		valueStack.push(val);
+		vspp.store<Pointer>(valueStack.sp);
 	}
 	// callback to set a global variable's value
-	def globalSet(instance: Instance, index: u32, vsp: Pointer) {
-		valueStack.sp = vsp;
+	def globalSet(instance: Instance, index: u32, vspp: Pointer) {
+		valueStack.sp = vspp.load<Pointer>();
 		var g = instance.globals[index];
 		var val = valueStack.pop(g.valtype);
 		g.value = val;
+		vspp.store<Pointer>(valueStack.sp);
 	}
 	// callback to get a table element's value
-	def tableGet(instance: Instance, index: u32, vsp: Pointer) -> (ExecState, TrapReason) {
+	def tableGet(instance: Instance, index: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+		valueStack.sp = vspp.load<Pointer>();
 		var table = instance.tables[index];
-		valueStack.sp = vsp;
 		var elem = Values.v_i(valueStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
 		var val = table.elems[elem];
 		valueStack.push(val);
+		vspp.store<Pointer>(valueStack.sp);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
 	// callback to set a table element's value
-	def tableSet(instance: Instance, index: u32, vsp: Pointer) -> (ExecState, TrapReason) {
+	def tableSet(instance: Instance, index: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+		valueStack.sp = vspp.load<Pointer>();
 		var table = instance.tables[index];
-		valueStack.sp = vsp;
 		var val = valueStack.pop(table.elemtype);
 		var elem = Values.v_i(valueStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
 		table.elems[elem] = val;
+		vspp.store<Pointer>(valueStack.sp);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
 }
@@ -185,7 +193,7 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 }
 
 class InterpreterCallbacks(i: X86_64Interpreter) {
-	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (Function, Pointer), (ExecState, TrapReason)>(i.callHost).0;
+	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (HostFunction, Pointer), (ExecState, TrapReason)>(i.callHost).0;
 	def memoryGrow: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.memoryGrow).0;
 	def globalGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalGet).0;
 	def globalSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.globalSet).0;
@@ -492,7 +500,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		{ // Re-entry for calls within the interpreter itself
 			callReentryRef = IcCodeRef.new(w.pos);
 			// Load and respill interpreter onto new stack frame
-			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset)); // TODO: account for additional return address
+			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset + PTR_SIZE)); // account for additional return address
 			// Allocate actual stack frame
 			asm.q.sub_r_i(R.RSP, frameSize);
 			// Re-spill interpreter object
@@ -759,10 +767,9 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				// HostFunction: call into interpreter callback to enter into V3 code
 				asm.bind(call_host);
 				saveIVar(IVar.VSP);
-				callV3(callHostRef, [I.r1, I.vsp]);
+				callV3WithVspp(callHostRef, [I.r1]);
 				genExecStateCheck();
-				restoreCallerIVars(true); // TODO: adjust VSP properly
-				return HandlerGenResult.END;
+				restoreCallerIVars(true);
 			}
 			CALL_INDIRECT => {
 				// XXX: save ip prior to call for stack traces?
@@ -867,31 +874,28 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 			GLOBAL_GET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3(globalGetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				callV3WithVspp(globalGetRef, [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
-				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
 			GLOBAL_SET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3(globalSetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				callV3WithVspp(globalSetRef, [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
 			}
 			TABLE_GET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3(tableGetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				callV3WithVspp(tableGetRef, [IVar.INSTANCE.gpr, I.r0]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
 			TABLE_SET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3(tableSetRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				callV3WithVspp(tableSetRef, [IVar.INSTANCE.gpr, I.r0]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
-				asm.sub_r_i(I.vsp, SLOT_SIZE * 2);
 			}
 			I32_LOAD => genLoad(BpTypecon.I32.code, asm.movd_r_m);
 			I64_LOAD => genLoad(BpTypecon.I64.code, asm.movq_r_m);
@@ -936,7 +940,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 			MEMORY_GROW => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3(memoryGrowRef, [IVar.INSTANCE.gpr, I.r0, I.vsp]);
+				callV3WithVspp(memoryGrowRef, [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
 			}
 			I32_CONST => {
@@ -1359,7 +1363,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		restoreIVar(IVar.VFP);
 		if (vsp) restoreIVar(IVar.VSP);
 	}
-	def callV3(ref: IcCodeRef, regs: Array<X86_64Gpr>) {
+	def callV3WithVspp(ref: IcCodeRef, regs: Array<X86_64Gpr>) {
 		// Generate parallel moves from args into param gprs; assume each src register used only once
 		var dst = Array<X86_64Gpr>.new(G.length);
 		for (i < regs.length) {
@@ -1371,6 +1375,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		for (i < dst.length) orderMoves(dst, stk, i);
 		// load interpreter into first arg register
 		asm.movq_r_m(I.V3_PARAM_GPRS[0], R.RSP.plus(IVar.INTERPRETER.frameOffset));
+		asm.q.lea(I.V3_PARAM_GPRS[1 + regs.length], R.RSP.plus(IVar.VSP.frameOffset));
 		asm.icall_m(ref);
 	}
 	def orderMoves(dst: Array<X86_64Gpr>, stk: Array<i8>, i: int) {
