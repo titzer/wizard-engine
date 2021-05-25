@@ -10,8 +10,11 @@ class X86_64Interpreter extends Interpreter {
 
 	new() {
 		if (interpreterCode == null) {
+			var start = System.ticksUs();
 			interpreterCode = X86_64InterpreterGen.new(InterpreterCallbacks.new(this)).gen();
 			RiRuntime.userSignalHandler = handleSignal;
+			var diff = System.ticksUs() - start;
+			if (trace != null) trace.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
 		}
 		asmEntry = CiRuntime.forgeClosure<
 			X86_64Interpreter,				// closure type
@@ -27,7 +30,7 @@ class X86_64Interpreter extends Interpreter {
 
 		// Call the main loop with handles tail calls.
 		var state = runWithTailCalls(f);
-		
+
 		// Unpack state into interpreter result.
 		match (state.0) {
 			STOPPED,
@@ -433,7 +436,10 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	var globalSetRef: IcCodeRef;
 	var tableGetRef: IcCodeRef;
 	var tableSetRef: IcCodeRef;
-	var dispatchTableRef: IcCodeRef;
+	var dispatchTables = [
+		(0x00, IcCodeRef.new(-1)),
+		(0xFC, IcCodeRef.new(-1))
+	];
 
 	new() { asm.patcher = asm.d.patcher = Patcher.new(w); }
 
@@ -456,10 +462,12 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		w.put_b64(callbacks.tableGet - Pointer.NULL);
 		tableSetRef = IcCodeRef.new(w.pos);
 		w.put_b64(callbacks.tableSet - Pointer.NULL);
-		// Reserve space for a 2x256-entry signed-offset dispatch table.
-		asm.w.align(2);
-		dispatchTableRef = IcCodeRef.new(w.pos);
-		asm.w.skipN(256 * 2);
+		// Reserve space for each of the dispatch tables
+		for (t in dispatchTables) {
+			asm.w.align(2);
+			t.1.offset = w.pos;
+			asm.w.skipN(256 * 2);
+		}
 		// Begin code generation
 		genInterpreterEntry();
 		genOpcodeHandlers();
@@ -620,33 +628,46 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 
 		// execute first instruction
 		firstDispatchOffset = w.atEnd().pos;
-		genDispatch();
+		genDispatch(dispatchTables[0]);
 	}
 
 	// Generate all the opcode handlers.
 	def genOpcodeHandlers() {
-		// Generate the default handler and initialize the table
+		// Generate the default handler and initialize dispatch tables
 		var pos = w.atEnd().pos;
 		genDefaultOpcodeHandler();
-		for (i < 256) patchDispatchTable(i, pos);
+		for (t in dispatchTables) {
+			var ref = t.1;
+			var offset = pos - ref.offset;
+			for (i < 256) w.at(ref.offset + 2 * i).put_b16(offset);
+		}
 
-		// Generate handlers for all short opcodes
+		// Generate the secondary dispatch tables and point main table at them
+		var ref0 = dispatchTables[0].1;
+		for (t in dispatchTables) {
+			if (t.0 == 0) continue; // main dispatch table
+			var pos = w.atEnd().pos;
+			genDispatch(t);
+			var offset = pos - ref0.offset;
+			w.at(ref0.offset + 2 * t.0).put_b16(offset);
+		}
+
+		// Generate handlers for all opcodes
 		for (opcode in Opcode) {  // XXX: order opcodes by frequency
-			if (opcode.prefix != 0) continue;
 			var pos = w.atEnd().pos;
 			// try to generate the handler for the opcode
 			var result = genOpcodeHandler(opcode);
 			match (result) {
 				UNHANDLED => ; // already points to default handler
 				HANDLED => {
-					patchDispatchTable(opcode.code, pos);
+					patchDispatchTable(opcode, pos);
 					genDispatchOrJumpToDispatch();
 				}
 				Offset(off) => {
-					patchDispatchTable(opcode.code, off);
+					patchDispatchTable(opcode, off);
 				}
 				END => {
-					patchDispatchTable(opcode.code, pos);
+					patchDispatchTable(opcode, pos);
 				}
 			}
 		}
@@ -665,7 +686,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			NOP => {
-				// nothing to do
+				return HandlerGenResult.Offset(firstDispatchOffset); // just go to first dispatch
 			}
 			BLOCK, LOOP, TRY => {
 				if (handler_BLOCK != 0) return HandlerGenResult.Offset(handler_BLOCK);
@@ -1354,7 +1375,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2ss_s_r(I.xmm0, I.r0);
 				asm.movss_m_s(I.vsp_ptr_m1, I.xmm0);
-			}	
+			}
 // TODO			F32_CONVERT_I64_U => ;
 			F32_DEMOTE_F64 => {
 				updateTagOnTopOfStack(BpTypecon.F32.code);
@@ -1381,7 +1402,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2sd_s_r(I.xmm0, I.r0);
 				asm.movsd_m_s(I.vsp_ptr_m1, I.xmm0);
-			}	
+			}
 // TODO			F64_CONVERT_I64_U => ;
 			F64_PROMOTE_F32 => {
 				updateTagOnTopOfStack(BpTypecon.F64.code);
@@ -1722,26 +1743,33 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		if (tuning.threadedDispatch) genDispatch();
+		if (tuning.threadedDispatch) genDispatch(dispatchTables[0]);
 		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
-	def genDispatch() {
+	def genDispatch(prefix: int, ref: IcCodeRef) {
 		var opcode = I.r0;
 		var base = I.r1;
 		asm.movbzx_r_m(opcode, I.ip_ptr);
 		asm.inc_r(I.ip);
-		asm.lea(base, dispatchTableRef); // RIP-relative LEA
+		asm.lea(base, ref); // RIP-relative LEA
 		asm.movwsx_r_m(opcode, X86_64Addr.new(base, opcode, 2, 0)); // load 16-bit offset
 		asm.add_r_r(base, opcode);
 		dispatchJmpOffset = w.pos;
 		asm.ijmp_r(base);
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
-	def patchDispatchTable(opcode: int, pos: int) {
-		var offset = pos - dispatchTableRef.offset;
-		w.at(dispatchTableRef.offset + 2 * opcode).put_b16(offset);
-		w.atEnd();
+	def patchDispatchTable(opcode: Opcode, pos: int) {
+		for (t in dispatchTables) {
+			if (t.0 == opcode.prefix) {
+				var ref = t.1;
+				var offset = pos - ref.offset;
+				w.at(ref.offset + 2 * opcode.code).put_b16(offset);
+				w.atEnd();
+				return;
+			}
+		}
+		System.error("X86_64InterpreterGen", "no dispatch table found for prefix");
 	}
 	// Generate the out-of-line LEB decoding code.
 	def genOutOfLineLEBs() {
