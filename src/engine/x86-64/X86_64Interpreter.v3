@@ -135,7 +135,7 @@ class X86_64Interpreter extends Interpreter {
 	}
 	def callback_MEMORY_GROW(instance: Instance, index: u32, vspp: Pointer) {
 		var memory = instance.memories[index];
-		valueStack.sp = vspp.load<Pointer>();
+		valueStack.sp = vspp.load<Pointer>(); // XXX: set valueStack.sp in asm caller code
 		var pages = Values.v_u(valueStack.pop(ValueType.I32));
 		var result = memory.grow(pages);
 		valueStack.push(Values.i_v(result));
@@ -152,10 +152,6 @@ class X86_64Interpreter extends Interpreter {
 		var t = memory.copyD(dst_offset, data, src_offset, size);
 		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
 		return (ExecState.FINISHED, TrapReason.NONE);
-	}
-	def callback_DATA_DROP(instance: Instance, dindex: u32, vspp: Pointer) {
-		var data = instance.module.data[int.!(dindex)];
-		instance.dropped_data[dindex] = true;
 	}
 	def callback_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32, vspp: Pointer) -> (ExecState, TrapReason) {
 		var dst = instance.memories[mindex1];
@@ -209,8 +205,50 @@ class X86_64Interpreter extends Interpreter {
 		var val = valueStack.pop(table.elemtype);
 		var elem = Values.v_i(valueStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
-		table.elems[elem] = val;
+		table[elem] = val;
 		vspp.store<Pointer>(valueStack.sp);
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	def callback_TABLE_INIT(instance: Instance, tindex: u32, eindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+		valueStack.sp = vspp.load<Pointer>();
+		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var src_offset = valueStack.popu();
+		var dst_offset = valueStack.popu();
+		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
+		vspp.store<Pointer>(valueStack.sp);
+		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	def callback_TABLE_COPY(instance: Instance, t1: u32, t2: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+		valueStack.sp = vspp.load<Pointer>();
+		var dst = instance.tables[t1];
+		var src = instance.tables[t2];
+		var size = valueStack.popu(), src_offset = valueStack.popu(), dst_offset = valueStack.popu();
+		var t = dst.copyT(dst_offset, src, src_offset, size);
+		vspp.store<Pointer>(valueStack.sp);
+		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
+		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	def callback_TABLE_GROW(instance: Instance, tindex: u32, vspp: Pointer) {
+		valueStack.sp = vspp.load<Pointer>();
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var val = valueStack.pop(table.elemtype);
+		var r = table.grow(size, val);
+		valueStack.push(Values.i_v(r));
+		vspp.store<Pointer>(valueStack.sp);
+	}
+	def callback_TABLE_FILL(instance: Instance, tindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+		valueStack.sp = vspp.load<Pointer>();
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var val = valueStack.pop(table.elemtype);
+		var dest = valueStack.popu();
+		var t = table.fill(dest, val, size);
+		vspp.store<Pointer>(valueStack.sp);
+		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
 }
@@ -433,6 +471,7 @@ component I {
 // Options that only impact interpreter performance.
 class X86_64InterpreterTuning {
 	var threadedDispatch = false;
+	var handlerAlignment = 1;
 }
 
 // Encapsulates temporary state needed for generating the {InterpreterCode} for X86-64.
@@ -470,7 +509,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 	def gen() -> InterpreterCode {
 		// Map some executable memory for the interpreter.
-		def SIZE = 8192u;
+		def SIZE = 12288u;
 		var mapping = Mmap.reserve(SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE |  Mmap.PROT_EXEC);
 		if (mapping == null) return null;
 		ic = InterpreterCode.new(mapping);
@@ -671,7 +710,9 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// Generate handlers for all opcodes
 		for (opcode in Opcode) {  // XXX: order opcodes by frequency
-			var pos = w.atEnd().pos;
+			w.atEnd();
+			if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
+			var pos = w.pos;
 			// try to generate the handler for the opcode
 			var result = genOpcodeHandler(opcode);
 			match (result) {
@@ -933,32 +974,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_r_m(I.r1, X86_64Addr.new(IVar.VSP.gpr, null, 1, 8 - SLOT_SIZE));
 				asm.movq_m_r(X86_64Addr.new(IVar.VFP.gpr, I.r0, 1, 8), I.r1);
 			}
-			GLOBAL_GET => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_GLOBAL_GET), [IVar.INSTANCE.gpr, I.r0]);
-				restoreCallerIVars(true);
-			}
-			GLOBAL_SET => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_GLOBAL_SET), [IVar.INSTANCE.gpr, I.r0]);
-				restoreCallerIVars(true);
-			}
-			TABLE_GET => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_TABLE_GET), [IVar.INSTANCE.gpr, I.r0]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
-			}
-			TABLE_SET => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_TABLE_SET), [IVar.INSTANCE.gpr, I.r0]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
-			}
+			GLOBAL_GET => genCallbackWith1Leb(refCallback(i.callback_GLOBAL_GET), false);
+			GLOBAL_SET => genCallbackWith1Leb(refCallback(i.callback_GLOBAL_SET), false);
+			TABLE_GET => genCallbackWith1Leb(refCallback(i.callback_TABLE_GET), true);
+			TABLE_SET => genCallbackWith1Leb(refCallback(i.callback_TABLE_SET), true);
 			I32_LOAD => genLoad(BpTypecon.I32.code, asm.movd_r_m);
 			I64_LOAD => genLoad(BpTypecon.I64.code, asm.movq_r_m);
 			F32_LOAD => genLoad(BpTypecon.F32.code, asm.movd_r_m);
@@ -999,12 +1018,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r1);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			MEMORY_GROW => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_MEMORY_GROW), [IVar.INSTANCE.gpr, I.r0]);
-				restoreCallerIVars(true);
-			}
+			MEMORY_GROW => genCallbackWith1Leb(refCallback(i.callback_MEMORY_GROW), false);
 			I32_CONST => {
 				genReadSleb32_inline(I.r1); // TODO: r0 == ecx, which is overwritten
 				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
@@ -1469,7 +1483,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			}
 			REF_NULL => {
 				asm.movbzx_r_m(I.r0, I.ip_ptr);
-				genSkipLeb(); // XXX: skip type
+				genSkipLeb(); // skip type
 				asm.movq_m_r(I.vsp_ptr, I.r0);
 				asm.movq_m_i(I.vsp_ptr_p1, 0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
@@ -1697,38 +1711,51 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.jmp_rel_near(done);
 				return HandlerGenResult.END;
 			}
-			MEMORY_INIT => { // XXX: share code among call backs (load ref and jump to 1/2 lebs)
-				genReadUleb32(I.r0);
-				genReadUleb32(I.r1);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_MEMORY_INIT), [IVar.INSTANCE.gpr, I.r0, I.r1]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
-			}
+			MEMORY_INIT => genCallbackWith2Lebs(refCallback(i.callback_MEMORY_INIT), true);
 			DATA_DROP => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_DATA_DROP), [IVar.INSTANCE.gpr, I.r0]);
-				restoreCallerIVars(true);
-			}
-			MEMORY_COPY => {
-				genReadUleb32(I.r0);
 				genReadUleb32(I.r1);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_MEMORY_COPY), [IVar.INSTANCE.gpr, I.r0, I.r1]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
+				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_data));
+				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
 			}
-			MEMORY_FILL => {
-				genReadUleb32(I.r0);
-				saveCallerIVars(true);
-				callV3WithVspp(refCallback(i.callback_MEMORY_FILL), [IVar.INSTANCE.gpr, I.r0]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
+			MEMORY_COPY => genCallbackWith2Lebs(refCallback(i.callback_MEMORY_COPY), true); // XXX: inline
+			MEMORY_FILL => genCallbackWith1Leb(refCallback(i.callback_MEMORY_FILL), true);
+			TABLE_INIT => genCallbackWith2Lebs(refCallback(i.callback_TABLE_INIT), true);
+			ELEM_DROP => {
+				genReadUleb32(I.r1);
+				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_elems));
+				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
 			}
+			TABLE_COPY => genCallbackWith2Lebs(refCallback(i.callback_TABLE_COPY), true);
+			TABLE_GROW => genCallbackWith1Leb(refCallback(i.callback_TABLE_GROW), false);
+			TABLE_SIZE => {
+				genReadUleb32(I.r1); // TODO: r0 == ecx, which is overwritten
+				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
+				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Table_elems));
+				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Array_length));
+				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
+				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
+				asm.add_r_i(I.vsp, SLOT_SIZE);
+			}
+			TABLE_FILL => genCallbackWith1Leb(refCallback(i.callback_TABLE_FILL), true);
 			_ => return HandlerGenResult.UNHANDLED;
 		}
 		return HandlerGenResult.HANDLED;
+	}
+	def genCallbackWith1Leb(ref: IcCodeRef, canTrap: bool) { // XXX: load ref and jump to shared routine
+		genReadUleb32(I.r0);
+		saveCallerIVars(true);
+		callV3WithVspp(ref, [IVar.INSTANCE.gpr, I.r0]);
+		if (canTrap) genExecStateCheck();
+		restoreCallerIVars(true);
+	}
+	def genCallbackWith2Lebs(ref: IcCodeRef, canTrap: bool) { // XXX: load ref and jump to shared routine
+		genReadUleb32(I.r0);
+		genReadUleb32(I.r1);
+		saveCallerIVars(true);
+		callV3WithVspp(ref, [IVar.INSTANCE.gpr, I.r0, I.r1]);
+		if (canTrap) genExecStateCheck();
+		restoreCallerIVars(true);
 	}
 	def genExecStateCheck() {
 		asm.cmpb_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
