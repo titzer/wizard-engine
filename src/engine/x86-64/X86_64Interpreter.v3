@@ -11,7 +11,7 @@ class X86_64Interpreter extends Interpreter {
 	new() {
 		if (interpreterCode == null) {
 			var start = System.ticksUs();
-			interpreterCode = X86_64InterpreterGen.new(InterpreterCallbacks.new(this)).gen();
+			interpreterCode = X86_64InterpreterGen.new(this).gen();
 			RiRuntime.userSignalHandler = handleSignal;
 			var diff = System.ticksUs() - start;
 			if (trace != null) trace.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
@@ -250,19 +250,6 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 	return true;
 }
 
-class InterpreterCallbacks(i: X86_64Interpreter) {
-	def callHost: Pointer = CiRuntime.unpackClosure<Interpreter, (HostFunction, Pointer), (ExecState, TrapReason)>(i.callHost).0;
-	def memoryGrow: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.callback_MEMORY_GROW).0;
-	def globalGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.callback_GLOBAL_GET).0;
-	def globalSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.callback_GLOBAL_SET).0;
-	def tableGet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), (ExecState, TrapReason)>(i.callback_TABLE_GET).0;
-	def tableSet: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), (ExecState, TrapReason)>(i.callback_TABLE_SET).0;
-	def memoryInit: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, u32, Pointer), (ExecState, TrapReason)>(i.callback_MEMORY_INIT).0;
-	def memoryCopy: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, u32, Pointer), (ExecState, TrapReason)>(i.callback_MEMORY_COPY).0;
-	def memoryFill: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), (ExecState, TrapReason)>(i.callback_MEMORY_FILL).0;
-	def dataDrop: Pointer = CiRuntime.unpackClosure<Interpreter, (Instance, u32, Pointer), void>(i.callback_DATA_DROP).0;
-}
-
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
 // TODO: need custom scan extension for V3 garbage collector for reference values.
 class ValueStack {
@@ -449,7 +436,7 @@ class X86_64InterpreterTuning {
 }
 
 // Encapsulates temporary state needed for generating the {InterpreterCode} for X86-64.
-class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
+class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def w = DataWriter.new();
 	def asm = X86_64Assemblers.create64(w);
 	def frameSize = IVar.INSTANCE.frameOffset + PTR_SIZE;
@@ -471,17 +458,9 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
-	var callHostRef: IcCodeRef;
-	var memoryGrowRef: IcCodeRef;
 	var abruptRetRef: IcCodeRef;
-	var globalGetRef: IcCodeRef;
-	var globalSetRef: IcCodeRef;
-	var tableGetRef: IcCodeRef;
-	var tableSetRef: IcCodeRef;
-	var memoryInitRef: IcCodeRef;
-	var dataDropRef: IcCodeRef;
-	var memoryCopyRef: IcCodeRef;
-	var memoryFillRef: IcCodeRef;
+	var callbackTableOffset: int;
+	var callbackTableLimit: int;
 	var dispatchTables = [
 		(0x00, IcCodeRef.new(-1)),
 		(0xFC, IcCodeRef.new(-1))
@@ -495,27 +474,11 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		var mapping = Mmap.reserve(SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE |  Mmap.PROT_EXEC);
 		if (mapping == null) return null;
 		ic = InterpreterCode.new(mapping);
-		// Write pointers to interpreter callbacks.
-		callHostRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.callHost - Pointer.NULL);
-		memoryGrowRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.memoryGrow - Pointer.NULL);
-		globalGetRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.globalGet - Pointer.NULL);
-		globalSetRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.globalSet - Pointer.NULL);
-		tableGetRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.tableGet - Pointer.NULL);
-		tableSetRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.tableSet - Pointer.NULL);
-		memoryInitRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.memoryInit - Pointer.NULL);
-		dataDropRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.dataDrop - Pointer.NULL);
-		memoryCopyRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.memoryCopy - Pointer.NULL);
-		memoryFillRef = IcCodeRef.new(w.pos);
-		w.put_b64(callbacks.memoryFill - Pointer.NULL);
+		// Reserve space for pointers to interpreter callbacks
+		w.align(8);
+		callbackTableOffset = w.pos;
+		w.skipN(16 * 8);
+		callbackTableLimit = w.pos;
 		// Reserve space for each of the dispatch tables
 		for (t in dispatchTables) {
 			asm.w.align(2);
@@ -866,7 +829,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				// HostFunction: call into interpreter callback to enter into V3 code
 				asm.bind(call_host);
 				saveIVar(IVar.VSP);
-				callV3WithVspp(callHostRef, [I.r1]);
+				callV3WithVspp(refCallback(i.callHost), [I.r1]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
@@ -973,26 +936,26 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 			GLOBAL_GET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(globalGetRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_GLOBAL_GET), [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
 			}
 			GLOBAL_SET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(globalSetRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_GLOBAL_SET), [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
 			}
 			TABLE_GET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(tableGetRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_TABLE_GET), [IVar.INSTANCE.gpr, I.r0]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
 			TABLE_SET => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(tableSetRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_TABLE_SET), [IVar.INSTANCE.gpr, I.r0]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
@@ -1016,7 +979,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movd_r_m(I.r1, X86_64Addr.new(IVar.MEM0_BASE.gpr, I.r0, 1, 0));
 				asm.q.shl_r_i(I.r1, 32); // special sign-extension necessary
 				asm.q.sar_r_i(I.r1, 32);
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				asm.movq_m_r(I.vsp_ptr_m1, I.r1);
 			}
 			I64_LOAD32_U => genLoad(BpTypecon.I64.code, asm.movd_r_m);
@@ -1039,7 +1002,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 			MEMORY_GROW => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(memoryGrowRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_MEMORY_GROW), [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
 			}
 			I32_CONST => {
@@ -1409,10 +1372,10 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.q.sub_r_i(I.vsp, SLOT_SIZE);
 			}
 			I32_WRAP_I64 => {
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 			}
 			F32_CONVERT_I32_S => {
-				updateTagOnTopOfStack(BpTypecon.F32.code);
+				genTagUpdate(BpTypecon.F32.code);
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.q.shl_r_i(I.r0, 32);
 				asm.q.sar_r_i(I.r0, 32); // sign-extend
@@ -1420,26 +1383,26 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movss_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			F32_CONVERT_I32_U => {
-				updateTagOnTopOfStack(BpTypecon.F32.code);
+				genTagUpdate(BpTypecon.F32.code);
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2ss_s_r(I.xmm0, I.r0);
 				asm.movss_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			F32_CONVERT_I64_S => {
-				updateTagOnTopOfStack(BpTypecon.F32.code);
+				genTagUpdate(BpTypecon.F32.code);
 				asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2ss_s_r(I.xmm0, I.r0);
 				asm.movss_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 // TODO			F32_CONVERT_I64_U => ;
 			F32_DEMOTE_F64 => {
-				updateTagOnTopOfStack(BpTypecon.F32.code);
+				genTagUpdate(BpTypecon.F32.code);
 				asm.movsd_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.cvtsd2ss_s_s(I.xmm0, I.xmm0);
 				asm.movss_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			F64_CONVERT_I32_S => {
-				updateTagOnTopOfStack(BpTypecon.F64.code);
+				genTagUpdate(BpTypecon.F64.code);
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.q.shl_r_i(I.r0, 32);
 				asm.q.sar_r_i(I.r0, 32); // sign-extend
@@ -1447,35 +1410,35 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movsd_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			F64_CONVERT_I32_U => {
-				updateTagOnTopOfStack(BpTypecon.F64.code);
+				genTagUpdate(BpTypecon.F64.code);
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2sd_s_r(I.xmm0, I.r0);
 				asm.movsd_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			F64_CONVERT_I64_S => {
-				updateTagOnTopOfStack(BpTypecon.F64.code);
+				genTagUpdate(BpTypecon.F64.code);
 				asm.movq_r_m(I.r0, I.vsp_ptr_m1);
 				asm.cvtsi2sd_s_r(I.xmm0, I.r0);
 				asm.movsd_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 // TODO			F64_CONVERT_I64_U => ;
 			F64_PROMOTE_F32 => {
-				updateTagOnTopOfStack(BpTypecon.F64.code);
+				genTagUpdate(BpTypecon.F64.code);
 				asm.movss_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.cvtss2sd_s_s(I.xmm0, I.xmm0);
 				asm.movsd_m_s(I.vsp_ptr_m1, I.xmm0);
 			}
 			I32_REINTERPRET_F32 => {
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 			}
 			I64_REINTERPRET_F64 => {
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 			}
 			F32_REINTERPRET_I32 => {
-				updateTagOnTopOfStack(BpTypecon.F32.code);
+				genTagUpdate(BpTypecon.F32.code);
 			}
 			F64_REINTERPRET_I64 => {
-				updateTagOnTopOfStack(BpTypecon.F64.code);
+				genTagUpdate(BpTypecon.F64.code);
 			}
 			I32_EXTEND8_S => {
 				asm.d.movbsx_r_m(I.r0, I.vsp_ptr_m1);
@@ -1494,14 +1457,14 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_m_r(I.vsp_ptr_m1, I.r0);
 			}
 			I64_EXTEND_I32_S, I64_EXTEND32_S => { // XXX: share code between these two
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				asm.movd_r_m(I.r0, I.vsp_ptr_m1);
 				asm.q.shl_r_i(I.r0, 32);
 				asm.q.sar_r_i(I.r0, 32);
 				asm.movq_m_r(I.vsp_ptr_m1, I.r0);
 			}
 			I64_EXTEND_I32_U => {
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				asm.movd_m_i(X86_64Addr.new(IVar.VSP.gpr, null, 1, -4), 0); // zero upper portion
 			}
 			REF_NULL => {
@@ -1526,7 +1489,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			BR_ON_NULL => {
+			BR_ON_NULL => { // TODO: broken
 				var label = X86_64Label.new();
 				asm.q.cmp_m_i(I.vsp_ptr_m1, 0);
 				asm.jc_rel_near(C.Z, label);
@@ -1541,7 +1504,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I32_TRUNC_SAT_F32_S => {
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 				asm.movss_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.movd_r_i(I.r0, int.view(Floats.f_1p31));
 				asm.movd_s_r(I.xmm1, I.r0);
@@ -1563,7 +1526,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I32_TRUNC_SAT_F32_U => {
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 				var is_zero = X86_64Label.new();
 				asm.d.cmp_m_i(I.vsp_ptr_m1, 0);
 				asm.jc_rel_near(C.L, is_zero); // negative
@@ -1588,7 +1551,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I32_TRUNC_SAT_F64_S => { // XXX: factor out common code for saturating truncations
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 				asm.movsd_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.movd_r_i(I.r0, int.view(Floats.d_1p31 >> 32));
 				asm.q.shl_r_i(I.r0, 32);
@@ -1611,7 +1574,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I32_TRUNC_SAT_F64_U => {
-				updateTagOnTopOfStack(BpTypecon.I32.code);
+				genTagUpdate(BpTypecon.I32.code);
 				var is_zero = X86_64Label.new();
 				asm.d.cmp_m_i(I.vsp_ptr_m1u, 0);
 				asm.jc_rel_near(C.L, is_zero); // negative
@@ -1637,7 +1600,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I64_TRUNC_SAT_F32_S => {
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				asm.movss_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.movd_r_i(I.r0, int.view(Floats.f_1p63));
 				asm.movd_s_r(I.xmm1, I.r0);
@@ -1660,7 +1623,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I64_TRUNC_SAT_F32_U => {
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				var is_zero = X86_64Label.new();
 				asm.d.cmp_m_i(I.vsp_ptr_m1, 0);
 				asm.jc_rel_near(C.L, is_zero); // negative
@@ -1685,7 +1648,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I64_TRUNC_SAT_F64_S => { // XXX: factor out common code for saturating truncations
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				asm.movsd_s_m(I.xmm0, I.vsp_ptr_m1);
 				asm.movd_r_i(I.r0, int.view(Floats.d_1p63 >> 32));
 				asm.q.shl_r_i(I.r0, 32);
@@ -1709,7 +1672,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				return HandlerGenResult.END;
 			}
 			I64_TRUNC_SAT_F64_U => { // XXX: factor out common code for saturating truncations
-				updateTagOnTopOfStack(BpTypecon.I64.code);
+				genTagUpdate(BpTypecon.I64.code);
 				var is_zero = X86_64Label.new();
 				asm.d.cmp_m_i(I.vsp_ptr_m1u, 0);
 				asm.jc_rel_near(C.L, is_zero); // negative
@@ -1738,28 +1701,28 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 				genReadUleb32(I.r0);
 				genReadUleb32(I.r1);
 				saveCallerIVars(true);
-				callV3WithVspp(memoryInitRef, [IVar.INSTANCE.gpr, I.r0, I.r1]);
+				callV3WithVspp(refCallback(i.callback_MEMORY_INIT), [IVar.INSTANCE.gpr, I.r0, I.r1]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
 			DATA_DROP => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(dataDropRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_DATA_DROP), [IVar.INSTANCE.gpr, I.r0]);
 				restoreCallerIVars(true);
 			}
 			MEMORY_COPY => {
 				genReadUleb32(I.r0);
 				genReadUleb32(I.r1);
 				saveCallerIVars(true);
-				callV3WithVspp(memoryCopyRef, [IVar.INSTANCE.gpr, I.r0, I.r1]);
+				callV3WithVspp(refCallback(i.callback_MEMORY_COPY), [IVar.INSTANCE.gpr, I.r0, I.r1]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
 			MEMORY_FILL => {
 				genReadUleb32(I.r0);
 				saveCallerIVars(true);
-				callV3WithVspp(memoryFillRef, [IVar.INSTANCE.gpr, I.r0]);
+				callV3WithVspp(refCallback(i.callback_MEMORY_FILL), [IVar.INSTANCE.gpr, I.r0]);
 				genExecStateCheck();
 				restoreCallerIVars(true);
 			}
@@ -1815,7 +1778,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		asm.movq_r_r(dreg, if(stk[i] == -2, I.scratch, G[i]));	// emit post-order move
 		stk[i] = 1;				// mark as done
 	}
-	def updateTagOnTopOfStack(tag: byte) {
+	def genTagUpdate(tag: byte) {
 		asm.movq_m_i(I.vsp_ptr_m2, tag);
 	}
 	def saveIVar(iv: IVar) {
@@ -1846,7 +1809,7 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 		asm.movd_r_m(I.r1, I.vsp_ptr_m1);		// read index
 		asm.q.add_r_r(I.r0, I.r1);			// add index + offset
 		gen(I.r1, X86_64Addr.new(IVar.MEM0_BASE.gpr, I.r0, 1, 0));
-		if (tag != BpTypecon.I32.code) updateTagOnTopOfStack(tag); // update tag if necessary
+		if (tag != BpTypecon.I32.code) genTagUpdate(tag); // update tag if necessary
 		asm.movq_m_r(I.vsp_ptr_m1, I.r1);
 	}
 	def genStore(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
@@ -2075,6 +2038,15 @@ class X86_64InterpreterGen(callbacks: InterpreterCallbacks) {
 
 		ic.divZeroHandlerOffset = w.pos;
 		genAbruptReturn(ExecState.TRAPPED, TrapReason.DIV_BY_ZERO);
+	}
+	def refCallback<P, R>(f: P -> R) -> IcCodeRef {
+		if (callbackTableOffset >= callbackTableLimit) fatal("out of callback ref slots");
+		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(f).0;
+		var ref = IcCodeRef.new(callbackTableOffset);
+		w.at(callbackTableOffset).put_b64(ptr - Pointer.NULL);
+		callbackTableOffset += 8;
+		w.atEnd();
+		return ref;
 	}
 }
 type HandlerGenResult {
