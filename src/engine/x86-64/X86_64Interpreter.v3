@@ -549,9 +549,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		if (Trace.interpreter) {
 			var buf = TraceBuilder.new();
 			var start = ic.mapping.range.start - Pointer.NULL;
-			buf.put2("Generated asm interpreter @ (0x%x ... 0x%x)\n",
+			buf.put3("Generated asm interpreter @ (0x%x ... 0x%x), %d bytes\n",
 				start,
-				(ic.mapping.range.end - Pointer.NULL));
+				(ic.mapping.range.end - Pointer.NULL),
+				w.pos);
 			buf.put1("\tv3 entry     = 0x%x\n", start + ic.v3EntryOffset);
 			buf.put1("\tcall entry   = 0x%x\n", start + callEntryOffset);
 			buf.put1("\tdispatch     = 0x%x\n", start + firstDispatchOffset);
@@ -732,73 +733,102 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				}
 			}
 		}
+		genControlFlow();
 		genFloatMinAndMax();
 	}
+	def genControlFlow() {
+		// NOP: just goes directly back to the dispatch loop
+		patchDispatchTable(Opcode.NOP, firstDispatchOffset);
 
+		// UNREACHABLE: abrupt return
+		bindOpcodeHandler(Opcode.UNREACHABLE);
+		genAbruptReturn(ExecState.TRAPPED, TrapReason.UNREACHABLE);
+
+		// BLOCK, LOOP, and TRY
+		bindOpcodeHandler(Opcode.BLOCK);
+		bindOpcodeHandler(Opcode.LOOP);
+		bindOpcodeHandler(Opcode.TRY);
+		genSkipLeb();
+		genDispatchOrJumpToDispatch();
+
+		var ctl_fallthru = X86_64Label.new();
+		var ctl_xfer = X86_64Label.new();
+		var ctl_xfer_nostack = X86_64Label.new();
+
+		// IF: check condition and either fall thru to next bytecode or ctl xfer (without stack copying)
+		bindOpcodeHandler(Opcode.IF);
+		asm.sub_r_i(I.vsp, SLOT_SIZE);
+		asm.d.cmp_m_i(I.vsp_ptr_p1, 0);
+		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
+		asm.bind(ctl_fallthru);
+		genSkipLeb();
+		asm.add_r_i(IVar.XIP.gpr, offsets.XIP_entry_size);
+		genDispatchOrJumpToDispatch();
+
+		// BR_IF: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
+		bindOpcodeHandler(Opcode.BR_IF);
+		asm.sub_r_i(I.vsp, SLOT_SIZE);
+		asm.d.cmp_m_i(I.vsp_ptr_p1, 0);
+		asm.jc_rel_near(C.Z, ctl_fallthru);
+		// fallthru to BR
+
+		// BR: unconditional ctl xfer with stack copying
+		bindOpcodeHandler(Opcode.BR);
+		asm.bind(ctl_xfer);
+		var popcount = I.r0;
+		var valcount = I.r1;
+		// if popcount > 0
+		asm.movd_r_m(popcount, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_popcount));
+		asm.d.cmp_r_i(popcount, 0);
+		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
+		// load valcount
+		asm.movd_r_m(valcount, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_valcount));
+		// popcount = popcount * SLOT_SIZE
+		asm.d.shl_r_i(popcount, SLOT_SIZE_LOG);
+		// vsp -= valcount + popcount (XXX: save an instruction here?)
+		asm.q.sub_r_r(I.vsp, popcount);
+		asm.movd_r_r(I.scratch, valcount);
+		asm.d.shl_r_i(I.scratch, SLOT_SIZE_LOG);
+		asm.q.sub_r_r(I.vsp, I.scratch);
+		// do { [vsp] = [vsp + popcount]; vsp++; valcount--; } while (valcount != 0)
+		var loop = X86_64Label.new();
+		asm.bind(loop);
+		asm.movdqu_s_m(I.xmm0, X86_64Addr.new(I.vsp, popcount, 1, 0));
+		asm.movdqu_m_s(X86_64Addr.new(I.vsp, null, 1, 0), I.xmm0);
+		asm.q.add_r_i(I.vsp, SLOT_SIZE);
+		asm.d.dec_r(valcount);
+		asm.jc_rel_near(C.G, loop);
+
+		// ELSE: unconditional ctl xfer without stack copying
+		bindOpcodeHandler(Opcode.ELSE);
+		asm.bind(ctl_xfer_nostack);
+		asm.movwsx_r_m(I.r0, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_pc_delta)); // TODO: 4 bytes
+		asm.q.lea(IVar.IP.gpr, X86_64Addr.new(IVar.IP.gpr, I.r0, 1, -1)); // adjust ip
+		asm.movwsx_r_m(I.r1, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_xip_delta)); // TODO: 4 bytes
+		asm.q.lea(IVar.XIP.gpr, X86_64Addr.new(IVar.XIP.gpr, I.r1, 4, 0)); // adjust xip XXX: preshift?
+		genDispatchOrJumpToDispatch();
+
+		// BR_TABLE: adjust XIP based on input value and then ctl xfer with stack copying
+		bindOpcodeHandler(Opcode.BR_TABLE);
+		var max = I.r0, key = I.r1;
+		asm.movd_r_m(max, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_pc_delta));
+		asm.sub_r_i(I.vsp, SLOT_SIZE);
+		asm.movd_r_m(key, I.vsp_ptr_p1);
+		asm.d.cmp_r_r(key, max);
+		var ok = X86_64Label.new();
+		asm.jc_rel_near(C.NC, ok);
+		asm.d.inc_r(key);
+		asm.movd_r_r(max, key);
+		asm.bind(ok);
+		asm.q.add_r_r(IVar.IP.gpr, max);
+		asm.shl_r_i(max, offsets.XIP_entry_size_log);
+		asm.q.add_r_r(IVar.XIP.gpr, max);
+		asm.jmp_rel_near(ctl_xfer);
+	}
 	// Generate the code of a single opcode.
 	def genOpcodeHandler(opcode: Opcode) -> HandlerGenResult {
 		// XXX: does it matter to update TOS tags first or last?
 		match (opcode) {
-			UNREACHABLE => {
-				genAbruptReturn(ExecState.TRAPPED, TrapReason.UNREACHABLE);
-				return HandlerGenResult.END;
-			}
-			NOP => {
-				return HandlerGenResult.Offset(firstDispatchOffset); // just go to first dispatch
-			}
-			BLOCK, LOOP, TRY => {
-				if (handler_BLOCK != 0) return HandlerGenResult.Offset(handler_BLOCK);
-				handler_BLOCK = w.pos;
-				genSkipLeb();
-			}
-			IF => {
-				var label = X86_64Label.new();
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
-				asm.d.cmp_m_i(I.vsp_ptr_p1, 0);
-				asm.jc_rel_near(C.Z, label);
-				// true case; skip leb and increment xip
-				genSkipLeb();
-				asm.add_r_i(IVar.XIP.gpr, offsets.XIP_entry_size);
-				genDispatchOrJumpToDispatch();
-				// false case
-				asm.bind(label);
-				genCtlXfer(false);
-			}
-			ELSE => {
-				genCtlXfer(false);
-			}
-			BR => {
-				genCtlXfer(true);
-			}
-			BR_IF => {
-				var label = X86_64Label.new();
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
-				asm.d.cmp_m_i(I.vsp_ptr_p1, 0);
-				asm.jc_rel_near(C.NZ, label);
-				// false case; skip leb and increment xip
-				genSkipLeb();
-				asm.add_r_i(IVar.XIP.gpr, offsets.XIP_entry_size);
-				genDispatchOrJumpToDispatch();
-				// true case
-				asm.bind(label);
-				genCtlXfer(true);
-			}
-			BR_TABLE => {
-				var max = I.r0, key = I.r1;
-				asm.movd_r_m(max, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_pc_delta));
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
-				asm.movd_r_m(key, I.vsp_ptr_p1);
-				asm.d.cmp_r_r(key, max);
-				var ok = X86_64Label.new();
-				asm.jc_rel_near(C.NC, ok);
-				asm.d.inc_r(key);
-				asm.movd_r_r(max, key);
-				asm.bind(ok);
-				asm.q.add_r_r(IVar.IP.gpr, max);
-				asm.shl_r_i(max, offsets.XIP_entry_size_log);
-				asm.q.add_r_r(IVar.XIP.gpr, max);
-				genCtlXfer(true);
-			}
 			END, RETURN => {
 				if (handler_END != 0) {
 					return HandlerGenResult.Offset(if(opcode == Opcode.END, handler_END, handler_RETURN));
@@ -1535,20 +1565,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			BR_ON_NULL => { // TODO: broken
-				var label = X86_64Label.new();
-				asm.q.cmp_m_i(I.vsp_ptr_m1, 0);
-				asm.jc_rel_near(C.Z, label);
-				// false case; skip leb and increment xip
-				genSkipLeb();
-				asm.add_r_i(IVar.XIP.gpr, offsets.XIP_entry_size);
-				genDispatchOrJumpToDispatch();
-				// true case
-				asm.bind(label);
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
-				genCtlXfer(true);
-				return HandlerGenResult.END;
-			}
 			I32_TRUNC_SAT_F32_S =>  return genFloatTrunc(TRUNC_i32_f32_s, true);
 			I32_TRUNC_SAT_F32_U => return genFloatTrunc(TRUNC_i32_f32_u, true);
 			I32_TRUNC_SAT_F64_S => return genFloatTrunc(TRUNC_i32_f64_s, true);
@@ -1896,39 +1912,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		abruptRetRef = IcCodeRef.new(w.pos);
 		asm.q.add_r_i(R.RSP, frameSize);
 		asm.ret();
-	}
-	def genCtlXfer(pop: bool) {
-		if (pop) {
-			var popcount = I.r0;
-			var valcount = I.r1;
-			var done = X86_64Label.new();
-			// if popcount > 0
-			asm.movd_r_m(popcount, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_popcount));
-			asm.d.cmp_r_i(popcount, 0);
-			asm.jc_rel_near(C.Z, done);
-			// load valcount
-			asm.movd_r_m(valcount, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_valcount));
-			// popcount = popcount * SLOT_SIZE
-			asm.d.shl_r_i(popcount, SLOT_SIZE_LOG);
-			// vsp -= valcount + popcount (XXX: save an instruction here?)
-			asm.q.sub_r_r(I.vsp, popcount);
-			asm.movd_r_r(I.scratch, valcount);
-			asm.d.shl_r_i(I.scratch, SLOT_SIZE_LOG);
-			asm.q.sub_r_r(I.vsp, I.scratch);
-			// do { [vsp] = [vsp + popcount]; vsp++; valcount--; } while (valcount != 0)
-			var loop = X86_64Label.new();
-			asm.bind(loop);
-			asm.movdqu_s_m(I.xmm0, X86_64Addr.new(I.vsp, popcount, 1, 0));
-			asm.movdqu_m_s(X86_64Addr.new(I.vsp, null, 1, 0), I.xmm0);
-			asm.q.add_r_i(I.vsp, SLOT_SIZE);
-			asm.d.dec_r(valcount);
-			asm.jc_rel_near(C.G, loop);
-			asm.bind(done);
-		}
-		asm.movwsx_r_m(I.r0, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_pc_delta)); // TODO: 4 bytes
-		asm.q.lea(IVar.IP.gpr, X86_64Addr.new(IVar.IP.gpr, I.r0, 1, -1)); // adjust ip
-		asm.movwsx_r_m(I.r1, X86_64Addr.new(IVar.XIP.gpr, null, 1, offsets.XIP_xip_delta)); // TODO: 4 bytes
-		asm.q.lea(IVar.XIP.gpr, X86_64Addr.new(IVar.XIP.gpr, I.r1, 4, 0)); // adjust xip XXX: preshift?
 	}
 
 	// Generate a read of a 32-bit unsigned LEB.
