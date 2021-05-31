@@ -141,7 +141,7 @@ class X86_64Interpreter extends Interpreter {
 		valueStack.push(Values.i_v(result));
 		vspp.store<Pointer>(valueStack.sp);
 	}
-	def callback_MEMORY_INIT(instance: Instance, mindex: u32, dindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+	def callback_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
 		var memory = instance.memories[mindex];
 		var data = if(!instance.dropped_data[dindex], instance.module.data[int.!(dindex)]);
 		valueStack.sp = vspp.load<Pointer>();
@@ -193,7 +193,7 @@ class X86_64Interpreter extends Interpreter {
 	def callback_TABLE_GET(instance: Instance, index: u32, vspp: Pointer) -> (ExecState, TrapReason) {
 		valueStack.sp = vspp.load<Pointer>();
 		var table = instance.tables[index];
-		var elem = Values.v_i(valueStack.pop(ValueType.I32));
+		var elem = Values.v_u(valueStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
 		var val = table.elems[elem];
 		valueStack.push(val);
@@ -204,13 +204,13 @@ class X86_64Interpreter extends Interpreter {
 		valueStack.sp = vspp.load<Pointer>();
 		var table = instance.tables[index];
 		var val = valueStack.pop(table.elemtype);
-		var elem = Values.v_i(valueStack.pop(ValueType.I32));
+		var elem = Values.v_u(valueStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_INDEX_OUT_OF_BOUNDS);
-		table[elem] = val;
+		table[int.view(elem)] = val;
 		vspp.store<Pointer>(valueStack.sp);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
-	def callback_TABLE_INIT(instance: Instance, tindex: u32, eindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
+	def callback_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32, vspp: Pointer) -> (ExecState, TrapReason) {
 		valueStack.sp = vspp.load<Pointer>();
 		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
 		var table = instance.tables[tindex];
@@ -1800,26 +1800,18 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var ret = X86_64Label.new();
 		asm.jc_rel_near(C.P, is_nan);
 		asm.jc_rel_near(C.NC, above);
-		if (config.minv == 0) {
-			asm.d.cmp_m_i(if(config.isF64, I.vsp_ptr_m1u, I.vsp_ptr_m1), 0);
-			asm.jc_rel_near(C.L, below);
-		} else if (!saturate) {
-			config.mov_s_i(asm, I.xmm1, config.minv);
-			config.ucomi_s_s(asm, I.xmm0, I.xmm1);
-			asm.jc_rel_near(C.C, below);
-		}
+
+		config.mov_s_i(asm, I.xmm1, config.minv);
+		config.ucomi_s_s(asm, I.xmm0, I.xmm1);
+		asm.jc_rel_near(C.NA, below); // v <= min
+
 		config.round_s_s(asm, I.xmm0, I.xmm0, X86_64Rounding.TO_ZERO);
 		config.cvt2si_r_s(asm, I.r0, I.xmm0);
 		asm.bind(ret);
 		config.mov_m_r(asm, I.vsp_ptr_m1, I.r0);
 		genTagUpdate(config.tag);
 		genDispatchOrJumpToDispatch();
-		if (!saturate) { // XXX: share trap code
-			asm.bind(above);
-			asm.bind(below);
-			asm.bind(is_nan);
-			genAbruptReturn(ExecState.TRAPPED, TrapReason.FLOAT_UNREPRESENTABLE);
-		} else {
+		if (saturate) {
 			asm.bind(above);
 			config.mov_r_i(asm, I.r0, config.ceilv);
 			asm.jmp_rel_near(ret);
@@ -1827,6 +1819,11 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.bind(below);
 			asm.movd_r_i(I.r0, 0);
 			asm.jmp_rel_near(ret);
+		} else {  // XXX: share trap code
+			asm.bind(above);
+			asm.bind(below);
+			asm.bind(is_nan);
+			genAbruptReturn(ExecState.TRAPPED, TrapReason.FLOAT_UNREPRESENTABLE);
 		}
 		return HandlerGenResult.END;
 	}
@@ -2180,11 +2177,15 @@ class FloatTrunc(isI64: bool, isF64: bool, isSigned: bool) {
 				if(isSigned,
 					if(isF64, Floats.d_1p31, Floats.f_1p31),
 					if(isF64, Floats.d_1p32, Floats.f_1p32)));
-	def minv: u64 = if(isI64,
+	def minv: u64 = if(isI64, // XXX: share these constants with V3 interpreter
 				if(isSigned,
-					if(isF64, Floats.d_minus1p63, Floats.f_minus1p63)),
+					if(isF64, u64.view(-9.223372036854778E18d), u32.view(-9.223373e18f)),
+					if(isF64, u64.view(-1d), u32.view(-1f))),
 				if(isSigned,
-					if(isF64, Floats.d_minus1p31, Floats.f_minus1p31)));
+					if(isF64, u64.view(-2147483649d), u32.view(-2.1474839E9f)),
+					if(isF64, u64.view(-1d), u32.view(-1f))));
+
+	def minus1: u64 = if(isF64, Floats.d_minus1, Floats.f_minus1);
 
 	def ceilv: u64 = if(isI64,
 				if(isSigned, u63.max, u64.max),
@@ -2196,9 +2197,19 @@ class FloatTrunc(isI64: bool, isF64: bool, isSigned: bool) {
 
 	def mov_s_i(asm: X86_64Assembler, s: X86_64Xmmr, v: u64) {
 		if (isF64) {
-			asm.movd_r_i(I.scratch, int.view(v >> 32));
-			asm.q.shl_r_i(I.scratch, 32);
-			asm.movq_s_r(s, I.scratch);
+			if ((v & u32.max) == 0) {
+				asm.movd_r_i(I.scratch, int.view(v >> 32));
+				asm.q.shl_r_i(I.scratch, 32);
+				asm.movq_s_r(s, I.scratch);
+			} else if (int.view(v) > 0) { // no sign extension
+				// XXX: load float constants from memory
+				asm.movd_r_i(I.scratch, int.view(v >> 32));
+				asm.q.shl_r_i(I.scratch, 32);
+				asm.q.or_r_i(I.scratch, int.view(v));
+				asm.movq_s_r(s, I.scratch);
+			} else {
+				System.error("FloatTrunc", "tricky 64-bit constant unimplemented");
+			}
 		} else {
 			asm.movd_r_i(I.scratch, int.view(v));
 			asm.movd_s_r(s, I.scratch);
@@ -2217,10 +2228,7 @@ class FloatTrunc(isI64: bool, isF64: bool, isSigned: bool) {
 			asm.movd_r_i(r, int.view(v));
 		}
 	}
-	def cvt2si_r_s(asm: X86_64Assembler, r: X86_64Gpr, s: X86_64Xmmr) {
-		asm = if(isI64, asm.q, asm.d);
-		(if(isF64, asm.cvtsd2si_r_s, asm.cvtss2si_r_s))(r, s);
-	}
+	def cvt2si_r_s = if(isF64, X86_64Assembler.cvtsd2si_r_s, X86_64Assembler.cvtss2si_r_s);
 }
 def TRUNC_i32_f32_s = FloatTrunc.new(false, false, true);
 def TRUNC_i32_f32_u = FloatTrunc.new(false, false, false);
