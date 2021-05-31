@@ -1,4 +1,4 @@
-all: TAGS bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux
+all: TAGS bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/spectest.x86-linux bin/spectest.x86-64-linux bin/wave.x86-linux bin/jawa.x86-linux
 
 clean:
 	rm -f bin/*
@@ -54,14 +54,14 @@ bin/jawa.x86-linux: $(JAWA)
 	./build.sh jawa x86-linux
 
 # x86-64-linux targets
-bin/unittest.x86-64-linux: $(UNITTEST)
+bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64)
 	./build.sh unittest x86-64-linux
 
-bin/spectest.x86-64-linux: $(SPECTEST)
+bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64)
 	./build.sh spectest x86-64-linux
 
-bin/wave.x86-64-linux: $(WAVE)
+bin/wave.x86-64-linux: $(WAVE) $(X86_64)
 	./build.sh wave x86-64-linux
 
-bin/jawa.x86-64-linux: $(JAWA)
+bin/jawa.x86-64-linux: $(JAWA) $(X86_64)
 	./build.sh jawa x86-64-linux
