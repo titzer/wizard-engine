@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wave|jawa|spectest|unittest> <x86_linux|jvm|wave>"
+    echo "Usage: build.sh <wave|jawa|spectest|unittest> <x86-linux|x86-64-linux|jvm|wave>"
     exit 1
 }
 
@@ -40,44 +40,30 @@ SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WAVE="src/wave/*.v3 src/wave.main.v3"
 JAWA="src/jawa/*.v3 src/jawa.main.v3"
 
-declare -A PROGRAMS=()
-PROGRAMS["wave"]="$ENGINE $WAVE"
-PROGRAMS["jawa"]="$ENGINE $JAWA"
-PROGRAMS["spectest"]="$ENGINE $SPECTEST"
-PROGRAMS["unittest"]="$ENGINE $UNITTEST $JAWA"
-
-declare -A BUILD=()
-BUILD["x86-linux"]="build_x86_linux"
-BUILD["x86-64-linux"]="build_x86_64_linux"
-BUILD["jvm"]="build_jvm"
-BUILD["wave"]="build_wave"
-
-function build_x86_linux() {
-    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
-}
-
-function build_x86_64_linux() {
-    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
-}
-
-function build_jvm() {
-    v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.jvm
-}
-
-function build_wave() {
-    v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $@ $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.wave
-}
-
+# compute sources
 PROGRAM=$1
-SOURCES=${PROGRAMS["$1"]}
-COMMAND=${BUILD["$2"]}
-
-if [ "$SOURCES" = "" ]; then
+if [ "$PROGRAM" = "wave" ]; then
+    SOURCES="$ENGINE $WAVE"
+elif [ "$PROGRAM" = "jawa" ]; then
+    SOURCES="$ENGINE $JAWA"
+elif [ "$PROGRAM" = "spectest" ]; then
+    SOURCES="$ENGINE $SPECTEST"
+elif [ "$PROGRAM" = "unittest" ]; then
+    SOURCES="$ENGINE $UNITTEST JAWA"
+else
     exit_usage
 fi
 
-if [ "$COMMAND" = "" ]; then
+# build
+TARGET="$2"
+if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
+    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
+elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
+    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
+elif [ "$TARGET" = "jvm" ]; then
+    v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.jvm
+elif [ "$TARGET" = "wave" ]; then
+    v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.wave
+else
     exit_usage
 fi
-
-$COMMAND $SOURCES
