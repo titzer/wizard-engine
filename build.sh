@@ -49,7 +49,7 @@ elif [ "$PROGRAM" = "jawa" ]; then
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
-    SOURCES="$ENGINE $UNITTEST JAWA"
+    SOURCES="$ENGINE $UNITTEST $JAWA"
 else
     exit_usage
 fi
