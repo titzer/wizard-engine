@@ -281,7 +281,11 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 			return true;
 		}
 		SIGBUS, SIGSEGV => {
-			// TODO: distinguish OOB from stack overflow, from interpreter crash
+			var addr = RiOs.getAccessAddress(siginfo, ucontext);
+			if (RedZones.isInRedZone(addr)) {
+				pip.store<Pointer>(r.start + interpreterCode.stackOverflowHandlerOffset);
+				return true;
+			}
 			pip.store<Pointer>(r.start + interpreterCode.oobMemoryHandlerOffset);
 			return true;
 		}
@@ -290,6 +294,7 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 }
 
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
+// Maps a value stack red zone at the end to catch and report stack overflow.
 // TODO: need custom scan extension for V3 garbage collector for reference values.
 class ValueStack {
 	def mapping = Mmap.reserve(DEFAULT_STACK_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE);
@@ -298,6 +303,9 @@ class ValueStack {
 	new() {
 		if (mapping == null) fatal("out of memory allocating value stack");
 		sp = mapping.range.start;
+		def PAGE_SIZE = 4096u;
+		var ok = RedZones.addRedZone(mapping, DEFAULT_STACK_SIZE - PAGE_SIZE, PAGE_SIZE);
+		if (!ok) fatal("could not protect value stack red zone");
 	}
 	def push(v: Value) {
 		match (v) {
@@ -573,6 +581,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			buf.put1("\tcode end     = 0x%x\n", start + codeEndOffset);
 			buf.put1("\toob mem      = 0x%x\n", start + ic.oobMemoryHandlerOffset);
 			buf.put1("\tdivzero      = 0x%x\n", start + ic.divZeroHandlerOffset);
+			buf.put1("\tstack ovflw  = 0x%x\n", start + ic.stackOverflowHandlerOffset);
 			buf.put1("break *0x%x\n", start + dispatchJmpOffset);
 			buf.outln();
 		}
@@ -2190,6 +2199,9 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		ic.divZeroHandlerOffset = w.pos;
 		genAbruptReturn(ExecState.TRAPPED, TrapReason.DIV_BY_ZERO);
+
+		ic.stackOverflowHandlerOffset = w.pos;
+		genAbruptReturn(ExecState.TRAPPED, TrapReason.STACK_OVERFLOW);
 	}
 	def refCallback<P, R>(f: P -> R) -> IcCodeRef {
 		if (callbackTableOffset >= callbackTableLimit) fatal("out of callback ref slots");
