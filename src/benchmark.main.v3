@@ -1,0 +1,91 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Main entrypoint to an wasm benchmark utility.
+def main(args: Array<string>) -> int {
+	var engine = Engine.new();
+
+	engine.extensions = Extension.set.all;
+
+	// Parse options and extract module and module arguments
+	for (i < args.length) {
+		var a = args[i];
+		if (a.length > 0 && a[0] == '-') {
+			if (!engine.parseOption(a)) return ErrorBuilder.new()
+				.puts("benchmark: unrecognized option ")
+				.putsq(a)
+				.ln()
+				.exit(1);
+			args[i] = null;
+		} else if (!Strings.endsWith(a, ".wasm")) {
+			return ErrorBuilder.new()
+				.puts(a)
+				.puts(": unknown file format, expected .wasm\n")
+				.exit(4);
+		}
+	}
+
+	for (a in args) {
+		if (a == null) continue;
+		var exit = parseAndRun(engine, a);
+		if (exit != 0) return exit;
+	}
+	return 0;
+}
+
+def parseAndRun(engine: Engine, path: string) -> int {
+	// Parse the binary module
+	var result = engine.loadWasmFile(path);
+	var module: Module;
+	match (result) {
+		Ok(m) => module = m;
+		FileNotFound => return ErrorBuilder.new()
+			.puts("benchmark: could not load file ")
+			.puts(path)
+			.puts("\n")
+			.exit(2);
+		ParseError(code, path, error_pos, error_msg) => return ErrorBuilder.new()
+			.render(code, path, error_pos, error_msg)
+			.exit(3);
+	}
+	var names = if(module.names != null, module.names.lazyDecode());
+	var imports = Array<Exportable>.new(module.imports.length);
+	for (i < module.imports.length) {
+		var imp = module.imports[i];
+		if (Strings.equal("env", imp.imp.module_name)) {
+			if (Strings.equal("clock_ms", imp.imp.field_name)) {
+				imports[i] = HostFunction0.new("env.clock_ms", SigCache.v_l, eval_clock_ms);
+				continue;
+			}
+		}
+		return ErrorBuilder.new()
+			.put2("benchmark: import \"%s\".\"%s\" not found", imp.imp.module_name, imp.imp.field_name)
+			.exit(4);
+	}
+	var none: Extension.set, error = WasmErrorGen.new(path);
+	var instance = Instantiator.new(none, module, imports, error).run();
+	if (!error.ok()) return ErrorBuilder.new()
+		.render(error.error_code, path, error.error_pos, error.error_msg)
+		.exit(5);
+
+	var func: WasmFunction;
+	for (e in instance.exports) {
+		if (WasmFunction.?(e)) func = WasmFunction.!(e);
+	}
+	if (func == null) return 0;
+	var args = Array<Value>.new(func.sig.params.length);
+	for (i < args.length) {
+		args[i] = Values.default(func.sig.params[i]);
+	}
+	var r = Target.newInterpreter().run(-1, func, args);
+	match (r) {
+		Value(vals) => {
+			TraceBuilder.new().put1("result = %q", Values.renderVals(_, vals)).outln();
+		}
+		_ => return 1;
+	}
+	return 0;
+}
+def eval_clock_ms() -> HostResult {
+	return HostResult.Value1(Value.I64(u64.view(System.ticksMs())));
+}
