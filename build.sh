@@ -50,6 +50,8 @@ elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST $JAWA"
+elif [ "$PROGRAM" = "objdump" ]; then
+    SOURCES="$ENGINE src/objdump.main.v3"
 else
     exit_usage
 fi
