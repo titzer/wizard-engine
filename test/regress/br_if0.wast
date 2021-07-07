@@ -1,0 +1,12 @@
+(module 
+  (func (export "break-br_if-num-num") (param i32) (result i32 i64)
+    (drop (drop (br_if 0 (i32.const 50) (i64.const 51) (local.get 0))))
+    (i32.const 51) (i64.const 52)
+  )
+)
+(assert_return (invoke "break-br_if-num-num" (i32.const 0))
+  (i32.const 51) (i64.const 52)
+)
+(assert_return (invoke "break-br_if-num-num" (i32.const 1))
+  (i32.const 50) (i64.const 51)
+)
