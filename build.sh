@@ -68,6 +68,23 @@ elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.jvm
 elif [ "$TARGET" = "wave" ]; then
     v3c-wave -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.wave
+elif [ "$TARGET" = "int" ]; then
+    v3c $SOURCES $TARGET_V3
+    RET=$?
+    if [ $RET != 0 ]; then
+	exit $RET
+    fi
+    DIR=$(pwd)
+    LIST=""
+    for f in $SOURCES $TARGET_V3; do
+	if [[ "$f" != /* ]]; then
+	    f="$DIR/$f"
+	fi
+	LIST="$LIST $(ls $f)"
+    done
+    echo '#!/bin/bash' > bin/$PROGRAM.int
+    echo "v3c -run $LIST" '$@' >> bin/$PROGRAM.int
+    chmod 755 bin/$PROGRAM.int
 else
     exit_usage
 fi

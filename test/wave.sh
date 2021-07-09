@@ -9,10 +9,30 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-printf "Testing ${CYAN}wave${NORM} | "
+if [ "$TEST_TARGET" = "" ]; then
+    TEST_TARGET=int
+fi
+
+function make_wave() {
+    cd $WIZENG_LOC
+    make bin/wave.${TEST_TARGET} 2>&1 > /tmp/wave.build.out
+    RET=$?
+    if [ "$RET" != 0 ]; then
+	cat /tmp/wave.build.out
+	exit $RET
+    fi
+}
+
+(make_wave)
+RET=$?
+if [ "$RET" != 0 ]; then
+    exit $RET
+fi
+
+printf "Testing ${CYAN}wave${NORM} (${TEST_TARGET}) | "
 
 cd $(dirname ${BASH_SOURCE[0]})/wave
-WAVE=$WIZENG_LOC/bin/wave.jvm
+WAVE=$WIZENG_LOC/bin/wave.$TEST_TARGET
 export TMP=/tmp/$USER/wizeng-test/wave
 mkdir -p $TMP
 
@@ -24,6 +44,11 @@ function test_echo() {
     echo 'running: test_echo'
     # TODO: remove extra space in echo.wasm output
     $WAVE ./echo.wasm 1 222 3ABC > $TMP/echo.wasm.1.out
+    EXIT=$?
+    if [ $EXIT != 0 ]; then
+	echo "##-fail: wave exit code $EXIT"
+	return
+    fi
     echo '1 222 3ABC ' > $TMP/echo.wasm.1.expect
     diff $TMP/echo.wasm.1.expect $TMP/echo.wasm.1.out
     if [ $? != 0 ]; then

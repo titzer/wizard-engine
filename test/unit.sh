@@ -34,19 +34,6 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
 fi
 
 
-if [ "$1" = "x86-linux" ]; then
-    target=$1
-    shift
-elif [ "$1" = "x86-64-linux" ]; then
-    target=$1
-    shift
-elif [ "$1" = "jvm" ]; then
-    target=$1
-    shift
-else
-    target=int
-fi
-
 let PROGRESS_PIPE=1
 if [[ "$1" =~ "-trace-calls=" ]]; then
     V3C_OPTS="$1 $V3C_OPTS"
@@ -75,25 +62,29 @@ if [[ "$1" = "-fatal" ]]; then
     let PROGRESS_PIPE=0
 fi
 
-# Typecheck and verify wizeng first, printing out compile errors
-if [ "$target" = int ]; then
-    SRC="$WIZENG_LOC/src/*/*.v3 $WIZENG_LOC/src/engine/v3/*.v3 $VIRGIL_LIB_UTIL/*.v3"
-    TEST="$WIZENG_LOC/test/*/*.v3"
-    MAIN="$WIZENG_LOC/test/unittest.main.v3"
-    v3c -fp $SRC $TEST
-    if [ "$?" != 0 ]; then
-        exit 1
-    fi
-    cmd="v3c $V3C_OPTS -run $SRC $TEST $MAIN"
-else
-    make bin/unittest.$target
-    if [ "$?" != 0 ]; then
-        exit 1
-    fi
-    cmd="bin/unittest.$target"
+if [ "$TEST_TARGET" = "" ]; then
+    TEST_TARGET=int
 fi
 
-printf "Testing ${CYAN}unit${NORM} | "
+function make_unittest() {
+    cd $WIZENG_LOC
+    make bin/unittest.${TEST_TARGET} 2>&1 > /tmp/unittest.build.out
+    RET=$?
+    if [ $RET != 0 ]; then
+	cat /tmp/unittest.build.out
+	exit $RET
+    fi
+}
+
+(make_unittest)
+    RET=$?
+    if [ $RET != 0 ]; then
+	exit $RET
+    fi
+
+cmd="bin/unittest.$TEST_TARGET"
+
+printf "Testing ${CYAN}unit${NORM} ($TEST_TARGET) | "
 # run unittests and pipe through progress program
 LOG=/tmp/wizeng.unit.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then

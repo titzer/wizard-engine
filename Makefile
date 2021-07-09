@@ -94,3 +94,13 @@ bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
 bin/benchmark.x86-64-linux: $(BENCHMARK)
 	./build.sh benchmark x86-64-linux
 
+# interpreter targets
+bin/unittest.int: $(SPECTEST)
+	./build.sh unittest int
+
+bin/spectest.int: $(SPECTEST)
+	./build.sh spectest int
+
+bin/wave.int: $(WAVE)
+	./build.sh wave int
+

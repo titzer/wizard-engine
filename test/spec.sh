@@ -9,10 +9,6 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-if [ "$TEST_TARGET" = "" ]; then
-    TEST_TARGET=x86-linux
-fi
-
 SPEC_ROOT=$WIZENG_LOC/wasm-spec
 
 WIZENG_OPTS=
@@ -48,12 +44,32 @@ if [ "$BRANCHES" = "" ]; then
     BRANCHES=spec
 fi
 
+if [ "$TEST_TARGET" = "" ]; then
+    TEST_TARGET=int
+fi
+
+function make_spectest() {
+    cd $WIZENG_LOC
+    make bin/spectest.${TEST_TARGET} 2>&1 > /tmp/spectest.build.out
+    RET=$?
+    if [ "$RET" != 0 ]; then
+	cat /tmp/spectest.build.out
+	exit $RET
+    fi
+}
+
+(make_spectest)
+RET=$?
+if [ "$RET" != 0 ]; then
+    exit $RET
+fi
+
 for b in $BRANCHES; do
     if [ ! -d "$SPEC_ROOT/$b" ]; then
 	echo Spec branch \"$SPEC_ROOT/$b\" does not exist.
 	exit 1
     fi
-    printf "Testing ${CYAN}$SPEC_ROOT/$b${NORM} | "
+    printf "Testing ${CYAN}$SPEC_ROOT/$b${NORM} ($TEST_TARGET) | "
     if [ $PROGRESS_PIPE = 1 ]; then
 	run $b | tee /tmp/wizeng-spec-$b.out | progress tti
     else
