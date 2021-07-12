@@ -496,22 +496,19 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def w_ool = DataWriter.new().reset(buf, INL_SIZE, INL_SIZE);
 	def asm = X86_64Assemblers.create64(w);
 	def ool = X86_64Assemblers.create64(w_ool);
-	
+
 	def frameSize = IVar.INSTANCE.frameOffset + PTR_SIZE;
 	def offsets = V3Offsets.new();
 	def tuning = X86_64InterpreterTuning.new();
 
 	var ic: InterpreterCode;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
-	var handler_RETURN: int;
-	var handler_END: int;
 	var handler_BLOCK: int;
 	var handler_UNIMPLEMENTED: int;
 	var handler_INVALID: int;
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
 	var callEntryOffset: int;
-	var callFunctionOffset: int;
 	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
@@ -756,6 +753,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			}
 		}
 		genControlFlow();
+		genCallsAndRet();
 		genLoadsAndStores();
 		genFloatCmps();
 		genFloatMinAndMax();
@@ -848,6 +846,105 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.shl_r_i(max, offsets.XIP_entry_size_log);
 		asm.q.add_r_r(IVar.XIP.gpr, max);
 		asm.jmp_rel_near(ctl_xfer);
+	}
+	def genCallsAndRet() {
+		bindOpcodeHandler(Opcode.END);
+		asm.q.cmp_r_r(I.ip, I.eip);
+		asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
+
+		bindOpcodeHandler(Opcode.RETURN);
+		// Load return count from func.sig.results.length
+		var cnt = I.r0, i = I.r1;
+		asm.movq_r_m(cnt, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
+		asm.movq_r_m(cnt, X86_64Addr.new(cnt, null, 1, offsets.SigDecl_results));
+		asm.movd_r_m(cnt, X86_64Addr.new(cnt, null, 1, offsets.Array_length));
+		var done = X86_64Label.new();
+		// Copy return value(s) from VSP to VFP.
+		asm.cmp_r_i(cnt, 0);
+		asm.jc_rel_near(C.Z, done);
+		asm.movd_r_i(i, 0);
+		asm.d.shl_r_i(cnt, SLOT_SIZE_LOG);
+		asm.q.sub_r_r(IVar.VSP.gpr, cnt);
+		var loop = X86_64Label.new();
+		// while (i < cnt)
+		asm.bind(loop);
+		asm.movdqu_s_m(I.xmm0, X86_64Addr.new(IVar.VSP.gpr, i, 1, 0));
+		asm.movdqu_m_s(X86_64Addr.new(IVar.VFP.gpr, i, 1, 0), I.xmm0);
+		asm.q.add_r_i(i, SLOT_SIZE);
+		asm.q.cmp_r_r(i, cnt);
+		asm.jc_rel_near(C.L, loop);
+		asm.bind(done);
+		asm.q.lea(IVar.VSP.gpr, X86_64Addr.new(IVar.VFP.gpr, cnt, 1, 0)); // set VSP properly
+		// Deallocate interpreter frame and return to calling code.
+		asm.q.add_r_i(R.RSP, frameSize);
+		asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+		asm.ret();
+
+		bindOpcodeHandler(Opcode.CALL);
+		// XXX: save ip prior to call for stack traces?
+		genReadUleb32(I.r1); // TODO: r0 == ecx, which is overwritten
+
+		asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
+		asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+
+		// call_indirect jumps here
+		var callFunction = X86_64Label.new();
+		asm.bind(callFunction);
+		saveCallerIVars(false);
+		var call_host = X86_64Label.new();
+		asm.d.cmp_m_i(X86_64Addr.new(I.r1, null, 1, 0), offsets.WasmFunction_typeId);
+		asm.jc_rel_near(C.NZ, call_host);
+
+		// WasmFunction: call into interpreter reentry
+		asm.callr_addr(callReentryRef);
+		genExecStateCheck();
+		restoreCallerIVars(false);
+		genDispatchOrJumpToDispatch();
+
+		// HostFunction: call into interpreter callback to enter into V3 code
+		asm.bind(call_host);
+		saveIVar(IVar.VSP);
+		callV3WithVspp(refCallback(this.i.callHost), [I.r1]);
+		genExecStateCheck();
+		restoreCallerIVars(true);
+		genDispatchOrJumpToDispatch();
+
+		bindOpcodeHandler(Opcode.CALL_INDIRECT);
+		// XXX: save ip prior to call for stack traces?
+		var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
+		genReadUleb32(sig_index);
+		genReadUleb32(table_index);
+
+		asm.sub_r_i(I.vsp, SLOT_SIZE);
+		asm.movd_r_m(func_index, I.vsp_ptr_p1);
+
+		var trap_oob = X86_64Label.new(), trap_sig_mismatch = X86_64Label.new();
+
+		var tmp = I.r3;
+		// load instance.sig_ids[sig_index] into sig_index
+		asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_sig_ids));
+		asm.movd_r_m(sig_index, X86_64Addr.new(tmp, sig_index, offsets.INT_SIZE, offsets.Array_contents));
+		// Bounds-check table.ids[func_index]
+		asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
+		var table = table_index;
+		asm.movq_r_m(table, X86_64Addr.new(tmp, table_index, offsets.REF_SIZE, offsets.Array_contents));
+		asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_ids));
+		asm.d.cmp_r_m(func_index, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
+		asm.jc_rel_near(C.NC, trap_oob);
+		// Check table.ids[func_index] == sig_index
+		asm.d.cmp_r_m(sig_index, X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents));
+		asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+		// Load table.funcs[func_index] into r1 and jump to calling sequence
+		asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_funcs));
+		asm.movq_r_m(I.r1, X86_64Addr.new(tmp, func_index, offsets.REF_SIZE, offsets.Array_contents));
+		asm.jmp_rel_near(callFunction);
+		// XXX: move traps for call indirect out-of-line
+		asm.bind(trap_oob);
+		genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_INVALID);
+		asm.bind(trap_sig_mismatch);
+		asm.d.cmp_m_i(X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
+		asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
+		genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_SIG_MISMATCH);
 	}
 	def genLoadsAndStores() {
 		genLoad(Opcode.I32_LOAD, BpTypecon.I32.code, asm.movd_r_m);
@@ -956,109 +1053,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def genOpcodeHandler(opcode: Opcode) -> HandlerGenResult {
 		// XXX: does it matter to update TOS tags first or last?
 		match (opcode) {
-			END, RETURN => {
-				if (handler_END != 0) {
-					return HandlerGenResult.Offset(if(opcode == Opcode.END, handler_END, handler_RETURN));
-				}
-				handler_END = w.pos;
-				asm.q.cmp_r_r(I.ip, I.eip);
-				asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
-				handler_RETURN = w.pos;
-
-				// Load return count from func.sig.results.length
-				var cnt = I.r0, i = I.r1;
-				asm.movq_r_m(cnt, X86_64Addr.new(IVar.FUNC_DECL.gpr, null, 1, offsets.FuncDecl_sig));
-				asm.movq_r_m(cnt, X86_64Addr.new(cnt, null, 1, offsets.SigDecl_results));
-				asm.movd_r_m(cnt, X86_64Addr.new(cnt, null, 1, offsets.Array_length));
-				var done = X86_64Label.new();
-				// Copy return value(s) from VSP to VFP.
-				asm.cmp_r_i(cnt, 0);
-				asm.jc_rel_near(C.Z, done);
-				asm.movd_r_i(i, 0);
-				asm.d.shl_r_i(cnt, SLOT_SIZE_LOG);
-				asm.q.sub_r_r(IVar.VSP.gpr, cnt);
-				var loop = X86_64Label.new();
-				// while (i < cnt)
-				asm.bind(loop);
-				asm.movdqu_s_m(I.xmm0, X86_64Addr.new(IVar.VSP.gpr, i, 1, 0));
-				asm.movdqu_m_s(X86_64Addr.new(IVar.VFP.gpr, i, 1, 0), I.xmm0);
-				asm.q.add_r_i(i, SLOT_SIZE);
-				asm.q.cmp_r_r(i, cnt);
-				asm.jc_rel_near(C.L, loop);
-				asm.bind(done);
-				asm.q.lea(IVar.VSP.gpr, X86_64Addr.new(IVar.VFP.gpr, cnt, 1, 0)); // set VSP properly
-				// Deallocate interpreter frame and return to calling code.
-				asm.q.add_r_i(R.RSP, frameSize);
-				asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
-				asm.ret();
-
-				return HandlerGenResult.Offset(if(opcode == Opcode.END, handler_END, handler_RETURN));
-			}
-			CALL => {
-				// XXX: save ip prior to call for stack traces?
-				genReadUleb32(I.r1); // TODO: r0 == ecx, which is overwritten
-
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
-				asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
-
-				// call_indirect jumps here
-				callFunctionOffset = w.pos;
-				saveCallerIVars(false);
-				var call_host = X86_64Label.new();
-				asm.d.cmp_m_i(X86_64Addr.new(I.r1, null, 1, 0), offsets.WasmFunction_typeId);
-				asm.jc_rel_near(C.NZ, call_host);
-
-				// WasmFunction: call into interpreter reentry
-				asm.callr_addr(callReentryRef);
-				genExecStateCheck();
-				restoreCallerIVars(false);
-				genDispatchOrJumpToDispatch();
-
-				// HostFunction: call into interpreter callback to enter into V3 code
-				asm.bind(call_host);
-				saveIVar(IVar.VSP);
-				callV3WithVspp(refCallback(i.callHost), [I.r1]);
-				genExecStateCheck();
-				restoreCallerIVars(true);
-			}
-			CALL_INDIRECT => {
-				// XXX: save ip prior to call for stack traces?
-				var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
-				genReadUleb32(sig_index);
-				genReadUleb32(table_index);
-
-				asm.sub_r_i(I.vsp, SLOT_SIZE);
-				asm.movd_r_m(func_index, I.vsp_ptr_p1);
-
-				var trap_oob = X86_64Label.new(), trap_sig_mismatch = X86_64Label.new();
-
-				var tmp = I.r3;
-				// load instance.sig_ids[sig_index] into sig_index
-				asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_sig_ids));
-				asm.movd_r_m(sig_index, X86_64Addr.new(tmp, sig_index, offsets.INT_SIZE, offsets.Array_contents));
-				// Bounds-check table.ids[func_index]
-				asm.movq_r_m(tmp, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
-				var table = table_index;
-				asm.movq_r_m(table, X86_64Addr.new(tmp, table_index, offsets.REF_SIZE, offsets.Array_contents));
-				asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_ids));
-				asm.d.cmp_r_m(func_index, X86_64Addr.new(tmp, null, 1, offsets.Array_length));
-				asm.jc_rel_near(C.NC, trap_oob);
-				// Check table.ids[func_index] == sig_index
-				asm.d.cmp_r_m(sig_index, X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents));
-				asm.jc_rel_near(C.NZ, trap_sig_mismatch);
-				// Load table.funcs[func_index] into r1 and jump to calling sequence
-				asm.movq_r_m(tmp, X86_64Addr.new(table, null, 1, offsets.Table_funcs));
-				asm.movq_r_m(I.r1, X86_64Addr.new(tmp, func_index, offsets.REF_SIZE, offsets.Array_contents));
-				asm.jmp_rel(callFunctionOffset - w.pos);
-				// XXX: move traps for call indirect out-of-line
-				asm.bind(trap_oob);
-				genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_INVALID);
-				asm.bind(trap_sig_mismatch);
-				asm.d.cmp_m_i(X86_64Addr.new(tmp, func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
-				asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
-				genAbruptReturn(ExecState.TRAPPED, TrapReason.FUNC_SIG_MISMATCH);
-				return HandlerGenResult.END;
-			}
 			DROP => {
 				asm.sub_r_i(I.vsp, SLOT_SIZE);
 			}
