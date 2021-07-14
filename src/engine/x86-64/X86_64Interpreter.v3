@@ -4,11 +4,12 @@
 // Dynamically-generated interpreter code.
 var interpreterCode: InterpreterCode;
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
-class X86_64Interpreter extends Interpreter {
-	def valueStack = ValueStack.new();
+class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
+}
+class X86_64Interpreter extends X86_64InterpreterBase {
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
 
-	new() {
+	new() super(ValueStack.new(DEFAULT_STACK_SIZE)) {
 		if (interpreterCode == null) {
 			var start = System.ticksUs();
 			interpreterCode = X86_64InterpreterGen.new(this).gen();
@@ -297,10 +298,11 @@ def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
 // Maps a value stack red zone at the end to catch and report stack overflow.
 // TODO: need custom scan extension for V3 garbage collector for reference values.
 class ValueStack {
-	def mapping = Mmap.reserve(DEFAULT_STACK_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE);
+	def size: u32;
+	def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var sp: Pointer;
 
-	new() {
+	new(size) {
 		if (mapping == null) fatal("out of memory allocating value stack");
 		sp = mapping.range.start;
 		def PAGE_SIZE = 4096u;
@@ -765,6 +767,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		genFloatCmps();
 		genFloatMinAndMax();
 		genFloatTruncs();
+		genIrtOps();
 	}
 	def genControlFlow() {
 		// NOP: just goes directly back to the dispatch loop
@@ -1586,10 +1589,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				// true case, nothing to do
 				asm.bind(label);
 			}
-			GLOBAL_GET => genCallbackWith1Leb(refCallback(i.callback_GLOBAL_GET), false);
-			GLOBAL_SET => genCallbackWith1Leb(refCallback(i.callback_GLOBAL_SET), false);
-			TABLE_GET => genCallbackWith1Leb(refCallback(i.callback_TABLE_GET), true);
-			TABLE_SET => genCallbackWith1Leb(refCallback(i.callback_TABLE_SET), true);
 			MEMORY_SIZE => {
 				genReadUleb32(I.r1);
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_memories));
@@ -1602,7 +1601,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r1);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			MEMORY_GROW => genCallbackWith1Leb(refCallback(i.callback_MEMORY_GROW), false);
 			I32_CONST => {
 				genReadSleb32_inline(I.r1);
 				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
@@ -1786,22 +1784,16 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			MEMORY_INIT => genCallbackWith2Lebs(refCallback(i.callback_MEMORY_INIT), true);
 			DATA_DROP => {
 				genReadUleb32(I.r1);
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_data));
 				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
 			}
-			MEMORY_COPY => genCallbackWith2Lebs(refCallback(i.callback_MEMORY_COPY), true); // XXX: inline
-			MEMORY_FILL => genCallbackWith1Leb(refCallback(i.callback_MEMORY_FILL), true);
-			TABLE_INIT => genCallbackWith2Lebs(refCallback(i.callback_TABLE_INIT), true);
 			ELEM_DROP => {
 				genReadUleb32(I.r1);
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_elems));
 				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
 			}
-			TABLE_COPY => genCallbackWith2Lebs(refCallback(i.callback_TABLE_COPY), true);
-			TABLE_GROW => genCallbackWith1Leb(refCallback(i.callback_TABLE_GROW), false);
 			TABLE_SIZE => {
 				genReadUleb32(I.r1);
 				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
@@ -1812,7 +1804,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
 				asm.add_r_i(I.vsp, SLOT_SIZE);
 			}
-			TABLE_FILL => genCallbackWith1Leb(refCallback(i.callback_TABLE_FILL), true);
 			_ => return HandlerGenResult.UNHANDLED;
 		}
 		return HandlerGenResult.HANDLED;
@@ -1942,6 +1933,61 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			endHandler();
 		}
 	}
+	def genIrtOps() {
+		// generate code for callbacks with 1 LEB that cannot trap.
+		var call_irt = asm.newLabel();
+		for (t in [
+			(Opcode.GLOBAL_GET, refCallback(i.callback_GLOBAL_GET), false),
+			(Opcode.GLOBAL_SET, refCallback(i.callback_GLOBAL_SET), false),
+			(Opcode.MEMORY_GROW, refCallback(i.callback_MEMORY_GROW), false),
+			(Opcode.TABLE_GROW, refCallback(i.callback_TABLE_GROW), false)
+		]) {
+			bindHandler(t.0);
+			genReadUleb32(I.r0);
+			saveCallerIVars(true);
+			callV3WithVspp(t.1, [IVar.INSTANCE.gpr, I.r0]);
+			restoreCallerIVars(true);
+			endHandler();
+		}
+		asm.bind(call_irt);
+
+		// generate code for callbacks with 1 LEB that can trap.
+		call_irt = asm.newLabel();
+		for (t in [
+			(Opcode.TABLE_GET, refCallback(i.callback_TABLE_GET), true),
+			(Opcode.TABLE_SET, refCallback(i.callback_TABLE_SET), true),
+			(Opcode.MEMORY_FILL, refCallback(i.callback_MEMORY_FILL), true),
+			(Opcode.TABLE_FILL, refCallback(i.callback_TABLE_FILL), true)
+		]) {
+			bindHandler(t.0);
+			genReadUleb32(I.r0);
+			saveCallerIVars(true);
+			callV3WithVspp(t.1, [IVar.INSTANCE.gpr, I.r0]);
+			genExecStateCheck();
+			restoreCallerIVars(true);
+			endHandler();
+		}
+		asm.bind(call_irt);
+
+		// generate code for callbacks with 2 LEBS that can trap.
+		call_irt = asm.newLabel();
+		for (t in [
+			(Opcode.TABLE_INIT, refCallback(i.callback_TABLE_INIT), true),
+			(Opcode.MEMORY_INIT, refCallback(i.callback_MEMORY_INIT), true),
+			(Opcode.MEMORY_COPY, refCallback(i.callback_MEMORY_COPY), true),
+			(Opcode.TABLE_COPY, refCallback(i.callback_TABLE_COPY), true)
+		]) {
+			bindHandler(t.0);
+			genReadUleb32(I.r0);
+			genReadUleb32(I.r1);
+			saveCallerIVars(true);
+			callV3WithVspp(t.1, [IVar.INSTANCE.gpr, I.r0, I.r1]);
+			genExecStateCheck();
+			restoreCallerIVars(true);
+			endHandler();
+		}
+		asm.bind(call_irt);
+	}
 	def bindHandler(opcode: Opcode) {
 		patchDispatchTable(opcode, w.atEnd().pos);
 	}
@@ -2001,21 +2047,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.bind(is_nan);
 			genAbruptReturn(ExecState.TRAPPED, TrapReason.FLOAT_UNREPRESENTABLE);
 		}
-	}
-	def genCallbackWith1Leb(ref: IcCodeRef, canTrap: bool) { // XXX: load ref and jump to shared routine
-		genReadUleb32(I.r0);
-		saveCallerIVars(true);
-		callV3WithVspp(ref, [IVar.INSTANCE.gpr, I.r0]);
-		if (canTrap) genExecStateCheck();
-		restoreCallerIVars(true);
-	}
-	def genCallbackWith2Lebs(ref: IcCodeRef, canTrap: bool) { // XXX: load ref and jump to shared routine
-		genReadUleb32(I.r0);
-		genReadUleb32(I.r1);
-		saveCallerIVars(true);
-		callV3WithVspp(ref, [IVar.INSTANCE.gpr, I.r0, I.r1]);
-		if (canTrap) genExecStateCheck();
-		restoreCallerIVars(true);
 	}
 	def genExecStateCheck() {
 		asm.cmpb_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
