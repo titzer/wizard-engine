@@ -489,7 +489,7 @@ class X86_64InterpreterTuning {
 }
 
 // Space needed for the machine code of the interpreter
-def INL_SIZE = 32 * 1024;
+def INL_SIZE = 16 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 // Encapsulates temporary state needed for generating the {InterpreterCode} for X86-64.
@@ -506,9 +506,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 	var ic: InterpreterCode;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
-	var handler_BLOCK: int;
-	var handler_UNIMPLEMENTED: int;
-	var handler_INVALID: int;
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
 	var callEntryOffset: int;
@@ -734,27 +731,6 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			w.at(ref0.offset + 2 * t.0).put_b16(offset);
 		}
 
-		// Generate handlers for all opcodes
-		for (opcode in Opcode) {  // XXX: order opcodes by frequency
-			w.atEnd();
-			if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
-			var pos = w.pos;
-			// try to generate the handler for the opcode
-			var result = genOpcodeHandler(opcode);
-			match (result) {
-				UNHANDLED => ; // already points to default handler
-				HANDLED => {
-					patchDispatchTable(opcode, pos);
-					genDispatchOrJumpToDispatch();
-				}
-				Offset(off) => {
-					patchDispatchTable(opcode, off);
-				}
-				END => {
-					patchDispatchTable(opcode, pos);
-				}
-			}
-		}
 		genConsts();
 		genControlFlow();
 		genLocals();
@@ -771,6 +747,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		genFloatTruncs();
 		genFloatConversions();
 		genIrtOps();
+		genMisc();
 	}
 	def genConsts() {
 		bindHandler(Opcode.I32_CONST); {
@@ -1679,67 +1656,68 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movd_m_i(I.vsp_ptr_m1, 1);
 		genDispatchOrJumpToDispatch();
 	}
-	// Generate the code of a single opcode.
-	def genOpcodeHandler(opcode: Opcode) -> HandlerGenResult {
-		// XXX: does it matter to update TOS tags first or last?
-		match (opcode) {
-			MEMORY_SIZE => {
-				genReadUleb32(I.r1);
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_memories));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
-				asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, null, 1, offsets.X86_64Memory_limit));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.X86_64Memory_start));
-				asm.q.sub_r_r(I.r1, I.r0);
-				asm.q.shr_r_i(I.r1, 16);
-				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
-				asm.movq_m_r(I.vsp_ptr_p1, I.r1);
-				asm.add_r_i(I.vsp, SLOT_SIZE);
-			}
-			REF_NULL => {
-				asm.movbzx_r_m(I.r0, I.ip_ptr);
-				genSkipLeb(); // skip type
-				asm.movq_m_r(I.vsp_ptr, I.r0);
-				asm.movq_m_i(I.vsp_ptr_p1, 0);
-				asm.add_r_i(I.vsp, SLOT_SIZE);
-			}
-			REF_IS_NULL => {
-				asm.d.test_m_i(I.vsp_ptr_m1, -1);
-				asm.set_r(C.Z, I.r0);
-				asm.movbzx_r_r(I.r0, I.r0);
-				asm.movd_m_i(I.vsp_ptr_m2, i7.view(BpTypecon.I32.code));
-				asm.movd_m_r(I.vsp_ptr_m1, I.r0);
-			}
-			REF_FUNC => {
-				genReadUleb32(I.r1);
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
-				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.FUNCREF.code));
-				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
-				asm.add_r_i(I.vsp, SLOT_SIZE);
-			}
-			DATA_DROP => {
-				genReadUleb32(I.r1);
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_data));
-				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
-			}
-			ELEM_DROP => {
-				genReadUleb32(I.r1);
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_elems));
-				asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
-			}
-			TABLE_SIZE => {
-				genReadUleb32(I.r1);
-				asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Table_elems));
-				asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Array_length));
-				asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
-				asm.movq_m_r(I.vsp_ptr_p1, I.r0);
-				asm.add_r_i(I.vsp, SLOT_SIZE);
-			}
-			_ => return HandlerGenResult.UNHANDLED;
+	def genMisc() {
+		bindHandler(Opcode.MEMORY_SIZE); {
+			genReadUleb32(I.r1);
+			asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_memories));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_r_m(I.r1, X86_64Addr.new(I.r0, null, 1, offsets.X86_64Memory_limit));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.X86_64Memory_start));
+			asm.q.sub_r_r(I.r1, I.r0);
+			asm.q.shr_r_i(I.r1, 16);
+			asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
+			asm.movq_m_r(I.vsp_ptr_p1, I.r1);
+			asm.add_r_i(I.vsp, SLOT_SIZE);
+			endHandler();
 		}
-		return HandlerGenResult.HANDLED;
+		bindHandler(Opcode.REF_NULL); {
+			asm.movbzx_r_m(I.r0, I.ip_ptr);
+			genSkipLeb(); // skip type
+			asm.movq_m_r(I.vsp_ptr, I.r0);
+			asm.movq_m_i(I.vsp_ptr_p1, 0);
+			asm.add_r_i(I.vsp, SLOT_SIZE);
+			endHandler();
+		}
+		bindHandler(Opcode.REF_IS_NULL); {
+			asm.d.test_m_i(I.vsp_ptr_m1, -1);
+			asm.set_r(C.Z, I.r0);
+			asm.movbzx_r_r(I.r0, I.r0);
+			asm.movd_m_i(I.vsp_ptr_m2, i7.view(BpTypecon.I32.code));
+			asm.movd_m_r(I.vsp_ptr_m1, I.r0);
+			endHandler();
+		}
+		bindHandler(Opcode.REF_FUNC); {
+			genReadUleb32(I.r1);
+			asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_functions));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.FUNCREF.code));
+			asm.movq_m_r(I.vsp_ptr_p1, I.r0);
+			asm.add_r_i(I.vsp, SLOT_SIZE);
+			endHandler();
+		}
+		bindHandler(Opcode.DATA_DROP); {
+			genReadUleb32(I.r1);
+			asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_data));
+			asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
+			endHandler();
+		}
+		bindHandler(Opcode.ELEM_DROP); {
+			genReadUleb32(I.r1);
+			asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_dropped_elems));
+			asm.movb_m_i(X86_64Addr.new(I.r0, I.r1, 1, offsets.Array_contents), 1);
+			endHandler();
+		}
+		bindHandler(Opcode.TABLE_SIZE); {
+			genReadUleb32(I.r1);
+			asm.movq_r_m(I.r0, X86_64Addr.new(IVar.INSTANCE.gpr, null, 1, offsets.Instance_tables));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, I.r1, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Table_elems));
+			asm.movq_r_m(I.r0, X86_64Addr.new(I.r0, null, 1, offsets.Array_length));
+			asm.movq_m_i(I.vsp_ptr, i7.view(BpTypecon.I32.code));
+			asm.movq_m_r(I.vsp_ptr_p1, I.r0);
+			asm.add_r_i(I.vsp, SLOT_SIZE);
+			endHandler();
+		}
 	}
 	def genFloatMinAndMax() {
 		var ret_b = X86_64Label.new(), ret_a = X86_64Label.new(), is_nan32 = X86_64Label.new(), is_nan64 = X86_64Label.new();
@@ -2027,6 +2005,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.bind(call_irt);
 	}
 	def bindHandler(opcode: Opcode) {
+		// TODO: if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
 		patchDispatchTable(opcode, w.atEnd().pos);
 	}
 	def genFloatTrunc(opcode: Opcode, config: FloatTrunc, saturate: bool) {
