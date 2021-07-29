@@ -1,4 +1,4 @@
-# Wizard: An advanced Wasm Engine for Research
+# Wizard: An advanced WebAssembly Engine for Research
 
 The Wizard Engine is a lightweight WebAssembly virtual machine designed for teaching and research.
 Its implementation is designed to be flexible and easy to grasp, ideal for experimentation and modification.
