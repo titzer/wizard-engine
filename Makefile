@@ -12,7 +12,7 @@ x86-64-linux: bin/spectest.x86-64-linux bin/jawa.x86-64-linux bin/unittest.x86-6
 
 jvm: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/unittest.jvm bin/objdump.jvm;
 
-ENGINE=src/engine/*/*.v3 src/util/*.v3
+ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
 X86_64=src/engine/x86-64/*.v3
 WAVE=$(ENGINE) src/wave/*.v3 src/wave.main.v3
 JAWA=$(ENGINE) src/jawa/*.v3 src/jawa.main.v3
