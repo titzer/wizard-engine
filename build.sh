@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wave|jawa|spectest|unittest> <x86-linux|x86-64-linux|jvm|wave>"
+    echo "Usage: build.sh <wave|wasi|jawa|spectest|unittest> <x86-linux|x86-64-linux|jvm|wave>"
     exit 1
 }
 
@@ -38,12 +38,15 @@ TARGET_X86_64="src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WAVE="src/wave/*.v3 src/wave.main.v3"
+WASI="src/wasi/*.v3 src/wasi.main.v3"
 JAWA="src/jawa/*.v3 src/jawa.main.v3"
 
 # compute sources
 PROGRAM=$1
 if [ "$PROGRAM" = "wave" ]; then
     SOURCES="$ENGINE $WAVE"
+elif [ "$PROGRAM" = "wasi" ]; then
+    SOURCES="$ENGINE $WASI"
 elif [ "$PROGRAM" = "jawa" ]; then
     SOURCES="$ENGINE $JAWA"
 elif [ "$PROGRAM" = "spectest" ]; then
@@ -61,9 +64,9 @@ fi
 # build
 TARGET="$2"
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    v3c-x86-linux -heap-size=512m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
+    v3c-x86-linux -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.x86-linux
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -heap-size=700m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
+    v3c-x86-64-linux -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_X86_64 && mv bin/$PROGRAM bin/$PROGRAM.x86-64-linux
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=$PROGRAM -output=bin/ $SOURCES $TARGET_V3 && mv bin/$PROGRAM bin/$PROGRAM.jvm
 elif [ "$TARGET" = "wave" ]; then
