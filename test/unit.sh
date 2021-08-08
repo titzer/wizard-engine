@@ -82,7 +82,7 @@ function make_unittest() {
 	exit $RET
     fi
 
-cmd="bin/unittest.$TEST_TARGET"
+cmd="$WIZENG_LOC/bin/unittest.$TEST_TARGET"
 
 printf "Testing ${CYAN}unit${NORM} ($TEST_TARGET) | "
 # run unittests and pipe through progress program
