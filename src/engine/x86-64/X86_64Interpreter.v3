@@ -484,6 +484,7 @@ class X86_64InterpreterTuning {
 	var handlerAlignment = 1;
 	var shortDispatchEntries = true;
 	var twoByteEntries = false;
+	var useTypeTagTable = false;
 }
 
 // Space needed for the machine code of the interpreter
@@ -511,8 +512,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
 	var abruptRetRef: IcCodeRef;
+	var typeTagTableOffset: int;
 	var runtimeCallTableOffset: int;
 	var runtimeCallTableLimit: int;
+	var useTypeTagTable = false;
 
 	var dispatchTables = [
 		(0x00, IcCodeRef.new(-1)),
@@ -537,11 +540,32 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		runtimeCallTableOffset = w.pos;
 		w.skipN(16 * 8);
 		runtimeCallTableLimit = w.pos;
+		if (tuning.useTypeTagTable) {
+			// Reserve space for the type tag table and fill it out
+			typeTagTableOffset = w.pos;
+			w.skipN(256);
+			for (t in BpTypecon) {
+				var offset = typeTagTableOffset + t.code;
+				w.at(offset).putb(t.code);
+				w.at(offset + 0x80).putb(t.code);
+			}
+			for (t in [BpTypecon.RefNullT, BpTypecon.RefT, BpTypecon.Rtt]) { // set upper bit
+				var offset = typeTagTableOffset + t.code;
+				w.at(offset).putb(t.code | 0x80);
+				w.at(offset + 0x80).putb(t.code | 0x80);
+			}
+			for (t in [BpTypecon.AbstractT]) { // TODO: load default value from instance
+				var offset = typeTagTableOffset + t.code;
+				w.at(offset).putb(BpTypecon.RefNullT.code | 0x80);
+				w.at(offset + 0x80).putb(BpTypecon.RefNullT.code | 0x80);
+			}
+		}
+		w.atEnd();
 		// Reserve space for each of the dispatch tables
 		for (t in dispatchTables) {
-			asm.w.align(2);
+			w.align(2);
 			t.1.offset = w.pos;
-			asm.w.skipN(256 * 2);
+			w.skipN(256 * 2);
 		}
 		// Begin code generation
 		genInterpreterEntry();
@@ -675,16 +699,23 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var numGpr = I.r1;
 		genReadUleb32(numGpr);
 		// gen: var type = read_type();
-		var type_done = X86_64Label.new();
+		var type_leb_done = X86_64Label.new(), type_done = X86_64Label.new();
 		var typeGpr = I.r2;
 		asm.d.movbzx_r_m(typeGpr, I.ip_ptr);	// load first byte
 		asm.q.inc_r(I.ip);			// increment pointer
 		asm.d.test_r_i(typeGpr, 0x80);		// test most-significant bit
-		asm.jc_rel_near(C.Z, type_done);	// more type LEB bytes?
+		asm.jc_rel_near(C.Z, type_leb_done);	// more type LEB bytes?
 		genSkipLeb();				// only first byte matters
+		asm.bind(type_leb_done);
+		// gen: if((type = typeTags[type]) < 0) skip_leb()
+		if (tuning.useTypeTagTable) {
+			// TODO: AbstractT requires a load of the default value from the instance
+			asm.q.lea(I.scratch, IcCodeRef.new(typeTagTableOffset));   // materialize type tag table address
+			asm.d.movbsx_r_m(typeGpr, typeGpr.plusR(I.scratch, 1, 0)); // load from type tag table
+			asm.jc_rel_near(C.NC, type_done);	// check upper bit of entry
+			genSkipLeb();				// skip LEB if upper bit of entry set
+		}
 		asm.bind(type_done);
-
-		// TODO: for RefNullT, AbstractT, skip additional ULEB
 
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
