@@ -1,0 +1,136 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Parses and runs binary .wasm files.
+def main(args: Array<string>) -> int {
+	var trace = false;
+	var engine = Engine.new();
+	var programArgs: Array<string>;
+	var path: string;
+	// Parse option and extract module and module arguments
+	for (i < args.length) {
+		var a = args[i];
+		if (Strings.startsWith(a, "-trace-module=")) {
+			trace = true;
+		} else if (a.length > 0 && a[0] == '-') {
+			if (!engine.parseOption(a)) return ErrorBuilder.new()
+				.puts("wave: unrecognized option ")
+				.putsq(a)
+				.ln()
+				.exit(1);
+		} else {
+			path = a;
+			programArgs = Arrays.range(args, i+1, args.length);
+			break;
+		}
+	}
+
+	if (path == null) return ErrorBuilder.new()
+		.puts("wizeng: no input files\n")
+		.exit(3);
+
+	if (!Strings.endsWith(path, ".wasm")) return ErrorBuilder.new()
+		.puts(path)
+		.puts(": unknown file format, expected .wasm\n")
+		.exit(4);
+
+	// Parse the binary module
+	var result = engine.loadWasmFile(path);
+	var module: Module;
+	match (result) {
+		Ok(m) => module = m;
+		FileNotFound => return ErrorBuilder.new()
+			.puts("wave: could not load file ")
+			.puts(path)
+			.puts("\n")
+			.exit(2);
+		ParseError(code, path, error_pos, error_msg) => return ErrorBuilder.new()
+			.render(code, path, error_pos, error_msg)
+			.exit(3);
+	}
+
+	// Compile the list of import processors
+	var err = WasmErrorGen.new(path);
+	var imports = Array<Exportable>.new(module.imports.length);
+	var i = Instantiator.new(engine.extensions, module, imports, err);
+	var map = Strings.newMap<ImportProcessor>();
+
+	for (j < module.imports.length) {
+		var name = module.imports[j].imp.module_name;
+		if (map[name] == null) {
+			var p = HostModuleRegistry.map[name];
+			if (p == null) ErrorBuilder.new()
+				.puts(path)
+				.put2(": import[%d] from unknown module \"%s\"", j, name)
+				.exit(7);
+			p.init(programArgs, false); //TODO: tracing
+			map[name] = p;
+			i.processors.put(p);
+		}
+	}
+
+	// Run the instantiatior.
+	var instance = i.run();
+	if (!err.ok()) return ErrorBuilder.new()
+		.render(err.error_code, path, err.error_pos, err.error_msg)
+		.exit(6);
+
+	// Try to find the main entrypoint.
+	var entry: (Function, Array<Value>);
+	for (j < i.processors.length) {
+		var p = i.processors[j];
+		if (HostModule.?(p)) {
+			entry = HostModule.!(p).getEntry(instance);
+			if (entry.0 != null) break;
+		}
+	}
+
+	if (entry.0 == null) return ErrorBuilder.new()
+		.puts(path)
+		.puts(": no main export from module\n")
+		.exit(7);
+
+	// Execute the main entrypoint.
+	var exe = Target.newInterpreter();
+	var r = exe.run(-1, entry.0, entry.1);
+	match (r) {
+		Break => ;
+		Value(vals) => return if(vals.length == 1, Values.v_i(vals[0]));
+		Trap(reason) => {
+			var e = ErrorBuilder.new()
+				.puts("trap: ")
+				.puts(reason.name)
+				.ln();
+			// TODO: call back into module to render source-level stacktrace
+			for (i = exe.call_stack.top - 1; i >= 0; i--) {
+				var f = exe.call_stack.elems[i];
+				e.puts("\t@ ");
+				f.func.render(e);
+				e.puts(" +");
+				e.putd(f.pc);
+				e.ln();
+			}
+			e.exit(10);
+		}
+	}
+	return 0;
+}
+
+// Host modules must be registered by their name so the Wizard engine can find them.
+component HostModuleRegistry {
+	def map = Strings.newMap<HostModule>();
+	def add(m: HostModule) {
+		map[m.name] = m;
+	}
+}
+// A host module (with state) that can provide imports to a module as well as the entrypoint and exit value.
+class HostModule extends ImportProcessor {
+	new(name: string) super(name) { }
+
+	// Initializes the host module with the command-line arguments.
+	def init(args: Array<string>, trace: bool) { }
+	// Get the main export and arguments, if exported from the instance.
+	def getEntry(instance: Instance) -> (Function, Array<Value>) { return (null, null); }
+	// De-initialize after running.
+	def deinit(result: Result) { }
+}

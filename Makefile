@@ -1,27 +1,30 @@
 all: TAGS x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm
+.PHONY: clean TAGS x86-linux x86-64-linux jvm wave
 clean:
 	rm -f bin/*
 	cp scripts/* bin/
 
-x86-linux: bin/spectest.x86-linux bin/wave.x86-linux bin/jawa.x86-linux bin/unittest.x86-linux bin/objdump.x86-linux bin/benchmark.x86-linux;
+x86-linux: bin/spectest.x86-linux bin/wizeng.x86-linux bin/unittest.x86-linux bin/objdump.x86-linux
 
-# TODO: bin/wave.x86-64-linux
-x86-64-linux: bin/spectest.x86-64-linux bin/jawa.x86-64-linux bin/unittest.x86-64-linux bin/objdump.x86-64-linux bin/benchmark.x86-64-linux;
+x86-64-linux: bin/spectest.x86-64-linux bin/wizeng.x86-64-linux bin/unittest.x86-64-linux bin/objdump.x86-64-linux
 
-jvm: bin/spectest.jvm bin/wave.jvm bin/jawa.jvm bin/unittest.jvm bin/objdump.jvm;
+jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
+
+wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
 X86_64=src/engine/x86-64/*.v3
-WAVE=$(ENGINE) src/wave/*.v3 src/wave.main.v3
-JAWA=$(ENGINE) src/jawa/*.v3 src/jawa.main.v3
+WAVE=src/wave/*.v3
+WASI=src/wasi/*.v3
+JAWA=src/jawa/*.v3
+WIZENG=src/wizeng.main.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
-BENCHMARK=$(ENGINE) src/benchmark.main.v3
 SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
+WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3
 
-TAGS: $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST) $(X86_64)
+TAGS: $(ENGINE) $(WIZENG) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST) $(X86_64)
 	vctags -e $(ENGINE) $(WAVE) $(JAWA) $(SPECTEST) $(UNITTEST) $(X86_64)
 
 # JVM targets
@@ -31,11 +34,8 @@ bin/unittest.jvm: $(UNITTEST)
 bin/spectest.jvm: $(SPECTEST)
 	./build.sh spectest jvm
 
-bin/wave.jvm: $(WAVE)
-	./build.sh wave jvm
-
-bin/jawa.jvm: $(JAWA)
-	./build.sh jawa jvm
+bin/wizeng.jvm: $(WIZENG) 
+	./build.sh wizeng jvm
 
 bin/objdump.jvm: $(OBJDUMP)
 	./build.sh objdump jvm
@@ -47,11 +47,8 @@ bin/unittest.wasm: $(UNITTEST)
 bin/spectest.wasm: $(SPECTEST)
 	./build.sh spectest wave
 
-bin/wave.wasm: $(WAVE)
-	./build.sh wave wave
-
-bin/jawa.wasm: $(JAWA)
-	./build.sh jawa wave
+bin/wizeng.wasm: $(WIZENG)
+	./build.sh wizeng wave
 
 bin/objdump.wasm: $(OBJDUMP)
 	./build.sh objdump wave
@@ -63,17 +60,11 @@ bin/unittest.x86-linux: $(UNITTEST)
 bin/spectest.x86-linux: $(SPECTEST)
 	./build.sh spectest x86-linux
 
-bin/wave.x86-linux: $(WAVE)
-	./build.sh wave x86-linux
-
-bin/jawa.x86-linux: $(JAWA)
-	./build.sh jawa x86-linux
+bin/wizeng.x86-linux: $(WIZENG)
+	./build.sh wizeng x86-linux
 
 bin/objdump.x86-linux: $(OBJDUMP)
 	./build.sh objdump x86-linux
-
-bin/benchmark.x86-linux: $(BENCHMARK)
-	./build.sh benchmark x86-linux
 
 # x86-64-linux targets
 bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64)
@@ -82,17 +73,11 @@ bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64)
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64)
 	./build.sh spectest x86-64-linux
 
-bin/wave.x86-64-linux: $(WAVE) $(X86_64)
-	./build.sh wave x86-64-linux
-
-bin/jawa.x86-64-linux: $(JAWA) $(X86_64)
-	./build.sh jawa x86-64-linux
+bin/wizeng.x86-64-linux: $(WAVE) $(X86_64)
+	./build.sh wizeng x86-64-linux
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
 	./build.sh objdump x86-64-linux
-
-bin/benchmark.x86-64-linux: $(BENCHMARK)
-	./build.sh benchmark x86-64-linux
 
 # interpreter targets
 bin/unittest.int: $(SPECTEST)
@@ -101,6 +86,5 @@ bin/unittest.int: $(SPECTEST)
 bin/spectest.int: $(SPECTEST)
 	./build.sh spectest int
 
-bin/wave.int: $(WAVE)
-	./build.sh wave int
-
+bin/wizeng.int: $(WIZENG)
+	./build.sh wizeng int

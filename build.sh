@@ -37,26 +37,21 @@ TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
-WAVE="src/wave/*.v3 src/wave.main.v3"
-WASI="src/wasi/*.v3 src/wasi.main.v3"
-JAWA="src/jawa/*.v3 src/jawa.main.v3"
+WIZENG="src/wizeng.main.v3"
+WAVE="src/wave/*.v3"
+WASI="src/wasi/*.v3"
+JAWA="src/jawa/*.v3"
 
 # compute sources
 PROGRAM=$1
-if [ "$PROGRAM" = "wave" ]; then
-    SOURCES="$ENGINE $WAVE"
-elif [ "$PROGRAM" = "wasi" ]; then
-    SOURCES="$ENGINE $WASI"
-elif [ "$PROGRAM" = "jawa" ]; then
-    SOURCES="$ENGINE $JAWA"
+if [ "$PROGRAM" = "wizeng" ]; then
+    SOURCES="$ENGINE $WIZENG $WAVE $WASI"
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST $JAWA"
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
-elif [ "$PROGRAM" = "benchmark" ]; then
-    SOURCES="$ENGINE src/benchmark.main.v3"
 else
     exit_usage
 fi
