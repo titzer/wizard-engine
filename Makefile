@@ -73,7 +73,7 @@ bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64)
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64)
 	./build.sh spectest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WAVE) $(X86_64)
+bin/wizeng.x86-64-linux: $(WIZENG) $(X86_64)
 	./build.sh wizeng x86-64-linux
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)

@@ -81,7 +81,7 @@ elif [ "$TARGET" = "int" ]; then
 	LIST="$LIST $(ls $f)"
     done
     echo '#!/bin/bash' > bin/$PROGRAM.int
-    echo "v3c -run $LIST" '$@' >> bin/$PROGRAM.int
+    echo "v3c \$V3C_OPTS -run $LIST" '$@' >> bin/$PROGRAM.int
     chmod 755 bin/$PROGRAM.int
     # run v3c just to check for compile errors
     v3c $LIST
