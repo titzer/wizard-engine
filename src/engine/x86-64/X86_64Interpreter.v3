@@ -482,8 +482,7 @@ component I {
 class X86_64InterpreterTuning {
 	var threadedDispatch = true;
 	var handlerAlignment = 1;
-	var shortDispatchEntries = false;
-	var twoByteEntries = false;
+	var dispatchEntrySize = 4;
 	var useTypeTagTable = false;
 }
 
@@ -547,7 +546,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				skip);
 			buf.outln();
 		}
-		if (!tuning.shortDispatchEntries && (start - Pointer.NULL) > int.max) {
+		if (tuning.dispatchEntrySize == 4 && (start - Pointer.NULL) > int.max) {
 			fatal(Strings.format1("generated code start address of 0x%x out of 31-bit range", (start - Pointer.NULL)));
 		}
 
@@ -580,11 +579,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		}
 		w.atEnd();
 		// Reserve space for each of the dispatch tables
-		var dispatchEntrySize = if(tuning.shortDispatchEntries, 2, 4);
 		for (t in dispatchTables) {
-			w.align(dispatchEntrySize);
+			w.align(tuning.dispatchEntrySize);
 			t.1.offset = w.pos;
-			w.skipN(256 * dispatchEntrySize);
+			w.skipN(256 * tuning.dispatchEntrySize);
 		}
 		// Begin code generation
 		genInterpreterEntry();
@@ -793,10 +791,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		genMisc();
 	}
 	def writeDispatchEntry(ref: IcCodeRef, opcode: int, offset: int) {
-		if (tuning.shortDispatchEntries) {
-			w.at(ref.offset + 2 * opcode).put_b16(offset - ref.offset);
-		} else {
-			w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.range.start + offset) - Pointer.NULL));
+		match (tuning.dispatchEntrySize) {
+			2 => w.at(ref.offset + 2 * opcode).put_b16(offset - ref.offset);
+			4 => w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.range.start + offset) - Pointer.NULL));
+			8 => w.at(ref.offset + 8 * opcode).put_b64((ic.range.start + offset) - Pointer.NULL);
 		}
 	}
 	def genConsts() {
@@ -2298,16 +2296,26 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var base = I.r1;
 		asm.movbzx_r_m(opcode, I.ip_ptr);
 		asm.inc_r(I.ip);
-		if (tuning.shortDispatchEntries) {
-			asm.lea(base, ref); // RIP-relative LEA
-			asm.movwsx_r_m(opcode, base.plusR(opcode, 2, 0)); // load 16-bit offset
-			asm.add_r_r(base, opcode);
-		} else {
-			var addr = ic.range.start + ref.offset;
-			asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+		match (tuning.dispatchEntrySize) {
+			2 => {
+				asm.lea(base, ref); // RIP-relative LEA
+				asm.movwsx_r_m(opcode, base.plusR(opcode, 2, 0)); // load 16-bit offset
+				asm.add_r_r(base, opcode);
+				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+				asm.ijmp_r(base);
+			}
+			4 => {
+				var addr = ic.range.start + ref.offset;
+				asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+				asm.ijmp_r(base);
+			}
+			8 => {
+				var addr = ic.range.start + ref.offset;
+				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+				asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
+			}
 		}
-		if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
-		asm.ijmp_r(base);
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
 	def patchDispatchTable(opcode: Opcode, pos: int) {
