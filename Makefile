@@ -1,6 +1,6 @@
 all: TAGS x86-linux x86-64-linux jvm
 
-.PHONY: clean TAGS x86-linux x86-64-linux jvm wave
+.PHONY: clean x86-linux x86-64-linux jvm wave
 clean:
 	rm -f bin/*
 	cp scripts/* bin/
