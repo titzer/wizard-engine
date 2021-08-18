@@ -2,7 +2,7 @@ all: TAGS x86-linux x86-64-linux jvm
 
 .PHONY: clean x86-linux x86-64-linux jvm wave
 clean:
-	rm -f bin/*
+	rm -f TAGS bin/*
 	cp scripts/* bin/
 
 x86-linux: bin/spectest.x86-linux bin/wizeng.x86-linux bin/unittest.x86-linux bin/objdump.x86-linux
