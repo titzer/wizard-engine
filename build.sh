@@ -65,7 +65,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $TARGET_V3
 elif [ "$TARGET" = "wave" ]; then
-    v3c-wave -heap-size=512m $V3C_OPTS -program-name=${PROGRAM}.wave -output=bin/ $SOURCES $TARGET_V3
+    v3c-wave -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $TARGET_V3
 elif [ "$TARGET" = "int" ]; then
     v3c $SOURCES $TARGET_V3
     RET=$?
