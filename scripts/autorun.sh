@@ -31,6 +31,9 @@ function search_and_exe() {
 }
 
 function do_make() {
+    for t in "$targets"; do
+	MAKE_PROGRAMS="bin/$PROGRAM.$t $MAKE_PROGRAMS"
+    done
     cd $BIN/..
     make -j $MAKE_PROGRAMS 2>&1 > /tmp/$PROGRAM.$USER.build.out
     RET=$?
@@ -40,16 +43,14 @@ function do_make() {
     fi
 }
 
-search_and_exe
+# search for any suitable executable and run it
+search_and_exe $@
 
-# try to build an executable
-for t in "$targets"; do
-    MAKE_PROGRAMS="bin/$PROGRAM.$t $MAKE_PROGRAMS"
-done
-
+# not found, try building all targetrs
 (do_make)
 
-search_and_exe
+# try searching again after building
+search_and_exe $@
 
 echo "$PROGRAM: no executables found for targets \"$targets\""
 exit 1
