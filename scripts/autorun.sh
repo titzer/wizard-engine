@@ -10,7 +10,12 @@ BIN="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 PROGRAM=$1
 shift
-targets=$($BIN/sense_host.sh)
+export targets=$($BIN/sense_host.sh)
+
+if [ "$targets" = "" ]; then
+    echo "$PROGRAM: no suitable targets found"
+    exit 1
+fi
 
 function link_and_exe() {
     EXE=$1
@@ -22,16 +27,16 @@ function link_and_exe() {
 
 # search for existing executables
 function search_and_exe() {
-    for t in "$targets"; do
+    for t in $targets; do
 	EXE=$BIN/${PROGRAM}.$t
-	if [ -x $EXE ]; then
+	if [ -x "$EXE" ]; then
 	    link_and_exe $EXE $@
 	fi
     done
 }
 
 function do_make() {
-    for t in "$targets"; do
+    for t in $targets; do
 	MAKE_PROGRAMS="bin/$PROGRAM.$t $MAKE_PROGRAMS"
     done
     cd $BIN/..
