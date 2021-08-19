@@ -46,7 +46,7 @@ function do_make() {
 # search for any suitable executable and run it
 search_and_exe $@
 
-# not found, try building all targetrs
+# not found, try building all targets
 (do_make)
 
 # try searching again after building
