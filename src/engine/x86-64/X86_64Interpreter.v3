@@ -3,9 +3,10 @@
 
 def OUT = Trace.OUT;
 // Dynamically-generated interpreter code.
-var interpreterCode: InterpreterCode;
+var interpreterCode: X86_64InterpreterCode;
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
 class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
+	// XXX: hack so V3Offsets.new() can allocate an Interpreter without auto-generating the interpreter code
 }
 class X86_64Interpreter extends X86_64InterpreterBase {
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
@@ -14,7 +15,7 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		if (interpreterCode == null) {
 			var start = System.ticksUs();
 			interpreterCode = X86_64InterpreterGen.new(this).gen();
-			RiRuntime.userSignalHandler = handleSignal;
+			RiRuntime.registerUserCode(interpreterCode);
 			var diff = System.ticksUs() - start;
 			if (Trace.interpreter) OUT.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
 		}
@@ -22,7 +23,7 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 			X86_64Interpreter,				// closure type
 			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
 			(ExecState, TrapReason)>(			// return types
-				interpreterCode.range.start + interpreterCode.v3EntryOffset, this);
+				interpreterCode.start + interpreterCode.v3EntryOffset, this);
 	}
 
 	def run(count: int, f: Function, args: Array<Value>) -> Result {
@@ -269,31 +270,61 @@ def ucontext_rsp_offset = 160;
 def SIGFPE  = 8;
 def SIGBUS  = 10;
 def SIGSEGV = 11;
-def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer) -> bool {
-	var pip = ucontext + ucontext_rip_offset;
-	var ip = pip.load<Pointer>();
-	var r = interpreterCode.range;
-	if (!r.contains(ip)) return false;
-	if (Trace.interpreter) {
-		OUT.put2("  !signal %d in interpreter @ 0x%x", signum, ip - Pointer.NULL).outln();
+
+// Implements the RiUserCode interface in order to add generated machine code to the V3 runtime.
+// Also stores several important offsets needed in handling signals.
+class X86_64InterpreterCode extends RiUserCode {
+	def frameSize: int;
+	var v3EntryOffset: int;			// entry from V3 calling code
+	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
+	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
+	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
+
+	new(start: Pointer, end: Pointer, frameSize) super(start, end) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		var msg = "\tin (interpreter frame)\n";
+		out(msg, 0, msg.length);
+		// TODO: render WasmFunction and offset in frame
 	}
-	match (signum) {
-		SIGFPE => {
-			// presume divide/modulus by zero
-			pip.store<Pointer>(r.start + interpreterCode.divZeroHandlerOffset);
-			return true;
+
+	// Called from V3 runtime for a frame where {ip} is in interpreter code.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp += frameSize;	 // assume frame is allocated
+		ip = sp.load<Pointer>(); // return address on stack
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+
+	// Called from V3 runtime when the garbage collector needs to scan this stack frame.
+	def scanFrame(ip: Pointer, sp: Pointer) { } // TODO
+
+
+	// Called from V3 runtime to handle an OS-level signal that occurred while {ip} was in interpreter code.
+	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool {
+		var pip = ucontext + ucontext_rip_offset;
+		var ip = pip.load<Pointer>();
+		if (Trace.interpreter) {
+			OUT.put2("  !signal %d in interpreter @ 0x%x", signum, ip - Pointer.NULL).outln();
 		}
-		SIGBUS, SIGSEGV => {
-			var addr = RiOs.getAccessAddress(siginfo, ucontext);
-			if (RedZones.isInRedZone(addr)) {
-				pip.store<Pointer>(r.start + interpreterCode.stackOverflowHandlerOffset);
+		match (signum) {
+			SIGFPE => {
+				// presume divide/modulus by zero
+				pip.store<Pointer>(start + divZeroHandlerOffset);
 				return true;
 			}
-			pip.store<Pointer>(r.start + interpreterCode.oobMemoryHandlerOffset);
-			return true;
+			SIGBUS, SIGSEGV => {
+				var addr = RiOs.getAccessAddress(siginfo, ucontext);
+				if (RedZones.isInRedZone(addr)) {
+					pip.store<Pointer>(start + stackOverflowHandlerOffset);
+					return true;
+				}
+				pip.store<Pointer>(start + oobMemoryHandlerOffset);
+				return true;
+			}
 		}
+		return true;
 	}
-	return true;
 }
 
 // Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
@@ -408,14 +439,6 @@ def fatal(msg: string) {
 //-- Begin Interpreter Generator
 //------------------------------------------------------------------------------------------------
 
-// The result of generating an interpreter is machine code with some known offsets into it.
-class InterpreterCode(range: MemoryRange) {
-	var v3EntryOffset: int;			// entry from V3 calling code
-	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
-	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
-	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
-}
-
 // Internal register configuration for variables live in the interpreter execution context.
 def R: X86_64Regs, G = X86_64Regs.GPRs, C: X86_64Conds;
 enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mutable: bool) {
@@ -495,7 +518,7 @@ def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 // Statically-allocated buffer (in compiled binary).
 def global_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE);
 
-// Generates {InterpreterCode} for X86-64.
+// Generates {X86_64InterpreterCode} for X86-64.
 class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def w = DataWriter.new().reset(global_buffer, 0, 0);
 	def w_ool = DataWriter.new().reset(global_buffer, INL_SIZE, INL_SIZE);
@@ -506,7 +529,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def offsets = V3Offsets.new();
 	def tuning = X86_64InterpreterTuning.new();
 
-	var ic: InterpreterCode;
+	var ic: X86_64InterpreterCode;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
@@ -533,7 +556,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		ool.patcher = ool.d.patcher = p;
 	}
 
-	def gen() -> InterpreterCode {
+	def gen() -> X86_64InterpreterCode {
 		// Compute a range of memory within the statically-allocated {global_buffer}.
 		var start = Pointer.atElement(global_buffer, 0);
 		var mask = 4095L;
@@ -550,7 +573,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			fatal(Strings.format1("generated code start address of 0x%x out of 31-bit range", (start - Pointer.NULL)));
 		}
 
-		ic = InterpreterCode.new(range);
+		ic = X86_64InterpreterCode.new(range.start, range.end, frameSize);
 		// Reserve space for pointers to interpreter runtime calls
 		w.skipN(int.!(skip));  // page-align start of code to avoid write-protecting other parts of static heap
 		w.align(8);
@@ -792,8 +815,8 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def writeDispatchEntry(ref: IcCodeRef, opcode: int, offset: int) {
 		match (tuning.dispatchEntrySize) {
 			2 => w.at(ref.offset + 2 * opcode).put_b16(offset - ref.offset);
-			4 => w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.range.start + offset) - Pointer.NULL));
-			8 => w.at(ref.offset + 8 * opcode).put_b64((ic.range.start + offset) - Pointer.NULL);
+			4 => w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.start + offset) - Pointer.NULL));
+			8 => w.at(ref.offset + 8 * opcode).put_b64((ic.start + offset) - Pointer.NULL);
 		}
 	}
 	def genConsts() {
@@ -2304,13 +2327,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				asm.ijmp_r(base);
 			}
 			4 => {
-				var addr = ic.range.start + ref.offset;
+				var addr = ic.start + ref.offset;
 				asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
 			}
 			8 => {
-				var addr = ic.range.start + ref.offset;
+				var addr = ic.start + ref.offset;
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
 			}
