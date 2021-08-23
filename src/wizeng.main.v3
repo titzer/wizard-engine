@@ -3,16 +3,13 @@
 
 // Parses and runs binary .wasm files.
 def main(args: Array<string>) -> int {
-	var trace = false;
 	var engine = Engine.new();
 	var programArgs: Array<string>;
 	var path: string;
 	// Parse option and extract module and module arguments
 	for (i < args.length) {
 		var a = args[i];
-		if (Strings.startsWith(a, "-trace-module=")) {
-			trace = true;
-		} else if (a.length > 0 && a[0] == '-') {
+		if (a.length > 0 && a[0] == '-') {
 			var ok = TraceOptions.parse(a) || EngineOptions.parse(engine, a);
 
 			if (!ok) return ErrorBuilder.new()
@@ -70,6 +67,8 @@ def main(args: Array<string>) -> int {
 			i.processors.put(p);
 		}
 	}
+	var exe = Target.newInterpreter();
+	if (Trace.module) i.binder = ImportTracer.new(exe, TraceOptions.moduleGlob, TraceOptions.fieldGlob).wrap;  // intercepts and injects tracing
 
 	// Run the instantiatior.
 	var instance = i.run();
@@ -93,7 +92,6 @@ def main(args: Array<string>) -> int {
 		.exit(7);
 
 	// Execute the main entrypoint.
-	var exe = Target.newInterpreter();
 	var r = exe.run(-1, entry.0, entry.1);
 	match (r) {
 		Break => ;
@@ -135,4 +133,79 @@ class HostModule extends ImportProcessor {
 	def getEntry(instance: Instance) -> (Function, Array<Value>) { return (null, null); }
 	// De-initialize after running.
 	def deinit(result: Result) { }
+}
+// Wraps imported functions with tracing. Can apply a filter to be selective on which imports to trace.
+class ImportTracer(exe: Interpreter, var module_filter: GlobMatcher, var field_filter: GlobMatcher) {
+	def wrap(decl: Decl, ex: Exportable) -> Exportable {
+		if (!Function.?(ex)) return ex;
+		var func = Function.!(ex);
+		var imp = decl.imp;
+		if (module_filter != null && !module_filter.matches(imp.module_name)) return ex;
+		if (field_filter != null && !field_filter.matches(imp.module_name)) return ex;
+		var name = Strings.format1("trace(%q)", func.render);
+		func = HostFunctionN.new(name, func.sig, traceCall(imp, func, _));
+		return func;
+	}
+	def traceCall(imp: ImportInfo, f: Function, args: Array<Value>) -> HostResult {
+		var out = Trace.OUT;
+		out.puts(imp.module_name);
+		out.putc('.');
+		out.puts(imp.field_name);
+		Values.renderVals(out, args);
+		out.outln();
+		if (WasmFunction.?(f)) {
+			var result = exe.run(-1, f, args);
+			out.puts("  ==> ");
+			result.render(out);
+			out.outln();
+			match (result) {
+				Break => return HostResult.Error("unexpected break");
+				Value(vals) => return HostResult.ValueN(vals);
+				Trap(reason) => return HostResult.Trap(reason);
+			}
+		}
+		var result: HostResult;
+		match (f) {
+			hf: HostFunction0 => {
+				if (Trace.interpreter) exe.traceCallHostFunction(hf);
+				result = hf.invoke0();
+			}
+			hf: HostFunction1 => {
+				if (Trace.interpreter) exe.traceCallHostFunction(hf);
+				result = hf.invoke1(args[0]);
+			}
+			hf: HostFunction2 => {
+				if (Trace.interpreter) exe.traceCallHostFunction(hf);
+				result = hf.invoke2(args[0], args[1]);
+			}
+			hf: HostFunction3 => {
+				if (Trace.interpreter) exe.traceCallHostFunction(hf);
+				result = hf.invoke3(args[0], args[1], args[2]);
+			}
+			hf: HostFunctionN => {
+				if (Trace.interpreter) exe.traceCallHostFunction(hf);
+				result = hf.invokeN(args);
+			}
+		}
+		out.puts("  ==> ");
+		match (result) {
+			Value0 => {
+			}
+			Value1(val) => {
+				val.render(out);
+			}
+			ValueN(vals) => {
+				if (vals.length == 1) {
+					vals[0].render(out);
+				} else {
+					Values.renderVals(out, vals);
+				}
+			}
+			Trap(reason) => out.put1("trap %s", reason.name);
+			Error(msg) => out.put1("error %s", msg);
+			TailCall(func, args) => out.puts("<tailcall>");
+		}
+		out.outln();
+		return result;
+	}
 }
