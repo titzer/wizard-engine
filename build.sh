@@ -40,12 +40,18 @@ SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WIZENG="src/wizeng.main.v3"
 WAVE="src/wave/*.v3"
 WASI="src/wasi/*.v3"
+WASI_X86_64_LINUX="src/wasi/x86-64-linux/*.v3"
 JAWA="src/jawa/*.v3"
 
-# compute sources
 PROGRAM=$1
+TARGET=$2
+
+# compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
     SOURCES="$ENGINE $WIZENG $WAVE $WASI"
+    if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
+        SOURCES="$SOURCES $WASI_X86_64_LINUX"
+    fi
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
@@ -57,7 +63,6 @@ else
 fi
 
 # build
-TARGET="$2"
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
     v3c-x86-linux -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
