@@ -279,14 +279,20 @@ class X86_64InterpreterCode extends RiUserCode {
 	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
 	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
 	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
+	var buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
 
 	new(start: Pointer, end: Pointer, frameSize) super(start, end) { }
 
 	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
-		var msg = "\tin (interpreter frame)\n";
+		var msg = "\tin [fast-int] ";
 		out(msg, 0, msg.length);
-		// TODO: render WasmFunction and offset in frame
+		var instance = (sp + IVar.INSTANCE.frameOffset).load<Instance>();
+		var func = (sp + IVar.FUNC_DECL.frameOffset).load<FuncDecl>();
+		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
+		func.render(instance.module.names, buf);
+		buf.ln().out(out);
+		buf.reset();
 	}
 
 	// Called from V3 runtime for a frame where {ip} is in interpreter code.
@@ -296,9 +302,35 @@ class X86_64InterpreterCode extends RiUserCode {
 		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
 	}
 
-	// Called from V3 runtime when the garbage collector needs to scan this stack frame.
-	def scanFrame(ip: Pointer, sp: Pointer) { } // TODO
+	// Called from V3 runtime when the garbage collector needs to scan an interpreter stack frame.
+	def scanFrame(ip: Pointer, sp: Pointer) {
+		// Handle code and interior pointers
+		var code_loc = (sp + IVar.CODE.frameOffset);
+		var code = code_loc.load<Pointer>();
+		var ip_delta = (sp + IVar.IP.frameOffset).load<Pointer>() - code;
+		var eip_delta = (sp + IVar.EIP.frameOffset).load<Pointer>() - code;
+		RiGc.scanRoot(code_loc);
+		var new_code = code_loc.load<Pointer>();
+		if (new_code != code) {
+			(sp + IVar.IP.frameOffset).store<Pointer>(new_code + ip_delta);
+			(sp + IVar.EIP.frameOffset).store<Pointer>(new_code + eip_delta);
+		}
 
+		// Handle xcode and interior pointer
+		var xcode_loc = (sp + IVar.XCODE.frameOffset);
+		var xcode = xcode_loc.load<Pointer>();
+		var xip_delta = (sp + IVar.XIP.frameOffset).load<Pointer>() - xcode;
+		RiGc.scanRoot(xcode_loc);
+		var new_xcode = xcode_loc.load<Pointer>();
+		if (new_xcode != xcode) {
+			(sp + IVar.XIP.frameOffset).store<Pointer>(new_xcode + xip_delta);
+		}
+
+		// Handle other roots in the frame
+		RiGc.scanRoot(sp + IVar.INTERPRETER.frameOffset);
+		RiGc.scanRoot(sp + IVar.FUNC_DECL.frameOffset);
+		RiGc.scanRoot(sp + IVar.INSTANCE.frameOffset);
+	}
 
 	// Called from V3 runtime to handle an OS-level signal that occurred while {ip} was in interpreter code.
 	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool {
@@ -447,11 +479,13 @@ enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mut
 	MEM0_BASE	(-1,	R.R10,	8,	true,	false),	// base of memory #0
 	VFP		(-1,	R.R11,	16,	false,	false),	// value stack frame pointer
 	VSP		(2,	R.RSI,	24,	false,	true),	// value stack stack pointer
-	XIP		(-1,	R.RBX,	32,	false,	true),	// extended instruction pointer
-	IP		(-1,	R.RAX,	40,	false,	true),	// current instruction pointer
-	EIP		(-1,	R.R13,	48,	false,	false),	// end instruction pointer
-	FUNC_DECL	(-1,	R.R12,	56,	true,	false),	// FuncDecl
-	INSTANCE	(-1,	R.RDI,	64,	true,	false)	// Instance
+	XCODE		(-1,	null,	32,	false,  false), // extended code array
+	XIP		(-1,	R.RBX,	40,	false,	true),	// extended instruction pointer
+	CODE		(-1,	null,	48,	false,  false), // code array
+	IP		(-1,	R.RAX,	56,	false,	true),	// current instruction pointer
+	EIP		(-1,	R.R13,	64,	false,	false),	// end instruction pointer
+	FUNC_DECL	(-1,	R.R12,	72,	true,	false),	// FuncDecl
+	INSTANCE	(-1,	R.RDI,	80,	true,	false)	// Instance
 }
 // Shorthand for codegen.
 component I {
@@ -700,6 +734,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var codeReg = I.r0;
 		asm.movq_r_m(codeReg, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_code));
 		asm.movq_r_m(tmp, codeReg.plus(offsets.Code_code));
+		asm.movq_m_r(R.RSP.plus(IVar.CODE.frameOffset), tmp); // save CODE
 		asm.lea(IVar.IP.gpr, tmp.plus(offsets.Array_contents));
 		saveIVar(IVar.IP);
 		// Load IP + code.length into EIP
@@ -708,6 +743,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		saveIVar(IVar.EIP);
 		// Load &func.code.xcode[0] into XIP
 		asm.movq_r_m(tmp, codeReg.plus(offsets.Code_xcode));
+		asm.movq_m_r(R.RSP.plus(IVar.XCODE.frameOffset), tmp); // save XCODE
 		asm.lea(IVar.XIP.gpr, tmp.plus(offsets.Array_contents));
 		saveIVar(IVar.XIP);
 
