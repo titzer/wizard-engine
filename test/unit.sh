@@ -84,7 +84,7 @@ function make_unittest() {
 
 cmd="$WIZENG_LOC/bin/unittest.$TEST_TARGET"
 
-printf "Testing ${CYAN}unit${NORM} ($TEST_TARGET) | "
+printf "Testing ${CYAN}%-10s${NORM} %-13s | " unit $TEST_TARGET
 # run unittests and pipe through progress program
 LOG=/tmp/wizeng.unit.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then

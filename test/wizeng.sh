@@ -29,7 +29,7 @@ if [ "$RET" != 0 ]; then
     exit $RET
 fi
 
-printf "Testing ${CYAN}wizeng${NORM} (${TEST_TARGET}) | "
+printf "Testing ${CYAN}%-10s${NORM} %-13s | " wizeng $TEST_TARGET
 
 cd $(dirname ${BASH_SOURCE[0]})/wave
 WIZENG=$WIZENG_LOC/bin/wizeng.$TEST_TARGET
