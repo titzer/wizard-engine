@@ -10,27 +10,39 @@ type ValueType {
 	case F32;						// 32-bit float
 	case F64;						// 64-bit float
 	case VEC128;						// 128-bit vector
-	case ANYREF;						// supertype of all references
-	case I31REF;						// i31 or reference
-	case FUNCREF;						// supertype of all funcref types
-	case EXTERNREF;						// supertype of all extern types
 	case EXTERNREF_NULL;					// used internally
-	case RefFunc(nullable: bool, sig: SigDecl);		// reference to a function
-	case RefStruct(nullable: bool, sdecl: StructDecl);	// reference to a struct
-	case RefArray(nullable: bool, array: ArrayDecl);	// reference to an array
-	case FwRef(nullable: bool, index: u32);			// used in resolving cycles
-	case Rtt(depth: int, heaptype: HeapTypeDecl);		// type of runtime type values
 	case Abstract(it: AbsTypeDecl);				// imported abstract types
 	case Host(host: HostType);				// host-defined types
+	case Ref(nullable: bool, heap: HeapType);
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		return ValueTypes.render(this, null, buf);
 	}
 }
+type HeapType {
+	case ANY;
+	case EXTERN;
+	case DATA;
+	case EQ;
+	case I31;
+	case Func(sig: SigDecl);
+	case Struct(sdecl: StructDecl);
+	case Array(array: ArrayDecl);
+	case Rtt(depth: int, hdecl: HeapTypeDecl);
+	case FwRef(index: int);
+}
 
 // Utility functions associated with value types.
 component ValueTypes {
+	def ANYREF = ValueType.Ref(true, HeapType.ANY);
+	def EXTERNREF = ValueType.Ref(true, HeapType.EXTERN);
+	def EQREF = ValueType.Ref(true, HeapType.EQ);
+	def DATAREF = ValueType.Ref(true, HeapType.DATA);
+	def I31REF = ValueType.Ref(true, HeapType.I31);
+	def FUNCREF = ValueType.Ref(true, HeapType.Func(null));
+
 	def NONE = Array<ValueType>.new(0);
+
 	// Render a value type, careful not to recurse into any type in {seen}.
 	def render(vt: ValueType, seen: List<Decl>, buf: StringBuilder) -> StringBuilder {
 		var s: string;
@@ -48,49 +60,46 @@ component ValueTypes {
 				else buf.puts("<null>");
 				return buf.puts(")");
 			}
-			ANYREF => s = "(ref any)";
-			I31REF => s = "(ref i31)";
-			FUNCREF => s = "(ref func)";
-			EXTERNREF => s = "(ref extern)";
 			EXTERNREF_NULL => s = "externref null";
-			RefFunc(nullable, sig) => {
-				buf.puts("(ref ");
-				if (nullable) buf.puts("null ");
-				if (sig != null) sig.render2(seen, buf);
-				else buf.puts("<null>");
-				return buf.puts(")");
-			}
-			RefStruct(nullable, sdecl) => {
-				buf.puts("(ref ");
-				if (nullable) buf.puts("null ");
-				buf.put1("struct #%d", sdecl.struct_index);
-				return buf.puts(")");
-			}
-			RefArray(nullable, array) => {
-				buf.puts("(ref ");
-				if (nullable) buf.puts("null ");
-				buf.put1("array #%d", array.array_index);
-				return buf.puts(")");
-			}
-			Rtt(depth, heaptype) => {
-				buf.puts("(rtt ");
-				if (depth < 0) buf.puts("n ");
-				else buf.putd(depth).sp();
-				match (heaptype) {
-					x: StructDecl => buf.put1("#%d", x.struct_index);
-					x: ArrayDecl => buf.put1("#%d", x.array_index);
-					x: SigDecl => buf.put1("#%d", x.sig_index);
-					null => buf.puts("any");
+			Ref(nullable, heap) => {
+				match (heap) {
+					ANY => renderSimpleRef(buf, nullable, "any");
+					EXTERN => renderSimpleRef(buf, nullable, "extern");
+					DATA => renderSimpleRef(buf, nullable, "data");
+					EQ => renderSimpleRef(buf, nullable, "eq");
+					I31 => renderSimpleRef(buf, nullable, "i31");
+					Func(sig) => {
+						if (sig == null) renderSimpleRef(buf, nullable, "func");
+						else sig.render2(seen, buf.puts("(ref ")).puts(")");
+					}
+					Struct(sdecl) => renderIndexedRef(buf, nullable, "struct", sdecl.struct_index);
+					Array(array) => renderIndexedRef(buf, nullable, "array", array.array_index);
+					Rtt(depth, hdecl) => {
+						buf.puts("(rtt ");
+						if (depth >= 0) buf.putd(depth).sp();
+						match (hdecl) {
+							x: StructDecl => buf.put1("#%d", x.struct_index);
+							x: ArrayDecl => buf.put1("#%d", x.array_index);
+							x: SigDecl => buf.put1("#%d", x.sig_index);
+							null => buf.puts("any");
+						}
+						buf.puts(")");
+					}
+					FwRef(index) => buf.put1("(ref #%d)", index);
 				}
-				return buf.puts(")");
-			}
-			FwRef(nullable, index) => {
-				buf.puts("(ref ");
-				if (nullable) buf.puts("null ");
-				buf.put1("#%d)", index);
+				return buf;
 			}
 		}
 		return buf.puts(s);
+	}
+	def renderSimpleRef(buf: StringBuilder, nullable: bool, str: string) {
+		if (nullable) buf.puts(str).puts("ref");
+		else buf.puts("(ref ").puts(str).puts(")");
+	}
+	def renderIndexedRef(buf: StringBuilder, nullable: bool, str: string, index: int) {
+		buf.puts("(ref ");
+		if (nullable) buf.puts("null ");
+		buf.put2("%s #%d)", str, index);
 	}
 	def isNumeric(t: ValueType) -> bool {
 		match (t) {
@@ -100,7 +109,7 @@ component ValueTypes {
 	}
 	def isRef(t: ValueType) -> bool {
 		match (t) {
-			BOTTOM, FUNCREF, EXTERNREF, RefFunc, RefStruct, RefArray, Host => return true;
+			BOTTOM, Ref, Host => return true;
 			Abstract(abs) => return abs.is_externref;
 			_ => return false;
 		}
@@ -112,7 +121,7 @@ component ValueTypes {
 		return eq == TypeEquiv.EQUAL || eq == TypeEquiv.SUB;
 	}
 	def isAssignableHeap(from: HeapTypeDecl, to: HeapTypeDecl) -> bool {
-		return isAssignable(ref(false, from), ref(false, to));
+		return isAssignable(Ref(false, from), Ref(false, to)); // XXX: make more efficient
 	}
 	def isEquivalent(x: ValueType, y: ValueType) -> bool {
 		var c = TypeComparator.new();
@@ -127,20 +136,75 @@ component ValueTypes {
 	}
 	def hasDefaultValue(t: ValueType) -> bool {
 		match (t) {
-			RefFunc(nullable, sig) => return nullable;
-			RefStruct(nullable, sdecl) => return nullable;
-			RefArray(nullable, array) => return nullable;
+			Ref(nullable, sig) => return nullable;
 			Abstract(abs) => return abs.has_default;
 			_ => return true;
 		}
 	}
-	def ref(nullable: bool, ht: HeapTypeDecl) -> ValueType {
+	def Ref(nullable: bool, ht: HeapTypeDecl) -> ValueType.Ref {
 		match (ht) {
-			x: StructDecl => return ValueType.RefStruct(nullable, x);
-			x: ArrayDecl => return ValueType.RefArray(nullable, x);
-			x: SigDecl => return ValueType.RefFunc(nullable, x);
-			_ => return ValueType.ANYREF; // should not happen
+			x: StructDecl => return ValueType.Ref(nullable, HeapType.Struct(x));
+			x: ArrayDecl => return ValueType.Ref(nullable, HeapType.Array(x));
+			x: SigDecl => return ValueType.Ref(nullable, HeapType.Func(x));
+			_ => return ValueTypes.ANYREF; // should not happen
 		}
+	}
+	def RefStruct(nullable: bool, x: StructDecl) -> ValueType.Ref {
+		return ValueType.Ref(nullable, HeapType.Struct(x));
+	}
+	def RefArray(nullable: bool, x: ArrayDecl) -> ValueType.Ref {
+		return ValueType.Ref(nullable, HeapType.Array(x));
+	}
+	def RefFunc(nullable: bool, x: SigDecl) -> ValueType.Ref {
+		return ValueType.Ref(nullable, HeapType.Func(x));
+	}
+	def map(t: ValueType, f: ValueType -> (bool, ValueType)) -> (bool, ValueType) {
+		var n = f(t);
+		if (n.0) return n;
+		match (t) {
+			Abstract(it) => {
+				var nassignable = mapArray(it.assignable, f);
+				if (nassignable.0) {
+					var nt = AbsTypeDecl.new(it.has_default, it.is_externref, nassignable.1);
+					nt.imp = it.imp;
+					nt.abstype_index = it.abstype_index;
+					return (true, ValueType.Abstract(nt));
+				}
+			}
+			Ref(nullable, heap) => {
+				match (heap) {
+					Func(sig) => {
+						if (sig == null) return (false, t);
+						var np = mapArray(sig.params, f);
+						var nr = mapArray(sig.results, f);
+						if (np.0 | nr.0) return (true, ValueType.Ref(nullable, HeapType.Func(SigDecl.new(np.1, nr.1))));
+					}
+					Struct(sdecl) => { // TODO
+					}
+					Array(array) => { // TODO
+					}
+					Rtt(depth, hdecl) => { // TODO
+					}
+					_ => ;
+				}
+			}
+			_ => ;
+		}
+		return (false, t);
+	}
+	def mapArray(array: Array<ValueType>, f: ValueType -> (bool, ValueType)) -> (bool, Array<ValueType>) {
+		for (i < array.length) {
+			var r = map(array[i], f);
+			if (r.0) {
+				var narray = Arrays.dup(array);
+				narray[i] = r.1;
+				for (j = i + 1; j < array.length; j++) {
+					narray[j] = map(array[j], f).1;
+				}
+				return (true, narray);
+			}
+		}
+		return (false, array);
 	}
 }
 
@@ -158,78 +222,15 @@ class TypeComparator {
 	def compare(from: ValueType, to: ValueType) -> TypeEquiv {
 		if (from == to) return TypeEquiv.EQUAL;
 		match (from) {
-			EXTERNREF => match (to) {
-				ANYREF => return TypeEquiv.SUB;
-				EXTERNREF_NULL => return TypeEquiv.SUPER;
-				_ => ;
-			}
 			EXTERNREF_NULL => match (to) {
-				EXTERNREF, ANYREF => return TypeEquiv.SUB;
+				Ref(nullable, heap) => match (heap) {
+					EXTERN, ANY => return if(nullable, TypeEquiv.SUB, TypeEquiv.UNRELATED);
+					_ => return TypeEquiv.UNRELATED;
+				}
 				Abstract(tabs) => {
 					if (tabs.is_externref && tabs.has_default) return TypeEquiv.SUB;
 					return TypeEquiv.UNRELATED;
 				}
-				_ => ;
-			}
-			FUNCREF => match (to) {
-				ANYREF => return TypeEquiv.SUB;
-				RefFunc => return TypeEquiv.SUPER;
-				_ => ;
-			}
-			ANYREF => match (to) {
-				EXTERNREF,
-				EXTERNREF_NULL,
-				FUNCREF,
-				I31REF,
-				RefFunc,
-				RefStruct,
-				RefArray,
-				Rtt => return TypeEquiv.SUPER;
-				_ => ;
-			}
-			I31REF => match (to) {
-				ANYREF => return TypeEquiv.SUB;
-				_ => ;
-			}
-			RefFunc(fnullable, fsig) => match (to) {
-				ANYREF, FUNCREF => return TypeEquiv.SUB;
-				RefFunc(tnullable, tsig) => {
-					var result = compareNullable(fnullable, tnullable);
-					if (push(fsig, tsig)) {
-						result = compareTypes(result, tsig.params, fsig.params);
-						result = compareTypes(result, fsig.results, tsig.results);
-						pop();
-					}
-					return result;
-				}
-				_ => return TypeEquiv.UNRELATED;
-			}
-			RefStruct(fnullable, fstruct) => match (to) {
-				ANYREF => return TypeEquiv.SUB;
-				RefStruct(tnullable, tstruct) => {
-					var result = compareNullable(fnullable, tnullable);
-					if (push(fstruct, tstruct)) {
-						result = compareStorageTypes(result, fstruct.field_types, tstruct.field_types);
-						pop();
-					}
-					return result;
-				}
-				_ => return TypeEquiv.UNRELATED;
-			}
-			RefArray(fnullable, farray) => match (to) {
-				ANYREF => return TypeEquiv.SUB;
-				RefArray(tnullable, tarray) => {
-					var result = compareNullable(fnullable, tnullable);
-					if (push(farray, tarray)) {
-						result = compareStorageTypes(result, farray.elem_types,	tarray.elem_types);
-						pop();
-					}
-					return result;
-				}
-				_ => return TypeEquiv.UNRELATED;
-			}
-			Rtt(fdepth, fheaptype) => match(to) {
-				ANYREF => return TypeEquiv.SUB;
 				_ => ;
 			}
 			Abstract(fabs) => match (to) {
@@ -248,6 +249,17 @@ class TypeComparator {
 					return TypeEquiv.UNRELATED;
 				}
 				_ => return if(fhost != null && fhost.isAssignableTo(to), TypeEquiv.SUB, TypeEquiv.UNRELATED);
+			}
+			Ref(fnullable, fheap) => match (to) {
+				Ref(tnullable, theap) => {
+					var eq = compareNullable(fnullable, tnullable);
+					return combineEq(eq, compareHeapTypes(fheap, theap));
+				}
+				EXTERNREF_NULL => {
+					if (fnullable && (fheap == HeapType.EXTERN || fheap == HeapType.ANY)) return TypeEquiv.SUPER;
+					else return TypeEquiv.UNRELATED;
+				}
+				_ => ;
 			}
 			_ => ;
 		}
@@ -290,6 +302,72 @@ class TypeComparator {
 			}
 		}
 		return eq;
+	}
+	def compareHeapTypes(from: HeapType, to: HeapType) -> TypeEquiv {
+		if (from == to) return TypeEquiv.EQUAL;
+		match (from) {
+			EQ,
+			EXTERN => match (to) {
+				ANY => return TypeEquiv.SUB;
+				_ => ;
+			}
+			ANY => return TypeEquiv.SUPER;
+			DATA,
+			I31 => match (to) {
+				EQ, ANY => return TypeEquiv.SUB;
+				_ => ;
+			}
+			Func(fsig) => match (to) {
+				ANY => return TypeEquiv.SUB;
+				Func(tsig) => {
+					if (fsig == null) return TypeEquiv.SUPER;
+					if (tsig == null) return TypeEquiv.SUB;
+					var result = TypeEquiv.EQUAL;
+					if (push(fsig, tsig)) {
+						result = compareTypes(result, tsig.params, fsig.params);
+						result = compareTypes(result, fsig.results, tsig.results);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			Struct(fstruct) => match (to) {
+				DATA, EQ, ANY => return TypeEquiv.SUB;
+				Struct(tstruct) => {
+					var result = TypeEquiv.EQUAL;
+					if (push(fstruct, tstruct)) {
+						result = compareStorageTypes(result, fstruct.field_types, tstruct.field_types);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			Array(farray) => match (to) {
+				DATA, EQ, ANY => return TypeEquiv.SUB;
+				Array(tarray) => {
+					var result = TypeEquiv.EQUAL;
+					if (push(farray, tarray)) {
+						result = compareStorageTypes(result, farray.elem_types,	tarray.elem_types);
+						pop();
+					}
+					return result;
+				}
+				_ => return TypeEquiv.UNRELATED;
+			}
+			Rtt(fdepth, fheaptype) => match(to) {
+				EQ, ANY => return TypeEquiv.SUB;
+				Rtt(tdepth, theaptype) => {
+					if (fheaptype != theaptype) return TypeEquiv.UNRELATED;
+					if (tdepth < 0 && fdepth >= 0) return TypeEquiv.SUB;					
+					if (fdepth < 0 && tdepth >= 0) return TypeEquiv.SUPER;					
+				}
+				_ => ;
+			}
+			_ => ;
+		}
+		return TypeEquiv.UNRELATED;
 	}
 	def compareNullable(f: bool, t: bool) -> TypeEquiv {
 		return if(f,
