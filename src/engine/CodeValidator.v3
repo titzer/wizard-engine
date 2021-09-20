@@ -552,7 +552,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						}
 						Opcode.I31_NEW.code => {
 							popE(ValueType.I32);
-							push(ValueTypes.I31REF);
+							push(ValueTypes.I31REF_NONNULL);
 						}
 						Opcode.I31_GET_S.code => {
 							popE(ValueTypes.I31REF);
@@ -567,30 +567,27 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 							push(ValueType.Ref(false, HeapType.Rtt(1, t1))); // TODO: hash and lookup canonical RTT
 						}
 						Opcode.RTT_SUB.code => {
-							var depth = parser.readU32("rtt depth", limits.max_rtt_depth);
-							var t1 = parser.readHeapType();
-							var t2 = parser.readHeapType();
-							if (t1 == null) return;
-							if (t2 == null) return;
-							if (!ValueTypes.isAssignableHeap(t2, t1)) err_atpc().ExpectedSubtypeH(t1, t2);
-							popE(ValueType.Ref(true, HeapType.Rtt(int.!(depth), t1)));
-							push(ValueType.Ref(false, HeapType.Rtt(int.!(depth) + 1, t2)));
+							var sub = parser.readHeapType();
+							if (sub == null) return;
+							var rtt = popRtt();
+							if (rtt.1) {
+								var subrtt = HeapType.Rtt(if(rtt.0.depth >= 0, rtt.0.depth + 1, -1), sub);
+								var result = ValueType.Ref(false, subrtt);
+								if (!ValueTypes.isAssignableHeap(sub, rtt.0.hdecl)) err_atpc().ExpectedRttSubType(result, rtt.0);
+								push(result);
+							}
 						}
 						Opcode.REF_TEST.code => {
 							var rtt = popRtt();
-							var ref = popConcreteRef();
-							if (ref.1) {
-								if (!ValueTypes.isRttSuperType(ref.0, rtt.0)) err_atpc().ExpectedRttSuperType(ref.0, rtt.0);
-							}
+							var ref = popRef();
+							if (ref.1) checkRttSubtype(ref.0, rtt.0);
 							push(ValueType.I32);
 						}
 						Opcode.REF_CAST.code => {
 							var rtt = popRtt();
-							var ref = popConcreteRef();
-							if (ref.1) {
-								if (!ValueTypes.isRttSuperType(ref.0, rtt.0)) err_atpc().ExpectedRttSuperType(ref.0, rtt.0);
-							}
-							push(rttToHeapType(rtt.0));
+							var ref = popRef();
+							if (ref.1) checkRttSubtype(ref.0, rtt.0);
+							push(rttToRefTypeWithOriginalNullability(ref.0, rtt.0));
 						}
 						Opcode.BR_ON_CAST.code => {
 							var depth = parser.readLabel();
@@ -598,11 +595,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 							if (target == null) return;
 							var rtt = popRtt();
 							ctlxfer.refS(target, opcode_pos, val_stack);
-							var ref = popConcreteRef();
-							if (ref.1) {
-								if (!ValueTypes.isRttSuperType(ref.0, rtt.0)) err_atpc().ExpectedRttSuperType(ref.0, rtt.0);
-							}
-							push(rttToHeapType(rtt.0));
+							var ref = popRef();
+							if (ref.1) checkRttSubtype(ref.0, rtt.0);
+							push(ValueTypes.Ref(false, rtt.0.hdecl));
 							checkAndPopArgs(labelArgs(target));
 							push(ref.0);  // leave original value
 						}
@@ -612,13 +607,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 							if (target == null) return;
 							var rtt = popRtt();
 							ctlxfer.refS(target, opcode_pos, val_stack);
-							var ref = popConcreteRef();
-							if (ref.1) {
-								if (!ValueTypes.isRttSuperType(ref.0, rtt.0)) err_atpc().ExpectedRttSuperType(ref.0, rtt.0);
-							}
-							push(ref.0);  // leave original value
+							var ref = popRef();
+							if (ref.1) checkRttSubtype(ref.0, rtt.0);
+							push(ref.0); // leave original value
 							checkAndPopArgs(labelArgs(target));
-							push(rttToHeapType(rtt.0));
+							push(ValueTypes.Ref(false, rtt.0.hdecl));
 						}
 						Opcode.REF_IS_FUNC.code,
 						Opcode.REF_IS_DATA.code,
@@ -746,20 +739,20 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			if (Trace.validation) traceStack(false);
 		}
 	}
-	def rttToHeapType(rtt: ValueType) -> ValueType.Ref {
-		var result = ValueTypes.ANYREF_NONNULL;
-		match (rtt) {
-			Ref(nullable, heap) => match (heap) {
-				Rtt(depth, hdecl) => match (hdecl) {
-					x: SigDecl => result = ValueType.Ref(false, HeapType.Func(x));
-					x: StructDecl => result = ValueType.Ref(false, HeapType.Struct(x));
-					x: ArrayDecl => result = ValueType.Ref(false, HeapType.Array(x));
-				}
-				_ => ;
-			}
+
+	def checkRttSubtype(ref: ValueType, rtt: HeapType.Rtt) {
+		if (!ValueTypes.isAssignable(ValueTypes.Ref(false, rtt.hdecl), ref)) {
+			err_atpc().ExpectedRttSuperType(ref, rtt);
+		}
+	}
+	def rttToRefTypeWithOriginalNullability(ref: ValueType, rtt: HeapType.Rtt) -> ValueType.Ref {
+		var nullable = true;
+		match (ref) {
+			Ref(nnullable, heap) => nullable = nnullable;
+			Abstract(abs) => nullable = abs.has_default;
 			_ => ;
 		}
-		return result;
+		return ValueTypes.Ref(nullable, rtt.hdecl);
 	}
 	def checkBrOn(rt: ValueType) {
 		var depth = parser.readLabel();
@@ -859,16 +852,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			err_atpc().ExpectedType(expected, t);
 		}
 	}
-	def popRtt() -> (ValueType, bool) {
+	def popRtt() -> (HeapType.Rtt, bool) {
 		var t = popAny();
 		if (t.1) {
 			match (t.0) {
-				Ref(nullable, heap) => if (HeapType.Rtt.?(heap)) return t;
+				Ref(nullable, heap) => if (HeapType.Rtt.?(heap)) return (HeapType.Rtt.!(heap), true);
 				_ => ;
 			}
 			err_atpc().ExpectedRtt(t.0);
 		}
-		return t;
+		return (HeapType.Rtt(-1, null), t.1);
 	}
 	def popRtt2(expected: HeapTypeDecl) -> HeapType.Rtt {
 		var t = popAny();
@@ -883,7 +876,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			_ => ;
 		}
 		err_atpc().ExpectedRtt2(expected, t.0);
-		return HeapType.Rtt(0, null);
+		return HeapType.Rtt(-1, null);
 	}
 	def checkReturnSig(results: Array<ValueType>) {
 		var expected = sig.results;
@@ -926,19 +919,21 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		if (t.1 && !ValueTypes.isRef(t.0)) err_atpc().ExpectedRefType(t.0);
 		return t;
 	}
-	def popConcreteRef() -> (ValueType, bool) {
+	def popNullableRef() -> (bool, ValueType, bool) {
 		var t = popAny();
 		if (t.1) {
 			match (t.0) {
 				Ref(nullable, heap) => match(heap) {
-					DATA, Struct, Array, Func => return t;
+					Struct(sdecl) => return (nullable, t.0, t.1);
+					Array(array) => return (nullable, t.0, t.1);
+					Func(sig) => return (nullable, t.0, t.1);
 					_ => ;
 				}
 				_ => ;
 			}
-			err_atpc().ExpectedConcreteRefType(t.0);
+			err_atpc().ExpectedRefType(t.0);
 		}
-		return t;
+		return (true, t.0, t.1);
 	}
 	def asNonNullRefType(t: ValueType) -> ValueType {
 		match (t) {
