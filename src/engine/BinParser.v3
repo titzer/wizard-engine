@@ -660,11 +660,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		else init_stack.clear();
 		var wasEnd = false;
 		var pt = decoder.pos;
+		var last: byte;
 		while (decoder.pos < decoder.limit) {
 			pt = decoder.pos;
-			def opcode = readByte("opcode", Opcodes.render);
-			wasEnd = false;
-			match (opcode) {
+			last = readByte("opcode", Opcodes.render);
+			match (last) {
 				Opcode.I32_CONST.code => {
 					var val = readI32();
 					init_stack.push(ValueType.I32, InitExpr.I32(int.view(val)));
@@ -699,15 +699,55 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 					}
 				}
 				Opcode.END.code => {
-					wasEnd = true;
 					break;
 				}
+				0xFB => if (extensions.GC) {
+					var b2 = decoder.read1();
+					match (b2) {
+						Opcode.I31_NEW.code => {
+							var e = init_stack.pop();
+							if (e.0 == ValueType.I32) {
+								init_stack.push(ValueTypes.I31REF_NONNULL, InitExpr.I31(e.1));
+							} else {
+								err.rel(decoder, pt).TypeMismatchIn(Strings.format1("i31.new in %s", quantity), ValueType.I32, e.0);
+							}
+						}
+						Opcode.RTT_CANON.code => {
+							var t1 = readHeapType();
+							var vt = ValueType.Ref(false, HeapType.Rtt(1, t1));
+							init_stack.push(vt, InitExpr.Const(Value.Ref(Canon.getRtt(t1))));
+						}
+						Opcode.RTT_SUB.code => {
+							var sub = readHeapType();
+							if (sub == null) break;
+							var e = init_stack.pop();
+							var rtt: HeapType.Rtt;
+							match (e.0) {
+								Ref(nullable, heap) => if (HeapType.Rtt.?(heap)) rtt = HeapType.Rtt.!(heap);
+								_ => ;
+							}
+							if (rtt.hdecl == null) {
+								err.rel(decoder, pt).ExpectedRtt(e.0);
+								break;
+							}
+
+							var subrtt = HeapType.Rtt(if(rtt.depth >= 0, rtt.depth + 1, -1), sub);
+							var result = ValueType.Ref(false, subrtt);
+							if (!ValueTypes.isAssignableHeap(sub, rtt.hdecl)) {
+								err.rel(decoder, pt).ExpectedRttSubType(result, rtt);
+								break;
+							}
+							init_stack.push(result, InitExpr.RttSub(e.1, subrtt));
+						}
+						_ => err.rel(decoder, pt).UnexpectedOpcodeInInit(last, b2);
+					}
+				}
 				_ => {
-					err.rel(decoder, pt).UnexpectedOpcodeInInit(opcode);
+					err.rel(decoder, pt).UnexpectedOpcodeInInit(0, last);
 				}
 			}
 		}
-		if (!wasEnd) err.rel(decoder, pt).ExpectedEndInInit(0);
+		if (last != Opcode.END.code) err.rel(decoder, pt).ExpectedEndInInit(0);
 		if (init_stack.top != 1) {
 			err.rel(decoder, decoder.pos).TypeMismatchIn(quantity, expected, ValueType.BOTTOM); // TODO: proper msg for multiple
 			return InitExpr.ExternRefNull;
