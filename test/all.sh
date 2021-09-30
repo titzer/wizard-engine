@@ -13,9 +13,12 @@ function skip() {
     printf "${YELLOW}skipped${NORM}\n"
 }
 
-#TODO: out of memory TEST_TARGET=int $SCRIPT_LOC/spec.sh
-skip spec int
+TEST_TARGET=int $SCRIPT_LOC/unit.sh
+TEST_TARGET=x86-linux $SCRIPT_LOC/unit.sh
+TEST_TARGET=x86-64-linux $SCRIPT_LOC/unit.sh
+skip unit jvm # TODO: v3 heap too large
 
+skip spec int # TODO: out of memory
 TEST_TARGET=x86-linux $SCRIPT_LOC/spec.sh
 TEST_TARGET=x86-64-linux $SCRIPT_LOC/spec.sh
 TEST_TARGET=jvm $SCRIPT_LOC/spec.sh
@@ -24,10 +27,3 @@ TEST_TARGET=int $SCRIPT_LOC/wizeng.sh
 TEST_TARGET=x86-linux $SCRIPT_LOC/wizeng.sh
 TEST_TARGET=x86-64-linux $SCRIPT_LOC/wizeng.sh
 TEST_TARGET=jvm $SCRIPT_LOC/wizeng.sh
-
-TEST_TARGET=int $SCRIPT_LOC/unit.sh
-skip unit jvm
-TEST_TARGET=x86-linux $SCRIPT_LOC/unit.sh
-TEST_TARGET=x86-64-linux $SCRIPT_LOC/unit.sh
-
-#TODO: v3 heap too large TEST_TARGET=jvm $SCRIPT_LOC/unit.sh
