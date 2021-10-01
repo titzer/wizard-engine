@@ -28,26 +28,13 @@ class V3Interpreter extends Interpreter {
 		pushFrame(WasmFunction.new(null, synth));
 		// Begin execution
 		state = ExecState.RUNNING;
-		loop(1 + count);  // 1 instruction for the special START bytecode
-		return finish(f.sig.results.length);
-	}
-	def resume(count: int) -> Result {
-		var results = if(call_stack.top > 0, call_stack.elems[0].func.sig.results.length);
+		loop(1 + count);  // +1 instruction for the special START bytecode
+		// Convert internal state into result
 		match (state) {
+			FINISHED => return Result.Value(popN(f.sig.results.length));
 			TRAPPED => return Result.Trap(trap_reason);
-			TIMEOUT, STOPPED => state = ExecState.RUNNING;
-			BREAKPOINT => ;
-			_ => System.error("InterpreterError", "unexpected state");
-		}
-		loop(count);
-		return finish(results);
-	}
-
-	def finish(results: int) -> Result {
-		match (state) {
-			FINISHED => return Result.Value(popN(results));
-			TRAPPED => return Result.Trap(trap_reason);
-			BREAKPOINT, TIMEOUT => return Result.Break;
+			BREAKPOINT => return Result.Trap(TrapReason.BREAK);
+			TIMEOUT => return Result.Trap(TrapReason.TIMEOUT);
 			_ => System.error("InterpreterError", "unexpected state");
 		}
 		return Result.Break;
@@ -120,7 +107,10 @@ class V3Interpreter extends Interpreter {
 			while (true) {
 				if (step()) {
 					step_count++;
-					if (--count <= 0 && state == ExecState.RUNNING) state = ExecState.TIMEOUT;
+					if (--count <= 0 && state == ExecState.RUNNING) {
+						frame.pc = codeptr.pos;
+						resume(handleTimeout());
+					}
 				}
 				if (state != ExecState.RUNNING) break;
 			}
@@ -571,12 +561,12 @@ class V3Interpreter extends Interpreter {
 				doCallFunction(entry);
 			}
 			InternalOpcode.BREAK.code => {
-				if (state == ExecState.BREAKPOINT) {
-					state = ExecState.RUNNING;
+				state = ExecState.BREAKPOINT;
+				frame.pc = pc;
+				if (resume(handleBreak())) {
 					var orig_opcode = frame.func.decl.code.orig[pc];
 					return orig_opcode | 0x100;
 				} else {
-					state = ExecState.BREAKPOINT;
 					codeptr.at(pc);
 					return -1;
 				}
@@ -1198,10 +1188,24 @@ class V3Interpreter extends Interpreter {
 		push(trunc(a));
 	}
 	def trap(reason: TrapReason) {
-		state = ExecState.TRAPPED;
-		trap_reason = reason;
+		state = ExecState.TRAPPING;
+		frame.pc = codeptr.pos;
+		resume(handleTrap(reason));
 	}
-	def pause();
+	def resume(r: Resumption) -> bool {
+		match (r) {
+			Continue(vals) => {
+				state = ExecState.RUNNING;
+				if (vals != null) for (v in vals) val_stack.push(v);
+				return true;
+			}
+			Trap(reason, trace) => { // TODO: add exception backtrace
+				state = ExecState.TRAPPED;
+				trap_reason = reason;
+				return false;
+			}
+		}
+	}
 	def error(msg: string) {
 		state = ExecState.TRAPPED;
 		trap_reason = TrapReason.ERROR;
@@ -1243,7 +1247,16 @@ class V3Interpreter extends Interpreter {
 		for (i < call_stack.top) OUT.sp();
 		OUT.put1("+%d: ", codeptr.pos);  // XXX: fixed with decimal offset
 		var module = if(frame.func.instance != null, frame.func.instance.module);
-		instrTracer.putInstr(OUT, module, codeptr);
+		var opcode = codeptr.data[codeptr.pos];
+		if (opcode == InternalOpcode.BREAK.code) {
+			OUT.puts("<break> ");
+			var prev = (codeptr.data, codeptr.pos, codeptr.limit);
+			codeptr.reset(frame.func.decl.code.orig, prev.1, prev.2);
+			instrTracer.putInstr(OUT, module, codeptr);
+			codeptr.reset(prev.0, prev.1, prev.2);
+		} else {
+			instrTracer.putInstr(OUT, module, codeptr);
+		}
 		if (Trace.operands) {
 			for (i = frame.fp; i < val_stack.top; i++) {
 				var v = val_stack.elems[i];
