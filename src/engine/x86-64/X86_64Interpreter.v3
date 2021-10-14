@@ -10,6 +10,7 @@ class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
 }
 class X86_64Interpreter extends X86_64InterpreterBase {
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
+	var frame: Frame;
 
 	new() super(ValueStack.new(EngineOptions.stackSize)) {
 		if (interpreterCode == null) {
@@ -44,6 +45,12 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 			FINISHED => return popResult(f.sig);
 			TIMEOUT => return Result.Break;
 		}
+	}
+	def getTopFrame() -> Frame {
+		return if(frame == null, Frame.new(), frame);
+	}
+	def getCallStack() -> ArrayStack<Frame> {
+		return ArrayStack.new();
 	}
 	private def runWithTailCalls(f: Function) -> (ExecState, TrapReason) {
 		var state = (ExecState.FINISHED, TrapReason.NONE);
@@ -117,11 +124,6 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		return state;
 	}
 	private def invoke(wf: WasmFunction, sp: Pointer) -> (ExecState, TrapReason) {
-		if (Trace.interpreter) {
-			OUT.put2("X86_64Interpreter.asmEntry(wf=0x%x, sp=0x%x)",
-				Pointer.atObject(wf) - Pointer.NULL, sp - Pointer.NULL);
-			OUT.outln();
-		}
 		return asmEntry(wf, sp);
 	}
 	private def popResult(sig: SigDecl) -> Result {
@@ -230,6 +232,32 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		var t = table.fill(dest, val, size);
 		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
 		return (ExecState.FINISHED, TrapReason.NONE);
+	}
+	def runtime_BREAK(instance: Instance) -> (ExecState, TrapReason) {
+		var sp = CiRuntime.callerSp();
+		var func = (sp + IVar.WASM_FUNC.frameOffset).load<WasmFunction>();
+		var ip   = (sp + IVar.IP.frameOffset).load<Pointer>();
+		var code = Pointer.atContents((sp + IVar.CODE.frameOffset).load<Array<byte>>());
+		var xip  = (sp + IVar.XIP.frameOffset).load<Pointer>();
+
+		frame = Frame.new();
+		frame.func = func;
+		frame.pc = int.!(ip - code - 1);
+		frame.xip = int.!(xip - Pointer.atContents(func.decl.code.xcode));
+
+		var r = handleBreak();
+		match (r) {
+			Continue(vals) => {
+				state = ExecState.RUNNING;
+				if (vals != null) for (v in vals) valueStack.push(v);
+				frame = null;
+				return (ExecState.FINISHED, TrapReason.NONE);
+			}
+			Trap(reason, trace) => { // TODO: add exception backtrace
+				frame = null;
+				return (ExecState.TRAPPED, reason);
+			}
+		}
 	}
 }
 
@@ -509,7 +537,7 @@ component I {
 
 // Options that only impact interpreter performance.
 class X86_64InterpreterTuning {
-	var threadedDispatch = true;
+	var threadedDispatch = false;
 	var handlerAlignment = 1;
 	var dispatchEntrySize = 4;
 	var useTypeTagTable = false;
@@ -775,7 +803,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// execute first instruction
 		firstDispatchOffset = w.atEnd().pos;
-		genDispatch(dispatchTables[0]);
+		genDispatch(I.ip_ptr, dispatchTables[0], true);
 	}
 
 	// Generate all the opcode handlers.
@@ -793,7 +821,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		for (t in dispatchTables) {
 			if (t.0 == 0) continue; // main dispatch table
 			var pos = w.atEnd().pos;
-			genDispatch(t);
+			genDispatch(I.ip_ptr, t, true);
 			writeDispatchEntry(ref0, t.0, pos);
 		}
 
@@ -821,6 +849,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			4 => w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.start + offset) - Pointer.NULL));
 			8 => w.at(ref.offset + 8 * opcode).put_b64((ic.start + offset) - Pointer.NULL);
 		}
+		w.atEnd();
 	}
 	def genConsts() {
 		bindHandler(Opcode.I32_CONST); {
@@ -1782,6 +1811,22 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.add_r_i(I.vsp, SLOT_SIZE);
 			endHandler();
 		}
+		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.BREAK.code, w.atEnd().pos); {
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(this.i.runtime_BREAK), [IVar.INSTANCE.gpr], true);
+			genExecStateCheck();
+			restoreCallerIVars();
+			// Compute a pointer to the original code at this pc offset
+			var pc = I.r1; // = IP - CODE
+			asm.movq_r_r(pc, IVar.IP.gpr);
+			asm.sub_r_m(pc, R.RSP.plus(IVar.CODE.frameOffset));
+			var origIp = I.r0; // FUNC_DECL.code.orig + pc - 1
+			asm.movq_r_m(origIp, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_code));
+			asm.movq_r_m(origIp, origIp.plus(offsets.Code_orig));
+			asm.add_r_r(origIp, pc);
+			asm.sub_r_i(origIp, 1);
+			genDispatch(origIp.indirect(), dispatchTables[0], false);
+		}
 	}
 	def genFloatMinAndMax() {
 		var ret_b = X86_64Label.new(), ret_a = X86_64Label.new(), is_nan32 = X86_64Label.new(), is_nan64 = X86_64Label.new();
@@ -2320,15 +2365,16 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		if (tuning.threadedDispatch) genDispatch(dispatchTables[0]);
+		if (tuning.threadedDispatch) genDispatch(I.ip_ptr, dispatchTables[0], true);
 		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
-	def genDispatch(prefix: int, ref: IcCodeRef) {
+	def genDispatch(ptr: X86_64Addr, table: (int, IcCodeRef), increment: bool) {
+		var ref = table.1;
 		var opcode = I.r0;
 		var base = I.r1;
-		asm.movbzx_r_m(opcode, I.ip_ptr);
-		asm.inc_r(I.ip);
+		asm.movbzx_r_m(opcode, ptr);
+		if (increment) asm.inc_r(I.ip);
 		match (tuning.dispatchEntrySize) {
 			2 => {
 				asm.lea(base, ref); // RIP-relative LEA
