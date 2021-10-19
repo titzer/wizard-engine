@@ -570,6 +570,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
+	var tailCallReentryRef: IcCodeRef;
 	var abruptRetRef: IcCodeRef;
 	var typeTagTableOffset: int;
 	var useTypeTagTable = false;
@@ -724,6 +725,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.q.sub_r_r(IVar.VFP.gpr, tmp);
 		saveIVar(IVar.VFP);
 
+		tailCallReentryRef = IcCodeRef.new(w.pos);
 		// Load &func.code.code[0] into IP
 		var codeReg = I.r0;
 		asm.movq_r_m(codeReg, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_code));
@@ -1048,28 +1050,12 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
 
 		bindHandler(Opcode.RETURN);
-		// Load return count from func.sig.results.length
-		var cnt = I.r0, i = I.r1;
+		// Copy return values from stack to overwrite locals
+		var cnt = I.r0;
 		asm.movq_r_m(cnt, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_sig));
 		asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_results));
 		asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
-		var done = X86_64Label.new();
-		// Copy return value(s) from VSP to VFP.
-		asm.cmp_r_i(cnt, 0);
-		asm.jc_rel_near(C.Z, done);
-		asm.movd_r_i(i, 0);
-		asm.d.shl_r_i(cnt, SLOT_SIZE_LOG);
-		asm.q.sub_r_r(IVar.VSP.gpr, cnt);
-		var loop = X86_64Label.new();
-		// while (i < cnt)
-		asm.bind(loop);
-		asm.movdqu_s_m(I.xmm0, IVar.VSP.gpr.plusR(i, 1, 0));
-		asm.movdqu_m_s(IVar.VFP.gpr.plusR(i, 1, 0), I.xmm0);
-		asm.q.add_r_i(i, SLOT_SIZE);
-		asm.q.cmp_r_r(i, cnt);
-		asm.jc_rel_near(C.L, loop);
-		asm.bind(done);
-		asm.q.lea(IVar.VSP.gpr, IVar.VFP.gpr.plusR(cnt, 1, 0)); // set VSP properly
+		genCopyStackValsToVfp(cnt, I.r1);
 		// Deallocate interpreter frame and return to calling code.
 		asm.q.add_r_i(R.RSP, frameSize);
 		asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
@@ -1139,6 +1125,80 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.d.cmp_m_i(tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
 		asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
 		genTrap(TrapReason.FUNC_SIG_MISMATCH);
+
+		// Generate tail call
+		bindHandler(Opcode.RETURN_CALL);
+		// XXX: save ip prior to call for stack traces?
+		genReadUleb32(I.r1);
+
+		asm.movq_r_m(I.r0, IVar.INSTANCE.gpr.plus(offsets.Instance_functions));
+		var target_func = I.r1;
+		asm.movq_r_m(target_func, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
+
+		// Overwrite current locals with outgoing arguments
+		cnt = I.r0;
+		asm.movq_r_m(cnt, target_func.plus(offsets.Function_sig));
+		asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_params));
+		asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
+		genCopyStackValsToVfp(cnt, I.r2);
+
+		// Check if the target function is a WasmFunction or HostFunction
+		var tail_call_host = X86_64Label.new();
+		asm.d.cmp_m_i(target_func.plus(0), offsets.WasmFunction_typeId);
+		asm.jc_rel_near(C.NZ, tail_call_host);
+
+		// WasmFunction: jump into interpreter reentry
+		asm.q.lea(IVar.VSP.gpr, IVar.VFP.gpr.plusR(cnt, 1, 0)); // set VSP properly
+		asm.movq_r_m(IVar.INSTANCE.gpr, target_func.plus(offsets.WasmFunction_instance));
+		saveIVar(IVar.INSTANCE);
+		asm.movq_r_m(IVar.FUNC_DECL.gpr, target_func.plus(offsets.WasmFunction_decl));
+		saveIVar(IVar.FUNC_DECL);
+		asm.jmp_rel_addr(tailCallReentryRef);
+
+		// HostFunction: jump into interpreter runtimeCall to enter into V3 code
+		asm.bind(tail_call_host);
+
+		// Custom code to tail-call the runtime
+		asm.movq_r_r(I.r3, IVar.VSP.gpr); // save VSP from being overwritten
+		var abs = refRuntimeCall(this.i.runtime_callHost);
+		var regs = [target_func];
+		// Generate parallel moves from args into param gprs; assume each src register used only once
+		var dst = Array<X86_64Gpr>.new(G.length);
+		for (i < regs.length) {
+			var sreg = regs[i];
+			var dreg = I.V3_PARAM_GPRS[i + 1];
+			if (sreg != dreg) dst[sreg.regnum] = dreg;
+		}
+		var stk = Array<i8>.new(G.length);
+		for (i < dst.length) orderMoves(dst, stk, i);
+		// load interpreter into first arg register
+		var interp = I.V3_PARAM_GPRS[0];
+		// save a copy of VSP into interpreter.valueStack.sp
+		asm.movq_r_m(interp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
+		asm.movq_r_m(I.scratch, interp.plus(offsets.Interpreter_valueStack));
+		asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), I.r3);
+		asm.q.add_r_i(R.RSP, frameSize); // deallocate interpreter frame
+		asm.jmp_rel(int.view(u32.!(abs - (ic.start + w.pos)))); // tail-call into runtime
+	}
+	def genCopyStackValsToVfp(cnt: X86_64Gpr, i: X86_64Gpr) {
+		var done = X86_64Label.new();
+		// Copy argument(s) from VSP to VFP.
+		asm.cmp_r_i(cnt, 0);
+		asm.jc_rel_near(C.Z, done);
+		asm.movd_r_i(i, 0);
+		asm.d.shl_r_i(cnt, SLOT_SIZE_LOG);
+		asm.q.sub_r_r(IVar.VSP.gpr, cnt);
+		var loop = X86_64Label.new();
+		// while (i < cnt)
+		asm.bind(loop);
+		asm.movdqu_s_m(I.xmm0, IVar.VSP.gpr.plusR(i, 1, 0));
+		asm.movdqu_m_s(IVar.VFP.gpr.plusR(i, 1, 0), I.xmm0);
+		asm.q.add_r_i(i, SLOT_SIZE);
+		asm.q.cmp_r_r(i, cnt);
+		asm.jc_rel_near(C.L, loop);
+		asm.bind(done);
+		// set VSP properly
+		asm.q.lea(IVar.VSP.gpr, IVar.VFP.gpr.plusR(cnt, 1, 0));
 	}
 	def genLoadsAndStores() {
 		genLoad(Opcode.I32_LOAD, BpTypeCode.I32.code, asm.movd_r_m);
@@ -2216,6 +2276,8 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movq_r_m(IVar.VSP.gpr, R.RSP.plus(IVar.INTERPRETER.frameOffset));
 		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.Interpreter_valueStack));
 		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.ValueStack_sp));
+	}
+	def jumpRuntime(abs: Pointer, regs: Array<X86_64Gpr>) {
 	}
 	def orderMoves(dst: Array<X86_64Gpr>, stk: Array<i8>, i: int) {
 		var dreg = dst[i];
