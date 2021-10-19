@@ -1048,137 +1048,171 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		bindHandler(Opcode.END);
 		asm.q.cmp_r_r(I.ip, I.eip);
 		asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
+		// end falls through to return bytecode
 
-		bindHandler(Opcode.RETURN);
-		// Copy return values from stack to overwrite locals
-		var cnt = I.r0;
-		asm.movq_r_m(cnt, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_sig));
-		asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_results));
-		asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
-		genCopyStackValsToVfp(cnt, I.r1);
-		// Deallocate interpreter frame and return to calling code.
-		asm.q.add_r_i(R.RSP, frameSize);
-		asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
-		asm.ret();
-
-		bindHandler(Opcode.CALL);
-		// XXX: save ip prior to call for stack traces?
-		genReadUleb32(I.r1);
-
-		asm.movq_r_m(I.r0, IVar.INSTANCE.gpr.plus(offsets.Instance_functions));
-		asm.movq_r_m(I.r1, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
-
-		// call_indirect jumps here
 		var callFunction = X86_64Label.new();
-		asm.bind(callFunction);
-		saveCallerIVars();
-		var call_host = X86_64Label.new();
-		asm.d.cmp_m_i(I.r1.plus(0), offsets.WasmFunction_typeId);
-		asm.jc_rel_near(C.NZ, call_host);
+		bindHandler(Opcode.RETURN); {
+			// Copy return values from stack to overwrite locals
+			var cnt = I.r0;
+			asm.movq_r_m(cnt, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_sig));
+			asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_results));
+			asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
+			genCopyStackValsToVfp(cnt, I.r1);
+			// Deallocate interpreter frame and return to calling code.
+			asm.q.add_r_i(R.RSP, frameSize);
+			asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+			asm.ret();
 
-		// WasmFunction: call into interpreter reentry
-		asm.callr_addr(callReentryRef);
-		genExecStateCheck();
-		restoreCallerIVars();
-		genDispatchOrJumpToDispatch();
+			bindHandler(Opcode.CALL);
+			// XXX: save ip prior to call for stack traces?
+			genReadUleb32(I.r1);
 
-		// HostFunction: call into interpreter runtimeCall to enter into V3 code
-		asm.bind(call_host);
-		saveIVar(IVar.VSP);
-		callRuntime(refRuntimeCall(this.i.runtime_callHost), [I.r1], true);
-		restoreCallerIVars();
-		genDispatchOrJumpToDispatch();
+			asm.movq_r_m(I.r0, IVar.INSTANCE.gpr.plus(offsets.Instance_functions));
+			asm.movq_r_m(I.r1, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
 
-		bindHandler(Opcode.CALL_INDIRECT);
-		// XXX: save ip prior to call for stack traces?
-		var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
-		genReadUleb32(sig_index);
-		genReadUleb32(table_index);
+			// call_indirect jumps here
+			asm.bind(callFunction);
+			saveCallerIVars();
+			var call_host = X86_64Label.new();
+			asm.d.cmp_m_i(I.r1.plus(0), offsets.WasmFunction_typeId);
+			asm.jc_rel_near(C.NZ, call_host);
 
-		asm.sub_r_i(I.vsp, SLOT_SIZE);
-		asm.movd_r_m(func_index, I.vsp_ptr_p1);
+			// WasmFunction: call into interpreter reentry
+			asm.callr_addr(callReentryRef);
+			genExecStateCheck();
+			restoreCallerIVars();
+			genDispatchOrJumpToDispatch();
+
+			// HostFunction: call into interpreter runtimeCall to enter into V3 code
+			asm.bind(call_host);
+			saveIVar(IVar.VSP);
+			callRuntime(refRuntimeCall(this.i.runtime_callHost), [I.r1], true);
+			restoreCallerIVars();
+			genDispatchOrJumpToDispatch();
+		}
 
 		var trap_oob = X86_64Label.new(), trap_sig_mismatch = X86_64Label.new();
+		bindHandler(Opcode.CALL_INDIRECT); {
+			// XXX: save ip prior to call for stack traces?
+			var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
+			genReadUleb32(sig_index);
+			genReadUleb32(table_index);
 
-		var tmp = I.r3;
-		// load instance.sig_ids[sig_index] into sig_index
-		asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_sig_ids));
-		asm.movd_r_m(sig_index, tmp.plusR(sig_index, offsets.INT_SIZE, offsets.Array_contents));
-		// Bounds-check table.ids[func_index]
-		asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_tables));
-		var table = table_index;
-		asm.movq_r_m(table, tmp.plusR(table_index, offsets.REF_SIZE, offsets.Array_contents));
-		asm.movq_r_m(tmp, table.plus(offsets.Table_ids));
-		asm.d.cmp_r_m(func_index, tmp.plus(offsets.Array_length));
-		asm.jc_rel_near(C.NC, trap_oob);
-		// Check table.ids[func_index] == sig_index
-		asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
-		asm.jc_rel_near(C.NZ, trap_sig_mismatch);
-		// Load table.funcs[func_index] into r1 and jump to calling sequence
-		asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
-		asm.movq_r_m(I.r1, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
-		asm.jmp_rel_near(callFunction);
-		// XXX: move traps for call indirect out-of-line
-		asm.bind(trap_oob);
-		genTrap(TrapReason.FUNC_INVALID);
-		asm.bind(trap_sig_mismatch);
-		asm.d.cmp_m_i(tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
-		asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
-		genTrap(TrapReason.FUNC_SIG_MISMATCH);
+			asm.sub_r_i(I.vsp, SLOT_SIZE);
+			asm.movd_r_m(func_index, I.vsp_ptr_p1);
 
-		// Generate tail call
-		bindHandler(Opcode.RETURN_CALL);
-		// XXX: save ip prior to call for stack traces?
-		genReadUleb32(I.r1);
-
-		asm.movq_r_m(I.r0, IVar.INSTANCE.gpr.plus(offsets.Instance_functions));
-		var target_func = I.r1;
-		asm.movq_r_m(target_func, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
-
-		// Overwrite current locals with outgoing arguments
-		cnt = I.r0;
-		asm.movq_r_m(cnt, target_func.plus(offsets.Function_sig));
-		asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_params));
-		asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
-		genCopyStackValsToVfp(cnt, I.r2);
-
-		// Check if the target function is a WasmFunction or HostFunction
-		var tail_call_host = X86_64Label.new();
-		asm.d.cmp_m_i(target_func.plus(0), offsets.WasmFunction_typeId);
-		asm.jc_rel_near(C.NZ, tail_call_host);
-
-		// WasmFunction: jump into interpreter reentry
-		asm.q.lea(IVar.VSP.gpr, IVar.VFP.gpr.plusR(cnt, 1, 0)); // set VSP properly
-		asm.movq_r_m(IVar.INSTANCE.gpr, target_func.plus(offsets.WasmFunction_instance));
-		saveIVar(IVar.INSTANCE);
-		asm.movq_r_m(IVar.FUNC_DECL.gpr, target_func.plus(offsets.WasmFunction_decl));
-		saveIVar(IVar.FUNC_DECL);
-		asm.jmp_rel_addr(tailCallReentryRef);
-
-		// HostFunction: jump into interpreter runtimeCall to enter into V3 code
-		asm.bind(tail_call_host);
-
-		// Custom code to tail-call the runtime
-		asm.movq_r_r(I.r3, IVar.VSP.gpr); // save VSP from being overwritten
-		var abs = refRuntimeCall(this.i.runtime_callHost);
-		var regs = [target_func];
-		// Generate parallel moves from args into param gprs; assume each src register used only once
-		var dst = Array<X86_64Gpr>.new(G.length);
-		for (i < regs.length) {
-			var sreg = regs[i];
-			var dreg = I.V3_PARAM_GPRS[i + 1];
-			if (sreg != dreg) dst[sreg.regnum] = dreg;
+			var tmp = I.r3;
+			// load instance.sig_ids[sig_index] into sig_index
+			asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_sig_ids));
+			asm.movd_r_m(sig_index, tmp.plusR(sig_index, offsets.INT_SIZE, offsets.Array_contents));
+			// Bounds-check table.ids[func_index]
+			asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_tables));
+			var table = table_index;
+			asm.movq_r_m(table, tmp.plusR(table_index, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_r_m(tmp, table.plus(offsets.Table_ids));
+			asm.d.cmp_r_m(func_index, tmp.plus(offsets.Array_length));
+			asm.jc_rel_near(C.NC, trap_oob);
+			// Check table.ids[func_index] == sig_index
+			asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
+			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+			// Load table.funcs[func_index] into r1 and jump to calling sequence
+			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
+			asm.movq_r_m(I.r1, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
+			asm.jmp_rel_near(callFunction);
+			// XXX: move traps for call indirect out-of-line
+			asm.bind(trap_oob);
+			genTrap(TrapReason.FUNC_INVALID);
+			asm.bind(trap_sig_mismatch);
+			asm.d.cmp_m_i(tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
+			asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
+			genTrap(TrapReason.FUNC_SIG_MISMATCH);
 		}
-		var stk = Array<i8>.new(G.length);
-		for (i < dst.length) orderMoves(dst, stk, i);
-		// load interpreter into first arg register
-		var interp = I.V3_PARAM_GPRS[0];
-		// save a copy of VSP into interpreter.valueStack.sp
-		asm.movq_r_m(interp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
-		asm.movq_r_m(I.scratch, interp.plus(offsets.Interpreter_valueStack));
-		asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), I.r3);
-		asm.q.add_r_i(R.RSP, frameSize); // deallocate interpreter frame
-		asm.jmp_rel(int.view(u32.!(abs - (ic.start + w.pos)))); // tail-call into runtime
+
+		var tailCallFunction = X86_64Label.new();
+		bindHandler(Opcode.RETURN_CALL); {
+			// XXX: save ip prior to call for stack traces?
+			genReadUleb32(I.r1);
+
+			asm.movq_r_m(I.r0, IVar.INSTANCE.gpr.plus(offsets.Instance_functions));
+			var target_func = I.r1;
+			asm.movq_r_m(target_func, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
+
+			// return_tail_call jumps here
+			asm.bind(tailCallFunction);
+			// Overwrite current locals with outgoing arguments
+			var cnt = I.r0;
+			asm.movq_r_m(cnt, target_func.plus(offsets.Function_sig));
+			asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_params));
+			asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
+			genCopyStackValsToVfp(cnt, I.r2);
+
+			// Check if the target function is a WasmFunction or HostFunction
+			var tail_call_host = X86_64Label.new();
+			asm.d.cmp_m_i(target_func.plus(0), offsets.WasmFunction_typeId);
+			asm.jc_rel_near(C.NZ, tail_call_host);
+
+			// WasmFunction: jump into interpreter reentry
+			asm.q.lea(IVar.VSP.gpr, IVar.VFP.gpr.plusR(cnt, 1, 0)); // set VSP properly
+			asm.movq_r_m(IVar.INSTANCE.gpr, target_func.plus(offsets.WasmFunction_instance));
+			saveIVar(IVar.INSTANCE);
+			asm.movq_r_m(IVar.FUNC_DECL.gpr, target_func.plus(offsets.WasmFunction_decl));
+			saveIVar(IVar.FUNC_DECL);
+			asm.jmp_rel_addr(tailCallReentryRef);
+
+			// HostFunction: jump into interpreter runtimeCall to enter into V3 code
+			asm.bind(tail_call_host);
+
+			// Custom code to tail-call the runtime
+			asm.movq_r_r(I.r3, IVar.VSP.gpr); // save VSP from being overwritten
+			var abs = refRuntimeCall(this.i.runtime_callHost);
+			var regs = [target_func];
+			// Generate parallel moves from args into param gprs; assume each src register used only once
+			var dst = Array<X86_64Gpr>.new(G.length);
+			for (i < regs.length) {
+				var sreg = regs[i];
+				var dreg = I.V3_PARAM_GPRS[i + 1];
+				if (sreg != dreg) dst[sreg.regnum] = dreg;
+			}
+			var stk = Array<i8>.new(G.length);
+			for (i < dst.length) orderMoves(dst, stk, i);
+			// load interpreter into first arg register
+			var interp = I.V3_PARAM_GPRS[0];
+			// save a copy of VSP into interpreter.valueStack.sp
+			asm.movq_r_m(interp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
+			asm.movq_r_m(I.scratch, interp.plus(offsets.Interpreter_valueStack));
+			asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), I.r3);
+			asm.q.add_r_i(R.RSP, frameSize); // deallocate interpreter frame
+			asm.jmp_rel(int.view(u32.!(abs - (ic.start + w.pos)))); // tail-call into runtime
+		}
+
+		bindHandler(Opcode.RETURN_CALL_INDIRECT); {
+			// XXX: save ip prior to call for stack traces?
+			var sig_index = I.r1, table_index = I.r2, func_index = I.r0;
+			genReadUleb32(sig_index);
+			genReadUleb32(table_index);
+
+			asm.sub_r_i(I.vsp, SLOT_SIZE);
+			asm.movd_r_m(func_index, I.vsp_ptr_p1);
+
+			var tmp = I.r3;
+			// load instance.sig_ids[sig_index] into sig_index
+			asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_sig_ids));
+			asm.movd_r_m(sig_index, tmp.plusR(sig_index, offsets.INT_SIZE, offsets.Array_contents));
+			// Bounds-check table.ids[func_index]
+			asm.movq_r_m(tmp, IVar.INSTANCE.gpr.plus(offsets.Instance_tables));
+			var table = table_index;
+			asm.movq_r_m(table, tmp.plusR(table_index, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_r_m(tmp, table.plus(offsets.Table_ids));
+			asm.d.cmp_r_m(func_index, tmp.plus(offsets.Array_length));
+			asm.jc_rel_near(C.NC, trap_oob);
+			// Check table.ids[func_index] == sig_index
+			asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
+			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+			// Load table.funcs[func_index] into r1 and jump to calling sequence
+			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
+			asm.movq_r_m(I.r1, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
+			asm.jmp_rel_near(tailCallFunction);
+		}
 	}
 	def genCopyStackValsToVfp(cnt: X86_64Gpr, i: X86_64Gpr) {
 		var done = X86_64Label.new();
