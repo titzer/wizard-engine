@@ -10,6 +10,7 @@ class V3Interpreter extends Interpreter {
 	private var frame: Frame;		// cached of top-of-stack frame, TODO: V3Interpreter
 	private def call_stack = ArrayStack<Frame>.new();
 	private var entry: Function;		// entrypoint function from {run()}
+	var probes: ProbeList;
 
 	def run(count: int, f: Function, args: Array<Value>) -> Result {
 		// Reset interpreter state
@@ -29,17 +30,26 @@ class V3Interpreter extends Interpreter {
 		synth.code = SYNTH_CODE;
 		pushFrame(WasmFunction.new(null, synth));
 		// Begin execution
-		state = ExecState.RUNNING;
-		loop(1 + count);  // +1 instruction for the special START bytecode
+		var timeout: Probe;
+		if (count > 0) insertProbeBefore(timeout = TimeoutProbe.new(1 + count));
+		state = if(probes == null, ExecState.RUN_FAST, ExecState.RUN_SLOW);
+		loop();
+		if (count > 0) removeProbeBefore(timeout);
 		// Convert internal state into result
 		match (state) {
 			FINISHED => return Result.Value(popN(f.sig.results.length));
 			TRAPPED => return Result.Trap(trap_reason);
 			BREAKPOINT => return Result.Trap(TrapReason.BREAK);
-			TIMEOUT => return Result.Trap(TrapReason.TIMEOUT);
 			_ => System.error("InterpreterError", "unexpected state");
 		}
 		return Result.Break;
+	}
+	def insertProbeBefore(p: Probe) {
+		if (probes == null) probes = ProbeList.new(p);
+		else probes.add(p);
+	}
+	def removeProbeBefore(p: Probe) {
+		if (probes != null) probes.remove(p);
 	}
 	def getTopFrame() -> Frame {
 		return frame;
@@ -103,40 +113,28 @@ class V3Interpreter extends Interpreter {
 		for (i < call_stack.top) OUT.sp();
 		OUT.put2("pushFrame(func %q: %q)", f.renderShort, f.decl.sig.render).outln();
 	}
-	def loop(count: int) -> ExecState {
-		if (count <= 0) {
-			// Run until exhaustion.
-			while (true) {
-				if (step()) step_count++;
-				if (state != ExecState.RUNNING) break;
+	def loop() {
+		while (true) {
+			while (state == ExecState.RUN_FAST) {
+				var pc = codeptr.pos;
+				var opcode = codeptr.read1();
+				var origop = execOp(pc, opcode);
+				if (origop == 0) continue;  // instruction executed successfully
+				if (origop < 0) break;  // breakpoint
+				execOp(pc, byte.view(origop)); // breakpoint resumed, execute original code
 			}
-		} else {
-			// Run for a limited number of steps.
-			while (true) {
-				if (step()) {
-					step_count++;
-					if (--count <= 0 && state == ExecState.RUNNING) {
-						frame.pc = codeptr.pos;
-						resume(handleTimeout());
-					}
-				}
-				if (state != ExecState.RUNNING) break;
+			while (state == ExecState.RUN_SLOW) {
+				var pc = codeptr.pos;
+				frame.pc = pc;
+				fireProbes(frame.func, pc);
+				var opcode = codeptr.read1();
+				var origop = execOp(pc, opcode);
+				if (origop == 0) continue;  // instruction executed successfully
+				if (origop < 0) break;  // breakpoint
+				execOp(pc, byte.view(origop)); // breakpoint resumed, execute original code
 			}
+			if (state != ExecState.RUN_FAST) break;
 		}
-		return state;
-	}
-	// Try to take a step by decoding and executing a single instruction.
-	// Return {false} if a step couldn't be taken because a breakpoint was hit,
-	// {true} otherwise.
-	def step() -> bool {
-		if (Trace.interpreter) traceStep();
-		var pc = codeptr.pos;
-		var opcode = codeptr.read1();
-		var origop = execOp(pc, opcode);
-		if (origop == 0) return true;  // instruction executed successfully
-		if (origop < 0) return false;  // breakpoint
-		execOp(pc, byte.view(origop)); // breakpoint resumed, execute original code
-		return true;
 	}
 	// Execute the given opcode and return {0} if successfully executed. If a breakpoint
 	// is hit and the state is {RUNNING}, then {-1} is returned. If the state is {RESUME},
@@ -572,6 +570,17 @@ class V3Interpreter extends Interpreter {
 				state = ExecState.BREAKPOINT;
 				frame.pc = pc;
 				if (resume(handleBreak())) {
+					var orig_opcode = frame.func.decl.code.orig[pc];
+					return orig_opcode | 0x100;
+				} else {
+					codeptr.at(pc);
+					return -1;
+				}
+			}
+			InternalOpcode.PROBE.code => {
+				state = ExecState.PROBING;
+				frame.pc = pc;
+				if (fireProbesAt(frame.func, pc)) {
 					var orig_opcode = frame.func.decl.code.orig[pc];
 					return orig_opcode | 0x100;
 				} else {
@@ -1202,9 +1211,8 @@ class V3Interpreter extends Interpreter {
 	}
 	def resume(r: Resumption) -> bool {
 		match (r) {
-			Continue(vals) => {
-				state = ExecState.RUNNING;
-				if (vals != null) for (v in vals) val_stack.push(v);
+			Continue => {
+				state = if(probes == null, ExecState.RUN_FAST, ExecState.RUN_SLOW);
 				return true;
 			}
 			Trap(reason, trace) => { // TODO: add exception backtrace
@@ -1213,6 +1221,20 @@ class V3Interpreter extends Interpreter {
 				return false;
 			}
 		}
+	}
+	def fireProbes(func: WasmFunction, pc: int) -> bool {
+		if (probes != null) return resume(probes.fire(frame.func, frame.pc));
+		return true;
+	}
+	def fireProbesAt(func: WasmFunction, pc: int) -> bool {
+		var probes = func.instance.module.probes;
+		if (probes == null) return true;
+		var map = probes[func.decl.func_index];
+		if (map == null) return true;
+		var list = map[pc];
+		var r = list.fire(frame.func, pc);
+		if (list.elem == null) map[pc] = null;
+		return resume(r);
 	}
 	def error(msg: string) {
 		state = ExecState.TRAPPED;
