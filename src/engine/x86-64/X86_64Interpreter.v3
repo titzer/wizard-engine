@@ -532,7 +532,7 @@ class X86_64InterpreterTuning {
 
 // Space needed for the machine code of the interpreter
 def PAGE_SIZE = 4 * 1024;
-def INL_SIZE = 16 * 1024;
+def INL_SIZE = 20 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 // Statically-allocated buffer (in compiled binary).
@@ -574,10 +574,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def vsp_m2t = vsp.plus(-2 * tagging.slot_size);				// VSP[-2] tag
 	def vsp_m3 = vsp.plus(tagging.tag_size - 3 * tagging.slot_size);	// VSP[-3] value
 
-	var dispatchTables = [
-		(0x00, IcCodeRef.new(-1)),
-		(0xFC, IcCodeRef.new(-1))
-	];
+	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef)>.new(Opcodes.code_pages.length + 1);
 
 	new() {
 		w.refill = reportOom;
@@ -629,12 +626,9 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			}
 		}
 		w.atEnd();
-		// Reserve space for each of the dispatch tables
-		for (t in dispatchTables) {
-			w.align(tuning.dispatchEntrySize);
-			t.1.offset = w.pos;
-			w.skipN(256 * tuning.dispatchEntrySize);
-		}
+
+		// Reserve space for the dispatch tables.
+		reserveDispatchTables();
 		// Begin code generation
 		genInterpreterEntry();
 		genOpcodeHandlers();
@@ -670,7 +664,31 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		}
 		return ic;
 	}
+	def reserveDispatchTables() {
+		{ // table #0
+			w.align(tuning.dispatchEntrySize);
+			var ref = IcCodeRef.new(-1);
+			ref.offset = w.pos;
+			w.skipN(256 * tuning.dispatchEntrySize);
+			dispatchTables[0] = (0, ref, null);
+		}
+		for (i < Opcodes.code_pages.length) {
+			var page = Opcodes.code_pages[i];
+			var ref = IcCodeRef.new(-1);
+			w.align(tuning.dispatchEntrySize);
+			ref.offset = w.pos;
+			w.skipN(256 * tuning.dispatchEntrySize);
+			var ref2: IcCodeRef;
 
+			if (!page.oneByte) {
+				ref2 = IcCodeRef.new(-1);
+				ref2.offset = w.pos;
+				w.skipN(256 * tuning.dispatchEntrySize);
+			}
+
+			dispatchTables[i + 1] = (page.prefix, ref, ref2);
+		}
+	}
 	def genInterpreterEntry() {
 		var shared_entry = X86_64Label.new();
 		var tmp = I.scratch;
@@ -804,7 +822,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// execute first instruction
 		firstDispatchOffset = w.atEnd().pos;
-		genDispatch(I.ip_ptr, dispatchTables[0], true);
+		genDispatch(I.ip_ptr, dispatchTables[0].1, true);
 	}
 
 	// Generate all the opcode handlers.
@@ -822,8 +840,26 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		for (t in dispatchTables) {
 			if (t.0 == 0) continue; // main dispatch table
 			var pos = w.atEnd().pos;
-			genDispatch(I.ip_ptr, t, true);
+			genDispatch(I.ip_ptr, t.1, true);
 			writeDispatchEntry(ref0, t.0, pos);
+		}
+
+		// Generate extended LEB landing pads for secondary dispatch tables
+		for (i = 1; i < dispatchTables.length; i++) {
+			var t = dispatchTables[i];
+			var pos = w.pos;
+			if (t.2 != null) {
+				// TODO: some code in this page are in the upper 128; read extended LEB
+				genDispatch(null, t.2, false);
+			} else {
+				// all codes in this page are in the lower 128; just skip extended LEB
+				genSkipLeb();
+				asm.d.and_r_i(I.r0, 0x7F);
+				genDispatch(null, t.1, false);
+			}
+			for (i = 128; i < 256; i++) {
+				writeDispatchEntry(t.1, i, pos);
+			}
 		}
 
 		genConsts();
@@ -1915,7 +1951,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_r_m(origIp, origIp.plus(offsets.Code_orig));
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
-			genDispatch(origIp.indirect(), dispatchTables[0], false);
+			genDispatch(origIp.indirect(), dispatchTables[0].1, false);
 		}
 	}
 	def genFloatMinAndMax() {
@@ -2472,32 +2508,31 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		if (tuning.threadedDispatch) genDispatch(I.ip_ptr, dispatchTables[0], true);
+		if (tuning.threadedDispatch) genDispatch(I.ip_ptr, dispatchTables[0].1, true);
 		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
-	def genDispatch(ptr: X86_64Addr, table: (int, IcCodeRef), increment: bool) {
-		var ref = table.1;
+	def genDispatch(ptr: X86_64Addr, table: IcCodeRef, increment: bool) {
 		var opcode = I.r0;
 		var base = I.r1;
-		asm.movbzx_r_m(opcode, ptr);
+		if (ptr != null) asm.movbzx_r_m(opcode, ptr);
 		if (increment) asm.inc_r(I.ip);
 		match (tuning.dispatchEntrySize) {
 			2 => {
-				asm.lea(base, ref); // RIP-relative LEA
+				asm.lea(base, table); // RIP-relative LEA
 				asm.movwsx_r_m(opcode, base.plusR(opcode, 2, 0)); // load 16-bit offset
 				asm.add_r_r(base, opcode);
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
 			}
 			4 => {
-				var addr = ic.start + ref.offset;
+				var addr = ic.start + table.offset;
 				asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
 			}
 			8 => {
-				var addr = ic.start + ref.offset;
+				var addr = ic.start + table.offset;
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
 			}
@@ -2506,12 +2541,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	// Patch the dispatch table for the given opcode to go to the given position.
 	def patchDispatchTable(opcode: Opcode, pos: int) {
 		for (t in dispatchTables) {
-			if (t.0 == opcode.prefix) {
-				var ref = t.1;
-				writeDispatchEntry(ref, opcode.code, pos);
-				w.atEnd();
-				return;
-			}
+			if (t.0 != opcode.prefix) continue;
+			var ref1 = t.1;
+			if (opcode.prefix == 0 || opcode.code < 128) writeDispatchEntry(ref1, opcode.code, pos);
+			var ref2 = t.2;
+			if (ref2 != null) writeDispatchEntry(ref2, opcode.code, pos);
+			w.atEnd();
+			return;
 		}
 		fatal("no dispatch table found for prefix");
 	}
