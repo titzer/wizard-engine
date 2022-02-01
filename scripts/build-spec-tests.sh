@@ -26,6 +26,16 @@ function build {
 	echo   translate $t
 	../../interpreter/wasm $t -o bin/$t.bin.wast
     done
+    
+    if [ -d simd ]; then
+        cd simd
+        mkdir -p ../bin/simd
+        TESTS=$(ls *.wast)
+        for t in $TESTS; do
+	    echo   translate $t
+	    ../../../interpreter/wasm $t -o ../bin/simd/$t.bin.wast
+        done
+    fi
 }
 
 for b in $BRANCHES; do
