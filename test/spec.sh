@@ -30,6 +30,9 @@ function run {
     BRANCH=$1
     cd $SPEC_ROOT/$BRANCH/test/core/bin/
     TESTS=$(ls *.bin.wast)
+    if [[ -d simd && "$TEST_SIMD" != "" ]]; then
+       TESTS="$TESTS $(ls simd/*.bin.wast)"
+    fi
     COUNT=$(echo $TESTS | awk '{print NF}')
 
     # run unittests and pipe through progress program
