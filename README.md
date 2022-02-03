@@ -6,55 +6,67 @@ Built with the future in mind, it is written in a fast and lightweight safe, gar
 
 ## Features ##
 
-Wizard supports all of the currently specified features, including:
+Wizard supports Wasm standard features, including:
 
   * Wasm MVP features
-  * Multi-value extension (now standard)
-  * Reference types (now standard)
-  * Bulk-memory operations (now standard)
+  * Multi-values
+  * Reference types
+  * Bulk-memory operations
+  * SIMD (wip)
+
+Wizard fully supports these Wasm proposals:
+
   * Tail-call
   * GC
   * Multi-memory
   * Function References
   * Relaxed section order
-  * Type imports (wip)
-  * Atomics (wip)
-  * Type imports (wip)
-  * Exception handling (wip)
 
-Wizard can run testcases specified in the .bin.wast format, like the specification tests that are part of the Wasm spec repo, or proposal repos.
+Other features under development:
 
+  * Type imports
+  * Threads
+  * Exception handling
+
+Wizard can run testcases specified in the .bin.wast format, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.
-It does not currently, but will eventually support WASI.
+[WASI](https://github.com/WebAssembly/wasi) support in Wizard is a work in progress.
 
 ## Supported Targets ##
 
-Because Wizard is written in Virgil, it runs on all the targets that Virgil currently supports, including
+Because Wizard is written in [https://github.com/titzer/virgil](Virgil), it runs on all the targets that Virgil currently supports, including:
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
+* x86-64-linux : 64-bit Linux kernels
 * jar : JAR files for the Java Virtual Machine
 * wasm : WebAssembly module for any Wasm engine (!)
 
-In fact, because Wizard can itself be compiled to Wasm, it fully self-hosts!
+In fact, because Wizard can itself be compiled to Wasm, it fully self-hosts.
+This means that Wizard can run a copy of itself compiled to Wasm!
+
+Wizard has special support on the `x86-64-linux` target, with a fast, hand-written interpreter, nearly 40x faster than the simple interpreter, and as fast as interpreter tiers in other engines.
 
 ## Design and Implementation ##
 
-To understand Wizard, you'll have to learn Virgil, a fast and lightweight programming language.
-But learning Virgil is easy, and you can pick it up in no time!
-Wizard is implemented entirely in Virgil, with no supporting code in other languages.
+Wizard is simple!
+As opposed to engines focused on performance, Wizard is just a few thousand lines of code.
+Instead, its architecture is focused on flexibility and readability, making it suitable for language and VM research.
 
-Wizard is small!
-Its architecture is focused on flexibility and readability.
-As opposed to engines focused on performance (and sadly losing on readability due to verbosity), the core engine is just a few thousand lines of code.
-It currently has only one execution tier: an easy-to-read and fast interpreter.
-The interpreter is designed to execute Wasm binary code directly, both for simplicity (no code rewriting) and low memory overhead (~10% additional supporting data structures).
-A three tier architecture (interpreter, baseline compiler, and optimizing compiler) is planned.
+Wizard is implemented in Virgil, a fast and lightweight programming language.
+Learning Virgil is easy; you can pick it up in no time!
+Using Virgil allows Wizard to compile to a single native binary of just a few hundred kilobytes.
+Development with Wizard is very quick turnaround, as a full production build takes less than a second.
+Virgil is garbage-collected, thus Wasm proposals such as GC reuse the collector of the underlying language, which keeps Wizard small and easy to understand.
 
-Wizard compiles to a very small binary of just a few hundred kilobytes.
-Development with Wizard is very quick turnaround, as a full production build takes less than a second, and of course, it can run under Virgil's interpreter, too.
+Wizard is the first Wasm engine to do fast in-place interpretation of Wasm bytecode.
+Wizard currently has two interpreters:
 
-Because Wizard is implemented in a garbage-collected language, it can implement the Wasm GC proposal (and other extensions) without a complex undertaking, instead just relying on the host language's garbage collector.
+  * an easy-to-read, straightforward interpreter which runs on all the supported targets
+  * a fast interpreter in hand-written x86-64 assembly, which only runs on x86-64-linux
+
+Both interpreters execute bytecode in-place (no code rewriting) for simplicity and low memory overhead.
+Later, Wizard will have a baseline compiler and optimization compiler, to match production engines' performance.
 
 ## Documentation ##
 
@@ -64,10 +76,11 @@ See the [Design](Design.md) for a closer look at Wizard's internals.
 
 ### Research Projects
 
-Currently, Wizard supports two closely related research projects:
+Currently, Wizard supports three closely related research projects:
 
  * Generalized import system: a Wasm extension for expressing source-level constructs in Wasm
  * Jawa: a Java virtual machine runtime system implementation using the generalized import sytsem
+ * Fast-int: the fast, in-place interpreter for Wasm
 
 ## License
 
