@@ -4,7 +4,9 @@
 var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 def TAGGED = Tagging.new(true);
 // XXX: hack so V3Offsets.new() can allocate an Interpreter without auto-generating the interpreter code
-class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter { }
+class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
+	var dispatchTable: Pointer;
+}
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
 class X86_64Interpreter extends X86_64InterpreterBase {
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
@@ -23,6 +25,9 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
 			(ExecState, TrapReason)>(			// return types
 				interpreterCode.start + interpreterCode.v3EntryOffset, this);
+		dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
+		probes.onEnable = onProbeEnable;
+		probes.onDisable = onProbeDisable;
 	}
 
 	def run(f: Function, args: Array<Value>) -> Result {
@@ -41,6 +46,12 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 			TRAPPING => return Result.Trap(state.1);
 			FINISHED => return popResult(f.sig);
 		}
+	}
+	def onProbeEnable() {
+		dispatchTable = interpreterCode.start + interpreterCode.probedDispatchTableOffset;
+	}
+	def onProbeDisable() {
+		dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
 	}
 	def getTopFrame() -> Frame {
 		return if(frame == null, Frame.new(), frame);
@@ -229,8 +240,21 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
 		return (ExecState.FINISHED, TrapReason.NONE);
 	}
-	def runtime_PROBE(instance: Instance) -> (ExecState, TrapReason) {
+	def runtime_PROBE_loop(instance: Instance) -> (ExecState, TrapReason) {
 		var sp = CiRuntime.callerSp();
+		frame = materializeFrame(sp);
+
+		if (fireProbes(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
+		return (state, trap_reason);
+	}
+	def runtime_PROBE_instr(instance: Instance) -> (ExecState, TrapReason) {
+		var sp = CiRuntime.callerSp();
+		frame = materializeFrame(sp);
+
+		if (fireProbesAt(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
+		return (state, trap_reason);
+	}
+	private def materializeFrame(sp: Pointer) -> Frame {
 		var func = (sp + IVar.WASM_FUNC.frameOffset).load<WasmFunction>();
 		var ip   = (sp + IVar.IP.frameOffset).load<Pointer>();
 		var code = Pointer.atContents((sp + IVar.CODE.frameOffset).load<Array<byte>>());
@@ -240,9 +264,7 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		frame.func = func;
 		frame.pc = int.!(ip - code - 1);
 		frame.xip = int.!(xip - Pointer.atContents(func.decl.code.xcode));
-
-		if (fireProbesAt(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
-		return (state, trap_reason);
+		return frame;
 	}
 }
 
@@ -262,6 +284,8 @@ def SIGSEGV = 11;
 // Also stores several important offsets needed in handling signals.
 class X86_64InterpreterCode extends RiUserCode {
 	def frameSize: int;
+	var fastDispatchTableOffset: int;	// dispatch table when probes disabled
+	var probedDispatchTableOffset: int;	// dispatch table when probes enabled
 	var v3EntryOffset: int;			// entry from V3 calling code
 	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
 	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
@@ -464,6 +488,7 @@ def fatal(msg: string) {
 def R: X86_64Regs, G = X86_64Regs.GPRs, C: X86_64Conds;
 enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mutable: bool) {
 	INTERPRETER	(0, 	null,	0,	false,	false),	// Interpreter object
+	DISPATCH_TABLE	(-1,	R.R14,  -1,	false,  false), // dispatch table
 	WASM_FUNC	(1, 	null,	8,	false,	false),	// WasmFunction object
 	MEM0_BASE	(-1,	R.R10,	16,	true,	false),	// base of memory #0
 	VFP		(-1,	R.R11,	24,	false,	false),	// value stack frame pointer
@@ -524,6 +549,7 @@ class Tagging(on: bool) {
 }
 // Options that only impact interpreter performance.
 class X86_64InterpreterTuning {
+	var dispatchTableReg = false;
 	var threadedDispatch = true;
 	var handlerAlignment = 1;
 	var dispatchEntrySize = 4;
@@ -560,6 +586,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	var callReentryRef: IcCodeRef;
 	var tailCallReentryRef: IcCodeRef;
 	var abruptRetRef: IcCodeRef;
+	var probedDispatchTableRef: IcCodeRef;
 	var typeTagTableOffset: int;
 	var useTypeTagTable = false;
 
@@ -668,9 +695,15 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		{ // table #0
 			w.align(tuning.dispatchEntrySize);
 			var ref = IcCodeRef.new(-1);
-			ref.offset = w.pos;
+			ref.offset = ic.fastDispatchTableOffset = w.pos;
 			w.skipN(256 * tuning.dispatchEntrySize);
 			dispatchTables[0] = (0, ref, null);
+		}
+		if (tuning.dispatchTableReg) {
+			w.align(tuning.dispatchEntrySize);
+			probedDispatchTableRef = IcCodeRef.new(-1);
+			probedDispatchTableRef.offset = ic.probedDispatchTableOffset = w.pos;
+			w.skipN(256 * tuning.dispatchEntrySize);
 		}
 		for (i < Opcodes.code_pages.length) {
 			var page = Opcodes.code_pages[i];
@@ -698,13 +731,15 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			// Allocate and initialize interpreter stack frame from incoming V3 params.
 			asm.q.sub_r_i(R.RSP, frameSize);
 
-			var iv: IVar;
 			// Spill interpreter object
-			iv = IVar.INTERPRETER;
-			asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+			var interpReg = I.V3_PARAM_GPRS[IVar.INTERPRETER.entryParam];
+			asm.movq_m_r(R.RSP.plus(IVar.INTERPRETER.frameOffset), interpReg);
 			// Spill VSP (value stack pointer)
-			iv = IVar.VSP;
-			asm.movq_m_r(R.RSP.plus(iv.frameOffset), I.V3_PARAM_GPRS[iv.entryParam]);
+			asm.movq_m_r(R.RSP.plus(IVar.VSP.frameOffset), I.V3_PARAM_GPRS[IVar.VSP.entryParam]);
+			// load dispatch table into register
+			if (tuning.dispatchTableReg) {
+				asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, interpReg.plus(offsets.Interpreter_dispatchTable));
+			}
 			// move WasmFunction into tmp
 			asm.movq_r_r(tmp, I.V3_PARAM_GPRS[IVar.WASM_FUNC.entryParam]);
 			restoreIVar(IVar.VSP);
@@ -822,7 +857,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// execute first instruction
 		firstDispatchOffset = w.atEnd().pos;
-		genDispatch(I.ip_ptr, dispatchTables[0].1, true);
+		genDispatch(I.ip_ptr, if(!tuning.dispatchTableReg, dispatchTables[0].1), true);
 	}
 
 	// Generate all the opcode handlers.
@@ -1939,8 +1974,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		}
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			saveCallerIVars();
-			callRuntime(refRuntimeCall(this.i.runtime_PROBE), [IVar.INSTANCE.gpr], true);
-			genExecStateCheck();
+			callRuntime(refRuntimeCall(this.i.runtime_PROBE_instr), [IVar.INSTANCE.gpr], true);
 			restoreCallerIVars();
 			// Compute a pointer to the original code at this pc offset
 			var pc = I.r1; // = IP - CODE
@@ -1952,6 +1986,18 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
 			genDispatch(origIp.indirect(), dispatchTables[0].1, false);
+		}
+		if (tuning.dispatchTableReg) {
+			var offset = w.atEnd().pos;
+			for (i < 256) {
+				writeDispatchEntry(probedDispatchTableRef, i, offset);
+			}
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(this.i.runtime_PROBE_loop), [IVar.INSTANCE.gpr], true);
+			restoreCallerIVars();
+			// TODO: reload code from function, as local probes may have been inserted or removed
+			asm.sub_r_i(IVar.IP.gpr, 1);
+			genDispatch(IVar.IP.gpr.indirect(), dispatchTables[0].1, true);
 		}
 	}
 	def genFloatMinAndMax() {
@@ -2338,8 +2384,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.callr(int.view(u32.!(abs - (ic.start + w.pos + 5))));
 		// check for trap
 		if (canTrap) genExecStateCheck();
-		// restore VSP from interpreter.valueStack.sp
+		// reload interpreter (temporarily) from frame
 		asm.movq_r_m(IVar.VSP.gpr, R.RSP.plus(IVar.INTERPRETER.frameOffset));
+		if (tuning.dispatchTableReg) {
+			// restore dispatch table from interpreter.dispatchTable
+			asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, IVar.VSP.gpr.plus(offsets.Interpreter_dispatchTable));
+		}
+		// restore VSP from interpreter.valueStack.sp
 		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.Interpreter_valueStack));
 		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.ValueStack_sp));
 	}
@@ -2508,7 +2559,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		if (tuning.threadedDispatch) genDispatch(I.ip_ptr, dispatchTables[0].1, true);
+		if (tuning.threadedDispatch) genDispatch(I.ip_ptr, if (!tuning.dispatchTableReg, dispatchTables[0].1), true);
 		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
@@ -2519,22 +2570,32 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		if (increment) asm.inc_r(I.ip);
 		match (tuning.dispatchEntrySize) {
 			2 => {
-				asm.lea(base, table); // RIP-relative LEA
+				if (table == null) asm.movq_r_r(base, IVar.DISPATCH_TABLE.gpr);
+				else asm.lea(base, table); // RIP-relative LEA
 				asm.movwsx_r_m(opcode, base.plusR(opcode, 2, 0)); // load 16-bit offset
 				asm.add_r_r(base, opcode);
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
 			}
 			4 => {
-				var addr = ic.start + table.offset;
-				asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+				if (table == null) {
+					asm.movd_r_m(base, IVar.DISPATCH_TABLE.gpr.plusR(opcode, 4, 0));
+				} else {
+					var addr = ic.start + table.offset;
+					asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+				}
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
 			}
 			8 => {
-				var addr = ic.start + table.offset;
-				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
-				asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
+				if (table == null) {
+					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+					asm.ijmp_m(IVar.DISPATCH_TABLE.gpr.plusR(opcode, 8, 0));
+				} else {
+					var addr = ic.start + table.offset;
+					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+					asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
+				}
 			}
 		}
 	}
