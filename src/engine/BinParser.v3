@@ -65,7 +65,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 				var before = module.heaptypes.length;
 				var count = parser.readCountAndReserve("types", module.heaptypes, limits.max_num_types);
 				var max_fw_index = u32.view(before) + count;
-				readLoop("type", count, WasmParser.readDefType(_, _, max_fw_index));
+				readLoop("type", count, WasmParser.readDefType);
 				elimFwRefs(before);
 			}
 			Import => {
@@ -328,11 +328,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		return (true, int.!(index));
 	}
-	def readValueType(max_fw_index: u32) -> ValueType {
+	def readValueType(max_fw_index: int) -> ValueType {
 		var pt = decoder.pos, code = readTypeCode();
 		return readValueTypeSuffix(pt, code, max_fw_index);
 	}
-	def readValueTypeSuffix(pt: int, code: int, max_fw_index: u32) -> ValueType {
+	def readValueTypeSuffix(pt: int, code: int, max_fw_index: int) -> ValueType {
 		match (code) {
 			BpTypeCode.I32.val => return ValueType.I32;
 			BpTypeCode.I64.val => return ValueType.I64;
@@ -400,7 +400,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var heap = readHeapType1(0);
 		return ValueType.Ref(true, heap);
 	}
-	def readHeapType1(max_fw_index: u32) -> HeapType {
+	def readHeapType1(max_fw_index: int) -> HeapType {
 		var pt = decoder.pos;
 		var index = readTypeCode();
 		match (index) { // TODO: check extension set
@@ -427,11 +427,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			err.rel(decoder, decoder.pos - 1).InvalidHeapType(index);
 			return HeapType.ANY;
 		}
-		var def_length = u32.view(module.heaptypes.length);
+		var def_length = module.heaptypes.length;
 		if (index >= def_length) {
 			if (index < max_fw_index) return HeapType.FwRef(index);
 			if (max_fw_index > def_length) def_length = max_fw_index;
-			err.rel(decoder, pt).OobIndex("heap type index", u32.view(index), def_length);
+			err.rel(decoder, pt).OobIndex("heap type index", u32.view(index), u32.view(def_length));
 			return HeapType.ANY;
 		}
 		match (module.heaptypes[index]) {
@@ -778,45 +778,67 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			return t.1;
 		}
 	}
-	def readDefType(index: int, max_fw_index: u32) {
+	def readDefType(index: int) {
+		var max_fw_index = module.heaptypes.length - 1;
+		readDefSubOrRecType(extensions.GC, extensions.GC, ValueTypes.NO_HEAPTYPES, 0, max_fw_index);
+	}
+	def readDefSubOrRecType(subok: bool, recok: bool, supertypes: Array<HeapType>, recgrp_index: u32, max_fw_index: int) {
 		var pt = decoder.pos;
 		var code = readByte("deftype code", BpConstants.renderDefTypeCode); // XXX: LEB not allowed here
-		var decl: Decl;
 		match (code) {
-			BpDefTypeCode.Function.code => {
-				pt = decoder.pos;
-				var ptypes = readValueTypes("param count", limits.max_num_func_params, max_fw_index);
-				if (!err.ok()) return;
-				var rtypes = readValueTypes("result count", limits.max_num_func_results, max_fw_index);
-				if (!err.ok()) return;
-				decl = SigDecl.new(ptypes, rtypes);
-			}
-			BpDefTypeCode.Struct.code => if (extensions.GC) {
-				var count = readU32("field count", limits.max_num_struct_fields);
-				if (!err.ok()) return;
-				var field_types = Array<StorageType>.new(int.!(count));
-				for (j < field_types.length) {
-					field_types[j] = readStorageType(max_fw_index);
-				}
-				if (!err.ok()) return;
-				decl = StructDecl.new(field_types);
-			}
-			BpDefTypeCode.Array.code => if (extensions.GC) {
-				var elem_type = readStorageType(max_fw_index);
-				if (!err.ok()) return;
-				decl = ArrayDecl.new([elem_type]);
-			}
-			BpDefTypeCode.SUB.code => if (extensions.GC) {
-				var count = readU32("supertype count", limits.max_supertypes);
-			}
-			BpDefTypeCode.REC.code => if (extensions.GC) {
-				var count = readU32("recursion group count", limits.max_num_types);
-			}
+			BpDefTypeCode.Function.code => return readDefFuncType(supertypes, recgrp_index, max_fw_index);
+			BpDefTypeCode.Struct.code => if (extensions.GC) return readDefStructType(supertypes, recgrp_index, max_fw_index);
+			BpDefTypeCode.Array.code => if (extensions.GC) return readDefArrayType(supertypes, recgrp_index, max_fw_index);
+			BpDefTypeCode.SUB.code => if (subok) return readDefSubType(recgrp_index, max_fw_index);
+			BpDefTypeCode.REC.code => if (recok) return readDefRecType(recgrp_index, max_fw_index);
 		}
-		if (decl == null) err.rel(decoder, pt).InvalidTypeDeclCode(code);
-		else module.addDecl(decl);
+		err.rel(decoder, pt).InvalidTypeDeclCode(code);
 	}
-	def readStorageType(max_fw_index: u32) -> StorageType {
+	def readDefSubType(recgrp_index: u32, max_fw_index: int) {
+		var count = readU32("supertype count", limits.max_supertypes);
+		var supertypes = Array<HeapType>.new(int.view(count));
+		for (i < count) {
+			var index = readU32("type index", u32.view(module.heaptypes.length));
+			supertypes[i] = HeapType.FwRef(int.view(index));
+		}
+		readDefSubOrRecType(false, false, supertypes, recgrp_index, max_fw_index);
+	}
+	def readDefRecType(recgrp_index: u32, max_fw_index: int) {
+		var count = readU32("recursion group count", limits.max_num_types);
+		max_fw_index = int.!(recgrp_index + count);
+		for (i < count) {
+			readDefSubOrRecType(true, false, ValueTypes.NO_HEAPTYPES, recgrp_index + i, max_fw_index);
+		}
+	}
+	def readDefFuncType(supertypes: Array<HeapType>, recgrp_index: u32, max_fw_index: int) {
+		var ptypes = readValueTypes("param count", limits.max_num_func_params, max_fw_index);
+		if (!err.ok()) return;
+		var rtypes = readValueTypes("result count", limits.max_num_func_results, max_fw_index);
+		if (!err.ok()) return;
+		var decl = SigDecl.new(ptypes, rtypes);
+		decl.recgrp_index = int.view(recgrp_index);
+		module.addDecl(decl);
+	}
+	def readDefStructType(supertypes: Array<HeapType>, recgrp_index: u32, max_fw_index: int) {
+		var count = readU32("field count", limits.max_num_struct_fields);
+		if (!err.ok()) return;
+		var field_types = Array<StorageType>.new(int.!(count));
+		for (j < field_types.length) {
+			field_types[j] = readStorageType(max_fw_index);
+		}
+		if (!err.ok()) return;
+		var decl = StructDecl.new(field_types);
+		decl.recgrp_index = int.view(recgrp_index);
+		module.addDecl(decl);
+	}
+	def readDefArrayType(supertypes: Array<HeapType>, recgrp_index: u32, max_fw_index: int) {
+		var elem_type = readStorageType(max_fw_index);
+		if (!err.ok()) return;
+		var decl = ArrayDecl.new([elem_type]);
+		decl.recgrp_index = int.view(recgrp_index);
+		module.addDecl(decl);
+	}
+	def readStorageType(max_fw_index: int) -> StorageType {
 		var pt = decoder.pos;
 		var code = readTypeCode();
 		var vt: ValueType, packed: Packedness;
@@ -828,7 +850,7 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		var mut = readMutability();
 		return StorageType.new(vt, packed, mut);
 	}
-	def readValueTypes(quantity: string, limit: u32, max_fw_index: u32) -> Array<ValueType> {
+	def readValueTypes(quantity: string, limit: u32, max_fw_index: int) -> Array<ValueType> {
 		var count = readU32(quantity, limit);
 		if (!err.ok()) return ValueTypes.NONE;
 		var types = Array<ValueType>.new(int.!(count));
