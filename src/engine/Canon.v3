@@ -13,6 +13,37 @@ component Canon {
 		map[sig] = sig;
 		return sig.canon_id = ++count;
 	}
+	def equalSigDecl(a: SigDecl, b: SigDecl) -> bool {
+		return ValueTypes.isEquivalentArray(a.params, b.params) && ValueTypes.isEquivalentArray(a.results, b.results);
+	}
+	def hashValueType(t: ValueType) -> int {
+		return hashValueType0(t, true);
+	}
+	private def hashValueType0(t: ValueType, structural: bool) -> int {
+		var h = int.view(t.tag);
+		match (t) {
+			Ref(nullable, heap) => {
+				if (nullable) h *= 3;
+				match (heap) {
+					Struct(sdecl) => h += if(structural, hashStructDecl(sdecl), sdecl.recgrp_index);
+					Array(array) => h += if(structural, hashArrayDecl(array), array.recgrp_index);
+					Func(sig) => h += if(structural, hashSigDecl(sig), sig.recgrp_index);
+					Rtt(depth, heaptype) => h += depth; // XXX: more hash bits for RTT
+					_ => h += heap.tag;
+				}
+			}
+			_ => ;
+		}
+		return h;
+	}
+	def hashHeapTypeDecl(decl: HeapTypeDecl) -> int {
+		match (decl) {
+			x: StructDecl => return hashStructDecl(x);
+			x: ArrayDecl => return hashArrayDecl(x);
+			x: SigDecl => return hashSigDecl(x);
+		}
+		return -1;
+	}
 	def hashSigDecl(sig: SigDecl) -> int {
 		if (sig.hash >= 0) return sig.hash;
 		var h = sig.params.length;
@@ -20,37 +51,17 @@ component Canon {
 		for (t in sig.results) h = h * 31 + hashValueType(t);
 		return sig.hash = h & 0x7FFFFFFF;
 	}
-	def equalSigDecl(a: SigDecl, b: SigDecl) -> bool {
-		return ValueTypes.isEquivalentArray(a.params, b.params) && ValueTypes.isEquivalentArray(a.results, b.results);
+	def hashStructDecl(decl: StructDecl) -> int {
+		var h = 1;
+		for (st in decl.field_types) {
+			h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
+		}
+		return h;
 	}
-	def hashValueType(t: ValueType) -> int {
-		var h = int.view(t.tag);
-		match (t) {
-			Ref(nullable, heap) => {
-				if (nullable) h *= 3;
-				match (heap) {
-					Struct(sdecl) => {
-						for (st in sdecl.field_types) {
-							h = h * 31 + st.valtype.tag + st.packing.tag + if(st.mutable, 33);
-						}
-					}
-					Array(array) => {
-						for (st in array.elem_types) {
-							h = h * 31 + st.valtype.tag + st.packing.tag + if(st.mutable, 33);
-						}
-					}
-					Func(sig) => {
-						h += hashSigDecl(sig);
-					}
-					Rtt(depth, heaptype) => {
-						h += depth; // XXX: more hash bits for RTT
-					}
-					_ => {
-						h += heap.tag;
-					}
-				}
-			}
-			_ => ;
+	def hashArrayDecl(decl: ArrayDecl) -> int {
+		var h = 2;
+		for (st in decl.elem_types) {
+			h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
 		}
 		return h;
 	}
@@ -58,3 +69,161 @@ component Canon {
 		return RttObject.new(decl, Values.NO_SUPERS); // TODO: canonicalize
 	}
 }
+// Caches structurally-equivalent heap type declarations. Exposed as a separate mechanism only for testing.
+class HeapTypeCache {
+	var mask = 255;
+	var count = 0;
+	var table = Array<HeapTypeCacheLink>.new(256);
+
+	// insert a heap type that should not already be in this cache
+	def insert(decl: HeapTypeDecl) {
+		var hash = Canon.hashHeapTypeDecl(decl), index = hash & mask;
+		table[index] = HeapTypeCacheLink.new(hash, decl, table[index]);
+		if (count++ < mask * 5) return;
+		// resize x 4
+		mask = (mask << 2) | 3;
+		var old = table;
+		table = Array<HeapTypeCacheLink>.new(mask + 1);
+		for (i < old.length) {
+			var l = old[i], n = l.next;
+			while (l != null) {
+				l.next = table[l.hash & mask];
+				table[l.hash & mask] = l;
+				l = n;
+			}
+		}
+	}
+}
+// Internal link in hash-chaining of {HeapTypeCache}.
+class HeapTypeCacheLink(hash: int, heaptype: HeapTypeDecl, var next: HeapTypeCacheLink) { }
+
+// Compares and canonicalizes iso-recursive-equivalent heap type declarations.
+class HeapTypeComparator(cache: HeapTypeCache) {
+	private var heaptypes: Vector<HeapTypeDecl>;
+	private var recgrp_start: int;
+	private def state = Vector<(RecState, HeapTypeDecl)>.new();
+
+	def reset(heaptypes: Vector<HeapTypeDecl>, recgrp_start: int, count: int) {
+		this.heaptypes = heaptypes;
+		this.recgrp_start = recgrp_start;
+		state.resize(count);
+		for (i < count) state[i] = (RecState.UNSEEN, null);
+	}
+	def canon() {
+		for (i < state.length) computeEq(i);
+		for (i < state.length) subst(i);
+	}
+	private def computeEq(i: int) {
+		if (state[i].0 != RecState.UNSEEN) return;
+		var decl = heaptypes[recgrp_start + i];
+		var hash = Canon.hashHeapTypeDecl(decl);
+		for (l = cache.table[hash & cache.mask]; l != null; l = l.next) {
+			if (l.hash != hash) continue;
+			var prev = l.heaptype;
+			state[i] = (RecState.COMPARING, prev);
+			if (recEq(prev, decl)) {
+				heaptypes[recgrp_start + i] = prev; // equivalent to previous declaration
+				state[i] = (RecState.CACHED, prev);
+				return;
+			}
+		}
+		state[i] = (RecState.NEW, decl);
+	}
+	private def recEqFwRef(prev: HeapTypeDecl, index: int) -> bool {
+		if (index < recgrp_start) return prev == heaptypes[index];
+		var i = index - recgrp_start;
+		if (i >= state.length) return false;
+		var s = state[i];
+		if (s.0 == RecState.COMPARING) return s.1 == prev;
+		if (s.0 == RecState.UNSEEN) {
+			computeEq(i);
+			return state[i].1 == prev;
+		}
+		return false;
+	}
+	private def recEq(prev: HeapTypeDecl, decl: HeapTypeDecl) -> bool {
+		if (prev == decl) return true;
+		if (prev.recgrp_index != decl.recgrp_index) return false;
+		match (prev) {
+			px: StructDecl => match (decl) {
+				py: StructDecl => {
+					if (px.field_types.length != py.field_types.length) return false;
+					for (i < px.field_types.length) {
+						if (!recStorageTypeEq(px.field_types[i], py.field_types[i])) return false;
+					}
+					return true;
+				}
+				_ => return false;
+			}
+			px: ArrayDecl => match (decl) {
+				py: ArrayDecl => {
+					if (px.elem_types.length != py.elem_types.length) return false;
+					for (i < px.elem_types.length) {
+						if (!recStorageTypeEq(px.elem_types[i], py.elem_types[i])) return false;
+					}
+					return true;
+				}
+				_ => return false;
+			}
+			px: SigDecl => match (decl) {
+				py: SigDecl => {
+					if (px.params.length != py.params.length) return false;
+					if (px.results.length != py.results.length) return false;
+					for (i < px.params.length) {
+						if (!recValueTypeEq(px.params[i], py.params[i])) return false;
+					}
+					for (i < px.results.length) {
+						if (!recValueTypeEq(px.results[i], py.results[i])) return false;
+					}
+					return true;
+				}
+				_ => return false;
+			}
+		}
+		return false;
+	}
+	private def recValueTypeEq(prev: ValueType, vt: ValueType) -> bool {
+		match (prev) {
+			Ref(fnullable, fheap) => match (vt) {
+				Ref(tnullable, theap) => {
+					if (fnullable != tnullable) return false;
+					match (fheap) {
+						Struct(fdecl) => match (theap) {
+							Struct(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						Array(fdecl) => match (theap) {
+							Array(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						Func(fdecl) => match (theap) {
+							Func(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						_ => ;
+					}
+				}
+				_ => ;
+			}
+			_ => ;
+		}
+		return prev == vt; // full ADT comparison
+	}
+	private def recStorageTypeEq(prev: StorageType, vt: StorageType) -> bool {
+		if (prev == vt) return true;
+		if (prev.packing != vt.packing) return false;
+		if (prev.mutable != vt.mutable) return false;
+		return recValueTypeEq(prev.valtype, vt.valtype);
+	}
+	private def subst(i: int) {
+		var s = state[i];
+		if (s.0 == RecState.NEW) {
+			// TODO: recursively substitute canonicalized decls into value types
+			cache.insert(s.1);
+		}
+	}
+}
+enum RecState { UNSEEN, COMPARING, CACHED, NEW }
