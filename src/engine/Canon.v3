@@ -1,71 +1,310 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Canonicalizes signatures and structural types.
+// Canonicalizes structurally-equivalent heap type declarations.
 component Canon {
-	private def map = HashMap<SigDecl, SigDecl>.new(SigDecl.hash, equalSigDecl);
-	private var count = 0;
+	// The global heap type cache for the whole engine.
+	def globalCache = HeapTypeCache.new();
 
 	def sigId(sig: SigDecl) -> int {
 		if (sig.canon_id >= 0) return sig.canon_id;
-		var prev = map[sig];
-		if (prev != null) return prev.canon_id;
-		map[sig] = sig;
-		return sig.canon_id = ++count;
+		return canon.doOne(sig).canon_id;
 	}
-	def equalSigDecl(a: SigDecl, b: SigDecl) -> bool {
-		return ValueTypes.isEquivalentArray(a.params, b.params) && ValueTypes.isEquivalentArray(a.results, b.results);
+	def getRtt(decl: HeapTypeDecl) -> RttObject {
+		if (decl.rttObject == null) decl.rttObject = RttObject.new(decl, Values.NO_SUPERS);
+		return decl.rttObject;
 	}
-	def hashValueType(t: ValueType) -> int {
-		return hashValueType0(t, true);
+}
+
+def canon = IsoRecCanonicalizer.new(Canon.globalCache);
+
+def equalSigDecl(a: SigDecl, b: SigDecl) -> bool {
+	return ValueTypes.isEquivalentArray(a.params, b.params) && ValueTypes.isEquivalentArray(a.results, b.results);
+}
+def hashValueType(t: ValueType) -> int {
+	return hashValueType0(t, true);
+}
+def hashValueType0(t: ValueType, structural: bool) -> int {
+	var h = int.view(t.tag);
+	match (t) {
+		Ref(nullable, heap) => {
+			if (nullable) h *= 3;
+			match (heap) {
+				Struct(sdecl) => h += if(structural, hashStructDecl(sdecl), sdecl.recgrp_index);
+				Array(array) => h += if(structural, hashArrayDecl(array), array.recgrp_index);
+				Func(sig) => h += if(sig == null, 42, if(structural, hashSigDecl(sig), sig.recgrp_index));
+				Rtt(depth, heaptype) => h += depth; // XXX: more hash bits for RTT
+				_ => h += heap.tag;
+			}
+		}
+		_ => ;
 	}
-	private def hashValueType0(t: ValueType, structural: bool) -> int {
-		var h = int.view(t.tag);
-		match (t) {
-			Ref(nullable, heap) => {
-				if (nullable) h *= 3;
-				match (heap) {
-					Struct(sdecl) => h += if(structural, hashStructDecl(sdecl), sdecl.recgrp_index);
-					Array(array) => h += if(structural, hashArrayDecl(array), array.recgrp_index);
-					Func(sig) => h += if(structural, hashSigDecl(sig), sig.recgrp_index);
-					Rtt(depth, heaptype) => h += depth; // XXX: more hash bits for RTT
-					_ => h += heap.tag;
+	return h;
+}
+def hashHeapTypeDecl(decl: HeapTypeDecl) -> int {
+	match (decl) {
+		x: StructDecl => return hashStructDecl(x);
+		x: ArrayDecl => return hashArrayDecl(x);
+		x: SigDecl => return hashSigDecl(x);
+	}
+	return -1;
+}
+def hashSigDecl(sig: SigDecl) -> int {
+	if (sig.hash != 0) return sig.hash;
+	var h = sig.params.length;
+	for (t in sig.params) h = h * 31 + hashValueType(t);
+	for (t in sig.results) h = h * 31 + hashValueType(t);
+	return sig.hash = h | int.min;
+}
+def hashStructDecl(decl: StructDecl) -> int {
+	if (decl.hash != 0) return decl.hash;
+	var h = 1;
+	for (st in decl.field_types) {
+		h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
+	}
+	return decl.hash = h | int.min;
+}
+def hashArrayDecl(decl: ArrayDecl) -> int {
+	if (decl.hash >= 0) return decl.hash;
+	var h = 2;
+	for (st in decl.elem_types) {
+		h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
+	}
+	return decl.hash = h | int.min;
+}
+def storageTypeEq(prev: StorageType, vt: StorageType) -> bool {
+	if (prev == vt) return true;
+	return prev.packing == vt.packing && prev.mutable == vt.mutable && prev.valtype == vt.valtype;
+}
+
+// Caches structurally-equivalent heap type declarations.
+// Only exposed as a separate mechanism for testing.
+class HeapTypeCache {
+	var mask = 255;
+	var count = 0;
+	var uid = 0;
+	var table = Array<HeapTypeCacheLink>.new(256);
+
+	// insert a heap type that should not already be in this cache
+	def insert(decl: HeapTypeDecl) {
+		var hash = hashHeapTypeDecl(decl), index = hash & mask;
+		table[index] = HeapTypeCacheLink.new(hash, decl, table[index]);
+		decl.canon_id = ++uid;
+		if (count++ < mask * 5) return;
+		// resize x 4
+		mask = (mask << 2) | 3;
+		var old = table;
+		var ntable = table = Array<HeapTypeCacheLink>.new(mask + 1);
+		for (i < old.length) {
+			var l = old[i], n = l.next;
+			while (l != null) {
+				l.next = ntable[l.hash & mask];
+				ntable[l.hash & mask] = l;
+				l = n;
+			}
+		}
+	}
+}
+// Internal link in hash-chaining of {HeapTypeCache}.
+class HeapTypeCacheLink(hash: int, heaptype: HeapTypeDecl, var next: HeapTypeCacheLink) { }
+
+// Compares and canonicalizes iso-recursive-equivalent heap type declarations relative to a {cache}.
+class IsoRecCanonicalizer(cache: HeapTypeCache) {
+	// internal recursive state avoids passing lots of params
+	private var heaptypes: Vector<HeapTypeDecl>;
+	private var recgrp_start: int;
+	private def state = Vector<(RecState, HeapTypeDecl)>.new();
+
+	// Canonicalize a group in {heaptypes[recgrp_start...(recgrp_start + count)]} and update the
+	// vector if necessary.
+	def doGroup(heaptypes: Vector<HeapTypeDecl>, recgrp_start: int, count: int) {
+		this.heaptypes = heaptypes;
+		this.recgrp_start = recgrp_start;
+		state.resize(count);
+		for (i < count) state[i] = (RecState.UNSEEN, null);
+		for (i < state.length) computeEq(i);
+		for (i < state.length) subst(i);
+		this.heaptypes = null; // don't leak
+		this.recgrp_start = -1;
+	}
+	// Canonicalize a single (non-recursive) type whose nested types are already canonicalized.
+	// More efficient than above.
+	def doOne(decl: HeapTypeDecl) -> HeapTypeDecl {
+		var hash = hashHeapTypeDecl(decl);
+		for (l = cache.table[hash & cache.mask]; l != null; l = l.next) {
+			if (l.hash != hash) continue;
+			var prev = l.heaptype;
+			if (prev == decl) return prev;
+			if (quickEq(prev, decl)) {
+				decl.canon_id = prev.canon_id;
+				return prev; // equivalent to previous declaration
+			}
+		}
+		cache.insert(decl);
+		decl.canon_id = ++cache.uid;
+		return decl;
+	}
+	// Shallow test for equivalence that does not recurse into nested ValueTypes, suitable for
+	// non-recursive types only.
+	private def quickEq(prev: HeapTypeDecl, decl: HeapTypeDecl) -> bool {
+		if (prev.recgrp_index != decl.recgrp_index) return false;
+		match (prev) {
+			px: StructDecl => match (decl) {
+				py: StructDecl => return Arrays.allTrue(px.field_types, py.field_types, storageTypeEq);
+				_ => return false;
+			}
+			px: ArrayDecl => match (decl) {
+				py: ArrayDecl => return Arrays.allTrue(px.elem_types, py.elem_types, storageTypeEq);
+				_ => return false;
+			}
+			px: SigDecl => match (decl) {
+				py: SigDecl => {
+					return Arrays.allTrue(px.params, py.params, ValueType.==)
+						&& Arrays.allTrue(px.results, py.results, ValueType.==);
 				}
+				_ => return false;
+			}
+		}
+		return false;
+	}
+	// Recurse on the entry {i} if it has not been seen before.
+	private def computeEq(i: int) {
+		if (state[i].0 != RecState.UNSEEN) return;
+		var decl = heaptypes[recgrp_start + i];
+		var hash = hashHeapTypeDecl(decl);
+		for (l = cache.table[hash & cache.mask]; l != null; l = l.next) {
+			if (l.hash != hash) continue;
+			var prev = l.heaptype;
+			state[i] = (RecState.COMPARING, prev);
+			if (recEq(prev, decl)) {
+				heaptypes[recgrp_start + i] = prev; // equivalent to previous declaration
+				state[i] = (RecState.CACHED, prev);
+				return;
+			}
+		}
+		decl.canon_id = ++cache.uid;
+		state[i] = (RecState.NEW, decl);
+	}
+	// Compare {prev}, a canonicalized type, to a by-index type reference (usually within this recursion group).
+	private def recEqFwRef(prev: HeapTypeDecl, index: int) -> bool {
+		if (index < recgrp_start) return prev == heaptypes[index];
+		var i = index - recgrp_start;
+		if (i >= state.length) return false;
+		var s = state[i];
+		if (s.0 == RecState.COMPARING) return s.1 == prev;
+		if (s.0 == RecState.UNSEEN) {
+			computeEq(i);
+			return state[i].1 == prev;
+		}
+		return false;
+	}
+	// Compare {prev}, a canonicalized type, to {decl}, recursing through forward references to test isomorphism.
+	private def recEq(prev: HeapTypeDecl, decl: HeapTypeDecl) -> bool {
+		if (prev == decl) return true;
+		if (prev.recgrp_index != decl.recgrp_index) return false;
+		match (prev) {
+			px: StructDecl => match (decl) {
+				py: StructDecl => return Arrays.allTrue(px.field_types, py.field_types, recStorageTypeEq);
+				_ => return false;
+			}
+			px: ArrayDecl => match (decl) {
+				py: ArrayDecl => return Arrays.allTrue(px.elem_types, py.elem_types, recStorageTypeEq);
+				_ => return false;
+			}
+			px: SigDecl => match (decl) {
+				py: SigDecl => {
+					return Arrays.allTrue(px.params, py.params, recValueTypeEq)
+						&& Arrays.allTrue(px.results, py.results, recValueTypeEq);
+				}
+				_ => return false;
+			}
+		}
+		return false;
+	}
+	// Compare {prev}, a canonicalized value type, to {vt}, recursing through forward references to test isomorphism.
+	private def recValueTypeEq(prev: ValueType, vt: ValueType) -> bool {
+		match (prev) {
+			Ref(fnullable, fheap) => match (vt) {
+				Ref(tnullable, theap) => {
+					if (fnullable != tnullable) return false;
+					match (fheap) {
+						Struct(fdecl) => match (theap) {
+							Struct(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						Array(fdecl) => match (theap) {
+							Array(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						Func(fdecl) => match (theap) {
+							Func(tdecl) => return fdecl == tdecl;
+							FwRef(index) => return recEqFwRef(fdecl, index);
+							_ => return false;
+						}
+						_ => ;
+					}
+				}
+				_ => ;
 			}
 			_ => ;
 		}
-		return h;
+		return prev == vt; // full ADT comparison
 	}
-	def hashHeapTypeDecl(decl: HeapTypeDecl) -> int {
-		match (decl) {
-			x: StructDecl => return hashStructDecl(x);
-			x: ArrayDecl => return hashArrayDecl(x);
-			x: SigDecl => return hashSigDecl(x);
+	private def recStorageTypeEq(prev: StorageType, vt: StorageType) -> bool {
+		if (prev == vt) return true;
+		if (prev.packing != vt.packing) return false;
+		if (prev.mutable != vt.mutable) return false;
+		return recValueTypeEq(prev.valtype, vt.valtype);
+	}
+	// Eliminate references to non-canonicalized types within the declaration at {i}. We only need to update the
+	// declared storage types or value types.
+	private def subst(i: int) {
+		var s = state[i];
+		if (s.0 != RecState.NEW) return;
+		cache.insert(s.1);
+		match (s.1) {
+			x: SigDecl => {
+				for (i < x.params.length) x.params[i] = substValueType(x.params[i]);
+				for (i < x.results.length) x.results[i] = substValueType(x.results[i]);
+			}
+			x: StructDecl => {
+				for (i < x.field_types.length) {
+					var p = x.field_types[i];
+					x.field_types[i] = StorageType.new(substValueType(p.valtype), p.packing, p.mutable);
+				}
+			}
+			x: ArrayDecl => {
+				for (i < x.elem_types.length) {
+					var p = x.elem_types[i];
+					x.elem_types[i] = StorageType.new(substValueType(p.valtype), p.packing, p.mutable);
+				}
+			}
 		}
-		return -1;
 	}
-	def hashSigDecl(sig: SigDecl) -> int {
-		if (sig.hash >= 0) return sig.hash;
-		var h = sig.params.length;
-		for (t in sig.params) h = h * 31 + hashValueType(t);
-		for (t in sig.results) h = h * 31 + hashValueType(t);
-		return sig.hash = h & 0x7FFFFFFF;
-	}
-	def hashStructDecl(decl: StructDecl) -> int {
-		var h = 1;
-		for (st in decl.field_types) {
-			h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
+	// Eliminate references to non-canonicalized types within the value type {t}. We only need to recurse as deep
+	// as the first heap type and substitute in our newly canonicalized types.
+	private def substValueType(t: ValueType) -> ValueType {
+		match (t) {
+			Ref(nullable, heap) => match (heap) {
+				Struct(decl) => {
+					var n = heaptypes[decl.struct_index];
+					if (n != decl) return ValueType.Ref(nullable, HeapType.Struct(StructDecl.!(n)));
+				}
+				Array(decl) => {
+					var n = heaptypes[decl.array_index];
+					if (n != decl) return ValueType.Ref(nullable, HeapType.Array(ArrayDecl.!(n)));
+				}
+				Func(decl) => {
+					var n = heaptypes[decl.sig_index];
+					if (n != decl) return ValueType.Ref(nullable, HeapType.Func(SigDecl.!(n)));
+				}
+				_ => ;
+			}
+			_ => ;
 		}
-		return h;
-	}
-	def hashArrayDecl(decl: ArrayDecl) -> int {
-		var h = 2;
-		for (st in decl.elem_types) {
-			h = h * 31 + hashValueType0(st.valtype, false) + st.packing.tag + if(st.mutable, 33);
-		}
-		return h;
-	}
-	def getRtt(decl: HeapTypeDecl) -> RttObject {
-		return RttObject.new(decl, Values.NO_SUPERS); // TODO: canonicalize
+		return t;
 	}
 }
+enum RecState { UNSEEN, COMPARING, CACHED, NEW }
