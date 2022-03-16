@@ -35,6 +35,10 @@ fi
 
 
 let PROGRESS_PIPE=1
+if [ "$(which progress)" = "" ]; then
+    PROGRESS_PIPE=0
+fi
+
 if [[ "$1" =~ "-trace-calls=" ]]; then
     export V3C_OPTS="$1 $V3C_OPTS"
     shift

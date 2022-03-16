@@ -74,6 +74,8 @@ The most up-to-date documentation is, as always, the implementation in this repo
 
 See the [Design](Design.md) for a closer look at Wizard's internals.
 
+Read how to [Build and Test](Building.md) Wizard.
+
 ### Research Projects
 
 Currently, Wizard supports three closely related research projects:

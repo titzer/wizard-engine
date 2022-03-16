@@ -13,6 +13,10 @@ SPEC_ROOT=$WIZENG_LOC/wasm-spec
 
 WIZENG_OPTS=
 let PROGRESS_PIPE=1
+if [ "$(which progress)" = "" ]; then
+    PROGRESS_PIPE=0
+fi
+
 while [[ "$1" =~ ^\-.* ]]; do
     if [[ "$1" =~ "\--trace" ]]; then
 	# turn off the progress pipe in verbose mode
