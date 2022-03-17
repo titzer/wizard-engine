@@ -34,9 +34,16 @@ function run {
     BRANCH=$1
     cd $SPEC_ROOT/$BRANCH/test/core/bin/
     TESTS=$(ls *.bin.wast)
-    if [[ -d simd && "$TEST_SIMD" != "" ]]; then
-       TESTS="$TESTS $(ls simd/*.bin.wast)"
-    fi
+
+    # add optional subdirectories
+    for sub in simd gc; do
+        SUB=$(echo $sub | tr [a-z] [A-Z])
+        varname="TEST_$SUB"
+        if [[ -d $sub && "${!varname}" != "" ]]; then
+            TESTS="$TESTS $(ls $sub/*.bin.wast)"
+        fi
+    done
+
     COUNT=$(echo $TESTS | awk '{print NF}')
 
     # run unittests and pipe through progress program
