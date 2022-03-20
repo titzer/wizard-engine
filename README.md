@@ -76,6 +76,8 @@ See the [Design](Design.md) for a closer look at Wizard's internals.
 
 Read how to [Build and Test](doc/Building.md) Wizard.
 
+Read how to use [tracing options](doc/Tracing.md) in Wizard.
+
 ### Research Projects
 
 Currently, Wizard supports three closely related research projects:
