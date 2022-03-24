@@ -10,20 +10,41 @@ NORM='[0;00m'
 
 function skip() {
     printf "Testing ${CYAN}%-10s${NORM} %-13s | " $1 $2
-    printf "${YELLOW}skipped${NORM}\n"
+    printf "${YELLOW}skipped (%s)${NORM}\n" "$3"
 }
 
-TEST_TARGET=int $SCRIPT_LOC/unit.sh
-TEST_TARGET=x86-linux $SCRIPT_LOC/unit.sh
-TEST_TARGET=x86-64-linux $SCRIPT_LOC/unit.sh
-skip unit jvm # TODO: v3 heap too large
+if [ "$TEST_TARGETS" = "" ]; then
+    if [ "$TEST_TARGET" = "" ]; then
+	TEST_TARGETS="int x86-linux x86-64-linux jvm"
+    else
+	TEST_TARGETS="$TEST_TARGET"
+    fi
+fi
 
-skip spec int # TODO: out of memory
-TEST_TARGET=x86-linux $SCRIPT_LOC/spec.sh
-TEST_TARGET=x86-64-linux $SCRIPT_LOC/spec.sh
-TEST_TARGET=jvm $SCRIPT_LOC/spec.sh
+# Unit tests
+for target in $TEST_TARGETS; do
+    if [ "$target" = jvm ]; then # TODO: out of memory
+	skip unit $target "initial heap too large on this target"
+    else
+	TEST_TARGET=$target $SCRIPT_LOC/unit.sh
+    fi
+done
 
-TEST_TARGET=int $SCRIPT_LOC/wizeng.sh
-TEST_TARGET=x86-linux $SCRIPT_LOC/wizeng.sh
-TEST_TARGET=x86-64-linux $SCRIPT_LOC/wizeng.sh
-TEST_TARGET=jvm $SCRIPT_LOC/wizeng.sh
+# Spec tests
+for target in $TEST_TARGETS; do
+    if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
+	skip spec $target "will run out of memory"
+    else
+	TEST_TARGET=$target $SCRIPT_LOC/spec.sh
+    fi
+done
+
+# Wizeng tests
+for target in $TEST_TARGETS; do
+    if [ "$target" = "" ]; then # for symmetry
+	skip wizeng $target
+    else
+	TEST_TARGET=$target $SCRIPT_LOC/wizeng.sh
+    fi
+done
+
