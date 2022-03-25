@@ -87,8 +87,7 @@ You can also run one of the binaries built and put into the `bin/` directory.
 
 You'll notice this spews quite a lot of output on your terminal, and it can be hard to spot failures.
 The text output is formatted for a simple testing utility called `progress` (not included) that makes the output much more readable.
-You can build this utility from the Virgil repository in the `apps/Progress` directory.
-(TODO: more instructions for building/installing progress, or just include a copy?)
+You can get this utility from [this repository](https://github.com/titzer/progress).
 
 ### Specification tests
 
@@ -126,7 +125,7 @@ Now you're ready to run the specification tests.
 ### Proposal tests
 
 Note that you can check out modified specs associated with any proposal.
-Just place (or link) them under `wasm-spec` and follow similar steps to build/run them.
+Just place (or link) them under `wasm-spec` and follow similar steps to build and run them.
 For example, to test the `tail-call` proposal:
 
 ```
