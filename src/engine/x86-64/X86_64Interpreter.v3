@@ -2,8 +2,8 @@
 // See LICENSE for details of Apache 2.0 license.
 
 var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
-def TAGGED = Tagging.new(true);
-def UNTAGGED = Tagging.new(false);
+def TAGGED = ValueRep.new(true, false);
+def UNTAGGED = ValueRep.new(false, false);
 // XXX: hack so V3Offsets.new() can allocate an Interpreter without auto-generating the interpreter code
 class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
 	var dispatchTable: Pointer;
@@ -69,7 +69,7 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 					var sp = valueStack.sp;
 					state = invoke(wf, sp);
 					if (state.0 == ExecState.FINISHED) {
-						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.tagging.slot_size);
+						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.valuerep.slot_size);
 					}
 					break;
 				}
@@ -370,7 +370,7 @@ class X86_64InterpreterCode extends RiUserCode {
 // Maps a value stack red zone at the end to catch and report stack overflow.
 // TODO: need custom scan extension for V3 garbage collector for reference values.
 class ValueStack {
-	def tagging = TAGGED;
+	def valuerep = TAGGED;
 	def size: u32;
 	def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var sp: Pointer;
@@ -423,16 +423,16 @@ class ValueStack {
 	}
 	def popb32(tag: byte) -> u32 {
 		checkTag(tag);
-		sp += -(tagging.slot_size);
-		return (sp + tagging.tag_size).load<u32>();
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<u32>();
 	}
 	def popb64(tag: byte) -> u64 {
 		checkTag(tag);
-		sp += -(tagging.slot_size);
-		return (sp + tagging.tag_size).load<u64>();
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<u64>();
 	}
 	def popObject() -> Object {
-		if (tagging.on) {
+		if (valuerep.tagged) {
 			var got = peekTag();
 			match (got) {
 				BpTypeCode.ANYREF.code,
@@ -444,8 +444,8 @@ class ValueStack {
 				_ => fatal(Strings.format1("value stack tag mismatch, expected ref, got %x", got));
 			}
 		}
-		sp += -(tagging.slot_size);
-		return (sp + tagging.tag_size).load<Object>();
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<Object>();
 	}
 	def popFunction() -> Function {
 		var obj = popObject();
@@ -456,19 +456,19 @@ class ValueStack {
 		return RttObject.!(obj);
 	}
 	def checkTag(tag: byte) -> byte {
-		if (!tagging.on) return tag;
+		if (!valuerep.tagged) return tag;
 		var got = peekTag();
 		if (got == tag) return tag;
 		fatal(Strings.format2("value stack tag mismatch, expected: %x, got %x", tag, got));
 		return tag;
 	}
 	def peekTag() -> byte {
-		return (sp + -(tagging.slot_size)).load<u8>() & '\x7F';
+		return (sp + -(valuerep.slot_size)).load<u8>() & '\x7F';
 	}
 	def pushPair<T>(tag: byte, bits: T) {
-		if (tagging.on) sp.store<u8>(tag);
-		(sp + tagging.tag_size).store(bits);
-		sp += tagging.slot_size;
+		if (valuerep.tagged) sp.store<u8>(tag);
+		(sp + valuerep.tag_size).store(bits);
+		sp += valuerep.slot_size;
 	}
 }
 
@@ -537,11 +537,12 @@ component I {
 	def scratch = R.RBP;
 }
 
-// Enables or disables tagging of values on the value stack.
-class Tagging(on: bool) {
-	def tag_size: int = if(on, 8, 0);
-	def slot_size: int = if(on, 16, 8);
-	def slot_size_log: u6 = if(on, 4, 3);
+// Configures the representation of values on the value stack.
+class ValueRep(tagged: bool, simd: bool) {
+	def raw = if(simd, 16, 8);
+	def tag_size: int = if(tagged, raw, 0);
+	def slot_size: int = if(tagged, raw * 2, raw);
+	def slot_size_log: u6 = if(tagged, if(simd, 5, 4), if(simd, 4, 3));
 }
 // Options that only impact interpreter performance.
 class X86_64InterpreterTuning {
@@ -571,7 +572,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	def frameSize = IVar.INSTANCE.frameOffset + Pointer.SIZE;
 	def offsets = V3Offsets.new();
 	def tuning = X86_64InterpreterTuning.new();
-	def tagging = TAGGED;
+	def valuerep = TAGGED;
 
 	var ic: X86_64InterpreterCode;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
@@ -589,14 +590,14 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 	def vsp = I.vsp;
 	def vsp_p0t = vsp.indirect();						// VSP[0] tag
-	def vsp_p0 = vsp.plus(tagging.tag_size);				// VSP[0] value
-	def vsp_m1 = vsp.plus(tagging.tag_size - tagging.slot_size);		// VSP[-1] value
-	def vsp_m1u = vsp.plus(tagging.tag_size - tagging.slot_size + 4);	// VSP[-1] upper 32 bits
-	def vsp_m1t = vsp.plus(-tagging.slot_size);				// VSP[-1] tag
-	def vsp_m2 = vsp.plus(tagging.tag_size - 2 * tagging.slot_size);	// VSP[-2] value
-	def vsp_m2u = vsp.plus(tagging.tag_size - 2 * tagging.slot_size + 4);	// VSP[-2] upper 32 bits
-	def vsp_m2t = vsp.plus(-2 * tagging.slot_size);				// VSP[-2] tag
-	def vsp_m3 = vsp.plus(tagging.tag_size - 3 * tagging.slot_size);	// VSP[-3] value
+	def vsp_p0 = vsp.plus(valuerep.tag_size);				// VSP[0] value
+	def vsp_m1 = vsp.plus(valuerep.tag_size - valuerep.slot_size);		// VSP[-1] value
+	def vsp_m1u = vsp.plus(valuerep.tag_size - valuerep.slot_size + 4);	// VSP[-1] upper 32 bits
+	def vsp_m1t = vsp.plus(-valuerep.slot_size);				// VSP[-1] tag
+	def vsp_m2 = vsp.plus(valuerep.tag_size - 2 * valuerep.slot_size);	// VSP[-2] value
+	def vsp_m2u = vsp.plus(valuerep.tag_size - 2 * valuerep.slot_size + 4);	// VSP[-2] upper 32 bits
+	def vsp_m2t = vsp.plus(-2 * valuerep.slot_size);			// VSP[-2] tag
+	def vsp_m3 = vsp.plus(valuerep.tag_size - 3 * valuerep.slot_size);	// VSP[-3] value
 
 	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef)>.new(Opcodes.code_pages.length + 1);
 
@@ -769,7 +770,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movq_r_m(tmp, IVar.FUNC_DECL.gpr.plus(offsets.FuncDecl_sig));
 		asm.movq_r_m(tmp, tmp.plus(offsets.SigDecl_params));
 		asm.movd_r_m(tmp, tmp.plus(offsets.Array_length));
-		asm.q.shl_r_i(tmp, tagging.slot_size_log);
+		asm.q.shl_r_i(tmp, valuerep.slot_size_log);
 		asm.movq_r_r(IVar.VFP.gpr, IVar.VSP.gpr);
 		asm.q.sub_r_r(IVar.VFP.gpr, tmp);
 		saveIVar(IVar.VFP);
@@ -842,7 +843,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.bind(start2);
 		genTagPushR(typeGpr);			// *(sp) = type
 		asm.movq_m_i(vsp_p0, 0);		// *(sp + 8) = 0
-		asm.add_r_i(vsp, tagging.slot_size);		// sp += 16
+		asm.add_r_i(vsp, valuerep.slot_size);		// sp += 16
 		// gen: while (--num != 0)
 		asm.d.dec_r(numGpr);
 		asm.jc_rel_near(C.NZ, start2);
@@ -925,14 +926,14 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			genReadSleb32_inline(I.r1);
 			genTagPush(BpTypeCode.I32.code);
 			asm.movq_m_r(vsp_p0, I.r1);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_CONST); {
 			genReadSleb64_inline(I.r1);
 			genTagPush(BpTypeCode.I64.code);
 			asm.movq_m_r(vsp_p0, I.r1);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F32_CONST); {
@@ -940,7 +941,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.add_r_i(I.ip, 4);
 			genTagPush(BpTypeCode.F32.code);
 			asm.movq_m_r(vsp_p0, I.r0);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F64_CONST); {
@@ -948,7 +949,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.add_r_i(I.ip, 8);
 			genTagPush(BpTypeCode.F64.code);
 			asm.movq_m_r(vsp_p0, I.r0);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 	}
@@ -973,7 +974,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// IF: check condition and either fall thru to next bytecode or ctl xfer (without stack copying)
 		bindHandler(Opcode.IF);
-		asm.sub_r_i(vsp, tagging.slot_size);
+		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.d.cmp_m_i(vsp_p0, 0);
 		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
 		asm.bind(ctl_fallthru);
@@ -983,7 +984,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		// BR_IF: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
 		bindHandler(Opcode.BR_IF);
-		asm.sub_r_i(vsp, tagging.slot_size);
+		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.d.cmp_m_i(vsp_p0, 0);
 		asm.jc_rel_near(C.Z, ctl_fallthru);
 		// fallthru to BR
@@ -1000,17 +1001,17 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		// load valcount
 		asm.movd_r_m(valcount, IVar.XIP.gpr.plus(offsets.XIP_valcount));
 		// popcount = popcount * SLOT_SIZE
-		asm.d.shl_r_i(popcount, tagging.slot_size_log);
+		asm.d.shl_r_i(popcount, valuerep.slot_size_log);
 		// vsp -= valcount + popcount (XXX: save an instruction here?)
 		asm.q.sub_r_r(vsp, popcount);
 		asm.movd_r_r(I.scratch, valcount);
-		asm.d.shl_r_i(I.scratch, tagging.slot_size_log);
+		asm.d.shl_r_i(I.scratch, valuerep.slot_size_log);
 		asm.q.sub_r_r(vsp, I.scratch);
 		// do { [vsp] = [vsp + popcount]; vsp++; valcount--; } while (valcount != 0)
 		var loop = X86_64Label.new();
 		asm.bind(loop);
 		genCopySlot(vsp.plus(0), vsp.plusR(popcount, 1, 0));
-		asm.q.add_r_i(vsp, tagging.slot_size);
+		asm.q.add_r_i(vsp, valuerep.slot_size);
 		asm.d.dec_r(valcount);
 		asm.jc_rel_near(C.G, loop);
 
@@ -1027,7 +1028,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		bindHandler(Opcode.BR_TABLE);
 		var max = I.r0, key = I.r1;
 		asm.movd_r_m(max, IVar.XIP.gpr.plus(offsets.XIP_pc_delta));
-		asm.sub_r_i(vsp, tagging.slot_size);
+		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.movd_r_m(key, vsp_p0);
 		asm.d.cmp_r_r(key, max);
 		var ok = X86_64Label.new();
@@ -1049,7 +1050,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_m_r(vsp_m3, I.r0);
 			// true case, nothing to do
 			asm.bind(label);
-			asm.sub_r_i(vsp, 2 * tagging.slot_size);
+			asm.sub_r_i(vsp, 2 * valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.SELECT_T); {
@@ -1061,10 +1062,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.dec_r(I.r1);
 			asm.jc_rel_near(C.NZ, skip);
 
-			asm.d.shl_r_i(I.r0, tagging.slot_size_log);
+			asm.d.shl_r_i(I.r0, valuerep.slot_size_log);
 			asm.movd_r_m(I.r1, vsp_m1);
 			asm.sub_r_r(vsp, I.r0);
-			asm.sub_r_i(vsp, tagging.slot_size); // XXX: combine with above using lea
+			asm.sub_r_i(vsp, valuerep.slot_size); // XXX: combine with above using lea
 			asm.d.cmp_r_i(I.r1, 0);
 			var label = X86_64Label.new();
 			asm.jc_rel_near(C.NZ, label);
@@ -1075,7 +1076,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.bind(copy);
 			asm.movq_r_m(I.r2, vsp.plusR(I.r0, 1, - Pointer.SIZE));
 			asm.movq_m_r(I.r1.plusR(I.r0, 1, - Pointer.SIZE), I.r2);
-			asm.d.sub_r_i(I.r0, tagging.slot_size);
+			asm.d.sub_r_i(I.r0, valuerep.slot_size);
 			asm.jc_rel_near(C.NZ, copy);
 			// true case, nothing to do
 			asm.bind(label);
@@ -1084,29 +1085,29 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	def genLocals() {
 		bindHandler(Opcode.DROP);
-		asm.sub_r_i(vsp, tagging.slot_size);
+		asm.sub_r_i(vsp, valuerep.slot_size);
 		endHandler();
 
 		bindHandler(Opcode.LOCAL_GET);
 		genReadUleb32(I.r0);
-		asm.d.shl_r_i(I.r0, tagging.slot_size_log);
+		asm.d.shl_r_i(I.r0, valuerep.slot_size_log);
 		genCopySlot(vsp.indirect(), IVar.VFP.gpr.plusR(I.r0, 1, 0));
-		asm.add_r_i(vsp, tagging.slot_size);
+		asm.add_r_i(vsp, valuerep.slot_size);
 		endHandler();
 
 		bindHandler(Opcode.LOCAL_SET);
 		genReadUleb32(I.r0);
-		asm.d.shl_r_i(I.r0, tagging.slot_size_log);
-		asm.sub_r_i(vsp, tagging.slot_size);
+		asm.d.shl_r_i(I.r0, valuerep.slot_size_log);
+		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.movq_r_m(I.r1, vsp_p0);
-		asm.movq_m_r(IVar.VFP.gpr.plusR(I.r0, 1, tagging.tag_size), I.r1);
+		asm.movq_m_r(IVar.VFP.gpr.plusR(I.r0, 1, valuerep.tag_size), I.r1);
 		endHandler();
 
 		bindHandler(Opcode.LOCAL_TEE);
 		genReadUleb32(I.r0);
-		asm.d.shl_r_i(I.r0, tagging.slot_size_log);
+		asm.d.shl_r_i(I.r0, valuerep.slot_size_log);
 		asm.movq_r_m(I.r1, vsp_m1);
-		asm.movq_m_r(IVar.VFP.gpr.plusR(I.r0, 1, tagging.tag_size), I.r1);
+		asm.movq_m_r(IVar.VFP.gpr.plusR(I.r0, 1, valuerep.tag_size), I.r1);
 		endHandler();
 	}
 	def genCallsAndRet() {
@@ -1163,7 +1164,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			genReadUleb32(sig_index);
 			genReadUleb32(table_index);
 
-			asm.sub_r_i(vsp, tagging.slot_size);
+			asm.sub_r_i(vsp, valuerep.slot_size);
 			asm.movd_r_m(func_index, vsp_p0);
 
 			var tmp = I.r3;
@@ -1256,7 +1257,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			genReadUleb32(sig_index);
 			genReadUleb32(table_index);
 
-			asm.sub_r_i(vsp, tagging.slot_size);
+			asm.sub_r_i(vsp, valuerep.slot_size);
 			asm.movd_r_m(func_index, vsp_p0);
 
 			var tmp = I.r3;
@@ -1285,13 +1286,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.cmp_r_i(cnt, 0);
 		asm.jc_rel_near(C.Z, done);
 		asm.movd_r_i(i, 0);
-		asm.d.shl_r_i(cnt, tagging.slot_size_log);
+		asm.d.shl_r_i(cnt, valuerep.slot_size_log);
 		asm.q.sub_r_r(IVar.VSP.gpr, cnt);
 		var loop = X86_64Label.new();
 		// while (i < cnt)
 		asm.bind(loop);
 		genCopySlot(IVar.VFP.gpr.plusR(i, 1, 0), IVar.VSP.gpr.plusR(i, 1, 0));
-		asm.q.add_r_i(i, tagging.slot_size);
+		asm.q.add_r_i(i, valuerep.slot_size);
 		asm.q.cmp_r_r(i, cnt);
 		asm.jc_rel_near(C.L, loop);
 		asm.bind(done);
@@ -1362,7 +1363,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.set_r(t.1, I.r0);
 			asm.movbzx_r_r(I.r0, I.r0);
 			asm.movd_m_r(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		// 64-bit integer compares
@@ -1385,8 +1386,8 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.set_r(t.1, I.r0);
 			asm.movbzx_r_r(I.r0, I.r0);
 			asm.movq_m_r(vsp_m2, I.r0);
-			if (tagging.on) asm.movq_m_i(vsp_m2t, BpTypeCode.I32.code);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			if (valuerep.tagged) asm.movq_m_i(vsp_m2t, BpTypeCode.I32.code);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 
@@ -1424,7 +1425,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movd_r_m(I.r0, vsp_m1);
 			asm.d.imul_r_m(I.r0, vsp_m2);
 			asm.movd_m_r(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I32_DIV_S); {
@@ -1449,7 +1450,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
 			asm.bind(done);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I32_DIV_U); {
@@ -1462,7 +1463,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movd_m_r(vsp_m2, R.RAX);
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I32_REM_S); {
@@ -1482,7 +1483,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
 			asm.bind(done);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I32_REM_U); {
@@ -1495,7 +1496,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movd_m_r(vsp_m2, R.RDX);
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1508,7 +1509,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			bindHandler(t.0);
 			asm.movd_r_m(I.r0, vsp_m1);
 			t.1(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1521,7 +1522,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			bindHandler(t.0);
 			asm.movd_r_m(I.r0, vsp_m1);
 			t.1(vsp_m2);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 	}
@@ -1531,7 +1532,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.set_r(C.Z, I.r0);
 			asm.movbzx_r_r(I.r0, I.r0);
 			asm.movd_m_r(vsp_m1, I.r0);
-			if (tagging.on) asm.movd_m_i(vsp_m1t, BpTypeCode.I32.code);
+			if (valuerep.tagged) asm.movd_m_i(vsp_m1t, BpTypeCode.I32.code);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_CLZ); {
@@ -1559,7 +1560,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_r_m(I.r0, vsp_m1);
 			asm.q.imul_r_m(I.r0, vsp_m2);
 			asm.movq_m_r(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_DIV_S); {
@@ -1586,7 +1587,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
 			asm.bind(done);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_DIV_U); {
@@ -1599,7 +1600,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_m_r(vsp_m2, R.RAX);
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_REM_S); {
@@ -1619,7 +1620,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
 			asm.bind(done);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.I64_REM_U); {
@@ -1632,7 +1633,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_m_r(vsp_m2, R.RDX);
 			restoreReg(R.RAX);
 			restoreReg(R.RDX);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1645,7 +1646,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			bindHandler(t.0);
 			asm.movq_r_m(I.r0, vsp_m1);
 			t.1(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1658,7 +1659,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			bindHandler(t.0);
 			asm.movq_r_m(I.r0, vsp_m1);
 			t.1(vsp_m2);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 	}
@@ -1731,28 +1732,28 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movss_s_m(I.xmm0, vsp_m2);
 			asm.addss_s_m(I.xmm0, vsp_m1);
 			asm.movss_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F32_SUB); {
 			asm.movss_s_m(I.xmm0, vsp_m2);
 			asm.subss_s_m(I.xmm0, vsp_m1);
 			asm.movss_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F32_MUL); {
 			asm.movss_s_m(I.xmm0, vsp_m2);
 			asm.mulss_s_m(I.xmm0, vsp_m1);
 			asm.movss_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F32_DIV); {
 			asm.movss_s_m(I.xmm0, vsp_m2);
 			asm.divss_s_m(I.xmm0, vsp_m1);
 			asm.movss_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F32_SQRT); {
@@ -1767,7 +1768,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.d.and_r_i(I.r1, 0x80000000);
 			asm.d.or_r_r(I.r0, I.r1);
 			asm.movd_m_r(vsp_m2, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1796,28 +1797,28 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movsd_s_m(I.xmm0, vsp_m2);
 			asm.addsd_s_m(I.xmm0, vsp_m1);
 			asm.movsd_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F64_SUB); {
 			asm.movsd_s_m(I.xmm0, vsp_m2);
 			asm.subsd_s_m(I.xmm0, vsp_m1);
 			asm.movsd_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F64_MUL); {
 				asm.movsd_s_m(I.xmm0, vsp_m2);
 				asm.mulsd_s_m(I.xmm0, vsp_m1);
 				asm.movsd_m_s(vsp_m2, I.xmm0);
-				asm.q.sub_r_i(vsp, tagging.slot_size);
+				asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F64_DIV); {
 			asm.movsd_s_m(I.xmm0, vsp_m2);
 			asm.divsd_s_m(I.xmm0, vsp_m1);
 			asm.movsd_m_s(vsp_m2, I.xmm0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.F64_SQRT); {
@@ -1832,7 +1833,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.d.and_r_i(I.r1, 0x80000000);
 			asm.d.or_r_r(I.r0, I.r1);
 			asm.movd_m_r(vsp_m2u, I.r0);
-			asm.q.sub_r_i(vsp, tagging.slot_size);
+			asm.q.sub_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		for (t in [
@@ -1866,13 +1867,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		}
 
 		asm.bind(ret_zero);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		genTagUpdate(BpTypeCode.I32.code);
 		asm.movd_m_i(vsp_m1, 0);
 		endHandler();
 
 		asm.bind(ret_one);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		genTagUpdate(BpTypeCode.I32.code);
 		asm.movd_m_i(vsp_m1, 1);
 		endHandler();
@@ -1896,13 +1897,13 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		}
 
 		asm.bind(ret_zero);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		genTagUpdate(BpTypeCode.I32.code);
 		asm.movd_m_i(vsp_m1, 0);
 		genDispatchOrJumpToDispatch();
 
 		asm.bind(ret_one);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		genTagUpdate(BpTypeCode.I32.code);
 		asm.movd_m_i(vsp_m1, 1);
 		genDispatchOrJumpToDispatch();
@@ -1918,7 +1919,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.q.shr_r_i(I.r1, 16);
 			genTagPush(BpTypeCode.I32.code);
 			asm.movq_m_r(vsp_p0, I.r1);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.REF_NULL); {
@@ -1926,14 +1927,14 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			genSkipLeb(); // skip type
 			genTagPushR(I.r0);
 			asm.movq_m_i(vsp_p0, 0);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.REF_IS_NULL); {
 			asm.d.test_m_i(vsp_m1, -1);
 			asm.set_r(C.Z, I.r0);
 			asm.movbzx_r_r(I.r0, I.r0);
-			if (tagging.on) asm.movd_m_i(vsp_m1t, i7.view(BpTypeCode.I32.code));
+			if (valuerep.tagged) asm.movd_m_i(vsp_m1t, i7.view(BpTypeCode.I32.code));
 			asm.movd_m_r(vsp_m1, I.r0);
 			endHandler();
 		}
@@ -1943,7 +1944,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_r_m(I.r0, I.r0.plusR(I.r1, offsets.REF_SIZE, offsets.Array_contents));
 			genTagPush(BpTypeCode.FUNCREF.code);
 			asm.movq_m_r(vsp_p0, I.r0);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		bindHandler(Opcode.DATA_DROP); {
@@ -1966,7 +1967,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movq_r_m(I.r0, I.r0.plus(offsets.Array_length));
 			genTagPush(BpTypeCode.I32.code);
 			asm.movq_m_r(vsp_p0, I.r0);
-			asm.add_r_i(vsp, tagging.slot_size);
+			asm.add_r_i(vsp, valuerep.slot_size);
 			endHandler();
 		}
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
@@ -2032,7 +2033,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.jc_rel_near(C.S, ret_b); // handle min(-0, 0) == -0
 		// fall through to ret_a
 		asm.bind(ret_a);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		endHandler();
 
 		bindHandler(Opcode.F64_MAX);
@@ -2047,7 +2048,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		// fall through to ret_b
 		asm.bind(ret_b);
 		asm.movsd_m_s(vsp_m2, I.xmm1);
-		asm.q.sub_r_i(vsp, tagging.slot_size);
+		asm.q.sub_r_i(vsp, valuerep.slot_size);
 		endHandler();
 
 		asm.bind(is_nan32);
@@ -2408,16 +2409,16 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		stk[i] = 1;				// mark as done
 	}
 	def genTagUpdate(tag: byte) {
-		if (tagging.on) asm.movq_m_i(vsp_m1t, tag);
+		if (valuerep.tagged) asm.movq_m_i(vsp_m1t, tag);
 	}
 	def genTagPush(tag: byte) {
-		if (tagging.on) asm.movq_m_i(vsp_p0t, i7.view(tag));
+		if (valuerep.tagged) asm.movq_m_i(vsp_p0t, i7.view(tag));
 	}
 	def genTagPushR(r: X86_64Gpr) {
-		if (tagging.on) asm.movq_m_r(vsp_p0t, r);
+		if (valuerep.tagged) asm.movq_m_r(vsp_p0t, r);
 	}
 	def genCopySlot(dst: X86_64Addr, src: X86_64Addr) {
-		if (tagging.slot_size == 16) {
+		if (valuerep.slot_size == 16) {
 			asm.movdqu_s_m(I.xmm0, src);
 			asm.movdqu_m_s(dst, I.xmm0);
 		} else {
@@ -2449,23 +2450,23 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	def genLoad(opcode: Opcode, tag: byte, gen: (X86_64Gpr, X86_64Addr) -> X86_64Assembler) {
 		bindHandler(opcode);
-		asm.q.inc_r(I.ip);				// skip flags byte
-		genReadUleb32(I.r0);				// decode offset
+		asm.q.inc_r(I.ip);			// skip flags byte
+		genReadUleb32(I.r0);			// decode offset
 		asm.movd_r_m(I.r1, vsp_m1);		// read index
-		asm.q.add_r_r(I.r0, I.r1);			// add index + offset
+		asm.q.add_r_r(I.r0, I.r1);		// add index + offset
 		gen(I.r1, IVar.MEM0_BASE.gpr.plusR(I.r0, 1, 0));
-		if (tagging.on && tag != BpTypeCode.I32.code) genTagUpdate(tag); // update tag if necessary
+		if (valuerep.tagged && tag != BpTypeCode.I32.code) genTagUpdate(tag); // update tag if necessary
 		asm.movq_m_r(vsp_m1, I.r1);
 		endHandler();
 	}
 	def genStore(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
-		asm.q.inc_r(I.ip);				// skip flags byte
-		genReadUleb32(I.r0);				// decode offset
+		asm.q.inc_r(I.ip);			// skip flags byte
+		genReadUleb32(I.r0);			// decode offset
 		asm.movd_r_m(I.r1, vsp_m2);		// read index
-		asm.q.add_r_r(I.r0, I.r1);			// add index + offset
-		asm.movq_r_m(I.r1, vsp_m1);		// read vale
+		asm.q.add_r_r(I.r0, I.r1);		// add index + offset
+		asm.movq_r_m(I.r1, vsp_m1);		// read value
 		gen(IVar.MEM0_BASE.gpr.plusR(I.r0, 1, 0), I.r1);
-		asm.q.sub_r_i(vsp, 2 * tagging.slot_size);
+		asm.q.sub_r_i(vsp, 2 * valuerep.slot_size);
 		endHandler();
 	}
 	def genTrap(reason: TrapReason) {
