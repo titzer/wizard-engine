@@ -259,12 +259,12 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		var func = (sp + IVar.WASM_FUNC.frameOffset).load<WasmFunction>();
 		var ip   = (sp + IVar.IP.frameOffset).load<Pointer>();
 		var code = Pointer.atContents((sp + IVar.CODE.frameOffset).load<Array<byte>>());
-		var xip  = (sp + IVar.XIP.frameOffset).load<Pointer>();
+		var xip  = (sp + IVar.STP.frameOffset).load<Pointer>();
 
 		frame = Frame.new();
 		frame.func = func;
 		frame.pc = int.!(ip - code - 1);
-		frame.xip = int.!(xip - Pointer.atContents(func.decl.code.xcode));
+		frame.xip = int.!(xip - Pointer.atContents(func.decl.code.sidetable));
 		return frame;
 	}
 }
@@ -323,14 +323,14 @@ class X86_64InterpreterCode extends RiUserCode {
 			(sp + IVar.EIP.frameOffset).store<Pointer>(new_code + eip_delta);
 		}
 
-		// Handle xcode and interior pointer
-		var xcode_loc = (sp + IVar.XCODE.frameOffset);
-		var xcode = xcode_loc.load<Pointer>();
-		var xip_delta = (sp + IVar.XIP.frameOffset).load<Pointer>() - xcode;
-		RiGc.scanRoot(xcode_loc);
-		var new_xcode = xcode_loc.load<Pointer>();
-		if (new_xcode != xcode) {
-			(sp + IVar.XIP.frameOffset).store<Pointer>(new_xcode + xip_delta);
+		// Handle sidetable and interior pointer
+		var sidetable_loc = (sp + IVar.SIDETABLE.frameOffset);
+		var sidetable = sidetable_loc.load<Pointer>();
+		var xip_delta = (sp + IVar.STP.frameOffset).load<Pointer>() - sidetable;
+		RiGc.scanRoot(sidetable_loc);
+		var new_sidetable = sidetable_loc.load<Pointer>();
+		if (new_sidetable != sidetable) {
+			(sp + IVar.STP.frameOffset).store<Pointer>(new_sidetable + xip_delta);
 		}
 
 		// Handle other roots in the frame
@@ -489,8 +489,8 @@ enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mut
 	MEM0_BASE	(-1,	R.R10,	16,	true,	false),	// base of memory #0
 	VFP		(-1,	R.R11,	24,	false,	false),	// value stack frame pointer
 	VSP		(2,	R.RSI,	32,	false,	true),	// value stack stack pointer
-	XCODE		(-1,	null,	40,	false,  false), // extended code array
-	XIP		(-1,	R.RBX,	48,	false,	true),	// extended instruction pointer
+	SIDETABLE	(-1,	null,	40,	false,  false), // sidetable
+	STP		(-1,	R.RBX,	48,	false,	true),	// sidetable pointer
 	CODE		(-1,	null,	56,	false,  false), // code array
 	IP		(-1,	R.RAX,	64,	false,	true),	// current instruction pointer
 	EIP		(-1,	R.R13,	72,	false,	false),	// end instruction pointer
@@ -787,11 +787,11 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movd_r_m(IVar.EIP.gpr, tmp.plus(offsets.Array_length));
 		asm.q.add_r_r(IVar.EIP.gpr, IVar.IP.gpr);
 		saveIVar(IVar.EIP);
-		// Load &func.code.xcode[0] into XIP
-		asm.movq_r_m(tmp, codeReg.plus(offsets.Code_xcode));
-		asm.movq_m_r(R.RSP.plus(IVar.XCODE.frameOffset), tmp); // save XCODE
-		asm.lea(IVar.XIP.gpr, tmp.plus(offsets.Array_contents));
-		saveIVar(IVar.XIP);
+		// Load &func.code.sidetable[0] into STP
+		asm.movq_r_m(tmp, codeReg.plus(offsets.Code_sidetable));
+		asm.movq_m_r(R.RSP.plus(IVar.SIDETABLE.frameOffset), tmp); // save SIDETABLE
+		asm.lea(IVar.STP.gpr, tmp.plus(offsets.Array_contents));
+		saveIVar(IVar.STP);
 
 		// Load instance.memories[0].start into MEM0_BASE
 		var mem0 = IVar.MEM0_BASE.gpr;
@@ -979,7 +979,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
 		asm.bind(ctl_fallthru);
 		genSkipLeb();
-		asm.add_r_i(IVar.XIP.gpr, offsets.XIP_entry_size);
+		asm.add_r_i(IVar.STP.gpr, offsets.STP_entry_size);
 		endHandler();
 
 		// BR_IF: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
@@ -995,11 +995,11 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var popcount = I.r0;
 		var valcount = I.r1;
 		// if popcount > 0
-		asm.movd_r_m(popcount, IVar.XIP.gpr.plus(offsets.XIP_popcount));
+		asm.movd_r_m(popcount, IVar.STP.gpr.plus(offsets.STP_popcount));
 		asm.d.cmp_r_i(popcount, 0);
 		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
 		// load valcount
-		asm.movd_r_m(valcount, IVar.XIP.gpr.plus(offsets.XIP_valcount));
+		asm.movd_r_m(valcount, IVar.STP.gpr.plus(offsets.STP_valcount));
 		// popcount = popcount * SLOT_SIZE
 		asm.d.shl_r_i(popcount, valuerep.slot_size_log);
 		// vsp -= valcount + popcount (XXX: save an instruction here?)
@@ -1018,16 +1018,16 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		// ELSE: unconditional ctl xfer without stack copying
 		bindHandler(Opcode.ELSE);
 		asm.bind(ctl_xfer_nostack);
-		asm.movwsx_r_m(I.r0, IVar.XIP.gpr.plus(offsets.XIP_pc_delta)); // TODO: 4 bytes
+		asm.movwsx_r_m(I.r0, IVar.STP.gpr.plus(offsets.STP_pc_delta)); // TODO: 4 bytes
 		asm.q.lea(IVar.IP.gpr, IVar.IP.gpr.plusR(I.r0, 1, -1)); // adjust ip
-		asm.movwsx_r_m(I.r1, IVar.XIP.gpr.plus(offsets.XIP_xip_delta)); // TODO: 4 bytes
-		asm.q.lea(IVar.XIP.gpr, IVar.XIP.gpr.plusR(I.r1, 4, 0)); // adjust xip XXX: preshift?
+		asm.movwsx_r_m(I.r1, IVar.STP.gpr.plus(offsets.STP_xip_delta)); // TODO: 4 bytes
+		asm.q.lea(IVar.STP.gpr, IVar.STP.gpr.plusR(I.r1, 4, 0)); // adjust xip XXX: preshift?
 		endHandler();
 
-		// BR_TABLE: adjust XIP based on input value and then ctl xfer with stack copying
+		// BR_TABLE: adjust STP based on input value and then ctl xfer with stack copying
 		bindHandler(Opcode.BR_TABLE);
 		var max = I.r0, key = I.r1;
-		asm.movd_r_m(max, IVar.XIP.gpr.plus(offsets.XIP_pc_delta));
+		asm.movd_r_m(max, IVar.STP.gpr.plus(offsets.STP_pc_delta));
 		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.movd_r_m(key, vsp_p0);
 		asm.d.cmp_r_r(key, max);
@@ -1037,8 +1037,8 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movd_r_r(max, key);
 		asm.bind(ok);
 		asm.q.add_r_r(IVar.IP.gpr, max);
-		asm.shl_r_i(max, offsets.XIP_entry_size_log);
-		asm.q.add_r_r(IVar.XIP.gpr, max);
+		asm.shl_r_i(max, offsets.STP_entry_size_log);
+		asm.q.add_r_r(IVar.STP.gpr, max);
 		asm.jmp_rel_near(ctl_xfer);
 
 		bindHandler(Opcode.SELECT); {
@@ -2349,11 +2349,11 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 	}
 	def saveCallerIVars() {
 		saveIVar(IVar.IP);
-		saveIVar(IVar.XIP);
+		saveIVar(IVar.STP);
 	}
 	def restoreCallerIVars() {
 		restoreIVar(IVar.IP);
-		restoreIVar(IVar.XIP);
+		restoreIVar(IVar.STP);
 		restoreIVar(IVar.EIP);
 		restoreIVar(IVar.INSTANCE);
 		restoreIVar(IVar.FUNC_DECL);

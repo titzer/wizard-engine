@@ -11,7 +11,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def instrTracer = if(Trace.validation, InstrTracer.new());
 	def val_stack = ArrayStack<ValueType>.new();
 	def ctl_stack = ArrayStack<ControlEntry>.new();
-	def ctlxfer = XcodeBuilder.new();
+	def ctlxfer = SidetableBuilder.new();
 	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
 	var func: FuncDecl;
 	var sig: SigDecl;
@@ -51,7 +51,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			// TODO: double-check this error position
 			err.rel(d, f.code.abs_start + f.code.orig.length).UnterminatedFunctionBody();
 		}
-		func.code.xcode = ctlxfer.extract();
+		func.code.sidetable = ctlxfer.extract();
 		if (err.ok()) return CodeValidatorResult.Ok;
 		return reterr();
 	}
@@ -110,7 +110,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				Opcode.LOOP.code => {
 					var sig = parser.readBlockType();
 					checkArgsAndPushControl(opcode, sig);
-					ctl_top.xcode_pos = ctlxfer.xcode.length;
+					ctl_top.sidetable_pos = ctlxfer.sidetable.length;
 					ctl_top.next_pos = parser.decoder.pos;
 				}
 				Opcode.IF.code => {
@@ -128,10 +128,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var if_branch = ctl_top.ctl_refs[0];
 					ctl_top.ctl_refs[0] = -1;
 					// branches within if-true block go to "else"...
-					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.xcode.length);
+					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.sidetable.length);
 					// ... except false target of "if"
 					ctl_top.ctl_refs.put(if_branch);
-					ctlxfer.bind(ctl_top, opcode_pos + 1, ctlxfer.xcode.length + 4);
+					ctlxfer.bind(ctl_top, opcode_pos + 1, ctlxfer.sidetable.length + 4);
 					// "else" implicitly goes to end
 					ctlxfer.ref0(ctl_top, opcode_pos);
 
@@ -146,22 +146,22 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var ctl = ctl_stack.peek();
 					var next_pos = parser.decoder.pos; // target next bytecode if possible
 					if (ctl.start_opcode == Opcode.LOOP.code) {
-						ctlxfer.bind(ctl, ctl.next_pos, ctl.xcode_pos);
+						ctlxfer.bind(ctl, ctl.next_pos, ctl.sidetable_pos);
 					} else if (ctl.start_opcode == Opcode.IF.code) {
 						// one-armed if; simulate an empty else clause
 						val_stack.top = ctl_top.val_stack_top;
 						ctl_top.reachable = true;
 						pushTypes(ctl.sig.params);
 						checkArgsAndTransfer();
-						ctlxfer.bind(ctl, next_pos, ctlxfer.xcode.length);
+						ctlxfer.bind(ctl, next_pos, ctlxfer.sidetable.length);
 					} else if (ctl.start_opcode == Opcode.LET.code) {
 						locals = locals.parent;
-						ctlxfer.bind(ctl, next_pos, ctlxfer.xcode.length);
+						ctlxfer.bind(ctl, next_pos, ctlxfer.sidetable.length);
 					} else if (ctl.start_opcode == Opcode.BLOCK.code) {
-						ctlxfer.bind(ctl, next_pos, ctlxfer.xcode.length);
+						ctlxfer.bind(ctl, next_pos, ctlxfer.sidetable.length);
 					} else {
 						// the end bytecode of the function must be executed to tear frame down
-						ctlxfer.bind(ctl, opcode_pos, ctlxfer.xcode.length);
+						ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
 					}
 					ctl_stack.pop();
 					ctl_top = ctl_stack.peek();
@@ -185,7 +185,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				Opcode.BR_TABLE.code => {
 					var labels = parser.readLabels();
 					popE(ValueType.I32);
-					ctlxfer.xcode.put(labels.length).put(0).put(0).put(0);
+					ctlxfer.sidetable.put(labels.length).put(0).put(0).put(0);
 					// add refs for all labels and check args
 					var arity = -1;
 					for (i < labels.length) {
@@ -1056,7 +1056,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl_top = ctl;
 		ctl.start_pos = opcode_pos;
 		ctl.start_opcode = opcode;
-		ctl.xcode_pos = -1;
+		ctl.sidetable_pos = -1;
 		ctl.sig = sig;
 		ctl.val_stack_top = val_stack_top;
 		ctl.reachable = true;
@@ -1110,19 +1110,19 @@ class ControlEntry {
 	var start_pos: int;
 	var next_pos: int;
 	var start_opcode: byte;
-	var xcode_pos: int;
+	var sidetable_pos: int;
 	var sig: SigDecl;
 	var reachable = true;
 	var val_stack_top: int;
 	def ctl_refs = Vector<int>.new();
 }
-// Utility for building the extended code for a function, which contains control transfer information.
-class XcodeBuilder {
-	def xcode = Vector<i32>.new();
+// Utility for building the sidetable for a function, which contains control transfer information.
+class SidetableBuilder {
+	def sidetable = Vector<i32>.new();
 	var start_pos: int;
 	def reset(start_pos: int) {
 		this.start_pos = start_pos;
-		this.xcode.resize(0);
+		this.sidetable.resize(0);
 	}
 	def ref0(target: ControlEntry, pos: int) {
 		refV(target, pos, 0, 0);
@@ -1134,28 +1134,28 @@ class XcodeBuilder {
 	}
 	def refV(target: ControlEntry, pos: int, valcount: int, popcount: int) {
 		var pc = rel(pos);
-		var xi = xcode.length;
+		var xi = sidetable.length;
 		if (Trace.validation) {
 			OUT.put3("    refV(@+%d (xip=%d) to +%d.label, ", pc, xi, rel(target.start_pos));
 			OUT.put2("valcount=%d, popcount=%d)",	valcount, popcount);
 			OUT.outln();
 		}
 		target.ctl_refs.put(xi);
-		xcode.put(pc).put(valcount).put(popcount).put(0);
+		sidetable.put(pc).put(valcount).put(popcount).put(0);
 	}
-	def bind(target: ControlEntry, pos: int, xcode_pos: int) {
-		target.xcode_pos = xcode_pos;
+	def bind(target: ControlEntry, pos: int, sidetable_pos: int) {
+		target.sidetable_pos = sidetable_pos;
 		var refs = target.ctl_refs, pc = rel(pos);
 		for (i = refs.length - 1; i >= 0; i--) {
 			var xi = refs[i];
 			if (xi < 0) continue; // entry was deleted (if)
-			var pos = xcode[xi];
+			var pos = sidetable[xi];
 			var pc_delta = pc - pos;
-			xcode[xi] = pc_delta;
-			xcode[xi + 3] = xcode_pos - xi;
+			sidetable[xi] = pc_delta;
+			sidetable[xi + 3] = sidetable_pos - xi;
 
 			if (Trace.validation) {
-				OUT.put3("    resolve(@+%d to +%d) (xpc_delta=%d)", pos, pc, xcode_pos - xi);
+				OUT.put3("    resolve(@+%d to +%d) (xpc_delta=%d)", pos, pc, sidetable_pos - xi);
 				OUT.outln();
 			}
 		}
@@ -1165,10 +1165,10 @@ class XcodeBuilder {
 		return pos - start_pos;
 	}
 	def extract() -> Array<int> {
-		return if(xcode.length > 0, xcode.extract(), NO_XCODE);
+		return if(sidetable.length > 0, sidetable.extract(), NO_SIDETABLE);
 	}
 }
-def NO_XCODE = Array<int>.new(0);
+def NO_SIDETABLE = Array<int>.new(0);
 // Used for implementing the "let" instruction.
 class LocalsChunk(vec: Vector<ValueType>, parent: LocalsChunk) {
 }
