@@ -3,6 +3,7 @@
 
 var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 def TAGGED = Tagging.new(true);
+def UNTAGGED = Tagging.new(false);
 // XXX: hack so V3Offsets.new() can allocate an Interpreter without auto-generating the interpreter code
 class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
 	var dispatchTable: Pointer;
@@ -554,11 +555,12 @@ class X86_64InterpreterTuning {
 	var handlerAlignment = 1;
 	var dispatchEntrySize = 4;
 	var useTypeTagTable = false;
+	var inlineAllLEBs = false;
 }
 
 // Space needed for the machine code of the interpreter
 def PAGE_SIZE = 4 * 1024;
-def INL_SIZE = 20 * 1024;
+def INL_SIZE = 24 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 // Statically-allocated buffer (in compiled binary).
@@ -2481,14 +2483,24 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 	// Generate a read of a 32-bit unsigned LEB.
 	def genReadUleb32(dest: X86_64Gpr) {
-		var ool_leb = OutOfLineLEB.new(dest);
-		oolULeb32Sites.put(ool_leb);
+		var ool_leb: OutOfLineLEB;
+		if (!tuning.inlineAllLEBs) {
+			ool_leb = OutOfLineLEB.new(dest);
+			oolULeb32Sites.put(ool_leb);
+		}
 		var asm = this.asm.d;
 		asm.movbzx_r_m(dest, I.ip_ptr);		// load first byte
 		asm.q.inc_r(I.ip);			// increment pointer
 		asm.test_r_i(dest, 0x80);		// test most-significant bit
-		asm.jc_rel_addr(C.NZ, ool_leb);
-		ool_leb.retOffset = asm.pos();
+		if (tuning.inlineAllLEBs) {
+			var leb_done = X86_64Label.new();
+			asm.jc_rel_near(C.Z, leb_done);
+			genReadLEBext(dest);
+			asm.bind(leb_done);
+		} else {
+			asm.jc_rel_addr(C.NZ, ool_leb);
+			ool_leb.retOffset = asm.pos();
+		}
 	}
 	// Generate a read of a 32-bit signed LEB.
 	def genReadSleb32_inline(dest: X86_64Gpr) {
@@ -2620,37 +2632,39 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			w.at(o.pos).put_b32(pos - (o.pos + o.delta));
 			w.atEnd();
 			// XXX: share code between out-of-line LEB cases
-			// generate out-of-line code for > 1 byte LEB cases
-			var dest = o.dest, destRcx = dest == R.RCX;
-			asm.d.and_r_i(dest, 0x7F);		// mask off upper bit of first byte
-			if (destRcx) {
-				asm.movd_r_r(I.r3, dest);
-				dest = I.r3;
-			} else {
-				asm.movd_r_r(I.r4, R.RCX);	// save RCX
-			}
-			asm.movd_r_i(R.RCX, 7);
-			var loop = X86_64Label.new(), nomore = X86_64Label.new();
-			asm.bind(loop);
-			asm.movbzx_r_m(I.scratch, I.ip_ptr);	// load byte
-			asm.q.inc_r(I.ip);			// increment pointer
-			asm.d.test_r_i(I.scratch, 0x80);	// test most-significant bit
-			asm.jc_rel_near(C.Z, nomore);		// break if not set
-			asm.d.and_r_i(I.scratch, 0x7F);		// mask off upper bit
-			asm.d.shl_r_cl(I.scratch);		// shift byte into correct bit pos
-			asm.d.or_r_r(dest, I.scratch);		// merge byte into val
-			asm.d.add_r_i(R.RCX, 7);		// compute next bit pos
-			asm.jmp_rel_near(loop);			// loop
-
-			asm.bind(nomore);
-			asm.d.shl_r_cl(I.scratch);		// shift byte into correct bit pos
-			asm.d.or_r_r(dest, I.scratch);		// merge byte into val
-			if (destRcx) asm.movd_r_r(R.RCX, dest);
-			else asm.movd_r_r(R.RCX, I.r4);		// restore RCX
-
+			genReadLEBext(o.dest);
 			asm.jmp_rel(o.retOffset - w.atEnd().pos);
 		}
 		oolULeb32Sites = null;
+	}
+	// Generate code for > 1 byte LEB cases
+	def genReadLEBext(dest: X86_64Gpr) {
+		var destRcx = dest == R.RCX;
+		asm.d.and_r_i(dest, 0x7F);		// mask off upper bit of first byte
+		if (destRcx) {
+			asm.movd_r_r(I.r3, dest);
+			dest = I.r3;
+		} else {
+			asm.movd_r_r(I.r4, R.RCX);	// save RCX
+		}
+		asm.movd_r_i(R.RCX, 7);
+		var loop = X86_64Label.new(), nomore = X86_64Label.new();
+		asm.bind(loop);
+		asm.movbzx_r_m(I.scratch, I.ip_ptr);	// load byte
+		asm.q.inc_r(I.ip);			// increment pointer
+		asm.d.test_r_i(I.scratch, 0x80);	// test most-significant bit
+		asm.jc_rel_near(C.Z, nomore);		// break if not set
+		asm.d.and_r_i(I.scratch, 0x7F);		// mask off upper bit
+		asm.d.shl_r_cl(I.scratch);		// shift byte into correct bit pos
+		asm.d.or_r_r(dest, I.scratch);		// merge byte into val
+		asm.d.add_r_i(R.RCX, 7);		// compute next bit pos
+		asm.jmp_rel_near(loop);			// loop
+
+		asm.bind(nomore);
+		asm.d.shl_r_cl(I.scratch);		// shift byte into correct bit pos
+		asm.d.or_r_r(dest, I.scratch);		// merge byte into val
+		if (destRcx) asm.movd_r_r(R.RCX, dest);
+		else asm.movd_r_r(R.RCX, I.r4);		// restore RCX
 	}
 	// Generate trap handler code.
 	def genTrapHandlers() {
