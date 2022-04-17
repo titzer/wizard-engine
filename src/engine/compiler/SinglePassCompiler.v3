@@ -1,0 +1,509 @@
+// Copyright 2022 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+var config_TrackFloatZeroConst = false;
+
+// Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
+class SinglePassCompiler(masm: MacroAssembler) {
+	var codeptr: Decoder;
+	// Abstract state of the value stack
+	var val_state: Array<SpcState>;	// uncached, in a register, or a constant
+	var val_tagged: Array<bool>;	// tag is written properly into memory
+	var val_stored: Array<bool>;	// value is written into memory
+	var val_tag: Array<SpcTag>;	// type of the slot
+	var val_sp: u32;
+
+	def gen(func: FuncDecl) {
+		codeptr.reset(func.code.code, 0, func.code.code.length);
+	}
+
+	def genInstr() {
+		var opcode = codeptr.read1();
+		match (opcode) {
+			Opcode.LOCAL_GET.code => {
+				var index = codeptr.read_uleb32();
+				var state = val_state[index];
+				var tag = val_tag[index];
+				match (state) {
+					Uncached => { // alloc reg and load
+						var reg = allocRegTag(tag);
+						emit_read_slot_r(index, reg);
+						push(tag, SpcState.Register(reg));
+					}
+					Register(reg) => { // store + steal reg
+						if (!val_stored[index]) {
+							emit_write_slot_r(index, reg);
+							val_stored[index] = true;
+						}
+						val_state[index] = SpcState.Uncached;
+						push(tag, state);
+					}
+					Const(val) => { // copy constant state
+						push(tag, state);
+					}
+				}
+			}
+			Opcode.LOCAL_SET.code => {
+				var index = codeptr.read_uleb32();
+				var t = pop(), tag = t.1, state = t.2;
+				match (state) {
+					Uncached => { // alloc reg and load
+						var reg = allocRegTag(tag);
+						emit_read_slot_r(val_sp, reg);
+						val_state[index] = SpcState.Register(reg);
+						val_stored[index] = false;
+					}
+					Register(reg) => { // steal reg
+						val_state[index] = state;
+						val_stored[index] = false;
+					}
+					Const(val) => { // copy constant state
+						val_state[index] = state;
+						val_stored[index] = false;
+					}
+				}
+			}
+			Opcode.LOCAL_TEE.code => {
+				var index = codeptr.read_uleb32();
+				var tos = val_sp - 1;
+				var t = peek(), tag = t.1, state = t.2;
+				match (state) {
+					Uncached => { // alloc reg, load, write
+						var reg = allocRegTag(tag);
+						emit_read_slot_r(val_sp - 1, reg);
+						emit_write_slot_r(index, reg);
+						val_state[index] = SpcState.Uncached;
+						val_stored[index] = true;
+						val_state[tos] = SpcState.Register(reg);
+					}
+					Register(reg) => { // simply write local
+						emit_write_slot_r(index, reg);
+						val_state[index] = SpcState.Uncached;
+						val_stored[index] = true;
+					}
+					Const(val) => { // copy constant state
+						val_state[index] = state;
+						val_stored[index] = false;
+					}
+				}
+			}
+			Opcode.I32_CONST.code => {
+				var val = codeptr.read_sleb32();
+				push(SpcTag.I32, SpcState.Const(val));
+			}
+			Opcode.I64_CONST.code => {
+				var val = codeptr.read_sleb64();
+				if (i32.view(val) == val) {
+					push(SpcTag.I64, SpcState.Const(i32.view(val)));
+				} else {
+					var reg = allocRegI64();
+					push(SpcTag.I64, SpcState.Register(reg));
+					emit_write_tag_tos(SpcTag.I64);
+					masm.emit_mov_r_l(reg, val);
+				}
+			}
+			Opcode.F32_CONST.code => {
+				var val = codeptr.read_u32();
+				if (val == 0 && config_TrackFloatZeroConst) {
+					push(SpcTag.F32, SpcState.Const(0));
+				} else {
+					var reg = allocRegF32();
+					push(SpcTag.F32, SpcState.Register(reg));
+					emit_write_tag_tos(SpcTag.F32);
+					masm.emit_mov_r_f(reg, val);
+				}
+			}
+			Opcode.F64_CONST.code => {
+				var val = codeptr.read_u64();
+				if (val == 0 && config_TrackFloatZeroConst) {
+					push(SpcTag.F64, SpcState.Const(0));
+				} else {
+					var reg = allocRegF64();
+					push(SpcTag.F64, SpcState.Register(reg));
+					emit_write_tag_tos(SpcTag.F64);
+					masm.emit_mov_r_d(reg, val);
+				}
+			}
+			Opcode.I32_ADD.code => doCommutable(Opcode.I32_ADD, isZero, int.+);
+			Opcode.I32_SUB.code => doBinopNoCommute(Opcode.I32_SUB, isZero, int.-);
+			Opcode.I32_MUL.code => doCommutable(Opcode.I32_MUL, isOne, int.*);
+			Opcode.I32_DIV_S.code => doBinopNoFold(Opcode.I32_DIV_S, isOne);
+			Opcode.I32_DIV_U.code => doBinopNoFold(Opcode.I32_DIV_U, isOne);
+			Opcode.I32_REM_S.code => doBinopNoFold(Opcode.I32_REM_S, isAlwaysFalse);
+			Opcode.I32_REM_U.code => doBinopNoFold(Opcode.I32_REM_U, isAlwaysFalse); // XXX: rem by max int
+			Opcode.I32_AND.code => doCommutable(Opcode.I32_AND, isMinusOne, int.&);
+			Opcode.I32_XOR.code => doCommutable(Opcode.I32_XOR, isZero, int.^);
+			Opcode.I32_OR.code => doCommutable(Opcode.I32_OR, isZero, int.|);
+			Opcode.I32_SHL.code => doCommutable(Opcode.I32_SHL, isZero, ExecUtil.I32_SHL);
+			Opcode.I32_SHR_S.code => doCommutable(Opcode.I32_SHR_S, isZero, ExecUtil.I32_SHR_S);
+			Opcode.I32_SHR_U.code => doCommutable(Opcode.I32_SHR_U, isZero, ExecUtil.I32_SHR_U);
+			Opcode.I32_ROTL.code => doCommutable(Opcode.I32_ROTL, isZero, I32_ROTL);
+			Opcode.I32_ROTR.code => doCommutable(Opcode.I32_ROTR, isZero, I32_ROTR);
+			_ => unsupported();
+		}
+	}
+	def doBinopNoFold(op: Opcode, nop: int -> bool) { // XXX: factor commonality among binops
+		var b = pop();
+		var a = peek();
+		var tos = u32.!(val_sp - 1);
+		match (a.2) {
+			Uncached => match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					freeReg(reg_b);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+			}
+			Register(reg_a) => match (b.2) {
+				Uncached => {
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					freeReg(reg_b);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_stored[tos] = false;
+				}
+			}
+			Const(val_a) => if (!nop(val_a)) match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos+1, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_a);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					var reg_a = allocRegI32();
+					masm.emit_mov_r_i(reg_a, val_a);
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					freeReg(reg_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					var reg_a = allocRegI32();
+					masm.emit_mov_r_i(reg_a, val_a);
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+			}
+		}
+	}
+	def doBinopNoCommute(op: Opcode, nop: int -> bool, fold: (int, int) -> int) {
+		var b = pop();
+		var a = peek();
+		var tos = u32.!(val_sp - 1);
+		match (a.2) {
+			Uncached => match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					freeReg(reg_b);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+			}
+			Register(reg_a) => match (b.2) {
+				Uncached => {
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					freeReg(reg_b);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_stored[tos] = false;
+				}
+			}
+			Const(val_a) => if (!nop(val_a)) match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos+1, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_a);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					var reg_a = allocRegI32();
+					masm.emit_mov_r_i(reg_a, val_a);
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					freeReg(reg_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					val_state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
+					val_stored[tos] = false;
+				}
+			}
+		}
+	}
+	def doCommutable(op: Opcode, nop: int -> bool, fold: (int, int) -> int) {
+		var b = pop();
+		var a = peek();
+		var tos = u32.!(val_sp - 1);
+		match (a.2) {
+			Uncached => match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					masm.emit_binop_r_m(op, reg_b, slotAddr(tos));
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+			}
+			Register(reg_a) => match (b.2) {
+				Uncached => {
+					masm.emit_binop_r_m(op, reg_a, slotAddr(tos+1));
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					masm.emit_binop_r_r(op, reg_a, reg_b);
+					freeReg(reg_b);
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					if (nop(val_b)) return;
+					masm.emit_binop_r_i(op, reg_a, val_b);
+					val_stored[tos] = false;
+				}
+			}
+			Const(val_a) => if (!nop(val_a)) match (b.2) {
+				Uncached => {
+					var reg_a = allocRegI32();
+					emit_read_slot_r(tos+1, reg_a);
+					masm.emit_binop_r_i(op, reg_a, val_a);
+					val_state[tos] = SpcState.Register(reg_a);
+					val_stored[tos] = false;
+				}
+				Register(reg_b) => {
+					masm.emit_binop_r_i(op, reg_b, val_a); // commuted
+					val_stored[tos] = false;
+				}
+				Const(val_b) => {
+					val_state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
+					val_stored[tos] = false;
+				}
+			}
+		}
+	}
+	def unsupported() {
+		// TODO unsupported opcode, abort compilation
+	}
+
+	//====================================================================
+	// codegen operations
+	//====================================================================
+	def emit_read_slot_r(index: u32, reg: int);
+	def emit_read_tos_r(tag: SpcTag, reg: int);
+	def emit_write_tag_tos(tag: SpcTag);
+	def emit_write_slot_r(index: u32, reg: int);
+	def emit_write_slot_i(index: u32, val: int);
+	def emit_write_slot_l(index: u32, val: int);
+	def emit_write_slot_r_tagged(index: u32, reg: int, tag: SpcTag);
+	def emit_write_slot_i_tagged(index: u32, val: int, tag: SpcTag);
+	def emit_store_all(uncache: bool) {
+		for (i < val_sp) {
+			if (val_stored[i]) continue; // nothing to do
+			var t = val_state[i], index = u32.!(i);
+			match (t) {
+				Uncached => ; // nothing to do
+				Register(reg) => {
+					emit_write_slot_r_tagged(index, reg, val_tag[i]);
+					if (uncache) {
+						val_state[i] = SpcState.Uncached;
+						freeReg(reg);
+					}
+				}
+				Const(val) => {
+					emit_write_slot_i_tagged(index, val, val_tag[i]);
+				}
+			}
+			val_stored[i] = true;
+		}
+	}
+
+	
+	//====================================================================
+	// register allocation operations
+	//====================================================================
+	def freeReg(reg: int);
+	def allocRegTag(tag: SpcTag) -> int;
+	def allocRegI32() -> int;
+	def allocRegI64() -> int;
+	def allocRegF32() -> int;
+	def allocRegF64() -> int;
+
+	//====================================================================
+	// abstract stack operations
+	//====================================================================
+	def slotAddr(slot: u32) -> MasmAddr;
+	def push(tag: SpcTag, state: SpcState) {
+		var sp = val_sp;
+		if (sp >= val_state.length) {
+			var nlength = 8 + val_state.length * 2;
+			val_state = Arrays.grow(val_state, nlength);
+			val_tagged = Arrays.grow(val_tagged, nlength);
+			val_stored = Arrays.grow(val_stored, nlength);
+			val_tag = Arrays.grow(val_tag, nlength);
+		}
+		val_tagged[sp] = false;
+		val_stored[sp] = false;
+		val_tag[sp] = tag;
+		val_state[sp] = state;
+		val_sp = sp + 1;
+	}
+	def pop() -> (bool, SpcTag, SpcState) {
+		var sp = val_sp;
+		var result = (val_stored[sp], val_tag[sp], val_state[sp]);
+		sp--;
+		return result;
+	}
+	def peek() -> (bool, SpcTag, SpcState) {
+		var sp = val_sp;
+		return (val_stored[sp], val_tag[sp], val_state[sp]);
+	}
+}
+
+// States in which a local slot or operand stack slot could be in.
+type SpcState {
+	case Uncached;
+	case Register(num: int);
+	case Const(val: int);
+}
+
+// Slots in the value stack are tagged with a kind.
+enum SpcTag(code: byte) {
+	I32(BpTypeCode.I32.code),
+	I64(BpTypeCode.I64.code),
+	F32(BpTypeCode.F32.code),
+	F64(BpTypeCode.F64.code),
+	V128(BpTypeCode.V128.code),
+	REF(BpTypeCode.REF.code),
+}
+
+type MasmAddr { } // TODO
+// Abstract codegen interface.
+class MacroAssembler {
+	// Register set
+	def regNames: Array<string>;
+	def iregs: Array<int>;
+	def lregs: Array<int>;
+	def fregs: Array<int>;
+	def dregs: Array<int>;
+
+	def iparam_regs: Array<int>;
+	def lparam_regs: Array<int>;
+	def fparam_regs: Array<int>;
+	def dparam_regs: Array<int>;
+
+	def iresult_regs: Array<int>;
+	def lresult_regs: Array<int>;
+	def fresult_regs: Array<int>;
+	def dresult_regs: Array<int>;
+
+	// Interpreter/baseline register assignments
+	def sp_reg: int;
+	def vsp_reg: int;
+	def vfp_reg: int;
+	def ip_reg: int;
+	def eip_reg: int;
+	def stp_reg: int;
+	def instance_reg: int;
+	def func_reg: int;
+	def mem_reg: int;
+
+	def emit_mov_r_r(reg: int, reg2: int);
+	def emit_mov_r_m(reg: int, addr: MasmAddr);
+	def emit_mov_r_i(reg: int, val: int);
+	def emit_mov_r_l(reg: int, val: long);
+	def emit_mov_r_f(reg: int, bits: u32);
+	def emit_mov_r_d(reg: int, bits: u64);
+
+	def emit_mov_m_r(addr: MasmAddr, reg: int);
+	def emit_mov_m_i(addr: MasmAddr, val: int);
+	def emit_mov_m_l(addr: MasmAddr, val: long);
+	def emit_mov_m_f(addr: MasmAddr, bits: u32);
+	def emit_mov_m_d(addr: MasmAddr, bits: u64);
+
+	def emit_addi_r_r(reg: int, reg2: int);
+	def emit_addi_r_m(reg: int, add: int);
+	def emit_addi_r_i(reg: int, val: int);
+
+	def emit_binop_r_r(op: Opcode, reg: int, reg2: int);
+	def emit_binop_r_m(op: Opcode, reg: int, addr: MasmAddr);
+	def emit_binop_r_i(op: Opcode, reg: int, val: int);
+
+}
+
+class RegisterAssigner(numregs: int, iregs: Array<int>, lregs: Array<int>, fregs: Array<int>, dregs: Array<int>) {
+	def reset();
+	def alloc(tag: SpcTag) -> int;
+}
+
+def isAlwaysFalse(v: int) -> bool { return false; }
+def isZero = int.==(0, _);
+def isOne = int.==(1, _);
+def isMinusOne = int.==(-1, _);
+def to_ii_i(f: (u32, u32) -> u32, a: int, b: int) -> int {
+	return int.view(f(u32.view(a), u32.view(b)));
+}
+def I32_ROTL = to_ii_i(ExecUtil.I32_ROTL, _, _);
+def I32_ROTR = to_ii_i(ExecUtil.I32_ROTR, _, _);
