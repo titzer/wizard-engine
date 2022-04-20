@@ -1,4 +1,4 @@
-all: TAGS x86-linux x86-64-linux jvm
+all: x86-linux x86-64-linux jvm
 
 .PHONY: clean x86-linux x86-64-linux jvm wave
 clean:
