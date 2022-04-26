@@ -1,40 +1,23 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 def TAGGED = ValueRep.new(true, false);
 def UNTAGGED = ValueRep.new(false, false);
-// XXX: hack so V3Offsets.new() can allocate an Interpreter without auto-generating the interpreter code
-class X86_64InterpreterBase(valueStack: ValueStack) extends Interpreter {
-	var dispatchTable: Pointer;
-}
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
-class X86_64Interpreter extends X86_64InterpreterBase {
+component X86_64Interpreter {
+	var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
+	var valueStack: ValueStack;
+	var dispatchTable: Pointer;
 	var frame: Frame;
 
-	new() super(ValueStack.new(EngineOptions.stackSize)) {
-		if (interpreterCode == null) {
-			var start = System.ticksUs();
-			interpreterCode = X86_64InterpreterGen.new(this).gen();
-			RiRuntime.registerUserCode(interpreterCode);
-			var diff = System.ticksUs() - start;
-			if (Trace.interpreter) Trace.OUT.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
-		}
-		asmEntry = CiRuntime.forgeClosure<
-			X86_64Interpreter,				// closure type
-			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
-			(ExecState, TrapReason)>(			// return types
-				interpreterCode.start + interpreterCode.v3EntryOffset, this);
-		dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
-	}
-
 	def run(f: Function, args: Array<Value>) -> Result {
+		if (interpreterCode == null) genInterpreterCode();
 		// Unpack arguments into value stack format.
 		var fp = valueStack.sp;
 		if (args != null) for (v in args) valueStack.push(v);
 
-		// Call the main loop with handles tail calls.
+		// Call the main loop which handles tail calls.
 		var state = runWithTailCalls(f);
 
 		// Unpack state into interpreter result.
@@ -46,11 +29,25 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 			FINISHED => return popResult(f.sig);
 		}
 	}
+	private def genInterpreterCode() {
+		valueStack = ValueStack.new(EngineOptions.stackSize);
+		var start = System.ticksUs();
+		interpreterCode = X86_64InterpreterGen.new(this).gen();
+		RiRuntime.registerUserCode(interpreterCode);
+		var diff = System.ticksUs() - start;
+		if (Trace.interpreter) Trace.OUT.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
+		asmEntry = CiRuntime.forgeClosure<
+			X86_64Interpreter,				// closure type
+			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
+			(ExecState, TrapReason)>(			// return types
+				interpreterCode.start + interpreterCode.v3EntryOffset, this);
+		dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
+	}
 	def onProbeEnable() {
-		dispatchTable = interpreterCode.start + interpreterCode.probedDispatchTableOffset;
+		if (interpreterCode != null) dispatchTable = interpreterCode.start + interpreterCode.probedDispatchTableOffset;
 	}
 	def onProbeDisable() {
-		dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
+		if (interpreterCode != null) dispatchTable = interpreterCode.start + interpreterCode.fastDispatchTableOffset;
 	}
 	def getTopFrame() -> Frame {
 		return if(frame == null, Frame.new(), frame);
@@ -59,11 +56,8 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		return ArrayStack.new();
 	}
 	def reset() {
-		valueStack.sp = valueStack.mapping.range.start;
+		if (valueStack != null) valueStack.sp = valueStack.mapping.range.start;
 		frame = null;
-		state = ExecState.STOPPED;
-		trap_reason = TrapReason.NONE;
-		error_msg = null;
 	}
 	private def runWithTailCalls(f: Function) -> (ExecState, TrapReason) {
 		var state = (ExecState.FINISHED, TrapReason.NONE);
@@ -79,29 +73,29 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 					break;
 				}
 				hf: HostFunction0 => {
-					if (Trace.interpreter) traceCallHostFunction(hf);
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 					result = hf.invoke0();
 				}
 				hf: HostFunction1 => {
-					if (Trace.interpreter) traceCallHostFunction(hf);
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 					var a0 = valueStack.pop(hf.sig.params[0]);
 					result = hf.invoke1(a0);
 				}
 				hf: HostFunction2 => {
-					if (Trace.interpreter) traceCallHostFunction(hf);
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 					var a1 = valueStack.pop(hf.sig.params[1]);
 					var a0 = valueStack.pop(hf.sig.params[0]);
 					result = hf.invoke2(a0, a1);
 				}
 				hf: HostFunction3 => {
-					if (Trace.interpreter) traceCallHostFunction(hf);
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 					var a2 = valueStack.pop(hf.sig.params[2]);
 					var a1 = valueStack.pop(hf.sig.params[1]);
 					var a0 = valueStack.pop(hf.sig.params[0]);
 					result = hf.invoke3(a0, a1, a2);
 				}
 				hf: HostFunctionN => {
-					if (Trace.interpreter) traceCallHostFunction(hf);
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 					var aN = valueStack.popN(hf.sig.params);
 					result = hf.invokeN(aN);
 				}
@@ -113,7 +107,7 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 				}
 				Error(msg) => {
 					state = (ExecState.TRAPPED, TrapReason.ERROR);
-					error_msg = msg;
+					Execute.error_msg = msg;
 					break;
 				}
 				Value0 => {
@@ -250,15 +244,15 @@ class X86_64Interpreter extends X86_64InterpreterBase {
 		var sp = CiRuntime.callerSp();
 		frame = materializeFrame(sp);
 
-		if (fireProbes(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
-		return (state, trap_reason);
+		if (Execute.fireProbes(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
+		return (Execute.state, Execute.trap_reason);
 	}
 	def runtime_PROBE_instr(instance: Instance) -> (ExecState, TrapReason) {
 		var sp = CiRuntime.callerSp();
 		frame = materializeFrame(sp);
 
-		if (fireProbesAt(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
-		return (state, trap_reason);
+		if (Execute.fireProbesAt(frame.func, frame.pc)) return (ExecState.FINISHED, TrapReason.NONE);
+		return (Execute.state, Execute.trap_reason);
 	}
 	private def materializeFrame(sp: Pointer) -> Frame {
 		var func = (sp + IVar.WASM_FUNC.frameOffset).load<WasmFunction>();
@@ -339,7 +333,6 @@ class X86_64InterpreterCode extends RiUserCode {
 		}
 
 		// Handle other roots in the frame
-		RiGc.scanRoot(sp + IVar.INTERPRETER.frameOffset);
 		RiGc.scanRoot(sp + IVar.FUNC_DECL.frameOffset);
 		RiGc.scanRoot(sp + IVar.INSTANCE.frameOffset);
 	}
@@ -495,7 +488,7 @@ def fatal(msg: string) {
 // Internal register configuration for variables live in the interpreter execution context.
 def R: X86_64Regs, G = X86_64Regs.GPRs, C: X86_64Conds;
 enum IVar(entryParam: int, gpr: X86_64Gpr, frameOffset: int, baseline: bool, mutable: bool) {
-	INTERPRETER	(0, 	null,	0,	false,	false),	// Interpreter object
+	// TODO: reclaim a word from the interpreter frame
 	DISPATCH_TABLE	(-1,	R.R14,  -1,	false,  false), // dispatch table
 	WASM_FUNC	(1, 	null,	8,	false,	false),	// WasmFunction object
 	MEM0_BASE	(-1,	R.R10,	16,	true,	false),	// base of memory #0
@@ -724,14 +717,11 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			// Allocate and initialize interpreter stack frame from incoming V3 params.
 			asm.q.sub_r_i(R.RSP, frameSize);
 
-			// Spill interpreter object
-			var interpReg = I.V3_PARAM_GPRS[IVar.INTERPRETER.entryParam];
-			asm.movq_m_r(R.RSP.plus(IVar.INTERPRETER.frameOffset), interpReg);
 			// Spill VSP (value stack pointer)
 			asm.movq_m_r(R.RSP.plus(IVar.VSP.frameOffset), I.V3_PARAM_GPRS[IVar.VSP.entryParam]);
 			// load dispatch table into register
 			if (tuning.dispatchTableReg) {
-				asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, interpReg.plus(offsets.Interpreter_dispatchTable));
+				asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, absPointer(offsets.Interpreter_dispatchTable));
 			}
 			// move WasmFunction into tmp
 			asm.movq_r_r(tmp, I.V3_PARAM_GPRS[IVar.WASM_FUNC.entryParam]);
@@ -741,12 +731,8 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 		{ // Re-entry for calls within the interpreter itself
 			callReentryRef = IcCodeRef.new(w.pos);
-			// Load and respill interpreter onto new stack frame
-			asm.movq_r_m(tmp, R.RSP.plus(IVar.INTERPRETER.frameOffset + Pointer.SIZE)); // account for additional return address
 			// Allocate actual stack frame
 			asm.q.sub_r_i(R.RSP, frameSize);
-			// Re-spill interpreter object
-			asm.movq_m_r(R.RSP.plus(IVar.INTERPRETER.frameOffset), tmp);
 			// Spill the (valid) stack pointer
 			saveIVar(IVar.VSP);
 			// WasmFunction is in r1 for interpreter reentry
@@ -1239,8 +1225,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			// load interpreter into first arg register
 			var interp = I.V3_PARAM_GPRS[0];
 			// save a copy of VSP into interpreter.valueStack.sp
-			asm.movq_r_m(interp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
-			asm.movq_r_m(I.scratch, interp.plus(offsets.Interpreter_valueStack));
+			asm.movq_r_m(I.scratch, absPointer(offsets.Interpreter_valueStack));
 			asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), I.r3);
 			asm.q.add_r_i(R.RSP, frameSize); // deallocate interpreter frame
 			asm.jmp_rel(int.view(u32.!(abs - (ic.start + w.pos)))); // tail-call into runtime
@@ -2368,26 +2353,24 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		for (i < dst.length) orderMoves(dst, stk, i);
 		// load interpreter into first arg register
 		var interp = I.V3_PARAM_GPRS[0];
-		// save a copy of VSP into interpreter.valueStack.sp
-		asm.movq_r_m(interp, R.RSP.plus(IVar.INTERPRETER.frameOffset));
-		asm.movq_r_m(I.scratch, interp.plus(offsets.Interpreter_valueStack));
+		// save a copy of VSP into valueStack.sp
+		asm.movq_r_m(I.scratch, absPointer(offsets.Interpreter_valueStack));
 		asm.movq_r_m(R.R14, R.RSP.plus(IVar.VSP.frameOffset)); // TODO: use other register than R14
 		asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), R.R14);
 		// emit actual call
 		asm.callr(int.view(u32.!(abs - (ic.start + w.pos + 5))));
 		// check for trap
 		if (canTrap) genExecStateCheck();
-		// reload interpreter (temporarily) from frame
-		asm.movq_r_m(IVar.VSP.gpr, R.RSP.plus(IVar.INTERPRETER.frameOffset));
 		if (tuning.dispatchTableReg) {
 			// restore dispatch table from interpreter.dispatchTable
-			asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, IVar.VSP.gpr.plus(offsets.Interpreter_dispatchTable));
+			asm.movq_r_m(IVar.DISPATCH_TABLE.gpr, absPointer(offsets.Interpreter_dispatchTable));
 		}
-		// restore VSP from interpreter.valueStack.sp
-		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.Interpreter_valueStack));
+		// restore VSP from valueStack.sp
+		asm.movq_r_m(IVar.VSP.gpr, absPointer(offsets.Interpreter_valueStack));
 		asm.movq_r_m(IVar.VSP.gpr, IVar.VSP.gpr.plus(offsets.ValueStack_sp));
 	}
-	def jumpRuntime(abs: Pointer, regs: Array<X86_64Gpr>) {
+	def absPointer(ptr: Pointer) -> X86_64Addr {
+		return X86_64Addr.new(null, null, 1, int.!(ptr - Pointer.NULL));
 	}
 	def orderMoves(dst: Array<X86_64Gpr>, stk: Array<i8>, i: int) {
 		var dreg = dst[i];
