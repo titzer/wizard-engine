@@ -1,0 +1,27 @@
+(module 
+  (func (export "type-i32")
+    (block (drop (i32.ctz (br_table 0 0 (i32.const 0)))))
+  )
+
+ (func (export "meet-externref") (param i32) (param externref) (result externref)
+    (block $l1 (result externref)
+      (block $l2 (result externref)
+        (br_table $l1 $l2 $l1 (local.get 1) (local.get 0))
+      )
+    )
+  )
+
+  (func (export "meet-bottom")
+    (block (result f64)
+      (block (result f32)
+        (unreachable)
+        (br_table 0 1 1 (i32.const 1))
+      )
+      (drop)
+      (f64.const 0)
+    )
+    (drop)
+  )
+)
+
+(assert_return (invoke "type-i32"))
