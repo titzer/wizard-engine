@@ -404,3 +404,148 @@ class TypeComparator {
 		}
 	}
 }
+
+// Heap type declarations.
+class HeapTypeDecl(supertypes: Array<HeapType>) extends Decl {
+	var hash = 0;
+	var canon_id = -1;
+	var recgrp_index = 0;
+	var rttObject: RttObject;
+
+	def render(buf: StringBuilder) -> StringBuilder;
+	def getFirstSuperType() -> HeapTypeDecl {
+		if (supertypes == null || supertypes.length < 1) return null;
+		match (supertypes[0]) {
+			Struct(decl) => return decl;
+			Array(decl) => return decl;
+			Func(decl) => return decl;
+			_ => return null;
+		}
+	}
+}
+
+// Packedness and mutability for fields and array elements. (ext:gc)
+enum Packedness { UNPACKED, PACKED_I8, PACKED_I16 }
+type StorageType(valtype: ValueType, packing: Packedness, mutable: bool) { }
+
+// Struct type declaration. (ext:gc)
+class StructDecl extends HeapTypeDecl {
+	def field_types: Array<StorageType>;
+	var struct_index = -1;
+	def defaultable = allHaveDefaultValues(field_types);
+
+	new(supertypes: Array<HeapType>, field_types) super(supertypes) {}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put1("struct #%d", struct_index);
+	}
+}
+
+// Array type declaration. (ext:gc)
+class ArrayDecl extends HeapTypeDecl {
+	def elem_types: Array<StorageType>;
+	var array_index = -1;
+	def defaultable = allHaveDefaultValues(elem_types);
+
+	new(supertypes: Array<HeapType>, elem_types) super(supertypes) {}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put1("array #%d", array_index);
+	}
+}
+
+// Signature of a function.
+class SigDecl extends HeapTypeDecl {
+	def params: Array<ValueType>;
+	def results: Array<ValueType>;
+	var sig_index = -1;
+
+	new(supertypes: Array<HeapType>, params, results) super(supertypes) {}
+
+	def bindLeft(count: int) -> SigDecl {
+		var p = params, np = Array<ValueType>.new(p.length - count);
+		for (i < np.length) np[i] = p[i + count];
+		return SigDecl.new(ValueTypes.NO_HEAPTYPES, np, results); // TODO: bindLeft of SigDecl.supertypes
+	}
+	def isAssignableSig(that: SigDecl) -> bool {
+		if (that == null) return false;
+		var fp = this.params, tp = that.params;
+		if (fp.length != tp.length) return false;
+		var fr = this.results, tr = that.results;
+		if (fr.length != tr.length) return false;
+		for (i < fp.length) {
+			if (!ValueTypes.isAssignable(tp[i], fp[i])) return false; // contra-variant
+		}
+		for (i < fr.length) {
+			if (!ValueTypes.isAssignable(fr[i], tr[i])) return false; // co-variant
+		}
+		return true;
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		return render2(null, buf);
+	}
+	def render2(seen: List<Decl>, buf: StringBuilder) -> StringBuilder {
+		for (l = seen; l != null; l = l.tail) {
+			if (l.head == this) return buf.put1("#%d", sig_index);
+		}
+		seen = List.new(this, seen);
+		buf.puts("[");
+		for (i < params.length) {
+			if (i > 0) buf.puts(" ");
+			ValueTypes.render(params[i], seen, buf);
+		}
+		buf.puts("] -> [");
+		for (i < results.length) {
+			if (i > 0) buf.puts(" ");
+			ValueTypes.render(results[i], seen, buf);
+		}
+		buf.puts("]");
+		return buf;
+	}
+	def dup() -> SigDecl {
+		return SigDecl.new(supertypes, params, results);
+	}
+}
+
+def allHaveDefaultValues(at: Array<StorageType>) -> bool {
+	for (t in at) if (!ValueTypes.hasDefaultValue(t.valtype)) return false;
+	return true;
+}
+
+component HeapTypeDecls {
+	def checkSupertypes(pos: int, t: HeapTypeDecl, error: ErrorGen) {
+		if (t.supertypes == null || t.supertypes.length < 1) return; // nothing to do
+		match (t) {
+			x: StructDecl => {
+				for (s in t.supertypes) {
+					if (!HeapType.Struct.?(s)) return error.abs(pos).IllegalSupertype(x, s);
+					var y = HeapType.Struct.!(s).sdecl;
+					if (x.field_types.length < y.field_types.length) return error.abs(pos).IllegalSupertype(x, s);
+					for (i < y.field_types.length) {
+						if (!checkStorageType(x.field_types[i], y.field_types[i])) return error.abs(pos).IllegalSupertype(x, s);
+					}
+				}
+			}
+			x: ArrayDecl => {
+				for (s in t.supertypes) {
+					if (!HeapType.Array.?(s)) return error.abs(pos).IllegalSupertype(x, s);
+					var y = HeapType.Array.!(s).array;
+					if (!Arrays.allTrue(x.elem_types, y.elem_types, checkStorageType)) return error.abs(pos).IllegalSupertype(x, s);
+				}
+			}
+			x: SigDecl => {
+				for (s in t.supertypes) {
+					if (!HeapType.Func.?(s)) return error.abs(pos).IllegalSupertype(x, s);
+					var y = HeapType.Func.!(s).sig;
+					if (!Arrays.allTrue(x.results, y.results, ValueTypes.isAssignable)) return error.abs(pos).IllegalSupertype(x, s);
+					if (!Arrays.allTrue(y.params, x.params, ValueTypes.isAssignable)) return error.abs(pos).IllegalSupertype(x, s);
+				}
+			}
+		}
+	}
+	def checkStorageType(sub: StorageType, sup: StorageType) -> bool {
+		if (sub.packing != sup.packing) return false;
+		if (sup.mutable) return sub.mutable && ValueTypes.isEquivalent(sub.valtype, sup.valtype);
+		return !sub.mutable && ValueTypes.isAssignable(sub.valtype, sup.valtype);
+	}
+}
