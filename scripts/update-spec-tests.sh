@@ -44,12 +44,13 @@ function build {
     for sub in . simd gc; do
         if [ -d $sub ]; then
             pushd $sub
-            mkdir -p ../bin/$sub
+            BIN=bin/$sub
+            mkdir -p $BIN
             TESTS=$(ls *.wast)
-            rm -f bin/$sub/*.bin.wast
+            rm -f $BIN/*.bin.wast
             for t in $TESTS; do
 	        echo "##+[$b] translating $sub/$t"
-	        $WASM $t -o ../bin/$sub/$t.bin.wast
+	        $WASM $t -o $BIN/$t.bin.wast
                 check $?
             done
             popd
