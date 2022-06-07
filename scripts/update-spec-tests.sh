@@ -40,11 +40,12 @@ function build {
     mkdir -p bin
     TESTS=$(ls *.wast)
     rm -f bin/*.bin.wast
+    rm -f bin/*/*.bin.wast
     
     for sub in . simd gc; do
         if [ -d $sub ]; then
             pushd $sub
-            BIN=bin/$sub
+            BIN=$DIR/test/core/bin/$sub
             mkdir -p $BIN
             TESTS=$(ls *.wast)
             rm -f $BIN/*.bin.wast
