@@ -63,10 +63,20 @@ else
 fi
 
 # build
+exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
     v3c-x86-linux -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${PROGRAM}.x86-64-linux -output=bin/ $SOURCES $TARGET_X86_64
+    v3c-x86-64-linux -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $TARGET_X86_64
+    if [ $PROGRAM = "wizeng" ]; then
+	E=bin/${exe}
+        cp $E $E.genint
+        $E.genint -gen-int=$E > /tmp/wizeng.genint.out 2>&1
+	if [ $? != 0 ]; then
+	    echo warning: could not serialize interpreter into $E, may be slower
+	fi
+        rm $E.genint
+    fi
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $TARGET_V3
 elif [ "$TARGET" = "wave" ]; then
