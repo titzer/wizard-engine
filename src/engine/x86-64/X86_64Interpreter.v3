@@ -2,6 +2,9 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
+def GLOBAL_BUFFER_MARKER = 0xFACEBEEF778899AAuL;
+def INTERPRETER_CODE_MARKER = 0xFFAACCEEuL;
+def GLOBAL_BUFFER_HEADER_SIZE = 64;
 component X86_64Interpreter {
 	var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
@@ -27,13 +30,31 @@ component X86_64Interpreter {
 			FINISHED => return popResult(f.sig);
 		}
 	}
+	def serializeInterpreterCodeIntoExecutable(executable: Array<byte>) -> bool {
+		if (interpreterCode == null) genInterpreterCode();
+		// try to find {global_buffer} in {data}
+		var d = DataReader.new(executable);
+		// the global buffer contents will be at the same page alignment in the executable
+		var page_offset = int.!((Pointer.atContents(global_buffer) - Pointer.NULL) & (PAGE_SIZE - 1));
+		var found = -1;
+		for (pos = page_offset; pos < d.limit; pos += PAGE_SIZE) {
+			var val = d.at(pos).read_u64();
+			if (val == GLOBAL_BUFFER_MARKER) { found = pos; break; }
+		}
+		if (found < 0) return false;
+		// Write the executable code and the offsets of {InterpreterCode} into the executable.
+		var w = DataWriter.new().reset(executable, found, found);
+		w.puta(global_buffer); // write machine code
+		interpreterCode.serialize(w.at(found + 8)); // write interpreter offsets
+		return true;
+	}
 	private def genInterpreterCode() {
 		valueStack = ValueStack.new(EngineOptions.stackSize);
 		var start = System.ticksUs();
-		interpreterCode = X86_64InterpreterGen.new(this).gen();
+		interpreterCode = deserializeOrGenerateInterpreterCode();
 		RiRuntime.registerUserCode(interpreterCode);
 		var diff = System.ticksUs() - start;
-		if (Trace.interpreter) Trace.OUT.put1("Generated interpreter in %d \xCE\xBCs.\n", diff).outln();
+		if (Trace.interpreter) Trace.OUT.put1("Created interpreter in %d \xCE\xBCs.\n", diff).outln();
 		asmEntry = CiRuntime.forgeClosure<
 			X86_64Interpreter,				// closure type
 			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
@@ -282,16 +303,17 @@ def SIGSEGV = 11;
 // Implements the RiUserCode interface in order to add generated machine code to the V3 runtime.
 // Also stores several important offsets needed in handling signals.
 class X86_64InterpreterCode extends RiUserCode {
-	def frameSize: int;
+	def frameSize = IVar.INSTANCE.frameOffset + Pointer.SIZE;
 	var fastDispatchTableOffset: int;	// dispatch table when probes disabled
 	var probedDispatchTableOffset: int;	// dispatch table when probes enabled
 	var v3EntryOffset: int;			// entry from V3 calling code
 	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
 	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
 	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
+	var codeEnd: int;			// end of all code
 	var buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
 
-	new(start: Pointer, end: Pointer, frameSize) super(start, end) { }
+	new(start: Pointer, end: Pointer) super(start, end) { }
 
 	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
@@ -365,6 +387,29 @@ class X86_64InterpreterCode extends RiUserCode {
 			}
 		}
 		return true;
+	}
+	// Initializes the interpreter code object from serialized memory (e.g. global buffer).
+	def deserialize(d: DataReader) -> bool {
+		if (d.read_u32() != INTERPRETER_CODE_MARKER) return false;
+		fastDispatchTableOffset = int.view(d.read_u32());
+		probedDispatchTableOffset = int.view(d.read_u32());
+		v3EntryOffset = int.view(d.read_u32());
+		oobMemoryHandlerOffset = int.view(d.read_u32());
+		divZeroHandlerOffset = int.view(d.read_u32());
+		stackOverflowHandlerOffset = int.view(d.read_u32());
+		codeEnd = int.view(d.read_u32());
+		return true;
+	}
+	// Writes the interpreter code object fields to serialized memory (e.g. a file with global buffer).
+	def serialize(w: DataWriter) {
+		w.put_b32(int.!(INTERPRETER_CODE_MARKER));
+		w.put_b32(fastDispatchTableOffset);
+		w.put_b32(probedDispatchTableOffset);
+		w.put_b32(v3EntryOffset);
+		w.put_b32(oobMemoryHandlerOffset);
+		w.put_b32(divZeroHandlerOffset);
+		w.put_b32(stackOverflowHandlerOffset);
+		w.put_b32(codeEnd);
 	}
 }
 
@@ -550,26 +595,79 @@ def INL_SIZE = 24 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 // Statically-allocated buffer (in compiled binary).
-def global_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE);
+def global_buffer = allocGlobalBufferWithMarker(TOTAL_SIZE + PAGE_SIZE);
+def allocGlobalBufferWithMarker(size: int) -> Array<byte> {
+	var result = Array<byte>.new(size);
+	var w = DataWriter.new().reset(result, 0, result.length);
+	w.put_b64(long.!(GLOBAL_BUFFER_MARKER));
+	return result;
+}
+def deserializeOrGenerateInterpreterCode() -> X86_64InterpreterCode {
+	def r = DataReader.new(global_buffer);
+
+	var start = Pointer.atElement(global_buffer, 0);
+	var range = MemoryRange.new(start, start + global_buffer.length);
+
+	var ic = X86_64InterpreterCode.new(range.start, range.end);
+
+	var mask = 4095L;
+	var skip = mask & (PAGE_SIZE - ((start - Pointer.NULL) & mask));
+
+	// try deserializing the interpreter code object directly from the global buffer
+	if (ic.deserialize(r.at(8))) {
+		if (Trace.interpreter) {
+			Trace.OUT.put3("Deserialized asm interpreter into (0x%x ... 0x%x), skipping %d bytes",
+				(range.start - Pointer.NULL),
+				(range.end - Pointer.NULL),
+				skip);
+			Trace.OUT.outln();
+		}
+
+	} else {
+		if (Trace.interpreter) {
+			Trace.OUT.put3("Generating asm interpreter into (0x%x ... 0x%x), skipping %d bytes",
+				(range.start - Pointer.NULL),
+				(range.end - Pointer.NULL),
+				skip);
+			Trace.OUT.outln();
+		}
+		var w = DataWriter.new().reset(global_buffer, 0, 0);
+		w.skipN(int.!(skip));			// align to page
+		w.skipN(GLOBAL_BUFFER_HEADER_SIZE);	// skip global header
+		X86_64InterpreterGen.new(ic, w).gen(range);
+	}
+
+	// Write-protect the executable code for security and debugging
+	Mmap.protect(range.start + skip, u64.!(ic.codeEnd - skip), Mmap.PROT_READ | Mmap.PROT_EXEC);
+	// Trace results to help in debugging
+	if (Trace.interpreter) {
+		var s = range.start - Pointer.NULL;
+		Trace.OUT
+			.put1("\tv3 entry       = 0x%x\n", s + ic.v3EntryOffset)
+			.put1("\tfast dispatch  = 0x%x\n", s + ic.fastDispatchTableOffset)
+			.put1("\tprobed dispatch= 0x%x\n", s + ic.probedDispatchTableOffset)
+			.put1("\toob mem        = 0x%x\n", s + ic.oobMemoryHandlerOffset)
+			.put1("\tdivzero        = 0x%x\n", s + ic.divZeroHandlerOffset)
+			.put1("\tstack ovflw    = 0x%x\n", s + ic.stackOverflowHandlerOffset)
+			.put1("\tcode end       = 0x%x\n", s + ic.codeEnd)
+			.outln();
+	}
+	return ic;
+}
 
 // Generates {X86_64InterpreterCode} for X86-64.
-class X86_64InterpreterGen(i: X86_64Interpreter) {
-	def w = DataWriter.new().reset(global_buffer, 0, 0);
-	def w_ool = DataWriter.new().reset(global_buffer, INL_SIZE, INL_SIZE);
+class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
+	def i: X86_64Interpreter;
 	def asm = X86_64Assemblers.create64(w);
-	def ool = X86_64Assemblers.create64(w_ool);
 
-	def frameSize = IVar.INSTANCE.frameOffset + Pointer.SIZE;
 	def offsets = V3Offsets.new();
 	def tuning = X86_64InterpreterTuning.new();
 	def valuerep = Target.tagging;
 
-	var ic: X86_64InterpreterCode;
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
 	var callEntryOffset: int;
-	var codeEndOffset: int;
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
 	var tailCallReentryRef: IcCodeRef;
@@ -593,33 +691,15 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 
 	new() {
 		w.refill = reportOom;
-		w_ool.refill = reportOom;
 		var p = Patcher.new(w);
 		asm.patcher = asm.d.patcher = p;
-		ool.patcher = ool.d.patcher = p;
 	}
 
-	def gen() -> X86_64InterpreterCode {
-		// Compute a range of memory within the statically-allocated {global_buffer}.
-		var start = Pointer.atElement(global_buffer, 0);
-		var mask = 4095L;
-		var skip = mask & (PAGE_SIZE - ((start - Pointer.NULL) & mask));
-		var range = MemoryRange.new(start, start + global_buffer.length);
-		if (Trace.interpreter) {
-			Trace.OUT.put3("Generating asm interpreter into (0x%x ... 0x%x), skipping %d bytes",
-				(range.start - Pointer.NULL),
-				(range.end - Pointer.NULL),
-				skip);
-			Trace.OUT.outln();
-		}
-		if (tuning.dispatchEntrySize == 4 && (start - Pointer.NULL) > int.max) {
-			fatal(Strings.format1("generated code start address of 0x%x out of 31-bit range", (start - Pointer.NULL)));
-		}
-
-		ic = X86_64InterpreterCode.new(range.start, range.end, frameSize);
+	def gen(range: MemoryRange) {
 		// Reserve space for pointers to interpreter runtime calls
-		w.skipN(int.!(skip));  // page-align start of code to avoid write-protecting other parts of static heap
-		w.align(8);
+		if (tuning.dispatchEntrySize == 4 && (range.start - Pointer.NULL) > int.max) {
+			fatal(Strings.format1("global buffer start address of 0x%x out of 31-bit range", (range.start - Pointer.NULL)));
+		}
 		if (tuning.useTypeTagTable) {
 			// Reserve space for the type tag table and fill it out
 			typeTagTableOffset = w.pos;
@@ -640,44 +720,32 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 				w.at(offset + 0x80).putb(BpTypeCode.REF_NULL.code | 0x80);
 			}
 		}
-		w.atEnd();
 
 		// Reserve space for the dispatch tables.
 		reserveDispatchTables();
 		// Begin code generation
 		genInterpreterEntry();
 		genOpcodeHandlers();
-		handlerEndOffset = w.pos;
+		handlerEndOffset = w.atEnd().pos;
 		// Generate out-of-line code
 		genOutOfLineLEBs();
-		codeEndOffset = w.atEnd().pos;
 		genTrapHandlers();
-		// Finished. Copy code from Datawriter into the memory mapping
-		w.atEnd();
-		if (w.pos > TOTAL_SIZE) fatal(Strings.format2("need %d bytes for interpreter code, only allocated %d", w.pos, TOTAL_SIZE));
-		// Write-protect the executable code for security and debugging
-		Mmap.protect(range.start + skip, u64.!(w.end() - skip), Mmap.PROT_READ | Mmap.PROT_EXEC);
-		// Trace results to help in debugging
+		ic.codeEnd = w.atEnd().pos;
+
 		if (Trace.interpreter) {
-			var start = range.start - Pointer.NULL;
+			var s = range.start - Pointer.NULL;
 			Trace.OUT
 				.put3("Finished asm interpreter @ (0x%x ... 0x%x), used %d bytes\n",
-					start, (range.end - Pointer.NULL), w.pos)
-				.put1("\tv3 entry       = 0x%x\n", start + ic.v3EntryOffset)
-				.put1("\tcall entry     = 0x%x\n", start + callEntryOffset);
-			for (t in dispatchTables) Trace.OUT.put2("\tdispatch %x    = 0x%x\n", byte.view(t.0), start + t.1.offset);
+					s, (range.end - Pointer.NULL), w.pos)
+				.put1("\tcall entry     = 0x%x\n", s + callEntryOffset);
+			for (t in dispatchTables) Trace.OUT.put2("\tdispatch %x    = 0x%x\n", byte.view(t.0), s + t.1.offset);
 			Trace.OUT
-				.put1("\tfirst dispatch = 0x%x\n", start + firstDispatchOffset)
-				.put1("\thandlers end   = 0x%x\n", start + handlerEndOffset)
-				.put1("\tcode end       = 0x%x\n", start + codeEndOffset)
-				.put1("\toob mem        = 0x%x\n", start + ic.oobMemoryHandlerOffset)
-				.put1("\tdivzero        = 0x%x\n", start + ic.divZeroHandlerOffset)
-				.put1("\tstack ovflw    = 0x%x\n", start + ic.stackOverflowHandlerOffset)
-				.put2("\tprotected      = 0x%x + %d\n", start + skip, w.end() - skip)
-				.put1("break *0x%x\n", start + dispatchJmpOffset)
+				.put1("\tfirst dispatch = 0x%x\n", s + firstDispatchOffset)
+				.put1("\thandlers end   = 0x%x\n", s + handlerEndOffset)
+				.put1("break *0x%x\n", s + dispatchJmpOffset)
 				.outln();
 		}
-		return ic;
+		if (w.pos > TOTAL_SIZE) fatal(Strings.format2("need %d bytes for interpreter code, only allocated %d", w.pos, TOTAL_SIZE));
 	}
 	def reserveDispatchTables() {
 		{ // table #0
@@ -714,10 +782,10 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		var shared_entry = X86_64Label.new();
 		var tmp = I.scratch;
 		{ // Entrypoint for calls coming from V3
-			ic.v3EntryOffset = w.atEnd().pos;
+			ic.v3EntryOffset = w.pos;
 
 			// Allocate and initialize interpreter stack frame from incoming V3 params.
-			asm.q.sub_r_i(R.RSP, frameSize);
+			asm.q.sub_r_i(R.RSP, ic.frameSize);
 
 			// Spill VSP (value stack pointer)
 			asm.movq_m_r(R.RSP.plus(IVar.VSP.frameOffset), I.V3_PARAM_GPRS[IVar.VSP.entryParam]);
@@ -734,7 +802,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		{ // Re-entry for calls within the interpreter itself
 			callReentryRef = IcCodeRef.new(w.pos);
 			// Allocate actual stack frame
-			asm.q.sub_r_i(R.RSP, frameSize);
+			asm.q.sub_r_i(R.RSP, ic.frameSize);
 			// Spill the (valid) stack pointer
 			saveIVar(IVar.VSP);
 			// WasmFunction is in r1 for interpreter reentry
@@ -837,7 +905,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.bind(done);
 
 		// execute first instruction
-		firstDispatchOffset = w.atEnd().pos;
+		firstDispatchOffset = w.pos;
 		genDispatch(I.ip_ptr, if(!tuning.dispatchTableReg, dispatchTables[0].1), true);
 	}
 
@@ -1109,7 +1177,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
 			genCopyStackValsToVfp(cnt, I.r1);
 			// Deallocate interpreter frame and return to calling code.
-			asm.q.add_r_i(R.RSP, frameSize);
+			asm.q.add_r_i(R.RSP, ic.frameSize);
 			asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.FINISHED.tag);
 			asm.ret();
 
@@ -1230,7 +1298,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 			// save a copy of VSP into interpreter.valueStack.sp
 			asm.movq_r_m(I.scratch, absPointer(offsets.Interpreter_valueStack));
 			asm.movq_m_r(I.scratch.plus(offsets.ValueStack_sp), I.r3);
-			asm.q.add_r_i(R.RSP, frameSize); // deallocate interpreter frame
+			asm.q.add_r_i(R.RSP, ic.frameSize); // deallocate interpreter frame
 			asm.jmp_rel(int.view(u32.!(abs - (ic.start + w.pos)))); // tail-call into runtime
 		}
 
@@ -2452,7 +2520,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		asm.movd_r_i(I.V3_RET_GPRS[0], ExecState.TRAPPED.tag);
 		asm.movd_r_i(I.V3_RET_GPRS[1], reason.tag);
 		abruptRetRef = IcCodeRef.new(w.pos);
-		asm.q.add_r_i(R.RSP, frameSize);
+		asm.q.add_r_i(R.RSP, ic.frameSize);
 		asm.ret();
 	}
 
@@ -2600,7 +2668,7 @@ class X86_64InterpreterGen(i: X86_64Interpreter) {
 		fatal("no dispatch table found for prefix");
 	}
 	// Generate the out-of-line LEB decoding code.
-	def genOutOfLineLEBs() {
+	def genOutOfLineLEBs() { // XXX: use a separate out-of-line assembler on the end of the buffer
 		for (i < oolULeb32Sites.length) {
 			var o = oolULeb32Sites[i];
 			var pos = w.atEnd().pos;
