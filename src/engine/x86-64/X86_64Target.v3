@@ -3,6 +3,9 @@
 
 // Contains target-specific factory functions.
 component Target {
+	def V3_PARAM_GPRS = [X86_64Regs.RDI, X86_64Regs.RSI, X86_64Regs.RDX, X86_64Regs.RCX, X86_64Regs.R8, X86_64Regs.R9]; 		// System-V
+	def V3_RET_GPRS = [X86_64Regs.RAX, X86_64Regs.RDX, X86_64Regs.RCX, X86_64Regs.RSI]; 			// System-V + 2
+
 	def limit_memory_pages = 65536u;
 	def newMemory = X86_64Memory.new;
 	def forceGC = RiGc.forceGC;
@@ -11,6 +14,8 @@ component Target {
 	def getWasmTopFrame = X86_64Interpreter.getTopFrame;
 	def getWasmCallStack = X86_64Interpreter.getCallStack;
 	def getWasmCallDepth = X86_64Interpreter.getCallDepth;
+	var asmSpcEntry: (WasmFunction, Pointer, Pointer) -> (ExecState, TrapReason);
+	var globalCode: Mapping;
 	def tagging = Tagging.new(true, false);
 
 	new() {
@@ -20,16 +25,73 @@ component Target {
 
 	def setMode(m: EngineMode) -> bool {
 		match (m) {
-			JIT => return false;
-			INT, FAST, DEBUG => {
+			JIT => {
+				Execute.mode = Mode.JIT;
+				return true;
+			}
+			FAST => {
+				Execute.mode = Mode.MIXED;
+				return true;
+			}
+			INT, DEBUG => {
 				// x86-64 target has only one execution mode; interpreter only
 				Execute.mode = Mode.INTERPRETER;
 				return true;
 			}
 		}
 	}
-	def finishModule(m: Module, err: ErrorGen) {
-		// x86-64 target needs no post-processing for a module
+	def finishModule(module: Module, err: ErrorGen) {
+		if (Execute.mode == Mode.INTERPRETER) return; // interpreter needs no post-processing for a module
+
+		ensureSpcEntry();
+
+		var none: Extension.set;
+		var limits = Limits.new();
+		var compiler = X86_64SinglePassCompiler.new(none, limits, X86_64Regs2.CONFIG, module);
+		var w = compiler.w;
+		w.put_b32(0xFFDDEECC); // ensure non-zero offset
+
+		var starts = Array<int>.new(module.functions.length);
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			starts[i] = w.atEnd().pos;
+			var compiled = compiler.gen(f);
+			if (!compiled) {
+				if (Execute.mode == Mode.JIT) return err.abs(i).FailedToCompile(i);
+				starts[i] = 0;
+			}
+		}
+		// copy and map code
+		var mapping = mapCode(X86_64MacroAssembler.!(compiler.masm).asm);
+		for (i < starts.length) {
+			if (starts[i] > 0) {
+				var addr = mapping.range.start + starts[i];
+				if (Trace.compiler) Trace.OUT.put2("func[%d].spc_entry: break *0x%x", i, addr - Pointer.NULL).outln();
+				module.functions[i].code.target_code = TargetCode(addr);
+			}
+		}
+		module.target_module = TargetModule(mapping);
+	}
+	def callSpcEntry(wf: WasmFunction) -> (ExecState, TrapReason) {
+		var valueStack = X86_64Interpreter.valueStack;
+		return asmSpcEntry(wf, wf.decl.code.target_code.spc_entry, valueStack.sp);
+	}
+	def ensureSpcEntry() {
+		if (asmSpcEntry == null) {
+			var w = DataWriter.new();
+			var asm = X86_64Assemblers.create64(w);
+			var c = X86_64Regs2.CONFIG;
+			def G = X86_64Regs2.toGpr;
+			asm.movq_r_r(G(c.tmp_reg), Target.V3_PARAM_GPRS[1]); // function
+			asm.movq_r_r(G(c.vsp_reg), Target.V3_PARAM_GPRS[3]); // vsp
+			asm.icall_r(Target.V3_PARAM_GPRS[2]);
+			asm.movq_r_i(Target.V3_RET_GPRS[0], ExecState.FINISHED.tag); // TODO: traps
+			asm.ret();
+			globalCode = mapCode(asm);
+			asmSpcEntry = CiRuntime.forgeClosure<void, (WasmFunction, Pointer, Pointer), (ExecState, TrapReason)>(globalCode.range.start, ());
+			if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", globalCode.range.start - Pointer.NULL).outln();
+		}
 	}
 	def genInterpreterIntoFile(filename: string) -> ErrorBuilder {
 		var data = System.fileLoad(filename);
@@ -44,5 +106,21 @@ component Target {
 		return null;
 	}
 }
-type TargetCode(v: void) #unboxed { }
-type TargetModule(v: void) #unboxed { }
+
+type TargetCode(spc_entry: Pointer) #unboxed { }
+type TargetModule(code: Mapping) #unboxed { }
+
+def mapCode(asm: X86_64Assembler) -> Mapping {
+	var w = asm.w;
+	var length = u64.view(w.atEnd().pos);
+	var mapping = Mmap.reserve(length, Mmap.PROT_WRITE), range = mapping.range;
+	var t = range.start;
+	var f = Pointer.atContents(w.data);
+	for (i = 0; i < length; i += Pointer.SIZE) { // XXX: manual memcopy
+		t.store<Pointer>(f.load<Pointer>());
+		t += Pointer.SIZE;
+		f += Pointer.SIZE;
+	}
+	Mmap.protect(range.start, u64.!(range.end - range.start), Mmap.PROT_READ | Mmap.PROT_EXEC);
+	return mapping;
+}
