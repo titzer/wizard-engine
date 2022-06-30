@@ -14,6 +14,7 @@ jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
 wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
+JIT=src/engine/compiler/*.v3
 X86_64=src/engine/x86-64/*.v3
 WAVE=src/wave/*.v3
 WASI=src/wasi/*.v3
@@ -68,13 +69,13 @@ bin/objdump.x86-linux: $(OBJDUMP)
 	./build.sh objdump x86-linux
 
 # x86-64-linux targets
-bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64)
+bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64) $(JIT)
 	./build.sh unittest x86-64-linux
 
-bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64)
+bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT)
 	./build.sh spectest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WIZENG) $(wASI_X86_64_LINUX) $(X86_64)
+bin/wizeng.x86-64-linux: $(WIZENG) $(wASI_X86_64_LINUX) $(X86_64) $(JIT)
 	./build.sh wizeng x86-64-linux
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
