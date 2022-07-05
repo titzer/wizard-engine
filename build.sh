@@ -36,6 +36,7 @@ ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
+UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST="test/spectest/*.v3 test/spectest.main.v3"
 WIZENG="src/wizeng.main.v3"
 WAVE="src/wave/*.v3"
@@ -56,6 +57,9 @@ elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST $JAWA"
+    if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
+        SOURCES="$SOURCES $UNITTEST_X86_64_LINUX"
+    fi
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
 else

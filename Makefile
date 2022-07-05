@@ -24,6 +24,7 @@ WIZENG=src/wizeng.main.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
 SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
+UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3
 
 TAGS: $(ENGINE) $(WIZENG) $(WAVE) $(WASI) $(JAWA) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
@@ -69,7 +70,7 @@ bin/objdump.x86-linux: $(OBJDUMP)
 	./build.sh objdump x86-linux
 
 # x86-64-linux targets
-bin/unittest.x86-64-linux: $(UNITTEST) $(X86_64) $(JIT)
+bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT)
 	./build.sh unittest x86-64-linux
 
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT)
