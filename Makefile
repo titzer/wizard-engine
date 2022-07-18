@@ -76,7 +76,7 @@ bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT)
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT)
 	./build.sh spectest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WIZENG) $(wASI_X86_64_LINUX) $(X86_64) $(JIT)
+bin/wizeng.x86-64-linux: $(WIZENG) $(WASI_X86_64_LINUX) $(X86_64) $(JIT)
 	./build.sh wizeng x86-64-linux
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
