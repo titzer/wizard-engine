@@ -309,11 +309,12 @@ class X86_64InterpreterCode extends RiUserCode {
 	def frameSize = IVar.INSTANCE.frameOffset + Pointer.SIZE;
 	var fastDispatchTableOffset: int;	// dispatch table when probes disabled
 	var probedDispatchTableOffset: int;	// dispatch table when probes enabled
+	var codeStart: int;			// start of all executable code
 	var v3EntryOffset: int;			// entry from V3 calling code
 	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
 	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
 	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
-	var codeEnd: int;			// end of all code
+	var codeEnd: int;			// end of all executable code
 	var buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
 
 	new(start: Pointer, end: Pointer) super(start, end) { }
@@ -396,6 +397,7 @@ class X86_64InterpreterCode extends RiUserCode {
 		if (d.read_u32() != INTERPRETER_CODE_MARKER) return false;
 		fastDispatchTableOffset = int.view(d.read_u32());
 		probedDispatchTableOffset = int.view(d.read_u32());
+		codeStart = int.view(d.read_u32());
 		v3EntryOffset = int.view(d.read_u32());
 		oobMemoryHandlerOffset = int.view(d.read_u32());
 		divZeroHandlerOffset = int.view(d.read_u32());
@@ -408,6 +410,7 @@ class X86_64InterpreterCode extends RiUserCode {
 		w.put_b32(INTERPRETER_CODE_MARKER);
 		w.put_b32(fastDispatchTableOffset);
 		w.put_b32(probedDispatchTableOffset);
+		w.put_b32(codeStart);
 		w.put_b32(v3EntryOffset);
 		w.put_b32(oobMemoryHandlerOffset);
 		w.put_b32(divZeroHandlerOffset);
@@ -605,44 +608,53 @@ def allocGlobalBufferWithMarker(size: int) -> Array<byte> {
 def deserializeOrGenerateInterpreterCode() -> X86_64InterpreterCode {
 	def r = DataReader.new(global_buffer);
 
-	var start = Pointer.atElement(global_buffer, 0);
+	var start = Pointer.atContents(global_buffer);
 	var range = MemoryRange.new(start, start + global_buffer.length);
 
 	var ic = X86_64InterpreterCode.new(range.start, range.end);
 
-	var mask = 4095L;
-	var skip = mask & (PAGE_SIZE - ((start - Pointer.NULL) & mask));
-
 	// try deserializing the interpreter code object directly from the global buffer
 	if (ic.deserialize(r.at(8))) {
 		if (Trace.interpreter) {
-			Trace.OUT.put3("Deserialized asm interpreter into (0x%x ... 0x%x), skipping %d bytes",
+			Trace.OUT.put2("Deserialized asm interpreter into [0x%x ... 0x%x]",
 				(range.start - Pointer.NULL),
-				(range.end - Pointer.NULL),
-				skip);
+				(range.end - Pointer.NULL));
 			Trace.OUT.outln();
 		}
 
 	} else {
+		//         global buffer v   [0 ...                                         TOTAL_SIZE  ]
+		//      |xxxxxxxxxxxxxxxx|h|l|marker|global_header|...|dispatch|...|inline_code|ool_code|___
+		//      ^----elem0_offset----^
+		// page ^                                       1KiB  ^       page ^      page ^
+		var mask = 4095L;
+		var elem0_offset = (start - Pointer.NULL) & mask;
+		var alloc_offset = elem0_offset + 8 + GLOBAL_BUFFER_HEADER_SIZE;
+		var aligned_offset = (alloc_offset + mask) & ~mask;
+		var skip = int.!(aligned_offset - elem0_offset);
+
 		if (Trace.interpreter) {
-			Trace.OUT.put3("Generating asm interpreter into (0x%x ... 0x%x), skipping %d bytes",
+			Trace.OUT.put3("Generating asm interpreter into [0x%x ... 0x%x], skipping %d bytes",
 				(range.start - Pointer.NULL),
 				(range.end - Pointer.NULL),
 				skip);
 			Trace.OUT.outln();
 		}
-		var w = DataWriter.new().reset(global_buffer, 0, 0);
-		w.skipN(int.!(skip));			// align to page
-		w.skipN(GLOBAL_BUFFER_HEADER_SIZE);	// skip global header
-		X86_64InterpreterGen.new(ic, w).gen(range);
+
+
+		var w_inl = DataWriter.new().reset(global_buffer, skip, skip);
+		var w_ool = DataWriter.new().reset(global_buffer, skip + INL_SIZE,  skip + INL_SIZE);
+
+		X86_64InterpreterGen.new(ic, w_inl).gen(range);
 	}
 
 	// Write-protect the executable code for security and debugging
-	Mmap.protect(range.start + skip, u64.!(ic.codeEnd - skip), Mmap.PROT_READ | Mmap.PROT_EXEC);
+	Mmap.protect(range.start + ic.codeStart, u64.!(ic.codeEnd - ic.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
 	// Trace results to help in debugging
 	if (Trace.interpreter) {
 		var s = range.start - Pointer.NULL;
 		Trace.OUT
+			.put1("\tcode start     = 0x%x\n", s + ic.codeStart)
 			.put1("\tv3 entry       = 0x%x\n", s + ic.v3EntryOffset)
 			.put1("\tfast dispatch  = 0x%x\n", s + ic.fastDispatchTableOffset)
 			.put1("\tprobed dispatch= 0x%x\n", s + ic.probedDispatchTableOffset)
@@ -700,6 +712,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (tuning.dispatchEntrySize == 4 && (range.start - Pointer.NULL) > int.max) {
 			fatal(Strings.format1("global buffer start address of 0x%x out of 31-bit range", (range.start - Pointer.NULL)));
 		}
+		ic.codeStart = w.atEnd().pos; // XXX: don't make dispatch tables executable
 		if (tuning.useTypeTagTable) {
 			// Reserve space for the type tag table and fill it out
 			typeTagTableOffset = w.pos;
