@@ -34,7 +34,7 @@ Wizard supports a small embedding environment suitable for running simple progra
 
 ## Supported Targets ##
 
-Because Wizard is written in [https://github.com/titzer/virgil](Virgil), it runs on all the targets that Virgil currently supports, including:
+Because Wizard is written in [Virgil](https://github.com/titzer/virgil), it runs on all the targets that Virgil currently supports, including:
 
 * x86-darwin : 32-bit Darwin kernels (MacOS)
 * x86-linux : 32-bit Linux kernels
