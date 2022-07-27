@@ -49,7 +49,7 @@ function test_echo() {
 	echo "##-fail: wizeng exit code $EXIT"
 	return
     fi
-    echo '1 222 3ABC ' > $TMP/echo.wasm.1.expect
+    echo './echo.wasm 1 222 3ABC ' > $TMP/echo.wasm.1.expect
     diff $TMP/echo.wasm.1.expect $TMP/echo.wasm.1.out
     if [ $? != 0 ]; then
 	echo '##-fail: output does not match'
