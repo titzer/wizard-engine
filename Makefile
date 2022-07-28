@@ -14,6 +14,7 @@ jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
 wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
+MONITORS=src/monitors/*.v3
 JIT=src/engine/compiler/*.v3
 X86_64=src/engine/x86-64/*.v3
 WAVE=src/wave/*.v3
@@ -37,7 +38,7 @@ bin/unittest.jvm: $(UNITTEST)
 bin/spectest.jvm: $(SPECTEST)
 	./build.sh spectest jvm
 
-bin/wizeng.jvm: $(WIZENG) 
+bin/wizeng.jvm: $(WIZENG) $(MONITORS)
 	./build.sh wizeng jvm
 
 bin/objdump.jvm: $(OBJDUMP)
@@ -50,7 +51,7 @@ bin/unittest.wasm: $(UNITTEST)
 bin/spectest.wasm: $(SPECTEST)
 	./build.sh spectest wave
 
-bin/wizeng.wasm: $(WIZENG)
+bin/wizeng.wasm: $(WIZENG) $(MONITORS)
 	./build.sh wizeng wave
 
 bin/objdump.wasm: $(OBJDUMP)
@@ -63,7 +64,7 @@ bin/unittest.x86-linux: $(UNITTEST)
 bin/spectest.x86-linux: $(SPECTEST)
 	./build.sh spectest x86-linux
 
-bin/wizeng.x86-linux: $(WIZENG)
+bin/wizeng.x86-linux: $(WIZENG) $(MONITORS)
 	./build.sh wizeng x86-linux
 
 bin/objdump.x86-linux: $(OBJDUMP)
@@ -76,7 +77,7 @@ bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT)
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT)
 	./build.sh spectest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WIZENG) $(WASI_X86_64_LINUX) $(X86_64) $(JIT)
+bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(X86_64) $(JIT)
 	./build.sh wizeng x86-64-linux
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
@@ -89,7 +90,7 @@ bin/unittest.int: $(SPECTEST)
 bin/spectest.int: $(SPECTEST)
 	./build.sh spectest int
 
-bin/wizeng.int: $(WIZENG)
+bin/wizeng.int: $(WIZENG) $(MONITORS)
 	./build.sh wizeng int
 
 bin/objdump.int: $(OBJDUMP)

@@ -33,6 +33,7 @@ if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
 fi
     
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
+MONITORS="src/monitors/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3"
@@ -49,7 +50,7 @@ TARGET=$2
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WIZENG $WAVE $WASI"
+    SOURCES="$ENGINE $WIZENG $WAVE $WASI $MONITORS"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX"
     fi
