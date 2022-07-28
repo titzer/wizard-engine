@@ -44,7 +44,7 @@ for target in $TEST_TARGETS; do
     if [ "$target" = "" ]; then # for symmetry
 	skip wizeng $target
     else
-	TEST_TARGET=$target $SCRIPT_LOC/wizeng.sh
+	TEST_TARGET=$target $SCRIPT_LOC/wizeng/test.sh
     fi
 done
 
