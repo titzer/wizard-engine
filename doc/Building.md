@@ -24,6 +24,14 @@ Aeneas III-6.1418: no input files
 Build Data: x86-linux 2021-08-06 19:01:30 by titzer@magic-carpet
 ```
 
+The Virgil repo has stable binary checked in. If building Wizard fails you might need to bootstrap the latest version of Virgil.
+To do so change to the `virgil` directory and run `make` after adding `bin/dev` to your PATH.
+
+```
+% export PATH=$PATH:`pwd`/bin/dev
+% make
+```
+
 ## Stay up-to-date with Virgil
 
 The Wizard engine unabashedly uses all of the most cutting-edge Virgil language features.
