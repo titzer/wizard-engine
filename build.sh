@@ -9,19 +9,18 @@ if [ "$#" -lt 2 ]; then
     exit_usage
 fi
 
-CUR_V3C=$(which v3c)
-
-if [ ! -x "$CUR_V3C" ]; then
-    echo "Virgil compiler (v3c) not found in PATH"
+V3C=${V3C:=$(which v3c)}
+if [ ! -x "$V3C" ]; then
+    echo "Virgil compiler (v3c) not found in \$PATH, and \$V3C not set"
     exit 1
 fi
 
 if [ "$VIRGIL_LIB" = "" ]; then
     if [ "$VIRGIL_LOC" = "" ]; then
-	VIRGIL_LIB=$(dirname $CUR_V3C)/../lib/
-    else
-	VIRGIL_LIB=${VIRGIL_LOC}/lib/
+	V3C_LOC=$(dirname $(which v3c))
+	VIRGIL_LOC=$(cd $V3C_LOC/../ && pwd)
     fi
+    VIRGIL_LIB=${VIRGIL_LOC}/lib/
 fi
 
 if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
@@ -87,7 +86,8 @@ elif [ "$TARGET" = "jvm" ]; then
 elif [ "$TARGET" = "wave" ]; then
     v3c-wave -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $TARGET_V3
 elif [ "$TARGET" = "int" ]; then
-    v3c $SOURCES $TARGET_V3
+    # check that the sources typecheck
+    $V3C $SOURCES $TARGET_V3
     RET=$?
     if [ $RET != 0 ]; then
 	exit $RET
@@ -101,10 +101,10 @@ elif [ "$TARGET" = "int" ]; then
 	LIST="$LIST $(ls $f)"
     done
     echo '#!/bin/bash' > bin/$PROGRAM.int
-    echo "v3c \$V3C_OPTS -run $LIST" '$@' >> bin/$PROGRAM.int
+    echo "v3i \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.int
     chmod 755 bin/$PROGRAM.int
     # run v3c just to check for compile errors
-    v3c $LIST
+    $V3C $LIST
 else
     exit_usage
 fi
