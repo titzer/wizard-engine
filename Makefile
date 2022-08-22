@@ -32,66 +32,66 @@ TAGS: $(ENGINE) $(WIZENG) $(WAVE) $(WASI) $(JAWA) $(SPECTEST) $(UNITTEST) $(WASI
 	vctags -e $(ENGINE) $(WAVE) $(WASI) $(JAWA) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
 
 # JVM targets
-bin/unittest.jvm: $(UNITTEST)
+bin/unittest.jvm: $(UNITTEST) build.sh
 	./build.sh unittest jvm
 
-bin/spectest.jvm: $(SPECTEST)
+bin/spectest.jvm: $(SPECTEST) build.sh
 	./build.sh spectest jvm
 
-bin/wizeng.jvm: $(WIZENG) $(MONITORS)
+bin/wizeng.jvm: $(WIZENG) $(MONITORS) build.sh
 	./build.sh wizeng jvm
 
-bin/objdump.jvm: $(OBJDUMP)
+bin/objdump.jvm: $(OBJDUMP) build.sh
 	./build.sh objdump jvm
 
 # WAVE targets
-bin/unittest.wasm: $(UNITTEST)
+bin/unittest.wasm: $(UNITTEST) build.sh
 	./build.sh unittest wave
 
-bin/spectest.wasm: $(SPECTEST)
+bin/spectest.wasm: $(SPECTEST) build.sh
 	./build.sh spectest wave
 
-bin/wizeng.wasm: $(WIZENG) $(MONITORS)
+bin/wizeng.wasm: $(WIZENG) $(MONITORS) build.sh
 	./build.sh wizeng wave
 
-bin/objdump.wasm: $(OBJDUMP)
+bin/objdump.wasm: $(OBJDUMP) build.sh
 	./build.sh objdump wave
 
 # x86-linux targets
-bin/unittest.x86-linux: $(UNITTEST)
+bin/unittest.x86-linux: $(UNITTEST) build.sh
 	./build.sh unittest x86-linux
 
-bin/spectest.x86-linux: $(SPECTEST)
+bin/spectest.x86-linux: $(SPECTEST) build.sh
 	./build.sh spectest x86-linux
 
-bin/wizeng.x86-linux: $(WIZENG) $(MONITORS)
+bin/wizeng.x86-linux: $(WIZENG) $(MONITORS) build.sh
 	./build.sh wizeng x86-linux
 
-bin/objdump.x86-linux: $(OBJDUMP)
+bin/objdump.x86-linux: $(OBJDUMP) build.sh
 	./build.sh objdump x86-linux
 
 # x86-64-linux targets
-bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT)
+bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh unittest x86-64-linux
 
-bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT)
+bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT) build.sh
 	./build.sh spectest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(X86_64) $(JIT)
+bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh wizeng x86-64-linux
 
-bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64)
+bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
 	./build.sh objdump x86-64-linux
 
 # interpreter targets
-bin/unittest.int: $(SPECTEST)
+bin/unittest.int: $(SPECTEST) build.sh
 	./build.sh unittest int
 
-bin/spectest.int: $(SPECTEST)
+bin/spectest.int: $(SPECTEST) build.sh
 	./build.sh spectest int
 
-bin/wizeng.int: $(WIZENG) $(MONITORS)
+bin/wizeng.int: $(WIZENG) $(MONITORS) build.sh
 	./build.sh wizeng int
 
-bin/objdump.int: $(OBJDUMP)
+bin/objdump.int: $(OBJDUMP) build.sh
 	./build.sh objdump int
