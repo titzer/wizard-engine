@@ -141,14 +141,80 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
 				var limit = val_sp - u32.view(params.length);
 				emit_store_all(limit, false); // XXX: split and prepare merge
-				var ctl = pushControl(opcode, params, results, int.view(limit));
+				var ctl = pushControl(opcode, params, results, limit);
 			}
 			Opcode.LOOP.code => {
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				var limit = val_sp = u32.view(params.length);
+				var limit = val_sp - u32.view(params.length);
 				emit_store_all(limit, true); // XXX: prepare and pre-populate merge
-				var ctl = pushControl(opcode, params, results, int.view(limit));
+				var ctl = pushControl(opcode, params, results, limit);
+				saveStackAtStart(ctl);
 				masm.bindLabel(ctl.label);
+			}
+			Opcode.IF.code => {
+				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
+				var limit = val_sp - u32.view(params.length);
+				var t = pop();
+				var ctl = pushControl(opcode, params, results, limit);
+				saveStackAtStart(ctl);
+				ctl.else_label = masm.newLabel(opcode_pos);
+			}
+			Opcode.ELSE.code => {
+				var ctl_top = ctl_stack.peek();
+				emitFallThru();
+				masm.emit_br(ctl_top.label);
+				resetStackToStart(ctl_top);
+				masm.bindLabel(ctl_top.else_label);
+			}
+			Opcode.END.code => {
+				var ctl = ctl_stack.pop();
+				if (ctl.start_opcode == Opcode.LOOP.code) {
+					// nothing to do
+				} else {
+					masm.bindLabel(ctl.label);
+					if (ctl_stack.empty()) emitReturn();
+				}
+			}
+			Opcode.BR.code => {
+				var depth = parser.readLabel();
+				var target = getControl(depth);
+				emitTransfer(target);
+				masm.emit_br(target.label);
+			}
+			Opcode.BR_IF.code => {
+				var depth = parser.readLabel();
+				var target = getControl(depth);
+				var t = pop(), tag = t.1, state = t.2;
+				// XXX: emit only one jump if no transfer needed
+				match (state) {
+					Uncached => {
+						var label = masm.newLabel(opcode_pos);
+						masm.emit_br_m_z(masm.slotAddr(val_sp), label);
+						emitTransfer(target);
+						masm.emit_br(target.label);
+						masm.bindLabel(label);
+					}
+					Register(reg) => {
+						var label = masm.newLabel(opcode_pos);
+						masm.emit_br_r_z(reg.reg, label);
+						emitTransfer(target);
+						masm.emit_br(target.label);
+						masm.bindLabel(label);
+					}
+					Const(val) => {
+						if (val != 0) {
+							emitTransfer(target);
+							masm.emit_br(target.label);
+						}
+						// fall through
+					}
+				}
+			}
+			Opcode.RETURN.code => {
+				emitReturn(); // XXX: factor into one epilogue
+			}
+			Opcode.DROP.code => {
+				val_sp--;
 			}
 			Opcode.LOCAL_GET.code => {
 				var index = codeptr.read_uleb32();
@@ -293,11 +359,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.I64_LE_U.code => emitBinopNoFold(Opcode.I64_LE_U, isAlwaysFalse);
 			Opcode.I64_GE_S.code => emitBinopNoFold(Opcode.I64_GE_S, isAlwaysFalse);
 			Opcode.I64_GE_U.code => emitBinopNoFold(Opcode.I64_GE_U, isAlwaysFalse);
-			Opcode.END.code => {
-				if (codeptr.pos == codeptr.limit) emitReturn();
-				else ; // TODO: pop control
-			}
-			Opcode.RETURN.code => emitReturn();
 			_ => unsupported();
 		}
 	}
@@ -336,6 +397,31 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_add_r_l(c.sp_reg, c.spcFrameSize);
 		// Return to caller
 		masm.emit_ret();
+	}
+	def emitFallThru() {
+		emit_store_all(val_sp, true); // XXX
+	}
+	def emitTransfer(target: SpcControl) {
+		emit_store_all(target.val_stack_top, true); // XXX uncaching everything first
+		var arity = u32.view(labelArgs(target).length);
+		if (val_sp == target.val_stack_top + arity) return; // stack height match
+		var from = val_sp - arity, to = target.val_stack_top;
+		while (from < val_sp) {
+			match (val_state[from]) {
+				Uncached => {
+					masm.emit_mov_s_s(to, from, val_tag[to]);
+				}
+				Register(reg_b) => {
+					masm.emit_mov_s_r(to, reg_b.reg, reg_b.regClass);
+				}
+				Const(val_b) => {
+					masm.emit_mov_s_i(to, val_b);
+				}
+			}
+			if (!val_tagged[from]) emit_write_slot_tag(to, val_tag[to]);
+			from++;
+			to++;
+		}
 	}
 	def emitBinopNoFold(op: Opcode, nop: int -> bool) { // XXX: factor commonality among binops
 		var b = pop();
@@ -618,7 +704,17 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	//====================================================================
 	// abstract stack operations
 	//====================================================================
-	def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, val_stack_top: int) -> SpcControl {
+	def saveStackAtStart(ctl: SpcControl) {
+		emit_store_all(ctl.val_stack_top, false); // XXX: actually save instead
+	}
+	def resetStackToStart(ctl: SpcControl) {
+		val_sp = ctl.val_stack_top; // TODO: set uncached, tagged, etc
+	}
+	def labelArgs(ctl: SpcControl) -> Array<ValueType> {
+		if (ctl.start_opcode == Opcode.LOOP.code) return ctl.params;
+		else return ctl.results;
+	}
+	def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, val_stack_top: u32) -> SpcControl {
 		var ctl = ctl_stack.next();
 		if (ctl != null) { // FAST: reuse previous SpcControl object
 			ctl_stack.top++;
@@ -634,6 +730,10 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		ctl.val_stack_top = val_stack_top;
 		ctl.reachable = true;
 		return ctl;
+	}
+	def getControl(depth: u32) -> SpcControl {
+		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
+		return result;
 	}
 	def push(tag: RegClass, state: SpcState) {
 		var sp = val_sp;
@@ -673,6 +773,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		OUT.outln();
 	}
 	def traceStack() {
+		OUT.put1("sp=%d ", val_sp);
 		for (i < val_sp) {
 			OUT.put3("[%s %s%s: ",
 				val_tag[i].name,
@@ -705,8 +806,9 @@ class SpcControl {
 	var params: Array<ValueType>;
 	var results: Array<ValueType>;
 	var reachable = true;
-	var val_stack_top: int;
+	var val_stack_top: u32;
 	var label: MasmLabel;
+	var else_label: MasmLabel;
 }
 
 def isAlwaysFalse(v: int) -> bool { return false; }
