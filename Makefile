@@ -23,8 +23,8 @@ WASI_X86_64_LINUX=src/wasi/x86-64-linux/*.v3
 JAWA=src/jawa/*.v3
 WIZENG=src/wizeng.main.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
-SPECTEST=$(ENGINE) test/spectest/*.v3 test/spectest.main.v3
-UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/spectest/*.v3 test/unittest.main.v3
+SPECTEST=$(ENGINE) test/wasm-spec/*.v3 test/spectest.main.v3
+UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3
 

@@ -9,7 +9,7 @@ if [ "$WIZENG_LOC" = "" ]; then
     WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
 fi
 
-SPEC_ROOT=$WIZENG_LOC/wasm-spec
+SPEC_ROOT=$WIZENG_LOC/test/wasm-spec/bin
 
 WIZENG_OPTS=
 let PROGRESS_PIPE=1
@@ -32,7 +32,7 @@ done
 
 function run {
     BRANCH=$1
-    cd $SPEC_ROOT/$BRANCH/test/core/bin/
+    cd $SPEC_ROOT/$BRANCH/
     TESTS=$(ls *.bin.wast)
 
     # add optional subdirectories
