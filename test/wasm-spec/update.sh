@@ -8,7 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-WIZENG_LOC=${WIZENG_LOG:=$(cd $HERE/.. && pwd)}
+WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
 
 BRANCHES="$@"
 if [ "$#" = 0 ]; then

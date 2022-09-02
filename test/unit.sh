@@ -5,9 +5,15 @@ RED='[0;31m'
 GREEN='[0;32m'
 NORM='[0;00m'
 
-if [ "$WIZENG_LOC" = "" ]; then
-    WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
-fi
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
+done
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
 
 # TODO: factor out utility-finding code
 CUR_V3C=$(which v3c)

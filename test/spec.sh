@@ -5,11 +5,15 @@ RED='[0;31m'
 GREEN='[0;32m'
 NORM='[0;00m'
 
-if [ "$WIZENG_LOC" = "" ]; then
-    WIZENG_LOC=$(cd $(dirname ${BASH_SOURCE[0]}/..) && pwd)
-fi
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
+done
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-SPEC_ROOT=$WIZENG_LOC/test/wasm-spec/bin
+WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
 
 WIZENG_OPTS=
 let PROGRESS_PIPE=1
@@ -32,15 +36,16 @@ done
 
 function run {
     BRANCH=$1
-    cd $SPEC_ROOT/$BRANCH/
-    TESTS=$(ls *.bin.wast)
+    cd $WIZENG_LOC
+    DIR=test/wasm-spec/bin/$BRANCH
+    TESTS=$(ls $DIR/*.bin.wast)
 
     # add optional subdirectories
     for sub in simd gc; do
         SUB=$(echo $sub | tr [a-z] [A-Z])
         varname="TEST_$SUB"
-        if [[ -d $sub && "${!varname}" != "" ]]; then
-            TESTS="$TESTS $(ls $sub/*.bin.wast)"
+        if [[ -d $DIR/$sub && "${!varname}" != "" ]]; then
+            TESTS="$TESTS $(ls $DIR/$sub/*.bin.wast)"
         fi
     done
 
@@ -79,11 +84,12 @@ if [ "$RET" != 0 ]; then
 fi
 
 for b in $BRANCHES; do
-    if [ ! -d "$SPEC_ROOT/$b" ]; then
-	echo Spec branch \"$SPEC_ROOT/$b\" does not exist.
+    DIR=$WIZENG_LOC/test/wasm-spec/bin/$b
+    if [ ! -d "$DIR" ]; then
+	echo Spec branch \"$DIR\" does not exist.
 	exit 1
     fi
-    printf "Testing ${CYAN}%-10s${NORM} %-13s | " "$SPEC_ROOT/$b" $TEST_TARGET
+    printf "Testing ${CYAN}%-10s${NORM} %-13s | " "$b" $TEST_TARGET
     if [ $PROGRESS_PIPE = 1 ]; then
 	run $b | tee /tmp/wizeng-spec-$b.out | progress tti
     else
