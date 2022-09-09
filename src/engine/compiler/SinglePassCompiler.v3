@@ -19,13 +19,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 
 	// Abstract state of the value stack
-	var val_state = Array<SpcState>.new(INITIAL);	// uncached, in a register, or a constant
-	var val_tagged = Array<bool>.new(INITIAL);	// tag is written properly into memory
-	var val_stored = Array<bool>.new(INITIAL);	// value is written into memory
-	var val_tag = Array<RegClass>.new(INITIAL);	// type of the slot
-	var val_sp: u32;
-	// Abstract state of the control stack
-	var ctl_stack = ArrayStack<SpcControl>.new();
+	def state = SpcAbstractState.new(masm.regSet, masm.regConfig);
 	// Other state
 	var sig: SigDecl;
 	var start_pos: int;
@@ -42,18 +36,17 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		start_pos = 0;
 		sig = func.sig;
 
-		// initialize internal state
-		val_sp = 0;
-		ctl_stack.clear();
-		for (p in masm.regConfig.regSet.pools) p.reset();
-		initParams(sig.params);
+		// Initialize parameters, locals, and first control stack entry.
+		state.reset(sig);
 		initLocals();
+		opcode_pos = codeptr.pos;
+		var ret_label = masm.newLabel(opcode_pos);
+		state.pushEntry(sig.results, ret_label);
 
-		// emit prologue
+		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
 
-		// emit instructions
-		pushControl(Opcode.UNREACHABLE.code, sig.params, sig.results, 0);
+		// Emit instructions.
 		success = true;
 		while (d.pos < d.limit) {
 			emitInstr();
@@ -91,237 +84,187 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			masm.emit_mov_m_l(MasmAddr(c.sp_reg, c.mem_offset), 0);
 		}
 	}
-	def initParams(params: Array<ValueType>) {
-		if (val_state.length < params.length) val_state = Array.new(params.length + 32);
-		for (i < params.length) {
-			val_state[i] = SpcState.Uncached;
-			val_tagged[i] = true;
-			val_stored[i] = true;
-			val_tag[i] = toTag(params[i]);
-		}
-		val_sp = u32.view(params.length);
-	}
 	def initLocals() {
 		var max = limits.max_num_locals;
 		var dcount = parser.readU32("local decl count", max);
 		for (i < dcount) {
 			var count = parser.readU32("local count", max);
 			var ltype = parser.readValueType();
-			var nlength = val_sp + count;
-			if (nlength > val_state.length) grow(int.view(nlength + val_sp * 2));
-			for (j < count) {
-				var k = j + val_sp;
-				val_state[k] = SpcState.Const(0); // TODO: use default
-				val_tagged[k] = false;
-				val_stored[k] = false;
-				val_tag[k] = toTag(ltype);
-			}
-			val_sp = nlength;
-		}
-	}
-	def toTag(vt: ValueType) -> RegClass {
-		match (vt) {
-			I32 => return RegClass.I32;
-			I64 => return RegClass.I64;
-			F32 => return RegClass.F32;
-			F64 => return RegClass.F64;
-			V128 => return RegClass.V128;
-			_ => return RegClass.REF;
+			state.addLocals(count, ltype);
 		}
 	}
 	def emitInstr() {
 		opcode_pos = codeptr.pos;
 		var opcode = codeptr.read1();
-		if (Trace.compiler) { traceOpcode(); traceStack(); }
+		if (Trace.compiler) { traceStack(); traceOpcode(); }
 		match (opcode) {
 			Opcode.NOP.code => {
 				// emit nothing
 			}
 			Opcode.BLOCK.code => {
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				var limit = val_sp - u32.view(params.length);
-				emit_store_all(limit, false); // XXX: split and prepare merge
-				var ctl = pushControl(opcode, params, results, limit);
+				state.pushBlock(params, results, masm.newLabel(opcode_pos));
 			}
 			Opcode.LOOP.code => {
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				var limit = val_sp - u32.view(params.length);
-				prepareForLoop(limit);
-				var ctl = pushControl(opcode, params, results, limit);
-				saveStackAtStart(ctl);
-				masm.bindLabel(ctl.label);
+				state.pushLoop(params, results, masm.newLabel(opcode_pos));
+				var ctl_top = state.ctl_stack.peek();
+				masm.bindLabel(ctl_top.label);
 			}
 			Opcode.IF.code => {
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				var limit = val_sp - u32.view(params.length);
-				var t = pop();
-				var ctl = pushControl(opcode, params, results, limit);
-				saveStackAtStart(ctl);
-				ctl.else_label = masm.newLabel(opcode_pos);
+				var t = state.pop();
+				state.pushIf(params, results, masm.newLabel(opcode_pos), masm.newLabel(opcode_pos));
+				var tag = t.1, st = t.2;
+				var ctl_top = state.ctl_stack.peek();
+				emitBrIf(st, false, ctl_top.else_label, null, true);
 			}
 			Opcode.ELSE.code => {
-				var ctl_top = ctl_stack.peek();
-				emitFallThru();
+				var ctl_top = state.ctl_stack.peek();
+				state.emitFallthru(masm);
 				masm.emit_br(ctl_top.label);
-				resetStackToStart(ctl_top);
 				masm.bindLabel(ctl_top.else_label);
+				state.doElse();
 			}
 			Opcode.END.code => {
-				var ctl = ctl_stack.pop();
-				if (ctl.start_opcode == Opcode.LOOP.code) {
-					// nothing to do
-				} else {
-					masm.bindLabel(ctl.label);
-					if (ctl_stack.empty()) emitReturn();
+				var ctl_top = state.ctl_stack.peek();
+				if (ctl_top.opcode != Opcode.LOOP.code) {
+					state.emitFallthru(masm);
+					masm.bindLabel(ctl_top.label);
 				}
+				var ctl = state.doEnd(masm);
+				if (ctl.opcode == Opcode.RETURN.code && ctl.reachable) emitReturn();
 			}
 			Opcode.BR.code => {
 				var depth = parser.readLabel();
-				var target = getControl(depth);
-				emitTransfer(target);
+				var target = state.getControl(depth);
+				state.emitTransfer(target, masm);
 				masm.emit_br(target.label);
+				var ctl = state.ctl_stack.peek();
+				ctl.reachable = false;
 			}
 			Opcode.BR_IF.code => {
 				var depth = parser.readLabel();
-				var target = getControl(depth);
-				var t = pop(), tag = t.1, state = t.2;
-				// XXX: emit only one jump if no transfer needed
-				match (state) {
-					Uncached => {
-						var label = masm.newLabel(opcode_pos);
-						masm.emit_br_m_z(masm.slotAddr(val_sp), label);
-						emitTransfer(target);
-						masm.emit_br(target.label);
-						masm.bindLabel(label);
-					}
-					Register(reg) => {
-						var label = masm.newLabel(opcode_pos);
-						masm.emit_br_r_z(reg.reg, label);
-						emitTransfer(target);
-						masm.emit_br(target.label);
-						masm.bindLabel(label);
-					}
-					Const(val) => {
-						if (val != 0) {
-							emitTransfer(target);
-							masm.emit_br(target.label);
-						}
-						// fall through
-					}
-				}
+				var target = state.getControl(depth);
+				var t = state.pop(), tag = t.1, st = t.2;
+				emitBrIf(st, true, target.label, target, state.isTransferEmpty(target));
 			}
 			Opcode.RETURN.code => {
-				emitReturn(); // XXX: factor into one epilogue
+				var target = state.ctl_stack.elems[0];
+				state.emitTransfer(target, masm);
+				masm.emit_br(target.label);
+				var ctl = state.ctl_stack.peek();
+				ctl.reachable = false;
 			}
 			Opcode.DROP.code => {
-				val_sp--;
+				state.sp--;
 			}
 			Opcode.LOCAL_GET.code => {
 				var index = codeptr.read_uleb32();
-				var state = val_state[index];
-				var tag = val_tag[index];
-				match (state) {
+				var st = state.state[index];
+				var tag = state.regClass[index];
+				match (st) {
 					Uncached => { // alloc reg and load
 						var reg = allocReg(tag);
 						emit_read_slot_r(index, reg);
-						push(tag, SpcState.Register(reg));
+						state.push(tag, SpcState.Register(reg));
 					}
 					Register(reg) => { // store + steal reg
-						if (!val_stored[index]) {
+						if (!state.stored[index]) {
 							emit_write_slot_r(index, reg);
-							val_stored[index] = true;
+							state.stored[index] = true;
 						}
-						val_state[index] = SpcState.Uncached;
-						push(tag, state);
+						state.state[index] = SpcState.Uncached;
+						state.push(tag, st);
 					}
 					Const(val) => { // copy constant state
-						push(tag, state);
+						state.push(tag, st);
 					}
 				}
 			}
 			Opcode.LOCAL_SET.code => {
 				var index = codeptr.read_uleb32();
-				var t = pop(), tag = t.1, state = t.2;
-				match (state) {
+				var t = state.pop(), tag = t.1, st = t.2;
+				match (st) {
 					Uncached => { // alloc reg and load
 						var reg = allocReg(tag);
-						emit_read_slot_r(val_sp, reg);
-						val_state[index] = SpcState.Register(reg);
-						val_stored[index] = false;
+						emit_read_slot_r(state.sp, reg);
+						state.state[index] = SpcState.Register(reg);
+						state.stored[index] = false;
 					}
 					Register(reg) => { // steal reg
-						val_state[index] = state;
-						val_stored[index] = false;
+						state.state[index] = st;
+						state.stored[index] = false;
 					}
 					Const(val) => { // copy constant state
-						val_state[index] = state;
-						val_stored[index] = false;
+						state.state[index] = st;
+						state.stored[index] = false;
 					}
 				}
 			}
 			Opcode.LOCAL_TEE.code => {
 				var index = codeptr.read_uleb32();
-				var tos = val_sp - 1;
-				var t = peek(), tag = t.1, state = t.2;
-				match (state) {
+				var tos = state.sp - 1;
+				var t = state.peek(), tag = t.1, st = t.2;
+				match (st) {
 					Uncached => { // alloc reg, load, write
 						var reg = allocReg(tag);
 						emit_read_slot_r(tos, reg);
 						emit_write_slot_r(index, reg);
-						val_state[index] = SpcState.Uncached;
-						val_stored[index] = true;
-						val_state[tos] = SpcState.Register(reg);
+						state.state[index] = SpcState.Uncached;
+						state.stored[index] = true;
+						state.state[tos] = SpcState.Register(reg);
 					}
 					Register(reg) => { // simply write local
 						emit_write_slot_r(index, reg);
-						val_state[index] = SpcState.Uncached;
-						val_stored[index] = true;
+						state.state[index] = SpcState.Uncached;
+						state.stored[index] = true;
 					}
 					Const(val) => { // copy constant state
-						val_state[index] = state;
-						val_stored[index] = false;
+						state.state[index] = st;
+						state.stored[index] = false;
 					}
 				}
 			}
 			Opcode.I32_CONST.code => {
 				var val = codeptr.read_sleb32();
-				push(RegClass.I32, SpcState.Const(val));
+				state.push(RegClass.I32, SpcState.Const(val));
 			}
 			Opcode.I64_CONST.code => {
 				var val = codeptr.read_sleb64();
 				if (i32.view(val) == val) {
-					push(RegClass.I64, SpcState.Const(i32.view(val)));
+					state.push(RegClass.I64, SpcState.Const(i32.view(val)));
 				} else {
-					var tos = val_sp;
+					var tos = state.sp;
 					var addr = masm.slotAddr(tos);
 					masm.emit_mov_m_i(addr, int.view(val));
 					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					push(RegClass.I64, SpcState.Uncached); // XXX: load i64 constants into reg
-					val_stored[tos] = true;
+					state.push(RegClass.I64, SpcState.Uncached); // XXX: load i64 constants into reg
+					state.stored[tos] = true;
 				}
 			}
 			Opcode.F32_CONST.code => {
 				var val = codeptr.read_u32();
 				if (val == 0 && config_TrackFloatZeroConst) {
-					push(RegClass.F32, SpcState.Const(0));
+					state.push(RegClass.F32, SpcState.Const(0));
 				} else {
-					var tos = val_sp;
+					var tos = state.sp;
 					masm.emit_mov_m_i(masm.slotAddr(tos), int.view(val));
-					push(RegClass.F32, SpcState.Uncached); // XXX: load f32 constants into reg
-					val_stored[tos] = true;
+					state.push(RegClass.F32, SpcState.Uncached); // XXX: load f32 constants into reg
+					state.stored[tos] = true;
 				}
 			}
 			Opcode.F64_CONST.code => {
 				var val = codeptr.read_u64();
 				if (val == 0 && config_TrackFloatZeroConst) {
-					push(RegClass.F64, SpcState.Const(0));
+					state.push(RegClass.F64, SpcState.Const(0));
 				} else {
-					var tos = val_sp;
+					var tos = state.sp;
 					var addr = masm.slotAddr(tos);
 					masm.emit_mov_m_i(addr, int.view(val));
 					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					push(RegClass.F64, SpcState.Uncached); // XXX: load f64 constants into reg
-					val_stored[tos] = true;
+					state.push(RegClass.F64, SpcState.Uncached); // XXX: load f64 constants into reg
+					state.stored[tos] = true;
 				}
 			}
 			Opcode.I32_ADD.code => emitCommutable(Opcode.I32_ADD, isZero, int.+);
@@ -362,19 +305,51 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			_ => unsupported();
 		}
 	}
+	def emitBrIf(st: SpcState, nonzero: bool, label: MasmLabel, target: SpcControl, emptyTransfer: bool) {
+		match (st) {
+			Uncached => {
+				if (emptyTransfer) {
+					masm.emit_br_m(masm.slotAddr(state.sp), nonzero, label);
+				} else {
+					var skip = masm.newLabel(opcode_pos);
+					masm.emit_br_m(masm.slotAddr(state.sp), !nonzero, skip);
+					state.emitTransfer(target, masm);
+					masm.emit_br(label);
+					masm.bindLabel(skip);
+				}
+			}
+			Register(reg) => {
+				if (emptyTransfer) {
+					masm.emit_br_r(reg.reg, nonzero, label);
+				} else {
+					var skip = masm.newLabel(opcode_pos);
+					masm.emit_br_r(reg.reg, !nonzero, skip);
+					state.emitTransfer(target, masm);
+					masm.emit_br(label);
+					masm.bindLabel(skip);
+				}
+			}
+			Const(val) => {
+				if (val != 0) {
+					state.emitTransfer(target, masm);
+					masm.emit_br(target.label);
+				}
+				// fall through
+			}
+		}
+	}
 	def emitReturn() {
-		// XXX: emit only one copy of the epilogue
 		var c = masm.regConfig;
 		var len = sig.results.length;
 		// Copy values back to VSP
 		for (i = len - 1; i >= 0; i--) {
 			var index = u32.view(i);
-			var t = pop(), tag = t.1, state = t.2;
+			var t = state.pop(), tag = t.1, st = t.2;
 			var slot = masm.slotAddr(index);
-			match (state) {
+			match (st) {
 				Uncached => { // alloc reg, load, store
 					var reg = allocReg(tag);
-					emit_read_slot_r(val_sp, reg);
+					emit_read_slot_r(state.sp, reg);
 					masm.emit_mov_m_r(slot, reg.reg, reg.regClass);
 				}
 				Register(reg) => { // store
@@ -386,7 +361,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			// Update the slot's tag byte if necessary
 			var rtag = toTag(sig.results[i]);
-			if (masm.valuerep.tagged && !val_tagged[i] || val_tag[i] != rtag) {
+			if (masm.valuerep.tagged && !state.tagged[i] || state.regClass[i] != rtag) {
 				masm.emit_mov_m_i(masm.tagAddr(index), rtag.code);
 			}
 		}
@@ -398,18 +373,15 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		// Return to caller
 		masm.emit_ret();
 	}
-	def emitFallThru() {
-		emit_store_all(val_sp, true); // XXX
-	}
 	def emitTransfer(target: SpcControl) {
 		emit_store_all(target.val_stack_top, true); // XXX uncaching everything first
 		var arity = u32.view(labelArgs(target).length);
-		if (val_sp == target.val_stack_top + arity) return; // stack height match
-		var from = val_sp - arity, to = target.val_stack_top;
-		while (from < val_sp) {
-			match (val_state[from]) {
+		if (state.sp == target.val_stack_top + arity) return; // stack height match
+		var from = state.sp - arity, to = target.val_stack_top;
+		while (from < state.sp) {
+			match (state.state[from]) {
 				Uncached => {
-					masm.emit_mov_s_s(to, from, val_tag[to]);
+					masm.emit_mov_s_s(to, from, state.regClass[to]);
 				}
 				Register(reg_b) => {
 					masm.emit_mov_s_r(to, reg_b.reg, reg_b.regClass);
@@ -418,55 +390,55 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					masm.emit_mov_s_i(to, val_b);
 				}
 			}
-			if (!val_tagged[from]) emit_write_slot_tag(to, val_tag[to]);
+			if (!state.tagged[from]) emit_write_slot_tag(to, state.regClass[to]);
 			from++;
 			to++;
 		}
 	}
 	def emitBinopNoFold(op: Opcode, nop: int -> bool) { // XXX: factor commonality among binops
-		var b = pop();
-		var a = peek();
-		var tos = u32.!(val_sp - 1);
+		var b = state.pop();
+		var a = state.peek();
+		var tos = u32.!(state.sp - 1);
 		match (a.2) {
 			Uncached => match (b.2) {
 				Uncached => {
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
-					val_state[tos] = SpcState.Register(reg_a);
+					state.state[tos] = SpcState.Register(reg_a);
 					freeReg(reg_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 			}
 			Register(reg_a) => match (b.2) {
 				Uncached => {
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					freeReg(reg_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 			}
 			Const(val_a) => if (!nop(val_a)) match (b.2) {
@@ -474,71 +446,71 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos+1, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_a);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					var reg_a = allocReg(RegClass.I32);
 					masm.emit_mov_r_i(reg_a.reg, val_a);
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					freeReg(reg_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					var reg_a = allocReg(RegClass.I32);
 					masm.emit_mov_r_i(reg_a.reg, val_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 			}
 		}
 	}
 	def emitBinopNoCommute(op: Opcode, nop: int -> bool, fold: (int, int) -> int) {
-		var b = pop();
-		var a = peek();
-		var tos = u32.!(val_sp - 1);
+		var b = state.pop();
+		var a = state.peek();
+		var tos = u32.!(state.sp - 1);
 		match (a.2) {
 			Uncached => match (b.2) {
 				Uncached => {
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
-					val_state[tos] = SpcState.Register(reg_a);
+					state.state[tos] = SpcState.Register(reg_a);
 					freeReg(reg_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 			}
 			Register(reg_a) => match (b.2) {
 				Uncached => {
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					freeReg(reg_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 			}
 			Const(val_a) => if (!nop(val_a)) match (b.2) {
@@ -546,64 +518,64 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos+1, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_a);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					var reg_a = allocReg(RegClass.I32);
 					masm.emit_mov_r_i(reg_a.reg, val_a);
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					freeReg(reg_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
-					val_state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
+					state.stored[tos] = false;
 				}
 			}
 		}
 	}
 	def emitCommutable(op: Opcode, nop: int -> bool, fold: (int, int) -> int) {
-		var b = pop();
-		var a = peek();
-		var tos = u32.!(val_sp - 1);
+		var b = state.pop();
+		var a = state.peek();
+		var tos = u32.!(state.sp - 1);
 		match (a.2) {
 			Uncached => match (b.2) {
 				Uncached => {
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					masm.emit_binop_r_m(op, reg_b.reg, masm.slotAddr(tos));
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 			}
 			Register(reg_a) => match (b.2) {
 				Uncached => {
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					freeReg(reg_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
 					if (nop(val_b)) return;
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 			}
 			Const(val_a) => if (!nop(val_a)) match (b.2) {
@@ -611,16 +583,16 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					var reg_a = allocReg(RegClass.I32);
 					emit_read_slot_r(tos+1, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_a);
-					val_state[tos] = SpcState.Register(reg_a);
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Register(reg_a);
+					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
 					masm.emit_binop_r_i(op, reg_b.reg, val_a); // commuted
-					val_stored[tos] = false;
+					state.stored[tos] = false;
 				}
 				Const(val_b) => {
-					val_state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
-					val_stored[tos] = false;
+					state.state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
+					state.stored[tos] = false;
 				}
 			}
 		}
@@ -637,11 +609,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_s(reg.reg, reg.regClass, slot);
 	}
 	def emit_read_tos_r(reg: SpcReg) {
-		masm.emit_mov_r_s(reg.reg, reg.regClass, val_sp - 1);
+		masm.emit_mov_r_s(reg.reg, reg.regClass, state.sp - 1);
 	}
 	def emit_write_tos_tag(tag: RegClass) {
 		if (masm.valuerep.tagged) {
-			masm.emit_mov_m_i(masm.tagAddr(val_sp - 1), tag.code);
+			masm.emit_mov_m_i(masm.tagAddr(state.sp - 1), tag.code);
 		}
 	}
 	def emit_write_slot_tag(slot: u32, tag: RegClass) {
@@ -657,41 +629,31 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def emit_store_all(limit: u32, uncache: bool) {
 		for (i < limit) {
-			if (!val_tagged[i]) emit_write_slot_tag(i, val_tag[i]);
-			if (val_stored[i]) continue; // nothing to do
-			var t = val_state[i];
+			if (!state.tagged[i]) emit_write_slot_tag(i, state.regClass[i]);
+			if (state.stored[i]) continue; // nothing to do
+			var t = state.state[i];
 			match (t) {
 				Uncached => ; // nothing to do
 				Register(reg) => {
 					emit_write_slot_r(i, reg);
 					if (uncache) {
-						val_state[i] = SpcState.Uncached;
+						state.state[i] = SpcState.Uncached;
 						freeReg(reg);
 					}
 				}
 				Const(val) => {
-					emit_write_slot_i(i, val, val_tag[i]);
+					emit_write_slot_i(i, val, state.regClass[i]);
 				}
 			}
-			val_stored[i] = true;
-		}
-	}
-	def prepareForLoop(limit: u32) {
-		emit_store_all(limit, true);
-		for (i < limit) {
-			var t = val_state[i];
-			match (t) {
-				Const(val) => val_state[i] = SpcState.Uncached;
-				_ => ;
-			}
+			state.stored[i] = true;
 		}
 	}
 	def uncache_all(limit: u32) {
 		for (i < limit) {
-			var t = val_state[i];
+			var t = state.state[i];
 			match (t) {
 				Register(reg) => {
-					val_state[i] = SpcState.Uncached;
+					state.state[i] = SpcState.Uncached;
 					freeReg(reg);
 				}
 				_ => ;
@@ -714,65 +676,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	//====================================================================
 	// abstract stack operations
 	//====================================================================
-	def saveStackAtStart(ctl: SpcControl) {
-		emit_store_all(ctl.val_stack_top, false); // XXX: actually save instead
-	}
-	def resetStackToStart(ctl: SpcControl) {
-		val_sp = ctl.val_stack_top; // TODO: set uncached, tagged, etc
-	}
 	def labelArgs(ctl: SpcControl) -> Array<ValueType> {
-		if (ctl.start_opcode == Opcode.LOOP.code) return ctl.params;
+		if (ctl.opcode == Opcode.LOOP.code) return ctl.params;
 		else return ctl.results;
-	}
-	def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, val_stack_top: u32) -> SpcControl {
-		var ctl = ctl_stack.next();
-		if (ctl != null) { // FAST: reuse previous SpcControl object
-			ctl_stack.top++;
-		} else { // allocate and cache new SpcControl object
-			ctl = SpcControl.new();
-			ctl_stack.push(ctl);
-		}
-		ctl.start_pos = opcode_pos;
-		ctl.start_opcode = opcode;
-		ctl.label = masm.newLabel(opcode_pos);
-		ctl.params = params;
-		ctl.results = results;
-		ctl.val_stack_top = val_stack_top;
-		ctl.reachable = true;
-		return ctl;
-	}
-	def getControl(depth: u32) -> SpcControl {
-		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
-		return result;
-	}
-	def push(tag: RegClass, state: SpcState) {
-		var sp = val_sp;
-		if (sp >= val_state.length) grow(8 + val_state.length * 2);
-		val_tagged[sp] = false;
-		val_stored[sp] = false;
-		val_tag[sp] = tag;
-		val_state[sp] = state;
-		val_sp = sp + 1;
-	}
-	def pop() -> (bool, RegClass, SpcState) {
-		if (val_sp == 0) {
-			err.at(codeptr).set("stack underflow");
-			return (false, RegClass.I32, SpcState.Uncached);
-		}
-		var sp = val_sp - 1;
-		var result = (val_stored[sp], val_tag[sp], val_state[sp]);
-		val_sp = sp;
-		return result;
-	}
-	def peek() -> (bool, RegClass, SpcState) {
-		var sp = val_sp - 1;
-		return (val_stored[sp], val_tag[sp], val_state[sp]);
-	}
-	def grow(nlength: int) {
-		val_state = Arrays.grow(val_state, nlength);
-		val_tagged = Arrays.grow(val_tagged, nlength);
-		val_stored = Arrays.grow(val_stored, nlength);
-		val_tag = Arrays.grow(val_tag, nlength);
 	}
 	def traceOpcode() {
 		OUT.put2("  %x(+%d): ", opcode_pos, opcode_pos - start_pos);
@@ -783,13 +689,13 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		OUT.outln();
 	}
 	def traceStack() {
-		OUT.put1("sp=%d ", val_sp);
-		for (i < val_sp) {
+		OUT.put1("sp=%d ", state.sp);
+		for (i < state.sp) {
 			OUT.put3("[%s %s%s: ",
-				val_tag[i].name,
-				if(val_tagged[i], "T", ""),
-				if(val_stored[i], "S", ""));
-			match (val_state[i]) {
+				state.regClass[i].name,
+				if(state.tagged[i], "T", ""),
+				if(state.stored[i], "S", ""));
+			match (state.state[i]) {
 				Uncached => OUT.puts("uncached");
 				Register(reg) => OUT.put1("@%s", masm.regSet.getName(reg.reg));
 				Const(val) => OUT.put1("#%d", val);
@@ -809,10 +715,9 @@ type SpcState {
 
 type SpcReg(reg: Reg, regClass: RegClass) #unboxed { }
 
+// An entry in the abstract control stack.
 class SpcControl {
-	var start_pos: int;
-	var next_pos: int;
-	var start_opcode: byte;
+	var opcode: byte;
 	var params: Array<ValueType>;
 	var results: Array<ValueType>;
 	var reachable = true;
@@ -830,3 +735,155 @@ def to_ii_i(f: (u32, u32) -> u32, a: int, b: int) -> int {
 }
 def I32_ROTL = to_ii_i(Execute.I32_ROTL, _, _);
 def I32_ROTR = to_ii_i(Execute.I32_ROTR, _, _);
+
+// Contains both the abstract control and abstract value stack.
+class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
+	// Abstract state of the value stack
+	var state = Array<SpcState>.new(INITIAL);	// uncached, in a register, or a constant
+	var tagged = Array<bool>.new(INITIAL);	// tag is written properly into memory
+	var stored = Array<bool>.new(INITIAL);	// value is written into memory
+	var regClass = Array<RegClass>.new(INITIAL);	// type of the slot
+	var sp: u32;
+	var ctl_stack = ArrayStack<SpcControl>.new();
+
+	// Reset the state for starting a new function.
+	def reset(sig: SigDecl) {
+		sp = 0;
+		ctl_stack.clear();
+		for (p in regConfig.regSet.pools) p.reset();
+		// initialize parameters
+		var params = sig.params;
+		grow(params.length);
+		for (i < params.length) {
+			state[i] = SpcState.Uncached;
+			tagged[i] = true;
+			stored[i] = true;
+			regClass[i] = toTag(params[i]);
+		}
+		sp = u32.view(params.length);
+	}
+	// Add the specified number of locals of the specified type.
+	def addLocals(count: u32, ltype: ValueType) {
+		var nlength = sp + count;
+		if (nlength > state.length) grow(int.view(nlength + sp * 2));
+		for (j < count) {
+			var k = j + sp;
+			state[k] = SpcState.Const(0); // TODO: use default
+			tagged[k] = false;
+			stored[k] = false;
+			regClass[k] = toTag(ltype);
+		}
+		sp = nlength;
+	}
+	def pushEntry(results: Array<ValueType>, ret_label: MasmLabel) -> SpcControl {
+		return pushControl(Opcode.RETURN.code, ValueTypes.NONE, results, ret_label);
+	}
+	def pushBlock(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl {
+		return pushControl(Opcode.BLOCK.code, params, results, end_label);
+	}
+	def pushLoop(params: Array<ValueType>, results: Array<ValueType>, start_label: MasmLabel) -> SpcControl {
+		var ctl = pushControl(Opcode.LOOP.code, params, results, start_label);
+		saveStackAtStart(ctl);
+		return ctl;
+	}
+	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
+		var ctl = pushControl(Opcode.LOOP.code, params, results, end_label);
+		ctl.else_label = else_label;
+		return ctl;
+	}
+	def doElse() {
+		// TODO: reset stack to start of if
+		var ctl_top = ctl_stack.peek();
+		ctl_top.else_label = null;
+	}
+	def doEnd(masm: MacroAssembler) -> SpcControl {
+		// TODO: reset stack to merge
+		return ctl_stack.pop();
+	}
+	def popControl() {
+		ctl_stack.pop();
+	}
+	def isTransferEmpty(target: SpcControl) -> bool {
+		return false;
+	}
+	def emitTransfer(target: SpcControl, masm: MacroAssembler) {
+		// TODO: recognize transfers to opcode == RETURN, don't bother storing anything but results
+	}
+	def emitFallthru(masm: MacroAssembler) {
+	}
+	private def saveStackAtStart(ctl: SpcControl) {
+//		emit_store_all(ctl.val_stack_top, false); // XXX: actually save instead
+	}
+	private def resetStackToStart(ctl: SpcControl) {
+		sp = ctl.val_stack_top; // TODO: set uncached, tagged, etc
+	}
+	private def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
+		var ctl = ctl_stack.next();
+		if (ctl != null) { // FAST: reuse previous SpcControl object
+			ctl_stack.top++;
+		} else { // allocate and cache new SpcControl object
+			ctl = SpcControl.new();
+			ctl_stack.push(ctl);
+		}
+		ctl.opcode = opcode;
+		ctl.label = label;
+		ctl.params = params;
+		ctl.results = results;
+		ctl.val_stack_top = sp - u32.view(params.length);
+		ctl.reachable = true;
+		return ctl;
+	}
+	def getControl(depth: u32) -> SpcControl {
+		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
+		return result;
+	}
+	def push(tag: RegClass, st: SpcState) {
+		var sp = this.sp;
+		if (sp >= state.length) grow(8 + state.length * 2);
+		tagged[sp] = false;
+		stored[sp] = false;
+		regClass[sp] = tag;
+		state[sp] = st;
+		this.sp++;
+	}
+	def pop() -> (bool, RegClass, SpcState) {
+		if (sp == 0) {
+// TODO			err.at(codeptr).set("stack underflow");
+			return (false, RegClass.I32, SpcState.Uncached);
+		}
+		var sp = this.sp - 1;
+		var result = (stored[sp], regClass[sp], state[sp]);
+		this.sp = sp;
+		return result;
+	}
+	def peek() -> (bool, RegClass, SpcState) {
+		var sp = sp - 1;
+		return (stored[sp], regClass[sp], state[sp]);
+	}
+	def grow(nlength: int) {
+		state = Arrays.grow(state, nlength);
+		tagged = Arrays.grow(tagged, nlength);
+		stored = Arrays.grow(stored, nlength);
+		regClass = Arrays.grow(regClass, nlength);
+	}
+	def prepareForLoop(limit: u32) {
+// TODO		emit_store_all(limit, true);
+		for (i < limit) {
+			var t = state[i];
+			match (t) {
+				Const(val) => state[i] = SpcState.Uncached;
+				_ => ;
+			}
+		}
+	}
+}
+def toTag(vt: ValueType) -> RegClass {
+	match (vt) {
+		I32 => return RegClass.I32;
+		I64 => return RegClass.I64;
+		F32 => return RegClass.F32;
+		F64 => return RegClass.F64;
+		V128 => return RegClass.V128;
+		_ => return RegClass.REF;
+	}
+}
