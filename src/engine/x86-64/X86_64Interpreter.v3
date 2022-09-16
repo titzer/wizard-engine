@@ -667,6 +667,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def ivar_EIP		= (regs.EIP, frame.EIP);
 	def ivar_FUNC_DECL	= (regs.FUNC_DECL, frame.FUNC_DECL);
 	def ivar_INSTANCE	= (regs.INSTANCE, frame.INSTANCE);
+	def ivar_CURIP		= (regs.CURIP, frame.CURIP);
 	
 	def mutable_ivars = [
 		ivar_VSP,
@@ -901,8 +902,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(done);
 
 		// execute first instruction
-		firstDispatchOffset = w.pos;
-		genDispatch(regs.IP_ptr, if(!tuning.dispatchTableReg, dispatchTables[0].1), true);
+		genDispatchOrJumpToDispatch();
 	}
 
 	// Generate all the opcode handlers.
@@ -1037,7 +1037,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// fallthru to BR
 
 		// BR: unconditional ctl xfer with stack copying
-		bindHandler(Opcode.BR);
+		bindHandlerNoAlign(Opcode.BR);
 		asm.bind(ctl_xfer);
 		var popcount = regs.tmp0;
 		var valcount = regs.tmp1;
@@ -1063,7 +1063,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.jc_rel_near(C.G, loop);
 
 		// ELSE: unconditional ctl xfer without stack copying
-		bindHandler(Opcode.ELSE);
+		bindHandlerNoAlign(Opcode.ELSE);
 		asm.bind(ctl_xfer_nostack);
 		asm.movwsx_r_m(regs.tmp0, regs.STP.plus(offsets.STP_pc_delta)); // TODO: 4 bytes
 		asm.q.lea(regs.IP, regs.IP.plusR(regs.tmp0, 1, -1)); // adjust ip
@@ -1165,7 +1165,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// end falls through to return bytecode
 
 		var callFunction = X86_64Label.new();
-		bindHandler(Opcode.RETURN); {
+		bindHandlerNoAlign(Opcode.RETURN); {
 			// Copy return values from stack to overwrite locals
 			var cnt = regs.tmp0;
 			asm.movq_r_m(cnt, regs.FUNC_DECL.plus(offsets.FuncDecl_sig));
@@ -2330,7 +2330,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(call_irt);
 	}
 	def bindHandler(opcode: Opcode) {
-		// TODO: if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
+		if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
+		patchDispatchTable(opcode, w.atEnd().pos);
+	}
+	def bindHandlerNoAlign(opcode: Opcode) {
 		patchDispatchTable(opcode, w.atEnd().pos);
 	}
 	def genFloatTrunc(opcode: Opcode, config: FloatTrunc, saturate: bool) {
@@ -2397,6 +2400,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def saveCallerIVars() {
 		saveIVar(regs.IP);
 		saveIVar(regs.STP);
+		if (tuning.saveIPInReg && !tuning.saveIPInFrame) saveIVar(regs.CURIP);
 	}
 	def restoreCallerIVars() {
 		restoreReg(regs.IP);
@@ -2420,8 +2424,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		for (i < dst.length) orderMoves(dst, stk, i);
 		// save a copy of VSP into valueStack.sp
 		asm.movq_r_m(regs.scratch, absPointer(offsets.Interpreter_valueStack));
-		asm.movq_r_m(regs.tmp5, frame.VSP);
-		asm.movq_m_r(regs.scratch.plus(offsets.ValueStack_sp), regs.tmp5);
+		asm.movq_r_m(regs.tmp4, frame.VSP);
+		asm.movq_m_r(regs.scratch.plus(offsets.ValueStack_sp), regs.tmp4);
 		// emit actual call
 		asm.callr(int.!(abs - (ic.start + w.pos + 5)));
 		// check for trap
@@ -2603,8 +2607,18 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		if (tuning.threadedDispatch) genDispatch(regs.IP_ptr, if (!tuning.dispatchTableReg, dispatchTables[0].1), true);
-		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
+		var gen = tuning.threadedDispatch;
+		if (firstDispatchOffset == 0) {
+			firstDispatchOffset = w.pos;
+			gen = true;
+		}
+		if (gen) {
+			if (tuning.saveIPInReg) asm.movq_r_r(regs.CURIP, regs.IP);
+			if (tuning.saveIPInFrame) asm.movq_m_r(frame.CURIP, regs.IP);
+			genDispatch(regs.IP_ptr, if (!tuning.dispatchTableReg, dispatchTables[0].1), true);
+		} else {
+			asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
+		}
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
 	def genDispatch(ptr: X86_64Addr, table: IcCodeRef, increment: bool) {
