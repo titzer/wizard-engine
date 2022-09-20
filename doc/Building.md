@@ -77,10 +77,11 @@ Binaries will be deposited in the `bin` directory, with each platform binary hav
 
 ## Testing Wizard
 
-Wizard has two layers of tests:
+Wizard has three layers of tests:
 
 * internal unit tests
 * a runner for the testsuite from the Wasm [spec](http://github.com/WebAssembly/spec)
+* tests for the `wizeng` command-line and monitor functionality
 
 ### Unit tests
 Internal unit tests probe the internal functionality of Wizard's implementation much deeper than tests in the specification, and they are generally faster to run.
@@ -99,28 +100,18 @@ You can get this utility from [this repository](https://github.com/titzer/progre
 
 ### Specification tests
 
-To run tests from the specification, you'll need to clone the specification repo under `wasm-spec` in your Wizard checkout (or link to it).
-You'll also need to build the reference interpreter.
+The Wizard engine strives to be up-to-date with the WebAssembly official specification, as well as several in-flight proposals.
+The `test/` directory has scripts to clone or update the various specification repositories, build the reference interpreter, build the test suite, and run it against Wizard.
 
 ```
 % cd wizard-engine
-% mkdir wasm-spec
-% cd wasm-spec
-% git clone git@github.com:WebAssembly/spec.git
-% cd spec/interpreter
-% make
+% cd test/wasm-spec
+% ./update.sh
 ...
 ```
 
-The Wizard engine does not parse text files (`.wat` or `.wast`).
-It relies on the spec interpreter's binary encoding.
-There's a utility script to translate all spec tests into their binary format (`.bin.wast`) for testing with Wizard.
-
-```
-% cd wizard-engine
-% scripts/build-spec-tests.sh
-...
-```
+This will clone and build the main specification (aka `spec`).
+It will also build the tests and copy them into the `test/wasm-spec/src` and `test/wasm-spec/bin` directories.
 
 Now you're ready to run the specification tests.
 
@@ -130,21 +121,16 @@ Now you're ready to run the specification tests.
 ...
 ```
 
-### Proposal tests
+## Proposal Tests
 
-Note that you can check out modified specs associated with any proposal.
-Just place (or link) them under `wasm-spec` and follow similar steps to build and run them.
-For example, to test the `tail-call` proposal:
+The scripts for building and running specification tests can also handle proposals, such as (`gc` or `function-references`).
 
 ```
 % cd wizard-engine
-% cd wasm-spec
-% git clone git@github.com:WebAssembly/tail-call.git
-% cd tail-call/interpreter
-% make
+% cd test/wasm-spec
+% ./update.sh <proposal>
 ...
-% cd ../../../
-% scripts/build-spec-tests.sh tail-call
+% cd ../..
+% test/spec.sh -ext:<proposal> <proposal>
 ...
-% test/spec.sh -ext:tail-call tail-call
 ```
