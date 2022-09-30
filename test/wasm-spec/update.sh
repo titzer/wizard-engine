@@ -45,8 +45,10 @@ function update {
     pushd $DIR
     echo "##+[$b] make"
     make
-    check $?
+    RESULT=$?
+    check $RESULT
     popd
+    return $RESULT
 }
 
 function build {
