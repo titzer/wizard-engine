@@ -19,7 +19,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 
 	// Abstract state of the value stack
-	def state = SpcAbstractState.new(masm.regSet, masm.regConfig);
+	def state = SpcAbstractState.new(masm.regAlloc);
 	// Other state
 	var sig: SigDecl;
 	var start_pos: int;
@@ -54,34 +54,37 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		return success;
 	}
 	def emitPrologue() {
-		var c = masm.regConfig, offsets = getOffsets();
+		var c = masm.regAlloc.regConfig;
+		var regs = c.regs;
+
+		var offsets = getOffsets();
 		// Allocate stack frame
-		masm.emit_sub_r_l(c.sp_reg, c.spcFrameSize);
+		masm.emit_sub_r_l(regs.sp, c.spcFrameSize);
 
 		// Spill VSP
-		masm.emit_mov_m_r(MasmAddr(c.sp_reg, c.vsp_offset), c.vsp_reg, RegClass.REF); // XXX: track VSP-spilled state
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.vsp_offset), regs.vsp, ValueKind.REF); // XXX: track VSP-spilled state
 		// Load wf.instance and spill
-		masm.emit_mov_r_m(c.instance_reg, RegClass.REF, MasmAddr(c.tmp_reg, offsets.WasmFunction_instance));
-		masm.emit_mov_m_r(MasmAddr(c.sp_reg, c.instance_offset), c.instance_reg, RegClass.REF);
+		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_instance));
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.instance_offset), regs.instance, ValueKind.REF);
 		// Load wf.decl and spill
-		masm.emit_mov_r_m(c.func_reg, RegClass.REF, MasmAddr(c.tmp_reg, offsets.WasmFunction_decl));
-		masm.emit_mov_m_r(MasmAddr(c.sp_reg, c.instance_offset), c.func_reg, RegClass.REF);
+		masm.emit_mov_r_m(regs.func, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.instance_offset), regs.func, ValueKind.REF);
 		// spill 0 for EIP, STP
-		masm.emit_mov_m_l(MasmAddr(c.sp_reg, c.eip_offset), 0);
-		masm.emit_mov_m_l(MasmAddr(c.sp_reg, c.stp_offset), 0);
+		masm.emit_mov_m_l(MasmAddr(regs.sp, c.eip_offset), 0);
+		masm.emit_mov_m_l(MasmAddr(regs.sp, c.stp_offset), 0);
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
-		masm.emit_mov_r_r(c.vfp_reg, c.vsp_reg); // XXX: use 3-addr adjustment of VFP
-		masm.emit_sub_r_l(c.vfp_reg, sig.params.length * masm.valuerep.slot_size);
+		masm.emit_mov_r_r(regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
+		masm.emit_sub_r_l(regs.vfp, sig.params.length * masm.valuerep.slot_size);
 
 		// Load instance.memories[0].start into MEM0_BASE and spill
 		if (module.memories.length > 0) {
 			// XXX: skip loading memory base if function doesn't access memory
-			masm.emit_mov_r_m(c.mem_reg, RegClass.REF, MasmAddr(c.instance_reg, offsets.Instance_memories));
-			masm.emit_mov_r_m(c.mem_reg, RegClass.REF, MasmAddr(c.mem_reg, offsets.Array_contents));
-			masm.emit_mov_m_r(MasmAddr(c.sp_reg, c.mem_offset), c.mem_reg, RegClass.REF);
+			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_memories));
+			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.mem0, offsets.Array_contents));
+			masm.emit_mov_m_r(MasmAddr(regs.sp, c.mem_offset), regs.mem0, ValueKind.REF);
 		} else {
-			masm.emit_mov_m_l(MasmAddr(c.sp_reg, c.mem_offset), 0);
+			masm.emit_mov_m_l(MasmAddr(regs.sp, c.mem_offset), 0);
 		}
 	}
 	def initLocals() {
@@ -92,6 +95,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			var ltype = parser.readValueType();
 			state.addLocals(count, ltype);
 		}
+		state.num_locals = state.sp;
 	}
 	def emitInstr() {
 		opcode_pos = codeptr.pos;
@@ -121,7 +125,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Opcode.ELSE.code => {
 				var ctl_top = state.ctl_stack.peek();
-				state.emitFallthru(masm);
+				state.emitFallthru(emitSlotTransfer);
 				masm.emit_br(ctl_top.label);
 				masm.bindLabel(ctl_top.else_label);
 				state.doElse();
@@ -129,7 +133,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.END.code => {
 				var ctl_top = state.ctl_stack.peek();
 				if (ctl_top.opcode != Opcode.LOOP.code) {
-					state.emitFallthru(masm);
+					state.emitFallthru(emitSlotTransfer);
 					masm.bindLabel(ctl_top.label);
 				}
 				var ctl = state.doEnd(masm);
@@ -138,7 +142,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.BR.code => {
 				var depth = parser.readLabel();
 				var target = state.getControl(depth);
-				state.emitTransfer(target, masm);
+				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(target.label);
 				var ctl = state.ctl_stack.peek();
 				ctl.reachable = false;
@@ -151,7 +155,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Opcode.RETURN.code => {
 				var target = state.ctl_stack.elems[0];
-				state.emitTransfer(target, masm);
+				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(target.label);
 				var ctl = state.ctl_stack.peek();
 				ctl.reachable = false;
@@ -162,7 +166,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.LOCAL_GET.code => {
 				var index = codeptr.read_uleb32();
 				var st = state.state[index];
-				var tag = state.regClass[index];
+				var tag = state.kind[index];
 				match (st) {
 					Uncached => { // alloc reg and load
 						var reg = allocReg(tag);
@@ -228,42 +232,42 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Opcode.I32_CONST.code => {
 				var val = codeptr.read_sleb32();
-				state.push(RegClass.I32, SpcState.Const(val));
+				state.push(ValueKind.I32, SpcState.Const(val));
 			}
 			Opcode.I64_CONST.code => {
 				var val = codeptr.read_sleb64();
 				if (i32.view(val) == val) {
-					state.push(RegClass.I64, SpcState.Const(i32.view(val)));
+					state.push(ValueKind.I64, SpcState.Const(i32.view(val)));
 				} else {
 					var tos = state.sp;
 					var addr = masm.slotAddr(tos);
 					masm.emit_mov_m_i(addr, int.view(val));
 					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					state.push(RegClass.I64, SpcState.Uncached); // XXX: load i64 constants into reg
+					state.push(ValueKind.I64, SpcState.Uncached); // XXX: load i64 constants into reg
 					state.stored[tos] = true;
 				}
 			}
 			Opcode.F32_CONST.code => {
 				var val = codeptr.read_u32();
 				if (val == 0 && config_TrackFloatZeroConst) {
-					state.push(RegClass.F32, SpcState.Const(0));
+					state.push(ValueKind.F32, SpcState.Const(0));
 				} else {
 					var tos = state.sp;
 					masm.emit_mov_m_i(masm.slotAddr(tos), int.view(val));
-					state.push(RegClass.F32, SpcState.Uncached); // XXX: load f32 constants into reg
+					state.push(ValueKind.F32, SpcState.Uncached); // XXX: load f32 constants into reg
 					state.stored[tos] = true;
 				}
 			}
 			Opcode.F64_CONST.code => {
 				var val = codeptr.read_u64();
 				if (val == 0 && config_TrackFloatZeroConst) {
-					state.push(RegClass.F64, SpcState.Const(0));
+					state.push(ValueKind.F64, SpcState.Const(0));
 				} else {
 					var tos = state.sp;
 					var addr = masm.slotAddr(tos);
 					masm.emit_mov_m_i(addr, int.view(val));
 					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					state.push(RegClass.F64, SpcState.Uncached); // XXX: load f64 constants into reg
+					state.push(ValueKind.F64, SpcState.Uncached); // XXX: load f64 constants into reg
 					state.stored[tos] = true;
 				}
 			}
@@ -329,7 +333,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				} else {
 					var skip = masm.newLabel(opcode_pos);
 					masm.emit_br_m(masm.slotAddr(state.sp), !nonzero, skip);
-					state.emitTransfer(target, masm);
+					state.emitTransfer(target, emitSlotTransfer);
 					masm.emit_br(label);
 					masm.bindLabel(skip);
 				}
@@ -340,14 +344,14 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				} else {
 					var skip = masm.newLabel(opcode_pos);
 					masm.emit_br_r(reg.reg, !nonzero, skip);
-					state.emitTransfer(target, masm);
+					state.emitTransfer(target, emitSlotTransfer);
 					masm.emit_br(label);
 					masm.bindLabel(skip);
 				}
 			}
 			Const(val) => {
 				if (val != 0) {
-					state.emitTransfer(target, masm);
+					state.emitTransfer(target, emitSlotTransfer);
 					masm.emit_br(target.label);
 				}
 				// fall through
@@ -355,7 +359,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		}
 	}
 	def emitReturn() {
-		var c = masm.regConfig;
+		var c = masm.regAlloc.regConfig;
 		var len = sig.results.length;
 		// Copy values back to VSP
 		for (i = len - 1; i >= 0; i--) {
@@ -366,10 +370,10 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				Uncached => { // alloc reg, load, store
 					var reg = allocReg(tag);
 					emit_read_slot_r(state.sp, reg);
-					masm.emit_mov_m_r(slot, reg.reg, reg.regClass);
+					masm.emit_mov_m_r(slot, reg.reg, reg.kind);
 				}
 				Register(reg) => { // store
-					masm.emit_mov_m_r(slot, reg.reg, reg.regClass);
+					masm.emit_mov_m_r(slot, reg.reg, reg.kind);
 				}
 				Const(val) => { // store immediate
 					masm.emit_mov_m_l(slot, val);
@@ -377,17 +381,20 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			// Update the slot's tag byte if necessary
 			var rtag = toTag(sig.results[i]);
-			if (masm.valuerep.tagged && !state.tagged[i] || state.regClass[i] != rtag) {
+			if (masm.valuerep.tagged && !state.tagged[i] || state.kind[i] != rtag) {
 				masm.emit_mov_m_i(masm.tagAddr(index), rtag.code);
 			}
 		}
 		// Compute VSP = VFP + sig.resultslength
-		masm.emit_mov_r_r(c.vsp_reg, c.vfp_reg); // XXX: use 3-addr adjustment of VSP
-		masm.emit_add_r_l(c.vsp_reg, sig.results.length * masm.valuerep.slot_size);
+		masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
+		masm.emit_add_r_l(c.regs.vsp, sig.results.length * masm.valuerep.slot_size);
 		// Deallocate stack frame
-		masm.emit_add_r_l(c.sp_reg, c.spcFrameSize);
+		masm.emit_add_r_l(c.regs.sp, c.spcFrameSize);
 		// Return to caller
 		masm.emit_ret();
+	}
+	def emitSlotTransfer(from_slot: u32, to_slot: u32) {
+		// TODO
 	}
 	def emitTransfer(target: SpcControl) {
 		emit_store_all(target.val_stack_top, true); // XXX uncaching everything first
@@ -397,16 +404,16 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		while (from < state.sp) {
 			match (state.state[from]) {
 				Uncached => {
-					masm.emit_mov_s_s(to, from, state.regClass[to]);
+					masm.emit_mov_s_s(to, from, state.kind[to]);
 				}
 				Register(reg_b) => {
-					masm.emit_mov_s_r(to, reg_b.reg, reg_b.regClass);
+					masm.emit_mov_s_r(to, reg_b.reg, reg_b.kind);
 				}
 				Const(val_b) => {
 					masm.emit_mov_s_i(to, val_b);
 				}
 			}
-			if (!state.tagged[from]) emit_write_slot_tag(to, state.regClass[to]);
+			if (!state.tagged[from]) emit_write_slot_tag(to, state.kind[to]);
 			from++;
 			to++;
 		}
@@ -427,14 +434,14 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		match (a.2) {
 			Uncached => match (b.2) {
 				Uncached => {
-					var reg_a = allocReg(RegClass.I32);
+					var reg_a = allocReg(ValueKind.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_m(op, reg_a.reg, masm.slotAddr(tos+1));
 					state.state[tos] = SpcState.Register(reg_a);
 					state.stored[tos] = false;
 				}
 				Register(reg_b) => {
-					var reg_a = allocReg(RegClass.I32);
+					var reg_a = allocReg(ValueKind.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 					state.state[tos] = SpcState.Register(reg_a);
@@ -443,7 +450,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				}
 				Const(val_b) => {
 					if (isNop != null && isNop(val_b)) return;
-					var reg_a = allocReg(RegClass.I32);
+					var reg_a = allocReg(ValueKind.I32);
 					emit_read_slot_r(tos, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_b);
 					state.state[tos] = SpcState.Register(reg_a);
@@ -468,7 +475,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Const(val_a) => if (isNop != null && !isNop(val_a)) match (b.2) {
 				Uncached => {
-					var reg_a = allocReg(RegClass.I32);
+					var reg_a = allocReg(ValueKind.I32);
 					emit_read_slot_r(tos+1, reg_a);
 					masm.emit_binop_r_i(op, reg_a.reg, val_a);
 					state.state[tos] = SpcState.Register(reg_a);
@@ -478,7 +485,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					if (commute_op != Opcode.UNREACHABLE) {
 						masm.emit_binop_r_i(commute_op, reg_b.reg, val_a); // commuted
 					} else {
-						var reg_a = allocReg(RegClass.I32);
+						var reg_a = allocReg(ValueKind.I32);
 						masm.emit_mov_r_i(reg_a.reg, val_a);
 						masm.emit_binop_r_r(op, reg_a.reg, reg_b.reg);
 						freeReg(reg_b);
@@ -490,7 +497,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					if (fold != null) {
 						state.state[tos] = SpcState.Const(fold(val_a, val_b)); // constant fold
 					} else {
-						var reg_a = allocReg(RegClass.I32);
+						var reg_a = allocReg(ValueKind.I32);
 						masm.emit_mov_r_i(reg_a.reg, val_a);
 						masm.emit_binop_r_i(op, reg_a.reg, val_b);
 						state.state[tos] = SpcState.Register(reg_a);
@@ -509,30 +516,30 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	// codegen operations
 	//====================================================================
 	def emit_read_slot_r(slot: u32, reg: SpcReg) {
-		masm.emit_mov_r_s(reg.reg, reg.regClass, slot);
+		masm.emit_mov_r_s(reg.reg, reg.kind, slot);
 	}
 	def emit_read_tos_r(reg: SpcReg) {
-		masm.emit_mov_r_s(reg.reg, reg.regClass, state.sp - 1);
+		masm.emit_mov_r_s(reg.reg, reg.kind, state.sp - 1);
 	}
-	def emit_write_tos_tag(tag: RegClass) {
+	def emit_write_tos_tag(tag: ValueKind) {
 		if (masm.valuerep.tagged) {
 			masm.emit_mov_m_i(masm.tagAddr(state.sp - 1), tag.code);
 		}
 	}
-	def emit_write_slot_tag(slot: u32, tag: RegClass) {
+	def emit_write_slot_tag(slot: u32, tag: ValueKind) {
 		if (masm.valuerep.tagged) {
 			masm.emit_mov_m_i(masm.tagAddr(slot), tag.code);
 		}
 	}
 	def emit_write_slot_r(slot: u32, reg: SpcReg) {
-		masm.emit_mov_s_r(slot, reg.reg, reg.regClass);
+		masm.emit_mov_s_r(slot, reg.reg, reg.kind);
 	}
-	def emit_write_slot_i(slot: u32, val: int, tag: RegClass) {
+	def emit_write_slot_i(slot: u32, val: int, tag: ValueKind) {
 		masm.emit_mov_s_i(slot, val);
 	}
 	def emit_store_all(limit: u32, uncache: bool) {
 		for (i < limit) {
-			if (!state.tagged[i]) emit_write_slot_tag(i, state.regClass[i]);
+			if (!state.tagged[i]) emit_write_slot_tag(i, state.kind[i]);
 			if (state.stored[i]) continue; // nothing to do
 			var t = state.state[i];
 			match (t) {
@@ -545,7 +552,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					}
 				}
 				Const(val) => {
-					emit_write_slot_i(i, val, state.regClass[i]);
+					emit_write_slot_i(i, val, state.kind[i]);
 				}
 			}
 			state.stored[i] = true;
@@ -569,11 +576,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	// register allocation operations
 	//====================================================================
 	def freeReg(reg: SpcReg) {
-		return masm.regSet.pools[reg.regClass.tag].free(reg.reg);
+		masm.regAlloc.free(reg.reg);
 	}
-	def allocReg(regClass: RegClass) -> SpcReg {
-		var reg = masm.regSet.pools[regClass.tag].alloc(0);
-		return SpcReg(reg, regClass);
+	def allocReg(kind: ValueKind) -> SpcReg {
+		var reg = masm.regAlloc.alloc(kind, 2);
+		return SpcReg(reg, kind);
 	}
 
 	//====================================================================
@@ -595,12 +602,12 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		OUT.put1("sp=%d ", state.sp);
 		for (i < state.sp) {
 			OUT.put3("[%s %s%s: ",
-				state.regClass[i].name,
+				state.kind[i].name,
 				if(state.tagged[i], "T", ""),
 				if(state.stored[i], "S", ""));
 			match (state.state[i]) {
 				Uncached => OUT.puts("uncached");
-				Register(reg) => OUT.put1("@%s", masm.regSet.getName(reg.reg));
+				Register(reg) => OUT.put1("@%s", masm.regAlloc.regConfig.regSet.getName(reg.reg));
 				Const(val) => OUT.put1("#%d", val);
 			}
 			OUT.puts("]");
@@ -616,7 +623,7 @@ type SpcState {
 	case Const(val: int);
 }
 
-type SpcReg(reg: Reg, regClass: RegClass) #unboxed { }
+type SpcReg(reg: Reg, kind: ValueKind) #unboxed { }
 
 // An entry in the abstract control stack.
 class SpcControl {
@@ -627,6 +634,27 @@ class SpcControl {
 	var val_stack_top: u32;
 	var label: MasmLabel;
 	var else_label: MasmLabel;
+	// the state at the merge (label)
+	var merge_count: byte;
+	var merge_state: Array<SpcState>;
+	var merge_tagged: Array<bool>;
+	var merge_stored: Array<bool>;
+	// the state used to reset back to before the true branch of an if
+	var reset_state: Array<SpcState>;
+	var reset_tagged: Array<bool>;
+	var reset_stored: Array<bool>;
+
+	def clearMerge() {
+		merge_count = 0;
+		merge_state = null;
+		merge_tagged = null;
+		merge_stored = null;
+	}
+	def clearReset() {
+		reset_state = null;
+		reset_tagged = null;
+		reset_stored = null;
+	}
 }
 
 def isNeverNop: int -> bool = null;
@@ -641,20 +669,20 @@ def I32_ROTL = to_ii_i(Execute.I32_ROTL, _, _);
 def I32_ROTR = to_ii_i(Execute.I32_ROTR, _, _);
 
 // Contains both the abstract control and abstract value stack.
-class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
+class SpcAbstractState(regAlloc: RegAlloc) {
 	// Abstract state of the value stack
 	var state = Array<SpcState>.new(INITIAL);	// uncached, in a register, or a constant
-	var tagged = Array<bool>.new(INITIAL);	// tag is written properly into memory
-	var stored = Array<bool>.new(INITIAL);	// value is written into memory
-	var regClass = Array<RegClass>.new(INITIAL);	// type of the slot
+	var tagged = Array<bool>.new(INITIAL);		// tag is written properly into memory
+	var stored = Array<bool>.new(INITIAL);		// value is written into memory
+	var kind = Array<ValueKind>.new(INITIAL);	// type of the slot
 	var sp: u32;
 	var ctl_stack = ArrayStack<SpcControl>.new();
+	var num_locals: u32;
 
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl) {
 		sp = 0;
 		ctl_stack.clear();
-		for (p in regConfig.regSet.pools) p.reset();
 		// initialize parameters
 		var params = sig.params;
 		grow(params.length);
@@ -662,7 +690,7 @@ class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
 			state[i] = SpcState.Uncached;
 			tagged[i] = true;
 			stored[i] = true;
-			regClass[i] = toTag(params[i]);
+			kind[i] = toTag(params[i]);
 		}
 		sp = u32.view(params.length);
 	}
@@ -675,7 +703,7 @@ class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
 			state[k] = SpcState.Const(0); // TODO: use default
 			tagged[k] = false;
 			stored[k] = false;
-			regClass[k] = toTag(ltype);
+			kind[k] = toTag(ltype);
 		}
 		sp = nlength;
 	}
@@ -687,44 +715,79 @@ class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
 	}
 	def pushLoop(params: Array<ValueType>, results: Array<ValueType>, start_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.LOOP.code, params, results, start_label);
-		saveStackAtStart(ctl);
 		return ctl;
 	}
 	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.LOOP.code, params, results, end_label);
 		ctl.else_label = else_label;
+		ctl.reset_state = Arrays.dup(state);
+		ctl.reset_tagged = Arrays.dup(tagged);
+		ctl.reset_stored = Arrays.dup(stored);
 		return ctl;
 	}
 	def doElse() {
-		// TODO: reset stack to start of if
-		var ctl_top = ctl_stack.peek();
-		ctl_top.else_label = null;
+		var c = ctl_stack.peek();
+		c.else_label = null;
+		c.clearMerge();
+		// reset state to start of if
+		var max = c.val_stack_top + u32.view(c.params.length);
+		resetTo(max, c.reset_state, c.reset_tagged, c.reset_stored);
+		sp = max;
+		for (i < c.params.length) {
+			kind[int.view(c.val_stack_top) + i] = toTag(c.params[i]);
+		}
+		c.clearReset();
 	}
 	def doEnd(masm: MacroAssembler) -> SpcControl {
-		// TODO: reset stack to merge
+		var c = ctl_stack.peek();
+		var max = c.val_stack_top + u32.view(c.results.length);
+		resetTo(max, c.merge_state, c.merge_tagged, c.merge_stored);
 		return ctl_stack.pop();
 	}
-	def popControl() {
-		ctl_stack.pop();
-	}
 	def isTransferEmpty(target: SpcControl) -> bool {
-		return false;
+		return false; // XXX: approximate
 	}
-	def emitTransfer(target: SpcControl, masm: MacroAssembler) {
-		// TODO: recognize transfers to opcode == RETURN, don't bother storing anything but results
+	def emitFallthru(emitSlotTransfer: (u32, u32) -> void) {
+		emitTransfer(ctl_stack.peek(), emitSlotTransfer);
 	}
-	def emitFallthru(masm: MacroAssembler) {
+	def emitTransfer(target: SpcControl, emitSlotTransfer: (u32, u32) -> void) {
+		var vals = u32.view(target.results.length), max = target.val_stack_top + vals;
+		var start = if(target.opcode == Opcode.RETURN.code, target.val_stack_top, 0u); // discard locals on return
+		if (target.merge_count == 0) {
+			target.merge_count = 1;
+			target.merge_state = Arrays.range(state, 0, int.view(max));
+			target.merge_tagged = Arrays.range(tagged, 0, int.view(max));
+			target.merge_stored = Arrays.range(stored, 0, int.view(max));
+			// TODO: adjust popped values
+		} else {
+			for (i = start; i < target.val_stack_top; i++) {
+				if (state[i] != target.merge_state[i] || tagged[i] != target.merge_tagged[i] || stored[i] != target.merge_stored[i]) {
+					emitSlotTransfer(i, i);
+				}
+			}
+			// TODO: transfer popped values
+		}
 	}
-	private def saveStackAtStart(ctl: SpcControl) {
-//		emit_store_all(ctl.val_stack_top, false); // XXX: actually save instead
-	}
-	private def resetStackToStart(ctl: SpcControl) {
-		sp = ctl.val_stack_top; // TODO: set uncached, tagged, etc
+	private def resetTo(max: u32, nstate: Array<SpcState>, ntagged: Array<bool>, nstored: Array<bool>) {
+		regAlloc.clear();
+		for (i < max) {
+			var s = nstate[i];
+			match (s) {
+				Register(r) => regAlloc.unfree(r.reg);
+				_ => ;
+			}
+			state[i] = s;
+			tagged[i] = ntagged[i];
+			stored[i] = nstored[i];
+
+		}
 	}
 	private def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
 		var ctl = ctl_stack.next();
 		if (ctl != null) { // FAST: reuse previous SpcControl object
 			ctl_stack.top++;
+			ctl.clearMerge();
+			ctl.clearReset();
 		} else { // allocate and cache new SpcControl object
 			ctl = SpcControl.new();
 			ctl_stack.push(ctl);
@@ -741,54 +804,139 @@ class SpcAbstractState(regSet: RegSet, regConfig: RegConfig) {
 		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
 		return result;
 	}
-	def push(tag: RegClass, st: SpcState) {
+	def push(tag: ValueKind, st: SpcState) {
 		var sp = this.sp;
 		if (sp >= state.length) grow(8 + state.length * 2);
 		tagged[sp] = false;
 		stored[sp] = false;
-		regClass[sp] = tag;
+		kind[sp] = tag;
 		state[sp] = st;
 		this.sp++;
 	}
-	def pop() -> (bool, RegClass, SpcState) {
+	def pop() -> (bool, ValueKind, SpcState) {
 		if (sp == 0) {
 // TODO			err.at(codeptr).set("stack underflow");
-			return (false, RegClass.I32, SpcState.Uncached);
+			return (false, ValueKind.I32, SpcState.Uncached);
 		}
 		var sp = this.sp - 1;
-		var result = (stored[sp], regClass[sp], state[sp]);
+		var result = (stored[sp], kind[sp], state[sp]);
 		this.sp = sp;
 		return result;
 	}
-	def peek() -> (bool, RegClass, SpcState) {
+	def peek() -> (bool, ValueKind, SpcState) {
 		var sp = sp - 1;
-		return (stored[sp], regClass[sp], state[sp]);
+		return (stored[sp], kind[sp], state[sp]);
 	}
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 		tagged = Arrays.grow(tagged, nlength);
 		stored = Arrays.grow(stored, nlength);
-		regClass = Arrays.grow(regClass, nlength);
-	}
-	def prepareForLoop(limit: u32) {
-// TODO		emit_store_all(limit, true);
-		for (i < limit) {
-			var t = state[i];
-			match (t) {
-				Const(val) => state[i] = SpcState.Uncached;
-				_ => ;
-			}
-		}
+		kind = Arrays.grow(kind, nlength);
 	}
 }
-def toTag(vt: ValueType) -> RegClass {
+def toTag(vt: ValueType) -> ValueKind {
 	match (vt) {
-		I32 => return RegClass.I32;
-		I64 => return RegClass.I64;
-		F32 => return RegClass.F32;
-		F64 => return RegClass.F64;
-		V128 => return RegClass.V128;
-		_ => return RegClass.REF;
+		I32 => return ValueKind.I32;
+		I64 => return ValueKind.I64;
+		F32 => return ValueKind.F32;
+		F64 => return ValueKind.F64;
+		V128 => return ValueKind.V128;
+		_ => return ValueKind.REF;
+	}
+}
+
+class AbstractState<T> {
+	private var state: Array<T>;
+	private var sp: u32;
+
+	new(prev: AbstractState<T>) {
+		if (prev != null) {
+			this.state = Arrays.dup(prev.state);
+		}
+	}
+	def push(v: T) {
+		v = set(sp, v);
+		state[sp++] = v;
+	}
+	def pop() -> T {
+		var val = state[--sp];
+		return free(sp, val);
+	}
+	def set(sp: u32, v: T) -> T {
+		return v;
+	}
+	def free(sp: u32, v: T) -> T {
+		return v;
+	}
+}
+
+// Maps slots (locals, value stack) to registers and includes state for allocating registers
+// to slots.
+class AbstractRegState {
+	def regConfig: RegConfig;
+	private var pools: Array<PriorityRegPool>;
+	private var state: Array<Reg>;
+
+	new(regConfig, pools, prev: AbstractRegState) {
+		if (prev == null) {
+			state = Array.new(16);
+		} else {
+			state = Arrays.dup(prev.state);
+			pools = Arrays.dup(prev.pools);
+			for (i < pools.length) pools[i] = pools[i].copy();
+		}
+	}
+	def init(p: Array<PriorityRegPool>) {
+		pools = p;
+		for (i < pools.length) pools[i] = pools[i].copy();
+	}
+
+	def assignRegToSlot(r: Reg, slot: u32) {
+		if (slot >= state.length) {
+			state = Arrays.grow(state, int.!(slot + 16));
+		}
+		var pool_index = regConfig.regToPool[r.index];
+		pools[pool_index].unfree(r);
+		state[slot] = r;
+	}
+	def allocRegToSlot(slot: u32, kind: ValueKind) -> Reg {
+		if (slot >= state.length) {
+			state = Arrays.grow(state, 16 + state.length * 2);
+		} else {
+			var r = state[slot];
+			if (r.index > 0) return r;
+		}
+		var pool_index = regConfig.kindToPool[kind.tag];
+		var r = pools[pool_index].alloc();
+		if (r.index > 0) state[slot] = r;
+		return r;
+	}
+	def freeSlot(slot: u32) {
+		var r = state[slot];
+		if (r.index <= 0) return;
+		var pool_index = regConfig.regToPool[r.index];
+		return pools[pool_index].free(r);
+	}
+	def findSpill(top: u32) -> (u32, Reg) {
+		for (i < top) {
+			var r = state[i];
+			if (r.index > 0) return (i, r);
+		}
+		return (0, Reg(0));
+	}
+	def freeTo(top: u32) {
+		for (i = top; i < state.length; i++) freeSlot(i);
+	}
+	def clear() -> this {
+		var empty = Reg(0);
+		for (i < state.length) state[i] = empty;
+		for (p in pools) p.clear();
+	}
+	def copy() -> AbstractRegState {
+		return AbstractRegState.new(regConfig, null, this);
+	}
+	def grow(size: u32) {
+		if (size > state.length) state = Arrays.grow(state, int.!(size));
 	}
 }
 

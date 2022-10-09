@@ -1,11 +1,14 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Describes the set of architectural registers for a target. There must be < 256.
-// By convention, register #0 is reserved for indicated not a register.
+// Architecture-independent representation of a register of any register class for use in
+// the macro assembler and portable parts of compilers. Kept small to keep data structures small.
+type Reg(index: byte) #unboxed { }
+
+// Describes the set of registers for a target. There must be < 256.
+// By convention, register #0 is reserved for indicating an unallocated register or no register.
 class RegSet(regs: Array<Reg>, names: Array<string>) {
 	def length = regs.length;
-	def pools = Array<RegPool>.new(RegClass.REF.tag + 1);
 
 	def getName(r: Reg) -> string {
 		var n = names[r.index];
@@ -17,33 +20,28 @@ class RegSet(regs: Array<Reg>, names: Array<string>) {
 	}
 }
 
-enum RegClass(code: byte) {
-	I32(BpTypeCode.I32.code),
-	I64(BpTypeCode.I64.code),
-	F32(BpTypeCode.F32.code),
-	F64(BpTypeCode.F64.code),
-	V128(BpTypeCode.V128.code),
-	REF(BpTypeCode.REF.code)
+// Specialized roles for some registers, either in the interpreter or compiled code.
+enum RegRole(changes: bool) {
+	NONE		(false),	// no special role
+	FUNC_ARG	(false),	// incoming function argument
+	DISPATCH	(true),		// (int) dispatch table register
+	IP		(true),		// (int) instruction pointer
+	EIP		(false),	// (int) end instruction pointer
+	CIP		(true),		// (int) current instruction pointer
+	STP		(true),		// (int) side-table pointer
+	INSTANCE	(false),	// instance reference
+	FUNC_DECL	(false),	// (int) function declaration
+	MEM0_BASE	(false),	// memory #0 base address
+	VSP		(true),		// (int) value stack pointer
+	VFP		(false),	// value frame pointer
+	SP		(false),	// stack pointer
+	FP		(false),	// frame pointer
+	TLS		(false)		// thread local storage
 }
-type Reg(index: byte) #unboxed { }
 
 // Describes the register configuration for a target in terms of architectural registers.
-class RegConfig(regSet: RegSet) {
-	var sp_reg: Reg; // XXX: rename reg_xx ?
-	var fp_reg: Reg;
-	var tls_reg: Reg;
+class RegConfig(regSet: RegSet, regs: RegRoles) {
 	var spcFrameSize: int;
-
-	var vsp_reg: Reg;
-	var vfp_reg: Reg;
-	var ip_reg: Reg;
-	var eip_reg: Reg;
-	var stp_reg: Reg;
-	var instance_reg: Reg;
-	var dispatch_reg: Reg;
-	var func_reg: Reg;
-	var mem_reg: Reg;
-	var tmp_reg: Reg;
 
 	var vsp_offset: int;
 	var vfp_offset: int;
@@ -51,47 +49,125 @@ class RegConfig(regSet: RegSet) {
 	var stp_offset: int;
 	var instance_offset: int;
 	var mem_offset: int;
+
+	var numRegPools: int;
+	def regToPool = Array<i8>.new(regSet.regs.length);
+	def kindToPool = Array<byte>.new(ValueKind.REF.tag + 1);
+}
+// A utility giving easy access to registers for given roles.
+class RegRoles(array: Array<Reg>) {
+	def func_arg = array[RegRole.FUNC_ARG.tag];
+	def dispatch = array[RegRole.DISPATCH.tag];
+	def ip = array[RegRole.IP.tag];
+	def eip = array[RegRole.EIP.tag];
+	def stp = array[RegRole.STP.tag];
+	def instance = array[RegRole.INSTANCE.tag];
+	def func = array[RegRole.FUNC_DECL.tag];
+	def mem0 = array[RegRole.MEM0_BASE.tag];
+	def vsp = array[RegRole.VSP.tag];
+	def vfp = array[RegRole.VFP.tag];
+	def sp = array[RegRole.SP.tag];
+	def fp = array[RegRole.FP.tag];
+	def tls = array[RegRole.TLS.tag];
 }
 
-// Registers are allocated from a pool.
-class RegPool(regs: Array<Reg>) {
-	private def queue = Array<Reg>.new(regs.length);
-	private var state: Array<int>;
-	private var head: int;
+// Allocates register from a pool in a fixed priority order, given by the order in {regs}.
+// Handles a maximum of 32 registers.
+class PriorityRegPool {
+	def regs: Array<Reg>;
+	private var map: Array<byte>;
+	private var freebits = 0xFFFFFFFF;
 
-	new() {
-		var j = 0, max = int.min;
-		for (i < regs.length) {
-			var r = regs[i];
-			queue[i] = r;
-			if (r.index > max) max = r.index;
+	new(regs, prev: PriorityRegPool) {
+		if (prev == null) {
+			var max = int.min;
+			for (r in regs) if (r.index > max) max = r.index;
+			map = Array<byte>.new(max + 1);
+			for (i < regs.length) map[regs[i].index] = byte.!(i);
+		} else {
+			this.map = prev.map;
+			this.freebits = prev.freebits;
 		}
-		state = Array.new(max + 1);
-		for (i < state.length) state[i] = -1;
 	}
 
-	def alloc(assignment: int) -> Reg {
-		if (head >= queue.length) return Reg(0);
-		var r = queue[head++];
-		state[r.index] = assignment;
-		return r;
+	def alloc() -> Reg {
+		var f = freebits, i = 0;
+		// XXX: use CTZ (count trailing zeroes) instruction
+		if ((f & 0xFFFF) == 0) { i += 16; f >>= 16; }
+		if ((f & 0xFF) == 0) { i += 8; f >>= 8; }
+		if ((f & 0xF) == 0) { i += 4; f >>= 4; }
+		if ((f & 0x3) == 0) { i += 2; f >>= 2; }
+		if ((f & 0x1) == 0) { i += 1; f >>= 1; }
+		if (i > regs.length) return Reg(0);
+		freebits = freebits & ~(1 << u5.view(i));
+		return regs[i];
+	}
+	def unfree(r: Reg) {
+		var i = map[r.index];
+		freebits = freebits & ~(1 << i);
+	}
+	def isFree(r: Reg) -> bool {
+		var m = 1 << map[r.index];
+		return (freebits & m) == m;
 	}
 	def free(r: Reg) {
-		if (state[r.index] >= 0) {
-			state[r.index] = -1;
-			queue[--head] = r;
-		}
+		var i = map[r.index];
+		freebits = freebits | (1 << i);
 	}
-	def isEmpty() -> bool {
-		return head >= queue.length;
+	def copy() -> PriorityRegPool {
+		return PriorityRegPool.new(this.regs, this);
 	}
-	def assignment(r: Reg) -> int {
-		return state[r.index];
+	def clear() -> this {
+		freebits = 0xFFFFFFFF;
 	}
-	def reset() {
-		for (i < regs.length) queue[i] = regs[i];
-		for (i < state.length) state[i] = -1;
-		head = 0;
+	def unfreeAll() -> this {
+		freebits = 0;
 	}
 }
-type RegPoolState(reg: Reg, free: bool, prev: byte, next: byte) #unboxed { }
+
+// A register allocator that has different pools for different register classes.
+// When initially allocated, a register configuration has empty priority register
+// pools; they must be set with {setPool(i)}.
+class RegAlloc {
+	def regConfig: RegConfig;
+	private var pools: Array<PriorityRegPool>;
+	private var assign: Array<int>;
+
+	new(regConfig, prev: RegAlloc) {
+		if (prev == null) {
+			pools = Array<PriorityRegPool>.new(regConfig.numRegPools);
+			assign = Array<int>.new(regConfig.regSet.regs.length);
+			for (i < assign.length) assign[i] = -1;
+		} else {
+			pools = Arrays.dup(prev.pools);
+			for (i < pools.length) pools[i] = pools[i].copy();
+			assign = Arrays.dup(prev.assign);
+		}
+	}
+	def setPool(i: int, p: PriorityRegPool) {
+		pools[i] = p;
+	}
+	def alloc(kind: ValueKind, assignment: int) -> Reg {
+		var pool_index = regConfig.kindToPool[kind.tag];
+		var r = pools[pool_index].alloc();
+		if (r.index > 0) assign[r.index] = assignment;
+		return r;
+	}
+	def get(reg: Reg) -> int {
+		return assign[reg.index];
+	}
+	def free(reg: Reg) {
+		var pool_index = regConfig.regToPool[reg.index];
+		return pools[pool_index].free(reg);
+	}
+	def unfree(reg: Reg) {
+		var pool_index = regConfig.regToPool[reg.index];
+		return pools[pool_index].unfree(reg);
+	}
+	def clear() -> this {
+		for (p in pools) p.clear();
+	}
+	def copy() -> RegAlloc {
+		return RegAlloc.new(regConfig, this);
+	}
+}
