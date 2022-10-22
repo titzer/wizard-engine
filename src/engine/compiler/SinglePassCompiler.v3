@@ -302,6 +302,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.I32_SHR_U.code 	=> emitBinop(SpcBinop.I32_SHR_U);
 			Opcode.I32_ROTL.code 	=> emitBinop(SpcBinop.I32_ROTL);
 			Opcode.I32_ROTR.code 	=> emitBinop(SpcBinop.I32_ROTR);
+
+			Opcode.I32_EQZ.code	=> emitUnop(SpcUnop.I32_EQZ);
 			Opcode.I32_EQ.code 	=> emitBinop(SpcBinop.I32_EQ);
 			Opcode.I32_NE.code 	=> emitBinop(SpcBinop.I32_NE);
 			Opcode.I32_LT_S.code 	=> emitBinop(SpcBinop.I32_LT_S);
@@ -328,6 +330,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.I64_SHR_U.code 	=> emitBinop(SpcBinop.I64_SHR_U);
 			Opcode.I64_ROTL.code 	=> emitBinop(SpcBinop.I64_ROTL);
 			Opcode.I64_ROTR.code 	=> emitBinop(SpcBinop.I64_ROTR);
+
+			Opcode.I64_EQZ.code	=> emitUnop(SpcUnop.I64_EQZ);
 			Opcode.I64_EQ.code 	=> emitBinop(SpcBinop.I64_EQ);
 			Opcode.I64_NE.code 	=> emitBinop(SpcBinop.I64_NE);
 			Opcode.I64_LT_S.code 	=> emitBinop(SpcBinop.I64_LT_S);
@@ -494,6 +498,29 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				masm.emit_mov_r_s(tv.reg, tv.kind(), from.0);
 			}
 		}
+	}
+	def emitUnop(unop: SpcUnop) {
+		var a = state.peek();
+		var tos = u32.!(state.sp - 1);
+		var flags = (a.flags & unop.kind_sig.preserve_flags) | unop.kind_sig.add_flags;
+		if (a.isConst() && unop.fold != null) {
+			state.overwrite(flags | IS_CONST, NO_REG, unop.fold(a.const));
+			return;
+		}
+		var reg_a: Reg;
+		if (a.inReg()) {
+			reg_a = a.reg;
+		} else {
+			var kind = unop.kind_sig.a_kind;
+			reg_a = allocReg(unop.kind_sig.a_kind).reg;
+			if (a.isConst()) {
+				masm.emit_mov_r_k(reg_a, kind, a.const);
+			} else {
+				masm.emit_mov_r_s(reg_a, kind, tos);
+			}
+		}
+		masm.emit_unop_r(unop.op, a.reg);
+		state.overwrite(flags | IN_REG, a.reg, 0);
 	}
 	def emitBinop(binop: SpcBinop) {
 		var b = state.pop();
@@ -736,13 +763,18 @@ type SpcAbstractVal(flags: byte, reg: Reg, const: int) #unboxed {
 	}
 }
 
-type KindSig(a_kind: ValueKind, b_kind: ValueKind, preserve_flags: byte, add_flags: byte);
+type SpcBinopSig(a_kind: ValueKind, b_kind: ValueKind, preserve_flags: byte, add_flags: byte);
+type SpcUnopSig(a_kind: ValueKind, preserve_flags: byte, add_flags: byte);
 
-def kind_ii_i = KindSig(ValueKind.I32, ValueKind.I32, KIND_MASK | TAG_STORED, 0);
-def kind_ll_l = KindSig(ValueKind.I64, ValueKind.I64, KIND_MASK | TAG_STORED, 0);
-def kind_ll_i = KindSig(ValueKind.I64, ValueKind.I64, 0, KIND_I32);
+def kind_ii_i = SpcBinopSig(ValueKind.I32, ValueKind.I32, KIND_MASK | TAG_STORED, 0);
+def kind_ll_l = SpcBinopSig(ValueKind.I64, ValueKind.I64, KIND_MASK | TAG_STORED, 0);
+def kind_ll_i = SpcBinopSig(ValueKind.I64, ValueKind.I64, 0, KIND_I32);
 
-enum SpcBinop(op: Opcode, commute: Opcode, kind_sig: KindSig, isNop: int -> bool, fold: (int, int) -> int) {
+def kind_i_i = SpcUnopSig(ValueKind.I32, KIND_MASK | TAG_STORED, 0);
+def kind_l_i = SpcUnopSig(ValueKind.I32, 0, KIND_I32);
+def kind_l_l = SpcUnopSig(ValueKind.I64, KIND_MASK | TAG_STORED, 0);
+
+enum SpcBinop(op: Opcode, commute: Opcode, kind_sig: SpcBinopSig, isNop: int -> bool, fold: (int, int) -> int) {
 	I32_ADD		(Opcode.I32_ADD,	Opcode.I32_ADD,		kind_ii_i, isZero, int.+)
 	I32_SUB		(Opcode.I32_SUB,	Opcode.UNREACHABLE,	kind_ii_i, isZero, int.-),
 	I32_MUL		(Opcode.I32_MUL,	Opcode.I32_MUL,		kind_ii_i, isOne, int.*),
@@ -794,6 +826,11 @@ enum SpcBinop(op: Opcode, commute: Opcode, kind_sig: KindSig, isNop: int -> bool
 	I64_LE_U	(Opcode.I64_LE_U,	Opcode.I64_GE_U, kind_ll_i, null, null),
 	I64_GE_S	(Opcode.I64_GE_S,	Opcode.I64_LE_S, kind_ll_i, null, null),
 	I64_GE_U	(Opcode.I64_GE_U,	Opcode.I64_LE_U, kind_ll_i, null, null)
+}
+
+enum SpcUnop(op: Opcode, kind_sig: SpcUnopSig, fold: int -> int) {
+	I32_EQZ(Opcode.I32_EQZ, kind_i_i, null), // XXX: fold
+	I64_EQZ(Opcode.I64_EQZ, kind_l_i, null), // XXX: fold
 }
 
 // An entry in the abstract control stack.
