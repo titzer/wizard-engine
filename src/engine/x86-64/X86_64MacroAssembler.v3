@@ -17,9 +17,23 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def w: DataWriter;
 	def asm = X86_64Assemblers.create64(w);
 	var scratch: X86_64Gpr;
+	var jump_tables: Vector<(int, Array<X86_64Label>)>;
 
 	new(w, regAlloc: RegAlloc) super(Target.tagging, regAlloc) {
 		scratch = G(regAlloc.regConfig.regs.scratch);
+	}
+
+	// Called after
+	def prepareToCopyInto(asm: X86_64Assembler, addr: u64) {
+		if (jump_tables == null) return;
+		for (i < jump_tables.length) {
+			var t = jump_tables[i], offset = t.0, labels = t.1;
+			for (j < labels.length) {
+				var l = labels[j], target = addr + u64.!(l.pos);
+				asm.w.at(offset + j * 8).put_b64(long.view(target));
+			}
+		}
+		jump_tables = null;
 	}
 
 	// Label operations
@@ -27,6 +41,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		return X86_64MasmLabel.new(create_pos, asm.newLabel());
 	}
 	def bindLabel(l: MasmLabel) {
+		if (Trace.compiler) Trace.OUT.put2("    bind label (+%d) -> @%d", l.create_pos, w.end()).outln();
 		var label = X86_64MasmLabel.!(l);
 		asm.bind(label.label);
 	}
@@ -412,5 +427,39 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.d.cmp_m_i(A(addr), 0);
 		var cond = if(nonzero, X86_64Conds.NZ, X86_64Conds.Z);
 		asm.jc_rel_far(cond, X86_64MasmLabel.!(label).label);
+	}
+	def emit_br_table_r(reg: Reg, labels: Array<MasmLabel>) {
+		// XXX: simplify the label patching logic by improving X86_64Assembler
+		var r1 = G(reg);
+		asm.d.cmp_r_i(r1, labels.length);
+		asm.jc_rel_far(C.NC, X86_64MasmLabel.!(labels[labels.length - 1]).label);
+		var patcher = X86_64MasmJumpTablePatcher.new();
+		asm.q.patcher = patcher;
+		asm.q.lea(scratch, X86_64Addr.new(null, null, 1, REL_MARKER));
+		asm.q.patcher = null;
+		asm.ijmp_m(X86_64Addr.new(scratch, r1, 8, 0));
+		w.align(8);
+		var jtpos = w.atEnd().pos;
+		if (jump_tables == null) jump_tables = Vector.new();
+		jump_tables.put(jtpos, Arrays.map(labels, getLabel));
+		w.skipN(labels.length * 8);
+		w.at(patcher.pos).put_b32(jtpos - (patcher.pos + patcher.delta));
+		w.atEnd();
+	}
+	def getLabel(m: MasmLabel) -> X86_64Label {
+		return X86_64MasmLabel.!(m).label;
+	}
+}
+
+// XXX: Simplify relative loads for jump table by improving X86_64Assembler
+def ABS_MARKER = 0x77665544;
+def REL_MARKER = 0x99887766;
+class X86_64MasmJumpTablePatcher extends X86_64AddrPatcher {
+	var pos: int;
+	var delta: int;
+	new() super(ABS_MARKER, REL_MARKER) { }
+	def recordRel32(pos: int, delta: int, addr: X86_64Addr) {
+		this.pos = pos;
+		this.delta = delta;
 	}
 }

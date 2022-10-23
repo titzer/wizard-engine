@@ -27,6 +27,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	var start_pos: int;
 	var opcode_pos: int;
 	var success = true;
+	var trap_label: MasmLabel;
 
 	new() {
 		masm.unimplemented = unsupported;
@@ -38,6 +39,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 		start_pos = 0;
 		sig = func.sig;
+		trap_label = null;
 
 		// Initialize parameters, locals, and first control stack entry.
 		var ret_label = masm.newLabel(func.code.code.length);
@@ -53,6 +55,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		while (d.pos < d.limit) {
 			emitInstr();
 		}
+		// Emit epilogue
+		if (trap_label != null) emitTrapEpilogue();
 		return success;
 	}
 	def emitPrologue() {
@@ -104,6 +108,10 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var opcode = codeptr.read1();
 		if (Trace.compiler) { traceStack(); traceOpcode(); }
 		match (opcode) {
+			Opcode.UNREACHABLE.code => {
+				emitTrap(TrapReason.UNREACHABLE);
+				state.setUnreachable();
+			}
 			Opcode.NOP.code => {
 				// emit nothing
 			}
@@ -165,8 +173,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var target = state.getControl(depth);
 				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(target.label);
-				var ctl = state.ctl_stack.peek();
-				ctl.reachable = false;
+				state.setUnreachable();
 			}
 			Opcode.BR_IF.code => {
 				var depth = parser.readLabel();
@@ -174,12 +181,17 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var sv = state.pop();
 				emitBrIf(sv, true, target.label, target, state.isTransferEmpty(target));
 			}
+			Opcode.BR_TABLE.code => {
+				var depths = parser.readLabels();
+				var sv = state.pop();
+				emitBrTable(sv, depths);
+				state.setUnreachable();
+			}
 			Opcode.RETURN.code => {
 				var target = state.ctl_stack.elems[0];
 				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(target.label);
-				var ctl = state.ctl_stack.peek();
-				ctl.reachable = false;
+				state.setUnreachable();
 			}
 			Opcode.DROP.code => {
 				state.sp--;
@@ -453,6 +465,41 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		}
 		freeVal(sv);
 	}
+	def emitBrTable(sv: SpcAbstractVal, depths: Array<u32>) {
+		var labels = Array<MasmLabel>.new(state.ctl_stack.top);
+		var targets = Array<MasmLabel>.new(depths.length);
+		for (i < targets.length) { // create labels for all targets involved in this br_table
+			var depth = depths[i];
+			var l = labels[depth];
+			if (l == null) l = labels[depth] = masm.newLabel(opcode_pos);
+			targets[i] = l;
+		}
+		if (sv.isConst()) {
+			// constant-fold br_table into a br
+			var key = sv.const;
+			var depth = if(key >= depths.length, depths[depths.length - 1], depths[key]);
+			var target = state.ctl_stack.elems[depth];
+			state.emitTransfer(target, emitSlotTransfer);
+			masm.emit_br(target.label);
+		} else {
+			var reg = SpcReg(sv.reg, ValueKind.I32);
+			if (!sv.inReg()) {
+				reg = allocReg(ValueKind.I32);
+				masm.emit_mov_r_s(reg.reg, reg.kind, state.sp);
+			}
+			masm.emit_br_table_r(reg.reg, targets);
+			freeReg(reg);
+
+			for (depth < labels.length) {
+				var l = labels[depth];
+				if (l == null) continue;
+				masm.bindLabel(l);
+				var target = state.getControl(u32.view(depth));
+				state.emitTransfer(target, emitSlotTransfer);
+				masm.emit_br(target.label);
+			}
+		}
+	}
 	def emitReturn(ctl: SpcControl) {
 		var results = sig.results;
 		if (masm.valuerep.tagged) {
@@ -469,6 +516,22 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
 		if (results.length > 0)	masm.emit_add_r_l(c.regs.vsp, results.length * masm.valuerep.slot_size);
 		// Deallocate stack frame
+		masm.emit_add_r_l(c.regs.sp, c.spcFrameSize);
+		// Return to caller
+		masm.emit_mov_r_i(c.regs.ret_ExecState, ExecState.FINISHED.tag);
+		masm.emit_ret();
+	}
+	def emitTrap(reason: TrapReason) {
+		var c = masm.regAlloc.regConfig;
+		masm.emit_mov_r_i(c.regs.ret_TrapReason, reason.tag);
+		if (trap_label == null) trap_label = masm.newLabel(opcode_pos); // XXX: proper pos?
+		masm.emit_br(trap_label);
+	}
+	def emitTrapEpilogue() {
+		if (trap_label == null) return;
+		var c = masm.regAlloc.regConfig;
+		masm.bindLabel(trap_label);
+		masm.emit_mov_r_i(c.regs.ret_ExecState, ExecState.TRAPPED.tag);
 		masm.emit_add_r_l(c.regs.sp, c.spcFrameSize);
 		// Return to caller
 		masm.emit_ret();
@@ -1085,6 +1148,9 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 	def setStored(slot: u32) {
 		var b = state[slot];
 		state[slot] = SpcAbstractVal(b.flags | IS_STORED, b.reg, b.const);
+	}
+	def setUnreachable() {
+		ctl_stack.peek().reachable = false;
 	}
 	def setNoReg(slot: u32) {
 		var b = state[slot];
