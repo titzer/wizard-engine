@@ -9,6 +9,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def instrTracer = if(Trace.validation, InstrTracer.new());
 	def locals = Vector<ValueType>.new();
 	def val_stack = ArrayStack<ValueType>.new();
+	def init_status = Vector<InitStatus>.new();
 	def ctl_stack = ArrayStack<ControlEntry>.new();
 	def ctlxfer = SidetableBuilder.new();
 	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
@@ -37,7 +38,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 
 		// setup params
 		locals.resize(0);
+		init_status.resize(0);
 		locals.puta(sig.params);
+		init_status.putn(InitStatus.INIT, sig.params.length);
 		// read and initialize locals
 		if (!readLocals(locals)) return reterr();
 		func.code.num_locals = locals.length;
@@ -61,9 +64,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			var count = parser.readU32("local count", max);
 			var pt2 = parser.decoder.pos;
 			var ltype = parser.readValueType();
-			if (!ValueTypes.hasDefaultValue(ltype)) {
-				err.rel(parser.decoder, pt2).ExpectedTypeWithDefaultValue(ltype);
-			}
+			var init = if(ValueTypes.hasDefaultValue(ltype), InitStatus.INIT, InitStatus.UNINIT);
+			if (count <= limits.max_num_locals) init_status.putn(init, int.view(count));
 			if (!err.ok()) return false;
 			if (Trace.validation) traceLocals(count, ltype);
 			vec.putn(ltype, int.!(count));
@@ -123,6 +125,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						return err_atpc().MismatchedElse();
 					}
 					checkArgsAndTransfer();
+					resetInit();
 					var if_branch = ctl_top.ctl_refs[0];
 					ctl_top.ctl_refs[0] = -1;
 					// branches within if-true block go to "else"...
@@ -158,6 +161,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						// the end bytecode of the function must be executed to tear frame down
 						ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
 					}
+					resetInit();
 					ctl_stack.pop();
 					ctl_top = ctl_stack.peek();
 				}
@@ -269,16 +273,19 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				Opcode.LOCAL_GET.code => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
+					checkInit(index);
 					push(t);
 				}
 				Opcode.LOCAL_SET.code => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
+					setInit(index);
 					popE(t);
 				}
 				Opcode.LOCAL_TEE.code => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
+					setInit(index);
 					popE(t);
 					push(t);
 				}
@@ -727,7 +734,23 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			if (Trace.validation) traceStack(false);
 		}
 	}
-	
+	def checkInit(index: u32) {
+		if (index >= init_status.length) return;
+		var i = int.!(index);
+		if (init_status[i] == InitStatus.UNINIT) err_atpc().UninitializedLocal(index);
+	}
+	def setInit(index: u32) {
+		if (index >= init_status.length) return;
+		var i = int.!(index);
+		if (init_status[i] == InitStatus.UNINIT) {
+			init_status[i] = InitStatus.INIT;
+			ctl_top.undo_init_list = List.new(i, ctl_top.undo_init_list);
+		}
+	}
+	def resetInit() {
+		for (l = ctl_top.undo_init_list; l != null; l = l.tail) init_status[l.head] = InitStatus.UNINIT;
+		ctl_top.undo_init_list = null;
+	}
 	def checkSignature(sig: SigDecl) {
 		var p = sig.params, r = sig.results;
 		if (p.length > 0) checkAndPopArgs(p);
@@ -914,6 +937,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl.val_stack_top = val_stack_top;
 		ctl.reachable = true;
 		ctl.ctl_refs.resize(0);
+		ctl.undo_init_list = null;
 		return ctl;
 	}
 	def getControl(depth: u32) -> ControlEntry {
@@ -955,7 +979,10 @@ type CodeValidatorResult {
 	case Ok {}
 	case Error(error: WasmError, pc: int, msg: string) { }
 }
-
+enum InitStatus {
+	UNINIT,
+	INIT
+}
 // An entry in the control stack, exposed guts.
 class ControlEntry {
 	var start_pos: int;
@@ -967,6 +994,7 @@ class ControlEntry {
 	var reachable = true;
 	var val_stack_top: int;
 	def ctl_refs = Vector<int>.new(); // XXX: thread control refs through sidetable
+	var undo_init_list: List<int>;
 }
 // Utility for building the sidetable for a function, which contains control transfer information.
 class SidetableBuilder {
