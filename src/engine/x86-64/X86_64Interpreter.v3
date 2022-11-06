@@ -1244,10 +1244,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// Check table.ids[func_index] == sig_index
 			asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
 			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
-			// Load table.funcs[func_index] into r1 and jump to calling sequence
+			// Load table.funcs[func_index] into {targetFunc} and jump to calling sequence
 			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
 			asm.movq_r_m(targetFunc, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
-			asm.jmp_rel_near(callFunction);
+			asm.jmp_rel_near(callFunction);  // XXX: duplicate call sequence here?
 			// XXX: move traps for call indirect out-of-line
 			asm.bind(trap_oob);
 			genTrap(TrapReason.FUNC_INVALID);
@@ -1262,7 +1262,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genSkipLeb(); // skip signature index
 			asm.sub_r_i(vsp, valuerep.slot_size);
 			asm.movq_r_m(targetFunc, vsph[0].value);
-			asm.jmp_rel_near(callFunction);
+			asm.q.cmp_r_i(targetFunc, 0);
+			asm.jc_rel_near(X86_64Conds.NZ, callFunction);
+			genTrap(TrapReason.NULL_DEREF);
 		}
 
 		var tailCallFunction = X86_64Label.new();
@@ -1271,28 +1273,27 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(regs.tmp1);
 
 			asm.movq_r_m(regs.tmp0, regs.INSTANCE.plus(offsets.Instance_functions));
-			var target_func = regs.tmp1;
-			asm.movq_r_m(target_func, regs.tmp0.plusR(regs.tmp1, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movq_r_m(targetFunc, regs.tmp0.plusR(regs.tmp1, offsets.REF_SIZE, offsets.Array_contents));
 
 			// return_tail_call jumps here
 			asm.bind(tailCallFunction);
 			// Overwrite current locals with outgoing arguments
 			var cnt = regs.tmp0;
-			asm.movq_r_m(cnt, target_func.plus(offsets.Function_sig));
+			asm.movq_r_m(cnt, targetFunc.plus(offsets.Function_sig));
 			asm.movq_r_m(cnt, cnt.plus(offsets.SigDecl_params));
 			asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
 			genCopyStackValsToVfp(cnt, regs.tmp2);
 
 			// Check if the target function is a WasmFunction or HostFunction
 			var tail_call_host = X86_64Label.new();
-			asm.d.cmp_m_i(target_func.plus(0), offsets.WasmFunction_typeId);
+			asm.d.cmp_m_i(targetFunc.plus(0), offsets.WasmFunction_typeId);
 			asm.jc_rel_near(C.NZ, tail_call_host);
 
 			// WasmFunction: jump into interpreter reentry
 			asm.q.lea(regs.VSP, regs.VFP.plusR(cnt, 1, 0)); // set VSP properly
-			asm.movq_r_m(regs.INSTANCE, target_func.plus(offsets.WasmFunction_instance));
+			asm.movq_r_m(regs.INSTANCE, targetFunc.plus(offsets.WasmFunction_instance));
 			saveIVar(regs.INSTANCE);
-			asm.movq_r_m(regs.FUNC_DECL, target_func.plus(offsets.WasmFunction_decl));
+			asm.movq_r_m(regs.FUNC_DECL, targetFunc.plus(offsets.WasmFunction_decl));
 			saveIVar(regs.FUNC_DECL);
 			asm.jmp_rel_addr(tailCallReentryRef);
 
@@ -1302,7 +1303,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// Custom code to tail-call the runtime
 			asm.movq_r_r(regs.tmp3, regs.VSP); // save VSP from being overwritten
 			var abs = refRuntimeCall(this.i.runtime_callHost);
-			var args = [target_func];
+			var args = [targetFunc];
 			// Generate parallel moves from args into param gprs; assume each src register used only once
 			var dst = Array<X86_64Gpr>.new(G.length);
 			for (i < args.length) {
@@ -1346,8 +1347,18 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
 			// Load table.funcs[func_index] into r1 and jump to calling sequence
 			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
-			asm.movq_r_m(regs.tmp1, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
-			asm.jmp_rel_near(tailCallFunction);
+			asm.movq_r_m(targetFunc, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
+			asm.jmp_rel_near(tailCallFunction); // XXX: duplicate tail call sequence here?
+		}
+		
+		bindHandler(Opcode.RETURN_CALL_REF); {
+			// XXX: save ip prior to call for stack traces?
+			genSkipLeb(); // skip signature index
+			asm.sub_r_i(vsp, valuerep.slot_size);
+			asm.movq_r_m(targetFunc, vsph[0].value);
+			asm.q.cmp_r_i(targetFunc, 0);
+			asm.jc_rel_near(X86_64Conds.NZ, tailCallFunction);
+			genTrap(TrapReason.NULL_DEREF);
 		}
 	}
 	def genCopyStackValsToVfp(cnt: X86_64Gpr, i: X86_64Gpr) {
