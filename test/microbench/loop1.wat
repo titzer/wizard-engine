@@ -1,4 +1,7 @@
 (module
+  (func $start (export "_start")
+    (call $main)
+  )
   (func $main (export "main")
     (local $y i32)
     (local $z i32)
