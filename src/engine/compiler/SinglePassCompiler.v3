@@ -28,6 +28,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	var opcode_pos: int;
 	var success = true;
 	var trap_label: MasmLabel;
+	var unwind_label: MasmLabel;
 
 	new() {
 		masm.unimplemented = unsupported;
@@ -40,6 +41,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		start_pos = 0;
 		sig = func.sig;
 		trap_label = null;
+		unwind_label = null;
 
 		// Initialize parameters, locals, and first control stack entry.
 		var ret_label = masm.newLabel(func.code.code.length);
@@ -74,7 +76,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_m_r(MasmAddr(regs.sp, c.instance_offset), regs.instance, ValueKind.REF);
 		// Load wf.decl and spill
 		masm.emit_mov_r_m(regs.func, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
-		masm.emit_mov_m_r(MasmAddr(regs.sp, c.instance_offset), regs.func, ValueKind.REF);
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.func_decl_offset), regs.func, ValueKind.REF);
 		// spill 0 for EIP, STP
 		masm.emit_mov_m_l(MasmAddr(regs.sp, c.eip_offset), 0);
 		masm.emit_mov_m_l(MasmAddr(regs.sp, c.stp_offset), 0);
@@ -82,6 +84,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_sub_r_l(regs.vfp, sig.params.length * masm.valuerep.slot_size);
+		// XXX: skip spilling of VFP
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.vfp_offset), regs.vfp, ValueKind.REF);
 
 		// Load instance.memories[0].start into MEM0_BASE and spill
 		if (module.memories.length > 0) {
@@ -123,6 +127,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
 				state.pushLoop(params, results, masm.newLabel(opcode_pos));
 				var ctl_top = state.ctl_stack.peek();
+				state.prepareLoop(emitSlotTransfer);
 				masm.bindLabel(ctl_top.label);
 			}
 			Opcode.IF.code => {
@@ -205,6 +210,42 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				masm.emit_br(target.label);
 				state.setUnreachable();
 			}
+			Opcode.CALL.code => {
+				var func = parser.readFuncRef();
+				state.emitSpill(emitSlotTransfer);
+				var c = masm.regAlloc.regConfig;
+				var regs = c.regs;
+				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+				// XXX: skip loading the target function for direct intra-module calls?
+				masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
+				masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.func_arg, offsets.Array_contents + func.func_index * offsets.REF_SIZE));
+
+				masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
+				if (state.sp > 0) masm.emit_add_r_l(c.regs.vsp, int.view(state.sp) * masm.valuerep.slot_size);
+
+				if (func.imp == null) {
+					// XXX: emit a direct intra-module call
+					var tmp = regs.ip; // TODO: more robust register choice for indirect call
+					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
+					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
+					masm.emit_call_r(tmp);
+				} else {
+					bailout("call to imported function"); // TODO
+				}
+				// check for early return
+				if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
+				masm.emit_brne_r_i(c.regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
+				// reload VFP
+				// XXX: recompute VFP from VSP?
+				masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, c.vfp_offset));
+
+				// adjust abstract state
+				for (i < func.sig.params.length) state.pop();
+				for (t in func.sig.results) {
+					state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
+				}
+			}
 			Opcode.DROP.code => {
 				state.sp--;
 			}
@@ -257,18 +298,18 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var lv = state.get(index);
 				var sv = state.peek();
 				if (sv.isConst()) {
-					var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | IS_CONST;
+					var flags = lv.kindFlags(TAG_STORED | IS_CONST);
 					state.set(index, flags, NO_REG, sv.const);
 				} else if (sv.inReg()) {
 					masm.emit_mov_s_r(index, sv.reg, sv.kind());
-					var flags = (lv.flags & (KIND_MASK | TAG_STORED));
+					var flags = lv.kindFlags(TAG_STORED | IS_STORED);
 					state.set(index, flags, NO_REG, 0);
 				} else {
 					var tos = state.sp - 1;
 					var reg = allocReg(lv.kind());
 					emit_read_slot_r(tos, reg);
 					emit_write_slot_r(index, reg);
-					var flags = (lv.flags & (KIND_MASK | TAG_STORED));
+					var flags = lv.kindFlags(TAG_STORED | IS_STORED);
 					state.set(index, flags, NO_REG, 0);
 					state.overwrite(lv.kindFlags(IN_REG), reg.reg, 0);
 				}
@@ -535,10 +576,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var c = masm.regAlloc.regConfig;
 		masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
 		if (results.length > 0)	masm.emit_add_r_l(c.regs.vsp, results.length * masm.valuerep.slot_size);
-		// Deallocate stack frame
-		masm.emit_add_r_l(c.regs.sp, c.spcFrameSize);
 		// Return to caller
 		masm.emit_mov_r_i(c.regs.ret_ExecState, ExecState.FINISHED.tag);
+		// Deallocate stack frame
+		if (unwind_label != null) masm.bindLabel(unwind_label);
+		masm.emit_add_r_l(c.regs.sp, c.spcFrameSize);
 		masm.emit_ret();
 	}
 	def emitTrap(reason: TrapReason) {
@@ -1033,6 +1075,17 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 		var ctl = pushControl(Opcode.LOOP.code, params, results, start_label);
 		return ctl;
 	}
+	def prepareLoop(emitSlotTransfer: ((u32, SpcAbstractVal), (u32, SpcAbstractVal)) -> void) {
+		var target = ctl_stack.peek();
+		target.merge_count = 1;
+		target.merge_state = Arrays.range(state, 0, int.view(sp));
+		for (i < sp) {
+			var from = state[i], to = toMergeVal(from);
+			target.merge_state[i] = to;
+			state[i] = to;
+			if (from != to) emitSlotTransfer((i, to), (i, from));
+		}
+	}
 	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.IF.code, params, results, end_label);
 		ctl.else_label = else_label;
@@ -1067,7 +1120,8 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 			return; // do nothing
 		}
 		if (Trace.compiler) OUT.puts("    xfer").outln();
-		var vals = u32.view(target.results.length), top = target.val_stack_top, max = top + vals;
+		var vals = u32.view(if(target.opcode == Opcode.LOOP.code, target.params, target.results).length);
+		var top = target.val_stack_top, max = top + vals;
 		if (target.merge_count == 0) {
 			if (Trace.compiler) OUT.puts("    merge_count=1").outln();
 			target.merge_count = 1;
@@ -1097,6 +1151,17 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 				// TODO: write tag based on mismatch on this stack's target slot
 				emitSlotTransfer((t, to), (f, from));
 			}
+		}
+	}
+	def emitSpill(emitSlotTransfer: ((u32, SpcAbstractVal), (u32, SpcAbstractVal)) -> void) {
+		if (Trace.compiler) OUT.puts("    spill all").outln();
+		for (i < sp) {
+			var sv = state[i];
+			if (sv.isStored()) continue;
+			var tv = SpcAbstractVal(sv.kindFlags(IS_STORED), NO_REG, 0);
+			var slot = u32.view(i);
+			emitSlotTransfer((slot, tv), (slot, sv));
+			if (sv.inReg()) regAlloc.free(sv.reg);
 		}
 	}
 	private def toMergeVal(from: SpcAbstractVal) -> SpcAbstractVal {
