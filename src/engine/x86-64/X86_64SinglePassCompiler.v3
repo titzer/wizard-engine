@@ -7,3 +7,74 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		super(X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy()), extensions, limits, module) {
 	}
 }
+
+def ucontext_rip_offset = 168;
+def ucontext_rsp_offset = 160;
+def SIGFPE  = 8;
+def SIGBUS  = 10;
+def SIGSEGV = 11;
+
+// Implements the RiUserCode interface to add generated machine code to the V3 runtime.
+// Handles stackwalking and signals in JITed code.
+class X86_64SpcCode extends RiUserCode {
+	def mapping: Mapping;
+	def frameSize = IVarConfig.frameSize;
+	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
+	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
+	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
+	var buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
+
+	new(mapping) super(mapping.range.start, mapping.range.end) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		var msg = "\tin [spc-jit] ";
+		out(msg, 0, msg.length);
+		var instance = (sp + IVarConfig.frame.INSTANCE.disp).load<Instance>();
+		var func = (sp + IVarConfig.frame.FUNC_DECL.disp).load<FuncDecl>();
+		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
+		func.render(instance.module.names, buf);
+		buf.ln().out(out);
+		buf.reset();
+	}
+
+	// Called from V3 runtime for a frame where {ip} is in interpreter code.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp += frameSize;	 // assume frame is allocated
+		ip = sp.load<Pointer>(); // return address on stack
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+
+	// Called from V3 runtime when the garbage collector needs to scan an interpreter stack frame.
+	def scanFrame(ip: Pointer, sp: Pointer) {
+		// Handle other roots in the frame
+		RiGc.scanRoot(sp + IVarConfig.frame.FUNC_DECL.disp);
+		RiGc.scanRoot(sp + IVarConfig.frame.INSTANCE.disp);
+	}
+
+	// Called from V3 runtime to handle an OS-level signal that occurred while {ip} was in interpreter code.
+	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool {
+		var pip = ucontext + ucontext_rip_offset;
+		var ip = pip.load<Pointer>();
+		if (Trace.interpreter) {
+			Trace.OUT.put2("  !signal %d in JIT code @ 0x%x", signum, ip - Pointer.NULL).outln();
+		}
+		match (signum) {
+			SIGFPE => {
+				// presume divide/modulus by zero
+				pip.store<Pointer>(start + divZeroHandlerOffset);
+				return true;
+			}
+			SIGBUS, SIGSEGV => {
+				var addr = RiOs.getAccessAddress(siginfo, ucontext);
+				if (RedZones.isInRedZone(addr)) {
+					pip.store<Pointer>(start + stackOverflowHandlerOffset);
+					return true;
+				}
+				pip.store<Pointer>(start + oobMemoryHandlerOffset);
+				return true;
+			}
+		}
+		return true;
+	}
+}
