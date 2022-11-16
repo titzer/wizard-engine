@@ -255,6 +255,55 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 				}
 			}
+			Opcode.CALL_REF.code => {
+				var sig = parser.readSigRef();
+				var c = masm.regAlloc.regConfig, regs = c.regs;
+				var sv = state.pop();
+				if (sv.isConst() && sv.const == 0) {
+					emitTrap(TrapReason.NULL_DEREF);
+					state.setUnreachable();
+					return;
+				}
+				if (!sv.inReg()) {
+					emit_read_slot_r(state.sp, SpcReg(regs.func_arg, ValueKind.REF));
+				} else if (sv.reg != regs.func_arg) {
+					masm.emit_mov_r_r(regs.func_arg, sv.reg);
+				}
+				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
+				state.emitSpill(emitSlotTransfer);
+
+				masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
+				if (state.sp > 0) masm.emit_add_r_l(c.regs.vsp, int.view(state.sp) * masm.valuerep.slot_size);
+				// check for null
+				masm.emit_breq_r_l(regs.func_arg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
+
+				// check for WasmFunction
+				var tmp = regs.ip;
+				masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+				masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
+				masm.emit_call_runtime_callHost(regs.func_arg);
+				masm.emit_br(retpt);
+
+				masm.bindLabel(wasmcall_label);
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
+				masm.emit_call_r(tmp);
+				// check for early return
+				masm.bindLabel(retpt);
+				if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
+				masm.emit_brne_r_i(c.regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
+				// reload VFP
+				// XXX: recompute VFP from VSP?
+				masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, c.vfp_offset));
+
+				// adjust abstract state
+				for (i < sig.params.length) state.pop();
+				for (t in sig.results) {
+					state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
+				}
+				freeVal(sv);
+			}
 			Opcode.DROP.code => {
 				state.sp--;
 			}
@@ -436,6 +485,16 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				state.push(KIND_REF | IS_CONST, NO_REG, 0);
 			}
 			Opcode.REF_IS_NULL.code => emitUnop(SpcUnop.REF_IS_NULL);
+			Opcode.REF_FUNC.code => {
+				var c = masm.regAlloc.regConfig, regs = c.regs;
+				var func_index = codeptr.read_uleb32();
+				var reg = allocReg(ValueKind.REF).reg;
+				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+				// XXX: skip loading the target function for direct intra-module calls?
+				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_functions));
+				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Array_contents + int.!(func_index) * offsets.REF_SIZE));
+				state.push(KIND_REF | IN_REG, reg, 0);
+			}
 			Opcode.REF_EQ.code => emitBinop(SpcBinop.REF_EQ);
 			_ => unsupported();
 		}
