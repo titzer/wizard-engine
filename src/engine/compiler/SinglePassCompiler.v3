@@ -215,6 +215,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Opcode.CALL.code => {
 				var func = parser.readFuncRef();
+				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
 				state.emitSpill(emitSlotTransfer);
 				var c = masm.regAlloc.regConfig;
 				var regs = c.regs;
@@ -226,17 +227,22 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				masm.emit_mov_r_r(c.regs.vsp, c.regs.vfp); // XXX: use 3-addr adjustment of VSP
 				if (state.sp > 0) masm.emit_add_r_l(c.regs.vsp, int.view(state.sp) * masm.valuerep.slot_size);
 
-				if (func.imp == null) {
-					// XXX: emit a direct intra-module call
-					var tmp = regs.ip; // TODO: more robust register choice for indirect call
-					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
-					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
-					masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
-					masm.emit_call_r(tmp);
-				} else {
-					bailout("call to imported function"); // TODO
+				if (func.imp != null) {
+					// call to imported function must first check for WasmFunction
+					var tmp = regs.ip;
+					masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+					masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
+					masm.emit_call_runtime_callHost(regs.func_arg);
+					masm.emit_br(retpt);
 				}
+				var tmp = regs.ip; // TODO: more robust register choice for indirect call
+				masm.bindLabel(wasmcall_label);
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
+				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
+				masm.emit_call_r(tmp);
 				// check for early return
+				masm.bindLabel(retpt);
 				if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
 				masm.emit_brne_r_i(c.regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
 				// reload VFP
@@ -1138,8 +1144,9 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 		if (Trace.compiler) OUT.puts("    spill all").outln();
 		for (i < sp) {
 			var sv = state[i];
-			if (sv.isStored()) continue;
-			var tv = SpcAbstractVal(sv.kindFlags(IS_STORED), NO_REG, 0);
+			var stored = IS_STORED | TAG_STORED;
+			if (stored == (sv.flags & stored)) continue;
+			var tv = SpcAbstractVal(sv.kindFlags(stored), NO_REG, 0);
 			var slot = u32.view(i);
 			emitSlotTransfer((slot, tv), (slot, sv));
 			if (sv.inReg()) regAlloc.free(sv.reg);
