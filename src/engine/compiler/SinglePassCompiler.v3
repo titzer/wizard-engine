@@ -4,12 +4,6 @@
 var config_TrackFloatZeroConst = false;
 def INITIAL = 16;
 def OUT = Trace.OUT;
-var offsets: V3Offsets;
-
-def getOffsets() -> V3Offsets {
-	if (offsets == null) offsets = V3Offsets.new();
-	return offsets;
-}
 
 // TODO: unreachable
 // TODO: traps in JIT code
@@ -39,7 +33,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 
 	def gen(func: FuncDecl) -> bool {
-		if (Trace.compiler) OUT.put1("begin compile: %q", func.render(module.names, _)).outln();
+		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).outln();
 		var d = codeptr.reset(func.code.code, 0, func.code.code.length);
 
 		start_pos = 0;
@@ -68,7 +62,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def emitPrologue() {
 		var c = masm.regAlloc.regConfig;
 
-		var offsets = getOffsets();
+		var offsets = masm.getOffsets();
 		// Allocate stack frame
 		masm.emit_sub_r_l(regs.sp, c.spcFrameSize);
 
@@ -94,7 +88,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (module.memories.length > 0) {
 			// XXX: skip loading memory base if function doesn't access memory
 			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_memories));
-			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.mem0, offsets.Array_contents));
+			masm.emit_read_v3_array_r_i(regs.mem0, regs.mem0, 0, ValueKind.REF);
 			masm.emit_mov_m_r(MasmAddr(regs.sp, c.mem_offset), regs.mem0, ValueKind.REF);
 		} else {
 			masm.emit_mov_m_l(MasmAddr(regs.sp, c.mem_offset), 0);
@@ -215,43 +209,98 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			}
 			Opcode.CALL.code => {
 				var func = parser.readFuncRef();
+				var offsets = masm.getOffsets();
 				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
 				state.emitSpill(emitSlotTransfer);
 				var c = masm.regAlloc.regConfig;
 				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
 				// XXX: skip loading the target function for direct intra-module calls?
 				masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
-				masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.func_arg, offsets.Array_contents + func.func_index * offsets.REF_SIZE));
+				masm.emit_read_v3_array_r_i(regs.func_arg, regs.func_arg, func.func_index, ValueKind.REF);
 
 				masm.emit_mov_r_r(regs.vsp, regs.vfp); // XXX: use 3-addr adjustment of VSP
 				if (state.sp > 0) masm.emit_add_r_l(regs.vsp, int.view(state.sp) * masm.valuerep.slot_size);
 
+				var tmp = regs.ip; // TODO: more robust register choice for indirect call
 				if (func.imp != null) {
 					// call to imported function must first check for WasmFunction
-					var tmp = regs.ip;
 					masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
 					masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
 					masm.emit_call_runtime_callHost(regs.func_arg);
 					masm.emit_br(retpt);
 				}
-				var tmp = regs.ip; // TODO: more robust register choice for indirect call
 				masm.bindLabel(wasmcall_label);
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
 				masm.emit_call_r(tmp);
-				// check for early return
 				masm.bindLabel(retpt);
-				if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
-				masm.emit_brne_r_i(regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
-				// reload VFP
-				// XXX: recompute VFP from VSP?
-				masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, c.vfp_offset));
+				emit_unwind_check();
+				emit_reload_vfp();
 
 				state.popArgsAndPushResults(func.sig);
 			}
+			Opcode.CALL_INDIRECT.code => {
+				var sig = parser.readSigRef();
+				var offsets = masm.getOffsets();
+				var table_index = codeptr.read_uleb32();
+				var sv = state.pop();
+				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
+				state.emitSpill(emitSlotTransfer);
+				if (sv.isConst()) {
+					masm.emit_mov_r_i(regs.func_arg, sv.const);
+				} else if (!sv.inReg()) {
+					emit_read_slot_r(state.sp, SpcReg(regs.func_arg, ValueKind.REF));
+				} else if (sv.reg != regs.func_arg) {
+					masm.emit_mov_r_r(regs.func_arg, sv.reg);
+				}
+				// reload instance from frame
+				var c = masm.regAlloc.regConfig;
+				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+
+				var tmp1 = regs.stp; // TODO: allocate and release temp regs
+				var tmp2 = regs.ip;
+
+				// load table[table_index] from instance
+				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_tables));
+				masm.emit_read_v3_array_r_i(tmp1, tmp1, int.!(table_index), ValueKind.REF);
+				// bounds check
+				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
+				masm.emit_bounds_check_v3_array(tmp2, regs.func_arg, masm.newTrapLabel(TrapReason.FUNC_INVALID));
+				// signature check
+				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
+				masm.emit_read_v3_array_r_r(tmp2, tmp2, regs.func_arg, ValueKind.I32);
+				masm.emit_breq_r_i(tmp2, -1, masm.newTrapLabel(TrapReason.FUNC_INVALID));
+				masm.emit_brne_r_i(tmp2, sig.canon_id, masm.newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
+				// load from table
+				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_funcs));
+				masm.emit_read_v3_array_r_r(regs.func_arg, tmp2, regs.func_arg, ValueKind.REF);
+
+				masm.emit_mov_r_r(regs.vsp, regs.vfp); // XXX: use 3-addr adjustment of VSP
+				if (state.sp > 0) masm.emit_add_r_l(regs.vsp, int.view(state.sp) * masm.valuerep.slot_size);
+
+				// check for WasmFunction
+				masm.emit_mov_r_m(tmp1, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+				masm.emit_breq_r_i(tmp1, offsets.WasmFunction_typeId, wasmcall_label);
+				masm.emit_call_runtime_callHost(regs.func_arg);
+				masm.emit_br(retpt);
+
+				masm.bindLabel(wasmcall_label);
+				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(tmp1, offsets.FuncDecl_code));
+				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(tmp1, offsets.Code_target_code));
+				masm.emit_call_r(tmp1);
+				// merge point for both returns
+				masm.bindLabel(retpt);
+				emit_unwind_check();
+				emit_reload_vfp();
+
+				state.popArgsAndPushResults(sig);
+				freeVal(sv);
+			}
 			Opcode.CALL_REF.code => {
 				var sig = parser.readSigRef();
+				var offsets = masm.getOffsets();
 				var regs = masm.regAlloc.regConfig.regs;
 				var sv = state.pop();
 				var c = masm.regAlloc.regConfig;
@@ -273,25 +322,23 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				// check for null
 				masm.emit_breq_r_l(regs.func_arg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
 
-				// check for WasmFunction
-				var tmp = regs.ip;
+				var tmp = regs.ip; // TODO: allocate and release tmp regs
 				masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
 				masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
+				// not a WasmFunction
 				masm.emit_call_runtime_callHost(regs.func_arg);
 				masm.emit_br(retpt);
 
+				// WasmFunction
 				masm.bindLabel(wasmcall_label);
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_code));
 				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.Code_target_code));
 				masm.emit_call_r(tmp);
-				// check for early return
+
 				masm.bindLabel(retpt);
-				if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
-				masm.emit_brne_r_i(regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
-				// reload VFP
-				// XXX: recompute VFP from VSP?
-				masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, c.vfp_offset));
+				emit_unwind_check();
+				emit_reload_vfp();
 
 				state.popArgsAndPushResults(sig);
 				freeVal(sv);
@@ -479,12 +526,13 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			Opcode.REF_IS_NULL.code => emitUnop(SpcUnop.REF_IS_NULL);
 			Opcode.REF_FUNC.code => {
 				var c = masm.regAlloc.regConfig;
+				var offsets = masm.getOffsets();
 				var func_index = codeptr.read_uleb32();
 				var reg = allocReg(ValueKind.REF).reg;
 				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
 				// XXX: skip loading the target function for direct intra-module calls?
 				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_functions));
-				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Array_contents + int.!(func_index) * offsets.REF_SIZE));
+				masm.emit_read_v3_array_r_i(reg, reg, int.!(func_index), ValueKind.REF);
 				state.push(KIND_REF | IN_REG, reg, 0);
 			}
 			Opcode.REF_EQ.code => emitBinop(SpcBinop.REF_EQ);
@@ -848,6 +896,15 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def emit_write_slot_r(slot: u32, reg: SpcReg) {
 		masm.emit_mov_s_r(slot, reg.reg, reg.kind);
+	}
+	def emit_unwind_check() {
+		if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
+		masm.emit_brne_r_i(regs.ret_ExecState, ExecState.FINISHED.tag, unwind_label);
+	}
+	def emit_reload_vfp() {
+		// reload VFP
+		// XXX: recompute VFP from VSP?
+		masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, masm.regAlloc.regConfig.vfp_offset));
 	}
 
 	//====================================================================
