@@ -86,7 +86,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			// XXX: skip loading memory base if function doesn't access memory
 			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_memories));
 			masm.emit_read_v3_array_r_i(regs.mem0, regs.mem0, 0, ValueKind.REF);
-			// TODO: read the actual base from the memory object
+			masm.emit_read_v3_mem_base(regs.mem0, regs.mem0);
 			masm.emit_mov_m_r(MasmAddr(regs.sp, c.mem_offset), regs.mem0, ValueKind.REF);
 		}
 	}
@@ -231,7 +231,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				masm.emit_call_r(tmp);
 				masm.bindLabel(retpt);
 				emit_unwind_check();
-				emit_reload_vfp();
+				emit_reload_regs();
 
 				state.popArgsAndPushResults(func.sig);
 			}
@@ -242,13 +242,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				var sv = state.pop();
 				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
 				state.emitSpill(emitSlotTransfer);
-				if (sv.isConst()) {
-					masm.emit_mov_r_i(regs.func_arg, sv.const);
-				} else if (!sv.inReg()) {
-					emit_read_slot_r(state.sp, SpcReg(regs.func_arg, ValueKind.REF));
-				} else if (sv.reg != regs.func_arg) {
-					masm.emit_mov_r_r(regs.func_arg, sv.reg);
-				}
+				ensure_reg(sv, state.sp, regs.func_arg);
 				// reload instance from frame
 				var c = masm.regAlloc.regConfig;
 				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
@@ -287,7 +281,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 				// merge point for both returns
 				masm.bindLabel(retpt);
 				emit_unwind_check();
-				emit_reload_vfp();
+				emit_reload_regs();
 
 				state.popArgsAndPushResults(sig);
 				freeVal(sv);
@@ -303,11 +297,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					state.setUnreachable();
 					return;
 				}
-				if (!sv.inReg()) {
-					emit_read_slot_r(state.sp, SpcReg(regs.func_arg, ValueKind.REF));
-				} else if (sv.reg != regs.func_arg) {
-					masm.emit_mov_r_r(regs.func_arg, sv.reg);
-				}
+				ensure_reg(sv, state.sp, regs.func_arg);
 				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
 				state.emitSpill(emitSlotTransfer);
 
@@ -331,7 +321,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 				masm.bindLabel(retpt);
 				emit_unwind_check();
-				emit_reload_vfp();
+				emit_reload_regs();
 
 				state.popArgsAndPushResults(sig);
 				freeVal(sv);
@@ -404,6 +394,20 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 					state.overwrite(lv.kindFlags(IN_REG), reg.reg, 0);
 				}
 			}
+			Opcode.I32_LOAD.code => emitLoad(ValueKind.I32, masm.emit_load_r_r_r_i);
+			Opcode.I64_LOAD.code => emitLoad(ValueKind.I64, masm.emit_load_r_r_r_i);
+			Opcode.F32_LOAD.code => emitLoad(ValueKind.F32, masm.emit_load_r_r_r_i);
+			Opcode.F64_LOAD.code => emitLoad(ValueKind.F64, masm.emit_load_r_r_r_i);
+			Opcode.I32_LOAD8_S.code => emitLoad(ValueKind.I32, masm.emit_loadbsx_r_r_r_i);
+			Opcode.I32_LOAD8_U.code => emitLoad(ValueKind.I32, masm.emit_loadbzx_r_r_r_i);
+			Opcode.I32_LOAD16_S.code => emitLoad(ValueKind.I32, masm.emit_loadwsx_r_r_r_i);
+			Opcode.I32_LOAD16_U.code => emitLoad(ValueKind.I32, masm.emit_loadwzx_r_r_r_i);
+			Opcode.I64_LOAD8_S.code => emitLoad(ValueKind.I64, masm.emit_loadbsx_r_r_r_i);
+			Opcode.I64_LOAD8_U.code => emitLoad(ValueKind.I64, masm.emit_loadbzx_r_r_r_i);
+			Opcode.I64_LOAD16_S.code => emitLoad(ValueKind.I64, masm.emit_loadwsx_r_r_r_i);
+			Opcode.I64_LOAD16_U.code => emitLoad(ValueKind.I64, masm.emit_loadwzx_r_r_r_i);
+			Opcode.I64_LOAD32_S.code => emitLoad(ValueKind.I64, masm.emit_loaddsx_r_r_r_i);
+			Opcode.I64_LOAD32_U.code => emitLoad(ValueKind.I64, masm.emit_loaddzx_r_r_r_i);
 			Opcode.I32_CONST.code => {
 				var val = codeptr.read_sleb32();
 				state.push(KIND_I32 | IS_CONST, NO_REG, val);
@@ -644,12 +648,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			state.emitTransfer(target, emitSlotTransfer);
 			masm.emit_br(target.label);
 		} else {
-			var reg = SpcReg(sv.reg, ValueKind.I32);
-			if (!sv.inReg()) {
-				reg = allocReg(ValueKind.I32);
-				masm.emit_mov_r_s(reg.reg, reg.kind, state.sp);
-			}
-			masm.emit_br_table_r(reg.reg, targets);
+			var reg = ensure_reg(sv, state.sp, NO_REG);
+			masm.emit_br_table_r(reg, targets);
 			freeReg(reg);
 
 			for (depth < labels.length) {
@@ -899,16 +899,57 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (slots > 0) masm.emit_add_r_l(regs.vsp, int.view(slots) * masm.valuerep.slot_size);
 		// TODO: actually spill VSP into frame?
 	}
-	def emit_reload_vfp() {
+	def emit_reload_regs() {
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(regs.vfp, ValueKind.REF, MasmAddr(regs.sp, masm.regAlloc.regConfig.vfp_offset));
+		if (module.memories.length > 0) {
+			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.sp, masm.regAlloc.regConfig.mem_offset));
+		}
+	}
+	def ensure_reg(sv: SpcAbstractVal, slot: u32, reg: Reg) -> Reg {
+		if (!sv.inReg()) {
+			if (reg == NO_REG) reg = allocReg(sv.kind()).reg;
+			if (sv.isConst()) masm.emit_mov_r_i(reg, sv.const);
+			else masm.emit_mov_r_s(reg, sv.kind(), slot);
+			return reg;
+		}
+		if (reg == NO_REG) return sv.reg;
+		masm.emit_mov_r_r(reg, sv.reg);
+		return reg;
+	}
+	def emitLoad(kind: ValueKind, meth: (Reg, Reg, Reg, u32, ValueKind) -> ())  {
+		var flags = codeptr.read1();
+		var mem_index = if((flags & BpConstants.MEMARG_INDEX_FLAG) != 0, codeptr.read_uleb32());
+		if (mem_index != 0) bailout("unsupported multi-memory operation");
+		var offset = codeptr.read_uleb32();
+		var iv = state.pop();
+		var reg: Reg;
+		if (iv.isConst()) {
+			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
+			if (sum > u32.max) {
+				masm.emit_br(masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS)); // statically OOB
+				state.setUnreachable();
+				state.push(kindToFlags(kind), NO_REG, 0);
+				return;
+			}
+			offset = u32.view(sum);
+		} else {
+			reg = ensure_reg(iv, state.sp, NO_REG);
+		}
+		var dest = reg;
+		if (kind != ValueKind.I32) dest = allocReg(kind).reg;
+		meth(dest, regs.mem0, reg, offset, kind);
+		if (dest != reg) freeReg(reg);
+		var nflags = IN_REG | kindToFlags(kind);
+		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
+		state.push(nflags, dest, 0);
 	}
 
 	//====================================================================
 	// register allocation operations
 	//====================================================================
-	def freeReg(reg: SpcReg) {
-		masm.regAlloc.free(reg.reg);
+	def freeReg(reg: Reg) {
+		masm.regAlloc.free(reg);
 	}
 	def freeVal(sv: SpcAbstractVal) {
 		if (sv.inReg()) masm.regAlloc.free(sv.reg);
@@ -1361,6 +1402,16 @@ def toTag(vt: ValueType) -> ValueKind {
 }
 def typeToKindFlags(vt: ValueType) -> byte {
 	match (vt) {
+		I32 => return KIND_I32;
+		I64 => return KIND_I64;
+		F32 => return KIND_F32;
+		F64 => return KIND_F64;
+		V128 => return KIND_V128;
+		_ => return KIND_REF;
+	}
+}
+def kindToFlags(kind: ValueKind) -> byte {
+	match (kind) {
 		I32 => return KIND_I32;
 		I64 => return KIND_I64;
 		F32 => return KIND_F32;
