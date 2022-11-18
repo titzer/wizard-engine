@@ -8,8 +8,8 @@ component V3Interpreter {
 	var instrTracer: InstrTracer;
 	def val_stack = ArrayStack<Value>.new();   // XXX: inline value stack array and top
 	def codeptr = CodePtr.new(null);	// pointer into code
-	private var frame: Frame;		// cached of top-of-stack frame, TODO: V3Interpreter
-	private def call_stack = ArrayStack<Frame>.new();
+	private var frame: V3Frame;		// cached of top-of-stack frame, TODO: V3Interpreter
+	def call_stack = ArrayStack<V3Frame>.new();
 	private var entry: Function;		// entrypoint function from {run()}
 
 	def run(f: Function, args: Array<Value>) -> Result {
@@ -37,30 +37,21 @@ component V3Interpreter {
 		return Result.Break;
 	}
 	def reset() {
+		for (f in call_stack.elems) if (f != null) f.accessor = null;
 		frame = null;
 		val_stack.top = 0;
 		call_stack.top = 0;
-	}
-	def getTopFrame() -> Frame {
-		return frame;
-	}
-	def getCallStack() -> ArrayStack<Frame> {
-		return call_stack;
-	}
-	def getCallDepth() -> int {
-		return call_stack.top;
 	}
 	def pushFrame(f: WasmFunction) {
 		if (call_stack.top >= E.limits.max_call_depth) {
 			return trap(TrapReason.STACK_OVERFLOW);
 		}
-		if (Trace.interpreter) traceFrame(f);
 		// Allocate a frame
 		var nf = call_stack.next();
 		if (nf != null) {  // reuse cached Frame object if possible
 			call_stack.top++;
 		} else {
-			nf = Frame.new();
+			nf = V3Frame.new();
 			call_stack.push(nf);
 		}
 		var sp = val_stack.top;
@@ -69,6 +60,7 @@ component V3Interpreter {
 		nf.func = f;
 		nf.pc = 0;
 		nf.xip = 0;
+		nf.accessor = null;
 		var code = f.decl.code.code;
 		codeptr.reset(code, 0, code.length);
 		// Initialize locals
@@ -102,13 +94,8 @@ component V3Interpreter {
 		nf.pc = codeptr.pos; // move code pointer after locals
 		frame = nf;
 	}
-	def traceFrame(f: WasmFunction) {
-		for (i < call_stack.top) OUT.sp();
-		OUT.put2("pushFrame(func %q: %q)", f.renderShort, f.decl.sig.render).outln();
-	}
 	def loop() {
 		while (E.state == ExecState.RUN) {
-			if (Trace.interpreter) traceStep(); // TODO: make into a probe
 			if (E.probes != null) E.fireProbes(frame.func, frame.pc, TargetFrame(frame));
 			var pc = codeptr.pos;
 			var opcode = codeptr.read1();
@@ -993,6 +980,7 @@ component V3Interpreter {
 	def doReturn() {
 		var count = frame.func.decl.sig.results.length;
 		copyVals(count, frame.fp);
+		frame.accessor = null;
 		call_stack.pop();
 		frame = call_stack.peek();
 		if (frame == null) {  // popped top frame, finished execution
@@ -1169,7 +1157,7 @@ component V3Interpreter {
 	}
 	def traceStep() {
 		for (i < call_stack.top) OUT.sp();
-		OUT.put1("+%d: ", codeptr.pos);  // XXX: fixed with decimal offset
+		OUT.put1("+%d: ", codeptr.pos);  // XXX: fixed width decimal offset
 		var module = if(frame.func.instance != null, frame.func.instance.module);
 		var opcode = codeptr.data[codeptr.pos];
 		if (instrTracer == null) instrTracer = InstrTracer.new();
@@ -1351,12 +1339,91 @@ def SYNTH_CODE = Code.new([
 	Opcode.END.code
 ]);
 
-enum RefKind {
-	NULL,
-	I31,
-	STRUCT,
-	ARRAY,
-	FUNC,
-	EXTERN,
-	INVALID
+class V3Frame {
+	var func: WasmFunction;
+	var fp: int;
+	var pc: int;
+	var xip: int;
+	var accessor: V3FrameAccessor;
+}
+
+class V3FrameAccessor(frame: V3Frame) extends FrameAccessor {
+	var cached_caller: V3Frame;
+	var cached_depth = -1;
+	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
+	def isUnwound() -> bool {
+		return frame.accessor != this;
+	}
+	// Returns the Wasm function in this frame.
+	def func() -> WasmFunction {
+		checkNotUnwound();
+		return frame.func;
+	}
+	// Returns the current program counter.
+	def pc() -> int {
+		checkNotUnwound();
+		return frame.pc;
+	}
+	// Returns {true} if this frame is currently the top executing frame, {false} if the
+	// frame has called another function or been unwound.
+	def isTop() -> bool {
+		return if(!isUnwound(), V3Interpreter.call_stack.peek() == frame);
+	}
+	// Returns the call depth of this frame within its segment, with the bottom frame being #0.
+	def depth() -> int {
+		checkNotUnwound();
+		if (cached_depth < 0) cached_depth = computeDepth();
+		return cached_depth;
+	}
+	private def computeDepth() -> int {
+		if (cached_caller != null) {
+			var a = cached_caller.accessor;
+			if (a != null && a.cached_depth >= 0) return a.cached_depth + 1;
+		}
+		for (i = V3Interpreter.call_stack.top - 1; i >= 0; i--) {
+			var f = V3Interpreter.call_stack.elems[i];
+			if (f == frame) return i;
+			// do a drive-by calculation of non-matching frame depth
+			var a = f.accessor;
+			if (a != null && a.cached_depth < 0) a.cached_depth = i;
+		}
+		return 0; // TODO: not found. error?
+	}
+	// Get the caller frame. If none, then {Frame.func} will be {null}.
+	def caller() -> ProbeFrame {
+		checkNotUnwound();
+		if (cached_caller == null) ; // TODO
+		return ProbeFrame(cached_caller.func, cached_caller.pc, TargetFrame(cached_caller));
+	}
+	// Get the number of local variables in this frame.
+	def numLocals() -> int {
+		checkNotUnwound();
+		return frame.func.decl.code.num_locals;
+	}
+	// Get the value of local variable {i}.
+	def getLocal(i: int) -> Value {
+		checkNotUnwound();
+		if (u32.view(i) >= frame.func.decl.code.num_locals) System.error("FrameAccessorError", "local index out-of-bounds");
+		return V3Interpreter.val_stack.elems[frame.fp + i];
+	}
+	// Set the value of a local variable. (dynamically typechecked).
+	def setLocal(i: int, v: Value);
+	// Get the number of operand stack elements.
+	def numOperands() -> int {
+		checkNotUnwound();
+		if (!isTop()) System.error("FrameAccessorError", "numOperands only supported for top frame"); // TODO
+		return V3Interpreter.val_stack.top - (frame.fp + frame.func.decl.code.num_locals);
+	}
+	// Get operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc.
+	def getOperand(i: int) -> Value {
+		checkNotUnwound();
+		if (!isTop()) System.error("FrameAccessorError", "numOperands only supported for top frame"); // TODO
+		return V3Interpreter.val_stack.elems[V3Interpreter.val_stack.top + i - 1]; // TODO: bounds check
+	}
+	// Set operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc. (dynamically typechecked).
+	def setOperand(i: int, v: Value);
+
+	private def checkNotUnwound() {
+		if (isUnwound()) System.error("FrameAccessorError", "frame has been unwound");
+	}
 }
