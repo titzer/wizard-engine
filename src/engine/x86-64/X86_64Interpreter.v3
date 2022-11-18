@@ -5,6 +5,7 @@
 def GLOBAL_BUFFER_MARKER = 0x7ACEBEEF778899AA;
 def INTERPRETER_CODE_MARKER = 0x7FAACCEE;
 def GLOBAL_BUFFER_HEADER_SIZE = 64;
+def tuning = X86_64InterpreterTuning.new();
 component X86_64Interpreter {
 	var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
 	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
@@ -75,7 +76,14 @@ component X86_64Interpreter {
 	def getFrameAccessor(sp: Pointer) -> X86_64InterpreterFrameAccessor {
 		var retip = (sp + -Pointer.SIZE).load<Pointer>();
 		if (!inCode(retip)) return null;
-		return X86_64InterpreterFrameAccessor.new(sp); // TODO: cache
+		if (tuning.cacheFrameAccessor) {
+			var prev = (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
+			if (prev != null) return prev;
+			var n = X86_64InterpreterFrameAccessor.new(sp);
+			(sp + IVarConfig.frame.ACCESSOR.disp).store<X86_64InterpreterFrameAccessor>(n);
+			return n;
+		}
+		return X86_64InterpreterFrameAccessor.new(sp);
 	}
 	def inCode(p: Pointer) -> bool {
 		return p >= interpreterCode.start && p < interpreterCode.end;
@@ -296,14 +304,12 @@ class X86_64InterpreterFrameAccessor(sp: Pointer) extends FrameAccessor {
 	var decl: FuncDecl;
 
 	new() {
-//TODO		(sp + IVarConfig.frame.ACCESSOR.disp).store<X86_64InterpreterFrameAccessor>(this);
 		decl = (sp + IVarConfig.frame.FUNC_DECL.disp).load<FuncDecl>();
 	}
 	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
 	def isUnwound() -> bool {
-		return false;
-//TODO		var prev = (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
-//TODO		return prev != this;
+		if (!tuning.cacheFrameAccessor) return false; // TODO: proper unwound check
+		return this != (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
 	}
 	// Returns the Wasm function in this frame.
 	def func() -> WasmFunction {
@@ -761,7 +767,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def frame = IVarConfig.frame;
 
 	def offsets = V3Offsets.new();
-	def tuning = X86_64InterpreterTuning.new();
 	def valuerep = Target.tagging;
 
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
@@ -905,6 +910,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			// Allocate and initialize interpreter stack frame from incoming V3 params.
 			asm.q.sub_r_i(R.RSP, ic.frameSize);
+			genInvalidateFrameAccessor();
 
 			// Spill VSP (value stack pointer)
 			asm.movq_m_r(frame.VSP, regs.v3_VSP);
@@ -922,6 +928,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			callReentryRef = IcCodeRef.new(w.pos);
 			// Allocate actual stack frame
 			asm.q.sub_r_i(R.RSP, ic.frameSize);
+			genInvalidateFrameAccessor();
 			// Spill the (valid) stack pointer
 			saveIVar(regs.VSP);
 			// WasmFunction is in r1 for interpreter reentry
@@ -1310,9 +1317,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movd_r_m(cnt, cnt.plus(offsets.Array_length));
 			genCopyStackValsToVfp(cnt, regs.tmp1);
 			// Deallocate interpreter frame and return to calling code.
-			asm.q.add_r_i(R.RSP, ic.frameSize);
 			asm.movd_r_i(Target.V3_RET_GPRS[0], ExecState.FINISHED.tag);
-			asm.ret();
+			genPopFrameAndRet();
 
 			bindHandler(Opcode.CALL);
 			// XXX: save ip prior to call for stack traces?
@@ -1440,6 +1446,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// save a copy of VSP into interpreter.valueStack.sp
 			asm.movq_r_m(regs.scratch, absPointer(offsets.Interpreter_valueStack));
 			asm.movq_m_r(regs.scratch.plus(offsets.ValueStack_sp), regs.tmp3);
+			genInvalidateFrameAccessor();
 			asm.q.add_r_i(R.RSP, ic.frameSize); // deallocate interpreter frame
 			asm.jmp_rel(int.!(abs - (ic.start + w.pos))); // tail-call into runtime
 		}
@@ -2669,8 +2676,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movd_r_i(Target.V3_RET_GPRS[0], ExecState.TRAPPED.tag);
 		asm.movd_r_i(Target.V3_RET_GPRS[1], reason.tag);
 		abruptRetRef = IcCodeRef.new(w.pos);
+		genPopFrameAndRet();
+	}
+	def genPopFrameAndRet() {
+		genInvalidateFrameAccessor();
 		asm.q.add_r_i(R.RSP, ic.frameSize);
 		asm.ret();
+	}
+	def genInvalidateFrameAccessor() {
+		if (tuning.cacheFrameAccessor) asm.movq_m_i(R.RSP.plus(IVarConfig.frame.ACCESSOR.disp), 0);
 	}
 
 	// Generate a read of a 32-bit unsigned LEB.
