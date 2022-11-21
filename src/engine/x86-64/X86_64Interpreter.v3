@@ -283,6 +283,10 @@ component X86_64Interpreter {
 		if (Execute.fireProbesAt(func, pc, frame)) return (ExecState.FINISHED, TrapReason.NONE);
 		return (Execute.state, Execute.trap_reason);
 	}
+	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> (ExecState, TrapReason) {
+		// TODO: capture stack trace and call probes
+		return (ExecState.TRAPPED, reason);
+	}
 }
 def computePCFromFrame(sp: Pointer) -> int {
 	var ip   = (sp + IVarConfig.frame.IP.disp).load<Pointer>();
@@ -768,10 +772,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var handlerEndOffset: int;
 	var callReentryRef: IcCodeRef;
 	var tailCallReentryRef: IcCodeRef;
-	var abruptRetRef: IcCodeRef;
+	var abruptRetLabel = X86_64Label.new();
 	var probedDispatchTableRef: IcCodeRef;
 	var typeTagTableOffset: int;
 	var useTypeTagTable = false;
+	var trap_labels = Array<X86_64Label>.new(TrapReason.ERROR.tag + 1);
 
 	def vsp = regs.VSP;
 	def vsph = VspHelper.new(regs.VSP, valuerep, 3);
@@ -811,11 +816,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 
 	def gen(range: MemoryRange) {
-		// Reserve space for pointers to interpreter runtime calls
 		if (tuning.dispatchEntrySize == 4 && (range.start - Pointer.NULL) > int.max) {
 			fatal(Strings.format1("global buffer start address of 0x%x out of 31-bit range", (range.start - Pointer.NULL)));
 		}
+		// Allocate trap labels
+		for (i < trap_labels.length) trap_labels[i] = X86_64Label.new();
+
+		// Record code start
 		ic.codeStart = w.atEnd().pos; // XXX: don't make dispatch tables executable
+
 		if (tuning.useTypeTagTable) {
 			// Reserve space for the type tag table and fill it out
 			typeTagTableOffset = w.pos;
@@ -845,7 +854,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		handlerEndOffset = w.atEnd().pos;
 		// Generate out-of-line code
 		genOutOfLineLEBs();
-		genTrapHandlers();
+		genTraps();
 		ic.codeEnd = w.atEnd().pos;
 
 		if (DEBUG) {
@@ -1028,7 +1037,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genOpcodeHandlers() {
 		// Generate the default handler and initialize dispatch tables
 		var pos = w.atEnd().pos;
-		genTrap(TrapReason.INVALID_OPCODE);
+		computeCurIpFromIp(-1);
+		asm.jmp_rel_far(trap_labels[TrapReason.INVALID_OPCODE.tag]);
 		for (t in dispatchTables) {
 			var ref = t.1;
 			for (i < 256) writeDispatchEntry(ref, i, pos);
@@ -1125,7 +1135,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		// UNREACHABLE: abrupt return
 		bindHandler(Opcode.UNREACHABLE);
-		genTrap(TrapReason.UNREACHABLE);
+		computeCurIpFromIp(-1);
+		asm.jmp_rel_far(trap_labels[TrapReason.UNREACHABLE.tag]);
 
 		// BLOCK, LOOP, and TRY are nops except skipping the LEB
 		bindHandler(Opcode.BLOCK);
@@ -1311,6 +1322,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genPopFrameAndRet();
 
 			bindHandler(Opcode.CALL);
+			computeCurIpFromIp(-1);
 			// XXX: save ip prior to call for stack traces?
 			genReadUleb32(regs.tmp1);
 
@@ -1332,15 +1344,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			// HostFunction: call into interpreter runtimeCall to enter into V3 code
 			asm.bind(call_host);
-			saveIVar(regs.VSP);
 			callRuntime(refRuntimeCall(this.i.runtime_callHost), [targetFunc], true);
 			restoreCallerIVars();
 			genDispatchOrJumpToDispatch();
 		}
 
-		var trap_oob = X86_64Label.new(), trap_sig_mismatch = X86_64Label.new();
+		var trap_func_invalid = trap_labels[TrapReason.FUNC_INVALID.tag];
+		var check_sig_mismatch = X86_64Label.new();
 		bindHandler(Opcode.CALL_INDIRECT); {
-			// XXX: save ip prior to call for stack traces?
+			computeCurIpFromIp(-1);
 			var sig_index = regs.tmp1, table_index = regs.tmp2, func_index = regs.tmp0;
 			genReadUleb32(sig_index);
 			genReadUleb32(table_index);
@@ -1358,36 +1370,33 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_m(table, tmp.plusR(table_index, offsets.REF_SIZE, offsets.Array_contents));
 			asm.movq_r_m(tmp, table.plus(offsets.Table_ids));
 			asm.d.cmp_r_m(func_index, tmp.plus(offsets.Array_length));
-			asm.jc_rel_near(C.NC, trap_oob);
+			asm.jc_rel_far(C.NC, trap_func_invalid);
 			// Check table.ids[func_index] == sig_index
 			asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
-			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+			asm.jc_rel_near(C.NZ, check_sig_mismatch);
 			// Load table.funcs[func_index] into {targetFunc} and jump to calling sequence
 			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
 			asm.movq_r_m(targetFunc, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
 			asm.jmp_rel_near(callFunction);  // XXX: duplicate call sequence here?
-			// XXX: move traps for call indirect out-of-line
-			asm.bind(trap_oob);
-			genTrap(TrapReason.FUNC_INVALID);
-			asm.bind(trap_sig_mismatch);
+			// Signature check failed. Mismatch or invalid function?
+			asm.bind(check_sig_mismatch);
 			asm.d.cmp_m_i(tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents), 0);
-			asm.jc_rel_near(C.S, trap_oob); // < 0 implies invalid function, not function sig mismatch
-			genTrap(TrapReason.FUNC_SIG_MISMATCH);
+			asm.jc_rel_far(C.S, trap_func_invalid); // < 0 implies invalid function, not function sig mismatch
+			asm.jmp_rel_far(trap_labels[TrapReason.FUNC_SIG_MISMATCH.tag]);
 		}
 
 		bindHandler(Opcode.CALL_REF); {
-			// XXX: save ip prior to call for stack traces?
+			computeCurIpFromIp(-1);
 			genSkipLeb(); // skip signature index
 			asm.sub_r_i(vsp, valuerep.slot_size);
 			asm.movq_r_m(targetFunc, vsph[0].value);
 			asm.q.cmp_r_i(targetFunc, 0);
 			asm.jc_rel_near(X86_64Conds.NZ, callFunction);
-			genTrap(TrapReason.NULL_DEREF);
+			asm.jmp_rel_far(trap_labels[TrapReason.NULL_DEREF.tag]);
 		}
 
 		var tailCallFunction = X86_64Label.new();
 		bindHandler(Opcode.RETURN_CALL); {
-			// XXX: save ip prior to call for stack traces?
 			genReadUleb32(regs.tmp1);
 
 			asm.movq_r_m(regs.tmp0, regs.INSTANCE.plus(offsets.Instance_functions));
@@ -1442,7 +1451,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 
 		bindHandler(Opcode.RETURN_CALL_INDIRECT); {
-			// XXX: save ip prior to call for stack traces?
+			computeCurIpFromIp(-1);
 			var sig_index = regs.tmp1, table_index = regs.tmp2, func_index = regs.tmp0;
 			genReadUleb32(sig_index);
 			genReadUleb32(table_index);
@@ -1460,10 +1469,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_m(table, tmp.plusR(table_index, offsets.REF_SIZE, offsets.Array_contents));
 			asm.movq_r_m(tmp, table.plus(offsets.Table_ids));
 			asm.d.cmp_r_m(func_index, tmp.plus(offsets.Array_length));
-			asm.jc_rel_near(C.NC, trap_oob);
+			asm.jc_rel_far(C.NC, trap_func_invalid);
 			// Check table.ids[func_index] == sig_index
 			asm.d.cmp_r_m(sig_index, tmp.plusR(func_index, offsets.INT_SIZE, offsets.Array_contents));
-			asm.jc_rel_near(C.NZ, trap_sig_mismatch);
+			asm.jc_rel_near(C.NZ, check_sig_mismatch);
 			// Load table.funcs[func_index] into r1 and jump to calling sequence
 			asm.movq_r_m(tmp, table.plus(offsets.Table_funcs));
 			asm.movq_r_m(targetFunc, tmp.plusR(func_index, offsets.REF_SIZE, offsets.Array_contents));
@@ -1471,13 +1480,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 
 		bindHandler(Opcode.RETURN_CALL_REF); {
-			// XXX: save ip prior to call for stack traces?
+			computeCurIpFromIp(-1);
 			genSkipLeb(); // skip signature index
 			asm.sub_r_i(vsp, valuerep.slot_size);
 			asm.movq_r_m(targetFunc, vsph[0].value);
 			asm.q.cmp_r_i(targetFunc, 0);
 			asm.jc_rel_near(X86_64Conds.NZ, tailCallFunction);
-			genTrap(TrapReason.NULL_DEREF);
+			asm.jmp_rel_far(trap_labels[TrapReason.NULL_DEREF.tag]);
 		}
 	}
 	def genCopyStackValsToVfp(cnt: X86_64Gpr, i: X86_64Gpr) {
@@ -1629,6 +1638,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I32_DIV_S); {
+			computeCurIpFromIp(-1);
 			var div = X86_64Label.new(), neg = X86_64Label.new(), done = X86_64Label.new();
 			asm.movd_r_m(regs.tmp0, vsph[-1].value);
 			asm.d.cmp_r_i(regs.tmp0, -1);
@@ -1636,7 +1646,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movd_r_m(regs.tmp0, vsph[-2].value);
 			asm.d.cmp_r_i(regs.tmp0, 0x80000000);
 			asm.jc_rel_near(C.NZ, neg);
-			genTrap(TrapReason.DIV_UNREPRESENTABLE);
+			asm.jmp_rel_far(trap_labels[TrapReason.DIV_UNREPRESENTABLE.tag]); // XXX: invert
 			asm.bind(neg);
 			asm.d.neg_m(vsph[-2].value);
 			asm.jmp_rel_near(done);
@@ -1654,6 +1664,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I32_DIV_U); {
+			computeCurIpFromIp(-1);
 			asm.movd_r_m(regs.tmp0, vsph[-1].value);
 			spillReg(R.RAX);
 			spillReg(R.RDX);
@@ -1667,6 +1678,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I32_REM_S); {
+			computeCurIpFromIp(-1);
 			var div = X86_64Label.new(), done = X86_64Label.new();
 			asm.movd_r_m(regs.tmp0, vsph[-1].value);
 			asm.d.cmp_r_i(regs.tmp0, -1);
@@ -1687,6 +1699,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I32_REM_U); {
+			computeCurIpFromIp(-1);
 			asm.movd_r_m(regs.tmp0, vsph[-1].value);
 			spillReg(R.RAX);
 			spillReg(R.RDX);
@@ -1764,6 +1777,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I64_DIV_S); {
+			computeCurIpFromIp(-1);
 			var div = X86_64Label.new(), neg = X86_64Label.new(), done = X86_64Label.new();
 			asm.movq_r_m(regs.tmp0, vsph[-1].value);
 			asm.cmp_r_i(regs.tmp0, -1);
@@ -1773,7 +1787,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.shl_r_i(regs.tmp1, 56);
 			asm.cmp_r_r(regs.tmp0, regs.tmp1);
 			asm.jc_rel_near(C.NZ, neg);
-			genTrap(TrapReason.DIV_UNREPRESENTABLE);
+			asm.jmp_rel_far(trap_labels[TrapReason.DIV_UNREPRESENTABLE.tag]); // XXX: invert
 			asm.bind(neg);
 			asm.neg_m(vsph[-2].value);
 			asm.jmp_rel_near(done);
@@ -1791,6 +1805,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I64_DIV_U); {
+			computeCurIpFromIp(-1);
 			asm.movq_r_m(regs.tmp0, vsph[-1].value);
 			spillReg(R.RAX);
 			spillReg(R.RDX);
@@ -1804,6 +1819,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I64_REM_S); {
+			computeCurIpFromIp(-1);
 			var div = X86_64Label.new(), done = X86_64Label.new();
 			asm.movq_r_m(regs.tmp0, vsph[-1].value);
 			asm.cmp_r_i(regs.tmp0, -1);
@@ -1824,6 +1840,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.I64_REM_U); {
+			computeCurIpFromIp(-1);
 			asm.movq_r_m(regs.tmp0, vsph[-1].value);
 			spillReg(R.RAX);
 			spillReg(R.RDX);
@@ -2171,10 +2188,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
+			computeCurIpFromIp(-1);
 			saveCallerIVars();
-			asm.movq_r_m(regs.tmp0, R.RSP.plus(IVarConfig.frame.WASM_FUNC.disp)); // XXX: compute func and pc directly in the right regs
+			asm.movq_r_m(regs.tmp0, frame.WASM_FUNC); // XXX: compute func and pc directly in the right regs
 			asm.lea(regs.tmp1, X86_64Addr.new(IVarConfig.regs.IP, null, 1, -1 - offsets.Array_contents));
-			asm.q.sub_r_m(regs.tmp1, R.RSP.plus(IVarConfig.frame.CODE.disp));
+			asm.q.sub_r_m(regs.tmp1, frame.CODE); // TODO: use curip register
 			callRuntime(refRuntimeCall(this.i.runtime_PROBE_instr), [regs.tmp0, regs.tmp1], true);
 			restoreCallerIVars();
 			// Compute a pointer to the original code at this pc offset
@@ -2192,10 +2210,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			for (i < 256) {
 				writeDispatchEntry(probedDispatchTableRef, i, offset);
 			}
+			computeCurIpFromIp(-1);
 			saveCallerIVars();
-			asm.movq_r_m(regs.tmp0, R.RSP.plus(IVarConfig.frame.WASM_FUNC.disp)); // XXX: compute func and pc directly in the right regs
+			asm.movq_r_m(regs.tmp0, frame.WASM_FUNC); // XXX: compute func and pc directly in the right regs
 			asm.lea(regs.tmp1, X86_64Addr.new(IVarConfig.regs.IP, null, 1, -1 - offsets.Array_contents));
-			asm.q.sub_r_m(regs.tmp1, R.RSP.plus(IVarConfig.frame.CODE.disp));
+			asm.q.sub_r_m(regs.tmp1, frame.CODE); // TODO: use curip register
 			callRuntime(refRuntimeCall(this.i.runtime_PROBE_loop), [regs.tmp0, regs.tmp1], true);
 			restoreCallerIVars();
 			// TODO: reload code from function, as local probes may have been inserted or removed
@@ -2460,6 +2479,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.TABLE_FILL, refRuntimeCall(i.runtime_TABLE_FILL))
 		]) {
 			bindHandler(t.0);
+			computeCurIpFromIp(-1); // TODO: account for opcode LEB
 			genReadUleb32(regs.tmp0);
 			saveCallerIVars();
 			callRuntime(t.1, [regs.INSTANCE, regs.tmp0], true);
@@ -2477,6 +2497,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.TABLE_COPY, refRuntimeCall(i.runtime_TABLE_COPY))
 		]) {
 			bindHandler(t.0);
+			computeCurIpFromIp(-1); // TODO: account for opcode LEB
 			genReadUleb32(regs.tmp0);
 			genReadUleb32(regs.tmp1);
 			saveCallerIVars();
@@ -2496,6 +2517,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genFloatTrunc(opcode: Opcode, config: FloatTrunc, saturate: bool) {
 		bindHandler(opcode);
+		if (!saturate) computeCurIpFromIp(-1);
 		config.mov_s_m(asm, regs.xmm0, vsph[-1].value);
 		config.mov_s_i(asm, regs.xmm1, config.maxv, regs.scratch);
 		config.ucomi_s_s(asm, regs.xmm0, regs.xmm1);
@@ -2548,17 +2570,16 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.bind(above);
 			asm.bind(below);
 			asm.bind(is_nan);
-			genTrap(TrapReason.FLOAT_UNREPRESENTABLE);
+			asm.jmp_rel_far(trap_labels[TrapReason.FLOAT_UNREPRESENTABLE.tag]);
 		}
 	}
 	def genExecStateCheck() {
 		asm.cmpb_r_i(Target.V3_RET_GPRS[0], ExecState.FINISHED.tag);
-		asm.jc_rel_addr(C.NZ, abruptRetRef);
+		asm.jc_rel_far(C.NZ, abruptRetLabel);
 	}
 	def saveCallerIVars() {
 		saveIVar(regs.IP);
 		saveIVar(regs.STP);
-		if (tuning.saveIPInReg && !tuning.saveIPInFrame) saveIVar(regs.CURIP);
 	}
 	def restoreCallerIVars() {
 		restoreReg(regs.IP);
@@ -2647,6 +2668,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genLoad(opcode: Opcode, tag: byte, gen: (X86_64Gpr, X86_64Addr) -> X86_64Assembler) {
 		bindHandler(opcode);
+		computeCurIpFromIp(-1);
 		asm.q.inc_r(regs.IP);				// skip flags byte
 		genReadUleb32(regs.tmp0);			// decode offset
 		asm.movd_r_m(regs.tmp1, vsph[-1].value);	// read index
@@ -2657,6 +2679,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		endHandler();
 	}
 	def genStore(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+		computeCurIpFromIp(-1);
 		asm.q.inc_r(regs.IP);				// skip flags byte
 		genReadUleb32(regs.tmp0);			// decode offset
 		asm.movd_r_m(regs.tmp1, vsph[-2].value);	// read index
@@ -2666,19 +2689,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.q.sub_r_i(vsp, 2 * valuerep.slot_size);
 		endHandler();
 	}
-	def genTrap(reason: TrapReason) {
-		asm.movd_r_i(Target.V3_RET_GPRS[0], ExecState.TRAPPED.tag);
-		asm.movd_r_i(Target.V3_RET_GPRS[1], reason.tag);
-		abruptRetRef = IcCodeRef.new(w.pos);
-		genPopFrameAndRet();
-	}
 	def genPopFrameAndRet() {
 		genInvalidateFrameAccessor();
 		asm.q.add_r_i(R.RSP, ic.frameSize);
 		asm.ret();
 	}
 	def genInvalidateFrameAccessor() {
-		if (tuning.cacheFrameAccessor) asm.movq_m_i(R.RSP.plus(IVarConfig.frame.ACCESSOR.disp), 0);
+		if (tuning.cacheFrameAccessor) asm.movq_m_i(frame.ACCESSOR, 0);
 	}
 
 	// Generate a read of a 32-bit unsigned LEB.
@@ -2777,8 +2794,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			gen = true;
 		}
 		if (gen) {
-			if (tuning.saveIPInReg) asm.movq_r_r(regs.CURIP, regs.IP);
-			if (tuning.saveIPInFrame) asm.movq_m_r(frame.CURIP, regs.IP);
 			genDispatch(regs.IP_ptr, if (!tuning.dispatchTableReg, dispatchTables[0].1), true);
 		} else {
 			asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
@@ -2855,7 +2870,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movd_r_r(regs.tmp3, dest);
 			dest = regs.tmp3;
 		} else {
-			asm.movd_r_r(regs.tmp4, R.RCX);	// save RCX
+			asm.movd_r_r(regs.tmp3, R.RCX);	// save RCX
 		}
 		asm.movd_r_i(R.RCX, 7);
 		var loop = X86_64Label.new(), nomore = X86_64Label.new();
@@ -2874,19 +2889,41 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.d.shl_r_cl(regs.scratch);		// shift byte into correct bit pos
 		asm.d.or_r_r(dest, regs.scratch);	// merge byte into val
 		if (destRcx) asm.movd_r_r(R.RCX, dest);
-		else asm.movd_r_r(R.RCX, regs.tmp4);	// restore RCX
+		else asm.movd_r_r(R.RCX, regs.tmp3);	// restore RCX
 	}
-	// Generate trap handler code.
-	def genTrapHandlers() {
+	// Runtime calls and traps need CURIP register to be valid.
+	def computeCurIpFromIp(delta: int) {
+//TODO		asm.q.lea(regs.CURIP, X86_64Addr.new(regs.IP, null, 1, delta - offsets.Array_contents));
+	}
+	// All traps are generated out-of-line and call into the runtime.
+	def genTraps() {
 		w.atEnd();
-		ic.oobMemoryHandlerOffset = w.pos;
-		genTrap(TrapReason.MEM_OUT_OF_BOUNDS);
 
-		ic.divZeroHandlerOffset = w.pos;
-		genTrap(TrapReason.DIV_BY_ZERO);
+		var call_runtime_TRAP = X86_64Label.new();
+		asm.bind(call_runtime_TRAP);
+		asm.q.sub_r_m(regs.CURIP, frame.CODE);
+		saveCallerIVars();
+		asm.movq_r_m(regs.tmp1, frame.WASM_FUNC);
+		callRuntime(refRuntimeCall(this.i.runtime_TRAP), [regs.tmp1, regs.CURIP, regs.tmp4], true);
+		asm.bind(abruptRetLabel);
+		genPopFrameAndRet();
 
-		ic.stackOverflowHandlerOffset = w.pos;
-		genTrap(TrapReason.STACK_OVERFLOW);
+		for (reason in TrapReason) {
+			if (reason == TrapReason.STACK_OVERFLOW) continue; // must be special
+			asm.bind(trap_labels[reason.tag]);
+			asm.movd_r_i(regs.tmp4, reason.tag);
+			asm.jmp_rel_near(call_runtime_TRAP);
+		}
+		ic.oobMemoryHandlerOffset = trap_labels[TrapReason.MEM_OUT_OF_BOUNDS.tag].pos;
+		ic.divZeroHandlerOffset = trap_labels[TrapReason.DIV_BY_ZERO.tag].pos;
+
+		// stack overflow cannot call into runtime, because it might be out of stack (!)
+		var stackoverflow_label = trap_labels[TrapReason.STACK_OVERFLOW.tag];
+		asm.bind(stackoverflow_label);
+		asm.movd_r_i(Target.V3_RET_GPRS[0], ExecState.TRAPPED.tag);
+		asm.movd_r_i(Target.V3_RET_GPRS[1], TrapReason.STACK_OVERFLOW.tag);
+		asm.jmp_rel_near(abruptRetLabel);
+		ic.stackOverflowHandlerOffset = stackoverflow_label.pos;
 	}
 	def refRuntimeCall<P, R>(f: P -> R) -> Pointer {
 		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(f).0;
