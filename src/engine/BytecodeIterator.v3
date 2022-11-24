@@ -1,80 +1,112 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// A simple iterator for bytecodes in a function.
+// An iterator for bytecodes in a function.
+// A {BytecodeIterator} initializes itself to point to the start of a function, before
+// the local declarations. Clients that wish to parse the local declarations can do so
+// through {parseLocalTypes} which requires a {WasmParser} (for parsing possibly-erroneous
+// {ValueTypes} and other error handling. Otherwise, the locals are automatically skipped
+// upon the first call to {more(), current(), or next()}.
+// The iterator does not automatically advance itself--clients must call {next()}--thus,
+// {pc} is always the current program counter.
 class BytecodeIterator(func: FuncDecl) {
 	private def codeptr = CodePtr.new(func.orig_bytecode);
-	def var pc: int;
+	private var skipped_locals: bool;
+	def var pc: int = codeptr.pos;
 
-	new() {
-		// skip local declarations
-		codeptr.skip_local_decls();
-		pc = codeptr.pos;
-	}
-
-	// Reset the {codeptr} to just after the current bytecode.
-	def immptr() -> DataReader {
-		return codeptr.at(pc + 1);
+	// Read any local declarations and apply the callback {f} to each pair.
+	def parseLocalTypes<T>(parser: WasmParser, f: (u32, ValueType) -> T) {
+		if (skipped_locals) return;
+		var cp = codeptr;
+		parser.decoder = cp;
+		var max = parser.limits.max_num_locals;
+		var dcount = parser.readU32("local decl count", max);
+		for (i < dcount) {
+			var count = parser.readU32("local count", max);
+			var vtype = parser.readValueType();
+			f(count, vtype);
+		}
+		pc = cp.pos;
+		skipped_locals = true;
 	}
 	// Return {true} if there are more bytecodes remaining.
 	def more() -> bool {
-		var orig = func.orig_bytecode;
-		if (codeptr.data != orig) codeptr.reset(orig, pc, orig.length);
-		return pc < codeptr.limit;
-	}
-	// Return the current opcode.
-	def current() -> Opcode {
-		if (more()) {
-			var b = codeptr.at(pc).read1();
-			if (Opcodes.attributes[b].PREFIX) return Opcodes.find(b, codeptr.read_uleb32());
-			else return Opcodes.opcodes[b];
+		if (!skipped_locals) {
+			skipped_locals = true;
+			codeptr.skip_local_decls();
+			pc = codeptr.pos;
 		}
-		return Opcode.NOP;
+		return pc < func.orig_bytecode.length;
+	}
+	// Return the current opcode; {Opcode.INVALID} if there are no more.
+	def current() -> Opcode {
+		var cp = origptr();
+		if (cp == null) return Opcode.INVALID; // no more bytecodes
+		return cp.read_opcode();
+	}
+	// Return the current opcode and a {DataReader} ready to read any immediates;
+	// {Opcode.INVALID} if there are no more.
+	def current2() -> (Opcode, CodePtr) {
+		var cp = origptr();
+		if (cp == null) return (Opcode.INVALID, codeptr); // no more bytecodes
+		return (cp.read_opcode(), cp);
 	}
 	// Advance to the next opcode.
 	def next() {
-		if (more()) {
-			var p = codeptr.at(pc);
-			for (imm in current().imms) {
-				match (imm) {
-					ARRAY_TYPE_INDEX,
-					BLOCK_TYPE,
-					DATA_INDEX,
-					ELEM_INDEX,
-					TAG_INDEX,
-					FIELD_INDEX,
-					FUNC_INDEX,
-					GLOBAL_INDEX,
-					TYPE_INDEX,
-					LABEL,
-					LOCAL_INDEX,
-					MEMORY_INDEX,
-					PARAM_INDEX,
-					SIG_INDEX,
-					STRUCT_TYPE_INDEX,
-					SUPER_COUNT,
-					TABLE_INDEX,
-					U32 => p.read_uleb32();
-					VALUE_TYPES => codeptr.read_value_types();
-					LABELS => {
-						var count = p.read_uleb32();
-						for (i < count + 1) p.read_uleb32();
-					}
-					MEMARG => {
-						p.read_uleb32();
-						p.read_uleb32();
-					}
-					HEAP_TYPE,
-					I32 => p.read_sleb32();
-					I64 => p.read_sleb64();
-					LANE_INDEX => p.skipN(1);
-					F32 => p.skipN(4);
-					F64 => p.skipN(8);
-					V128 => p.skipN(16);
-					ZERO_BYTE => p.read1();
+		var t = current2(), cp = t.1;
+		for (imm in t.0.imms) {
+			match (imm) {
+				ARRAY_TYPE_INDEX,
+				BLOCK_TYPE,
+				DATA_INDEX,
+				ELEM_INDEX,
+				TAG_INDEX,
+				FIELD_INDEX,
+				FUNC_INDEX,
+				GLOBAL_INDEX,
+				TYPE_INDEX,
+				LABEL,
+				LOCAL_INDEX,
+				MEMORY_INDEX,
+				PARAM_INDEX,
+				SIG_INDEX,
+				STRUCT_TYPE_INDEX,
+				SUPER_COUNT,
+				TABLE_INDEX,
+				U32,
+				I32,
+				I64 => cp.skip_leb();
+				VALUE_TYPES => codeptr.read_value_types();
+				LABELS => {
+					var count = cp.read_uleb32();
+					for (i < count + 1) cp.skip_leb();
 				}
+				MEMARG => {
+					cp.skip_leb();
+					cp.skip_leb();
+				}
+				HEAP_TYPE,
+				LANE_INDEX => cp.skipN(1);
+				F32 => cp.skipN(4);
+				F64 => cp.skipN(8);
+				V128 => cp.skipN(16);
+				ZERO_BYTE => cp.skipN(1);
 			}
-			pc = p.pos;
 		}
+		pc = cp.pos;
+	}
+	// Skip locals, check if any more bytecodes, and reset codeptr to function's original code.
+	private def origptr() -> CodePtr {
+		var orig = func.orig_bytecode;
+		if (pc >= orig.length) return null;
+		var cp = codeptr;
+		if (!skipped_locals) {
+			skipped_locals = true;
+			cp.at(pc).skip_local_decls();
+			pc = cp.pos;
+		}
+		if (cp.data != orig) cp.reset(orig, pc, orig.length);
+		else if (cp.pos != pc) cp.at(pc);
+		return cp;
 	}
 }
