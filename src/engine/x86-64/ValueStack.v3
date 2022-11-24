@@ -1,0 +1,153 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
+// Maps a value stack red zone at the end to catch and report stack overflow.
+class ValueStack {
+	def valuerep = Target.tagging;
+	def size: u32;
+	def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+	var sp: Pointer;
+
+	new(size) {
+		if (mapping == null) fatal("out of memory allocating value stack");
+		sp = mapping.range.start;
+		def PAGE_SIZE = 4096u;
+		var ok = RedZones.addRedZone(mapping, size - PAGE_SIZE, PAGE_SIZE);
+		if (!ok) fatal("could not protect value stack red zone");
+		if (valuerep.tagged) RiGc.registerScanner(this, ValueStack.scan);
+	}
+	def push(v: Value) {
+		match (v) {
+			Ref(obj) => pushPair(BpTypeCode.REF_NULL.code, obj);
+			I31(val) => pushPair(BpTypeCode.I31REF.code, u64.view(val));
+			I32(val) => pushPair(BpTypeCode.I32.code, u64.view(val));
+			I64(val) => pushPair(BpTypeCode.I64.code, u64.view(val));
+			F32(bits) => pushPair(BpTypeCode.F32.code, u64.view(bits));
+			F64(bits) => pushPair(BpTypeCode.F64.code, u64.view(bits));
+			V128(low, high) => {
+				if (valuerep.tagged) sp.store<u8>(BpTypeCode.V128.code); // XXX: factor out
+				(sp + valuerep.tag_size).store(u64.view(low));
+				(sp + valuerep.tag_size + 8).store(u64.view(high));
+				sp += valuerep.slot_size;
+			}
+		}
+	}
+	def popN(t: Array<ValueType>) -> Array<Value> {
+		var r = Array<Value>.new(t.length);
+		for (j = t.length - 1; j >= 0; j--) r[j] = pop(t[j]);
+		return r;
+	}
+	def pop(t: ValueType) -> Value {
+		match (t) {
+			I32 => return Value.I32(popb32(BpTypeCode.I32.code));
+			I64 => return Value.I64(popb64(BpTypeCode.I64.code));
+			F32 => return Value.F32(popb32(BpTypeCode.F32.code));
+			F64 => return Value.F64(popb64(BpTypeCode.F64.code));
+			V128 => {
+				checkTag(BpTypeCode.V128.code); // XXX: factor out
+				sp += -(valuerep.slot_size);
+				var low = (sp + valuerep.tag_size).load<u64>();
+				var high = (sp + valuerep.tag_size + 8).load<u64>();
+				return Value.V128(low, high);
+			}
+			Host => return Value.Ref(popObject());
+			Ref(nullable, heap) => match(heap) {
+				ANY, EXTERN, EQ, I31 => {
+					if (peekTag() == BpTypeCode.I31REF.code) return Value.I31(u31.view(popb32(BpTypeCode.I31REF.code)));
+					else return Value.Ref(popObject());
+				}
+				Func => return Value.Ref(popFunction());
+				_ => return Value.Ref(popObject());
+			}
+			_ => fatal(Strings.format1("unexpected type: %s", t.name));
+		}
+		return Value.Ref(null);
+	}
+	def popu() -> u32 {
+		return popb32(BpTypeCode.I32.code);
+	}
+	def popb32(tag: byte) -> u32 {
+		checkTag(tag);
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<u32>();
+	}
+	def popb64(tag: byte) -> u64 {
+		checkTag(tag);
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<u64>();
+	}
+	def popObject() -> Object {
+		if (valuerep.tagged) {
+			var got = peekTag();
+			match (got) {
+				BpTypeCode.ANYREF.code,
+				BpTypeCode.FUNCREF.code,
+				BpTypeCode.EXTERNREF.code,
+				BpTypeCode.NULLREF.code,
+				BpTypeCode.NULLFUNCREF.code,
+				BpTypeCode.NULLEXTERNREF.code,
+				BpTypeCode.REF_NULL.code,
+				BpTypeCode.REF.code => ;
+				_ => fatal(Strings.format1("value stack tag mismatch, expected ref, got %x", got));
+			}
+		}
+		sp += -(valuerep.slot_size);
+		return (sp + valuerep.tag_size).load<Object>();
+	}
+	def popFunction() -> Function {
+		var obj = popObject();
+		return Function.!(obj);
+	}
+	def checkTag(tag: byte) -> byte {
+		if (!valuerep.tagged) return tag;
+		var got = peekTag();
+		if (got == tag) return tag;
+		fatal(Strings.format2("value stack tag mismatch, expected: %x, got %x", tag, got));
+		return tag;
+	}
+	def peekTag() -> byte {
+		return (sp + -(valuerep.slot_size)).load<u8>() & '\x7F';
+	}
+	def pushPair<T>(tag: byte, bits: T) {
+		if (valuerep.tagged) sp.store<u8>(tag);
+		(sp + valuerep.tag_size).store(bits);
+		sp += valuerep.slot_size;
+	}
+	// GC callback to scan (tagged) values on this stack
+	def scan() {
+		for (p = mapping.range.start; p < sp; p += valuerep.slot_size) {
+			if (p.load<byte>() == BpTypeCode.REF_NULL.code) RiGc.scanRoot(p + valuerep.tag_size);
+		}
+	}
+	def readValue(base: Pointer, offset: int) -> Value {
+		if (!valuerep.tagged) fatal("untyped frame access requires value tagging to be enabled");
+		var tp = base + offset * valuerep.slot_size;
+		if (!mapping.range.contains(tp)) System.error("FrameAccessError", "out of bounds");
+		var vp = tp + valuerep.tag_size;
+		var tag = tp.load<u8>() & '\x7F';
+		match (tag) {
+			BpTypeCode.ANYREF.code,
+			BpTypeCode.FUNCREF.code,
+			BpTypeCode.EXTERNREF.code,
+			BpTypeCode.NULLREF.code,
+			BpTypeCode.NULLFUNCREF.code,
+			BpTypeCode.NULLEXTERNREF.code,
+			BpTypeCode.REF_NULL.code,
+			BpTypeCode.REF.code => return Value.Ref(vp.load<Object>());
+			BpTypeCode.I31REF.code => return Value.I31(vp.load<u31>()); // TODO: i31 tagging
+			BpTypeCode.I32.code => return Value.I32(vp.load<u32>());
+			BpTypeCode.I64.code => return Value.I64(vp.load<u64>());
+			BpTypeCode.F32.code => return Value.F32(vp.load<u32>());
+			BpTypeCode.F64.code => return Value.F64(vp.load<u64>());
+			BpTypeCode.V128.code => return Value.V128(vp.load<u64>(), (vp + 8).load<u64>());
+			_ => {
+				fatal(Strings.format2("unknown value tag %x @ 0x%x", tag, (tp - Pointer.NULL)));
+				return Values.REF_NULL;
+			}
+		}
+	}
+	def fatal(msg: string) {
+		System.error("ValueStackError", msg);
+	}
+}
