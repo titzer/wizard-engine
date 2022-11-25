@@ -7,9 +7,10 @@ def INTERPRETER_CODE_MARKER = 0x7FAACCEE;
 def GLOBAL_BUFFER_HEADER_SIZE = 64;
 def tuning = X86_64InterpreterTuning.new();
 def DEBUG = false;
+def FINISHED: AbruptReturn = null;
 component X86_64Interpreter {
 	var interpreterCode: X86_64InterpreterCode; // Dynamically-generated interpreter code.
-	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> (ExecState, TrapReason);
+	var asmEntry: (/*wf: */ WasmFunction, /*sp: */ Pointer) -> AbruptReturn;
 	var valueStack: ValueStack;
 	var dispatchTable: Pointer;
 
@@ -19,15 +20,12 @@ component X86_64Interpreter {
 		if (args != null) for (v in args) valueStack.push(v);
 
 		// Call the main loop which handles tail calls.
-		var state = runWithTailCalls(f);
-
-		// Unpack state into interpreter result.
-		match (state.0) {
-			STOPPED,
-			RUN, PROBING => return Result.Trap(TrapReason.UNIMPLEMENTED);
-			TRAPPED => return Result.Trap(state.1);
-			TRAPPING => return Result.Trap(state.1);
-			FINISHED => return popResult(f.sig);
+		var abrupt = runWithTailCalls(f);
+		// Unpack the abrupt return value into a {Result}.
+		match (abrupt) {
+			null => return popResult(f.sig);
+			x: Trap => return Result.Trap(x.reason);
+			_ => return Result.Break;
 		}
 	}
 	def serializeInterpreterCodeIntoExecutable(executable: Array<byte>) -> bool {
@@ -58,7 +56,7 @@ component X86_64Interpreter {
 		asmEntry = CiRuntime.forgeClosure<
 			X86_64Interpreter,				// closure type
 			(/*wf: */ WasmFunction, /*sp: */ Pointer),	// parameter types
-			(ExecState, TrapReason)>(			// return types
+			AbruptReturn>(			// return types
 				interpreterCode.start + interpreterCode.v3EntryOffset, this);
 		dispatchTable = interpreterCode.start +
 			if(Execute.probes.elem != null,
@@ -89,15 +87,15 @@ component X86_64Interpreter {
 	def inCode(p: Pointer) -> bool {
 		return p >= interpreterCode.start && p < interpreterCode.end;
 	}
-	private def runWithTailCalls(f: Function) -> (ExecState, TrapReason) {
-		var state = (ExecState.FINISHED, TrapReason.NONE);
+	private def runWithTailCalls(f: Function) -> AbruptReturn {
+		var state = FINISHED;
 		while (true) { // handle repeated tail calls
 			var result: HostResult;
 			match (f) {
 				wf: WasmFunction => {
 					var sp = valueStack.sp;
 					state = invoke(wf, sp);
-					if (state.0 == ExecState.FINISHED) {
+					if (state == null) {
 						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.valuerep.slot_size);
 					}
 					break;
@@ -132,11 +130,11 @@ component X86_64Interpreter {
 			}
 			match (result) {
 				Trap(reason) => {
-					state = (ExecState.TRAPPED, reason);
+					state = doTrap(reason);
 					break;
 				}
 				Error(msg) => {
-					state = (ExecState.TRAPPED, TrapReason.ERROR);
+					state = doTrap(TrapReason.ERROR);
 					Execute.error_msg = msg;
 					break;
 				}
@@ -160,7 +158,7 @@ component X86_64Interpreter {
 		}
 		return state;
 	}
-	private def invoke(wf: WasmFunction, sp: Pointer) -> (ExecState, TrapReason) {
+	private def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
 		if (wf.decl.target_code.spc_entry != Pointer.NULL) {
 			return Target.callSpcEntry(wf);
 		}
@@ -175,7 +173,7 @@ component X86_64Interpreter {
 	// =======================================================================================
 	// INTERPRETER RUNTIME CALLBACKS
 	// =======================================================================================
-	def runtime_callHost(f: Function) -> (ExecState, TrapReason) {
+	def runtime_callHost(f: Function) -> AbruptReturn {
 		var state = runWithTailCalls(f);
 		return state;
 	}
@@ -185,34 +183,34 @@ component X86_64Interpreter {
 		var result = memory.grow(pages);
 		valueStack.push(Values.i_v(result));
 	}
-	def runtime_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32) -> (ExecState, TrapReason) {
+	def runtime_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32) -> AbruptReturn {
 		var memory = instance.memories[mindex];
 		var ddecl = if(!instance.dropped_data[dindex], instance.module.data[int.!(dindex)]);
 		var size = valueStack.popu();
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
-	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> (ExecState, TrapReason) { // XXX: inline
+	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> AbruptReturn { // XXX: inline
 		var dst = instance.memories[mindex1];
 		var src = instance.memories[mindex2];
 		var size = valueStack.popu();
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = dst.copyM(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
-	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> (ExecState, TrapReason) {
+	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> AbruptReturn {
 		var memory = instance.memories[mindex];
 		var size = valueStack.popu();
 		var val = valueStack.popu();
 		var dest = valueStack.popu();
 		var t = memory.fill(dest, u8.view(val), size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
 	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
 		var val = instance.globals[index].value;
@@ -223,39 +221,39 @@ component X86_64Interpreter {
 		var val = valueStack.pop(g.valtype);
 		g.value = val;
 	}
-	def runtime_TABLE_GET(instance: Instance, index: u32) -> (ExecState, TrapReason) { // XXX: inline when Value rep known
+	def runtime_TABLE_GET(instance: Instance, index: u32) -> AbruptReturn { // XXX: inline when Value rep known
 		var table = instance.tables[index];
 		var elem = Values.v_u(valueStack.pop(ValueType.I32));
-		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_OUT_OF_BOUNDS);
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS);
 		var val = table.elems[elem];
 		valueStack.push(val);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		return FINISHED;
 	}
-	def runtime_TABLE_SET(instance: Instance, index: u32) -> (ExecState, TrapReason) {
+	def runtime_TABLE_SET(instance: Instance, index: u32) -> AbruptReturn {
 		var table = instance.tables[index];
 		var val = valueStack.pop(table.elemtype);
 		var elem = Values.v_u(valueStack.pop(ValueType.I32));
-		if (elem >= table.elems.length) return (ExecState.TRAPPED, TrapReason.TABLE_OUT_OF_BOUNDS);
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS);
 		table[int.view(elem)] = val;
-		return (ExecState.FINISHED, TrapReason.NONE);
+		return FINISHED;
 	}
-	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> (ExecState, TrapReason) {
+	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> AbruptReturn {
 		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
 		var table = instance.tables[tindex];
 		var size = valueStack.popu();
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
-	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> (ExecState, TrapReason) {
+	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> AbruptReturn {
 		var dst = instance.tables[t1];
 		var src = instance.tables[t2];
 		var size = valueStack.popu(), src_offset = valueStack.popu(), dst_offset = valueStack.popu();
 		var t = dst.copyT(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
 	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
 		var table = instance.tables[tindex];
@@ -264,28 +262,30 @@ component X86_64Interpreter {
 		var r = table.grow(size, val);
 		valueStack.push(Values.i_v(r));
 	}
-	def runtime_TABLE_FILL(instance: Instance, tindex: u32) -> (ExecState, TrapReason) { // XXX: inline when Value rep known
+	def runtime_TABLE_FILL(instance: Instance, tindex: u32) -> AbruptReturn { // XXX: inline when Value rep known
 		var table = instance.tables[tindex];
 		var size = valueStack.popu();
 		var val = valueStack.pop(table.elemtype);
 		var dest = valueStack.popu();
 		var t = table.fill(dest, val, size);
-		if (t != TrapReason.NONE) return (ExecState.TRAPPED, t);
-		return (ExecState.FINISHED, TrapReason.NONE);
+		if (t != TrapReason.NONE) return doTrap(t);
+		return FINISHED;
 	}
-	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> (ExecState, TrapReason) {
+	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> AbruptReturn {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		if (Execute.fireProbes(func, pc, frame)) return (ExecState.FINISHED, TrapReason.NONE);
-		return (Execute.state, Execute.trap_reason);
+		if (Execute.fireProbes(func, pc, frame)) return FINISHED;
+		return doTrap(Execute.trap_reason);
 	}
-	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> (ExecState, TrapReason) {
+	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> AbruptReturn {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		if (Execute.fireProbesAt(func, pc, frame)) return (ExecState.FINISHED, TrapReason.NONE);
-		return (Execute.state, Execute.trap_reason);
+		if (Execute.fireProbesAt(func, pc, frame)) return FINISHED;
+		return doTrap(Execute.trap_reason);
 	}
-	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> (ExecState, TrapReason) {
-		// TODO: capture stack trace and call probes
-		return (ExecState.TRAPPED, reason);
+	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> AbruptReturn {
+		return Trap.new(reason, StackSegment.new(null, null, [(func, pc)]));
+	}
+	def doTrap(reason: TrapReason) -> AbruptReturn {
+		return Trap.new(reason, null);
 	}
 }
 def computePCFromFrame(sp: Pointer) -> int {
@@ -2421,7 +2421,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 	}
 	def genExecStateCheck() {
-		asm.cmpb_r_i(Target.V3_RET_GPRS[0], ExecState.FINISHED.tag);
+		asm.q.cmp_r_i(Target.V3_RET_GPRS[0], 0);
 		asm.jc_rel_far(C.NZ, abruptRetLabel);
 	}
 	def saveCallerIVars() {
@@ -2774,8 +2774,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// stack overflow cannot call into runtime, because it might be out of stack (!)
 		var stackoverflow_label = trap_labels[TrapReason.STACK_OVERFLOW.tag];
 		asm.bind(stackoverflow_label);
-		asm.movd_r_i(Target.V3_RET_GPRS[0], ExecState.TRAPPED.tag);
-		asm.movd_r_i(Target.V3_RET_GPRS[1], TrapReason.STACK_OVERFLOW.tag);
+		var addr = Pointer.atObject(Execute.stackOverflowTrap) - Pointer.NULL;
+		asm.movd_r_i(Target.V3_RET_GPRS[0], int.view(u32.!(addr)));
 		asm.jmp_rel_near(abruptRetLabel);
 		ic.stackOverflowHandlerOffset = stackoverflow_label.pos;
 	}
