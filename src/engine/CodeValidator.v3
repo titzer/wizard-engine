@@ -5,7 +5,8 @@
 def OUT = Trace.OUT;
 class CodeValidator(extensions: Extension.set, limits: Limits,
 		module: Module, err: ErrorGen) {
-	def parser = WasmParser.new(extensions, limits, module, err, null);
+	def codeptr = CodePtr.new(null);
+	def parser = WasmParser.new(extensions, limits, module, err, codeptr);
 	def instrTracer = if(Trace.validation, InstrTracer.new());
 	def locals = Vector<ValueType>.new();
 	def val_stack = ArrayStack<ValueType>.new();
@@ -17,24 +18,26 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	var sig: SigDecl;
 	var opcode_pos: int;
 
+	new() {
+		codeptr.onError = err.onDataReaderError;
+	}
+
 	def validateFunc(f: FuncDecl) -> CodeValidatorResult {
-		// XXX: reset decoder instead of allocating a new one
-		return validate(f, Decoder.new(f.orig_bytecode, err));
+		codeptr.reset(f.orig_bytecode, 0, f.orig_bytecode.length);
+		return validate(f, codeptr);
 	}
 	def validate(f: FuncDecl, d: DataReader) -> CodeValidatorResult {
 		func = f;
 		sig = f.sig;
-		if (Trace.validation) {
-			OUT.put2("validate(func #%d: %q)",
-				f.func_index, sig.render).outln();
-		}
+		if (Trace.validation) OUT.put2("validate(func #%d: %q)", f.func_index, sig.render).outln();
+		codeptr.reset(d.data, d.pos, d.limit);
+		parser.reset(codeptr);
 		err.section = BpSection.Code;
 		err.index = func.func_index;
-		d.atoffset(func.abs_start);
-		parser.reset(d);
+		codeptr.atoffset(func.abs_start);
 		ctl_stack.clear();
 		val_stack.clear();
-		ctlxfer.reset(parser.decoder.pos);
+		ctlxfer.reset(codeptr.pos);
 
 		// setup params
 		locals.resize(0);
@@ -45,12 +48,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		if (!readLocals(locals)) return reterr();
 		func.num_locals = u16.!(locals.length);
 
-		opcode_pos = parser.decoder.pos;
+		opcode_pos = codeptr.pos;
 		pushControl(Opcode.UNREACHABLE.code, sig.params, sig.results, 0);
 		validateCode();
 		if (ctl_stack.top != 0 && err.ok()) {
 			// TODO: double-check this error position
-			err.rel(d, f.abs_start + f.orig_bytecode.length).UnterminatedFunctionBody();
+			err.rel(codeptr, f.abs_start + f.orig_bytecode.length).UnterminatedFunctionBody();
 		}
 		func.sidetable = ctlxfer.extract();
 		if (err.ok()) return CodeValidatorResult.Ok;
@@ -60,9 +63,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		var start = vec.length, max = limits.max_num_locals;
 		var dcount = parser.readU32("local decl count", max);
 		for (i < dcount) {
-			var pt = parser.decoder.pos;
+			var pt = codeptr.pos;
 			var count = parser.readU32("local count", max);
-			var pt2 = parser.decoder.pos;
+			var pt2 = codeptr.pos;
 			var ltype = parser.readValueType();
 			var init = if(ValueTypes.hasDefaultValue(ltype), InitStatus.INIT, InitStatus.UNINIT);
 			if (count <= limits.max_num_locals) init_status.putn(init, int.view(count));
@@ -71,7 +74,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 			vec.putn(ltype, int.!(count));
 			var size = vec.length - start;
 			if (size > max) {
-				err.rel(parser.decoder, pt).QuantityExceededMaximumI("maximum total locals", size, max);
+				err.rel(codeptr, pt).QuantityExceededMaximumI("maximum total locals", size, max);
 				return false;
 			}
 		}
@@ -84,43 +87,43 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		OUT.put2("  locals %d: %q", count, ltype.render).outln();
 	}
 	def err_atpc() -> ErrorGen {
-		return err.rel(parser.decoder, opcode_pos);
+		return err.rel(codeptr, opcode_pos);
 	}
 	def validateCode() {
-		var d = parser.decoder;
-		while (d.pos < d.limit) {
-			opcode_pos = parser.decoder.pos;
-			var opcode = parser.readByte("opcode", Opcodes.render);
+		while (codeptr.pos < codeptr.limit) {
+			opcode_pos = codeptr.pos;
+			var b = codeptr.peek1();
+			var opcode = codeptr.read_opcode();
 			if (Trace.validation) { traceOpcode(); traceStack(true); }
 			// FAST: Handle short operators (predictable direct branch)
-			if (Opcodes.attributes[opcode].SHORT_OP) {
-				checkSignature(Opcodes.signatures[opcode]);
+			if (Opcodes.attributes[b].SHORT_OP) {
+				checkSignature(opcode.sig);
 				if (Trace.validation) traceStack(false);
 				continue;
 			}
 			// Handle all other operators in the switch (indirect branch)
 			match (opcode) {
-				Opcode.UNREACHABLE.code => {
+				UNREACHABLE => {
 					setUnreachable();
 				}
-				Opcode.BLOCK.code => {
+				BLOCK => {
 					var pr = parser.readBlockType();
 					checkArgsAndPushControl(opcode, pr.0, pr.1);
 				}
-				Opcode.LOOP.code => {
+				LOOP => {
 					var pr = parser.readBlockType();
 					checkArgsAndPushControl(opcode, pr.0, pr.1);
 					ctl_top.sidetable_pos = ctlxfer.sidetable.length;
-					ctl_top.next_pos = parser.decoder.pos;
+					ctl_top.next_pos = codeptr.pos;
 				}
-				Opcode.IF.code => {
+				IF => {
 					var pr = parser.readBlockType();
 					popE(ValueType.I32);
 					var ctl = checkArgsAndPushControl(opcode, pr.0, pr.1);
 					ctlxfer.ref0(ctl, opcode_pos);
 					ctl_top.reachable = true; // true block now reachable
 				}
-				Opcode.ELSE.code => {
+				ELSE => {
 					if (ctl_top.start_opcode != Opcode.IF.code) {
 						return err_atpc().MismatchedElse();
 					}
@@ -136,16 +139,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					// "else" implicitly goes to end
 					ctlxfer.ref0(ctl_top, opcode_pos);
 
-					ctl_top.start_opcode = opcode;
+					ctl_top.start_opcode = opcode.code;
 					ctl_top.reachable = true;
 					val_stack.top = ctl_top.val_stack_top;
 					pushTypes(ctl_top.params);
 				}
-				Opcode.END.code => {
+				END => {
 					if (ctl_stack.top == 0) return err_atpc().EmptyControlStack();
 					checkArgsAndTransfer();
 					var ctl = ctl_stack.peek();
-					var next_pos = parser.decoder.pos; // target next bytecode if possible
+					var next_pos = codeptr.pos; // target next bytecode if possible
 					if (ctl.start_opcode == Opcode.LOOP.code) {
 						ctlxfer.bind(ctl, ctl.start_pos, ctl.sidetable_pos);
 					} else if (ctl.start_opcode == Opcode.IF.code) {
@@ -165,7 +168,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					ctl_stack.pop();
 					ctl_top = ctl_stack.peek();
 				}
-				Opcode.BR.code => {
+				BR => {
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
@@ -173,7 +176,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkAndPopArgs(labelArgs(target));
 					setUnreachable();
 				}
-				Opcode.BR_IF.code => {
+				BR_IF => {
 					var depth = parser.readLabel();
 					var target = getControl(depth);
 					if (target == null) return;
@@ -183,7 +186,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkAndPopArgs(args);
 					pushTypes(args);
 				}
-				Opcode.BR_TABLE.code => {
+				BR_TABLE => {
 					var labels = parser.readLabels();
 					popE(ValueType.I32);
 					ctlxfer.sidetable.put(labels.length).put(0).put(0).put(0);
@@ -201,23 +204,23 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					}
 					setUnreachable();
 				}
-				Opcode.RETURN.code => {
+				RETURN => {
 					checkAndPopArgs(sig.results);
 					setUnreachable();
 				}
-				Opcode.CALL.code => {
+				CALL => {
 					var func = parser.readFuncRef();
 					if (func == null) return;
 					checkSignature(func.sig);
 				}
-				Opcode.CALL_INDIRECT.code => {
+				CALL_INDIRECT => {
 					var sig = parser.readSigRef();
 					var t = parser.readTableImm();
 					popE(ValueType.I32);
 					if (sig == null) return;
 					checkSignature(sig);
 				}
-				Opcode.RETURN_CALL.code => {
+				RETURN_CALL => {
 					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
 					var func = parser.readFuncRef();
 					if (func == null) return;
@@ -225,7 +228,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkReturnSig(func.sig.results);
 					setUnreachable();
 				}
-				Opcode.RETURN_CALL_INDIRECT.code => {
+				RETURN_CALL_INDIRECT => {
 					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
 					var sig = parser.readSigRef();
 					var t = parser.readTableImm();
@@ -235,14 +238,14 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkReturnSig(sig.results);
 					setUnreachable();
 				}
-				Opcode.CALL_REF.code => {
+				CALL_REF => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var sig = parser.readSigRef();
 					if (sig == null) return;
 					popE(ValueTypes.Ref(true, sig)); // XXX: avoid allocation
 					checkSignature(sig);
 				}
-				Opcode.RETURN_CALL_REF.code => {
+				RETURN_CALL_REF => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var sig = parser.readSigRef();
 					if (sig == null) return;
@@ -251,10 +254,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkReturnSig(sig.results);
 					setUnreachable();
 				}
-				Opcode.DROP.code => {
+				DROP => {
 					popAny();
 				}
-				Opcode.SELECT.code => {
+				SELECT => {
 					popE(ValueType.I32);
 					var t = popAny();
 					var rt = t.0;
@@ -262,7 +265,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					popE(rt);
 					push(rt);
 				}
-				Opcode.SELECT_T.code => {
+				SELECT_T => {
 					var at = parser.readValueTypes("select count", limits.max_num_select_results);
 					if (at.length == 0) err_atpc().IllegalSelectCount();
 					popE(ValueType.I32);
@@ -270,31 +273,31 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					checkAndPopArgs(at);
 					pushTypes(at);
 				}
-				Opcode.LOCAL_GET.code => {
+				LOCAL_GET => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
 					checkInit(index);
 					push(t);
 				}
-				Opcode.LOCAL_SET.code => {
+				LOCAL_SET => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
 					setInit(index);
 					popE(t);
 				}
-				Opcode.LOCAL_TEE.code => {
+				LOCAL_TEE => {
 					var index = parser.readLocalIndex();
 					var t = getLocalType(index);
 					setInit(index);
 					popE(t);
 					push(t);
 				}
-				Opcode.GLOBAL_GET.code => {
+				GLOBAL_GET => {
 					var g = parser.readGlobalRef();
 					if (g == null) return;
 					push(g.valtype);
 				}
-				Opcode.GLOBAL_SET.code => {
+				GLOBAL_SET => {
 					var g = parser.readGlobalRef();
 					if (g == null) return;
 					if (!g.mutable) {
@@ -302,77 +305,76 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
  					}
 					popE(g.valtype);
 				}
-				Opcode.TABLE_GET.code => {
+				TABLE_GET => {
 					var table = parser.readTableRef();
 					if (table == null) return;
 					popE(ValueType.I32);
 					push(table.elemtype);
 				}
-				Opcode.TABLE_SET.code => {
+				TABLE_SET => {
 					var table = parser.readTableRef();
 					if (table == null) return;
 					popE(table.elemtype);
 					popE(ValueType.I32);
 				}
 
-				Opcode.I32_LOAD8_S.code,
-				Opcode.I32_LOAD8_U.code,
-				Opcode.I64_LOAD8_S.code,
-				Opcode.I64_LOAD8_U.code,
-				Opcode.I32_STORE8.code,
-				Opcode.I64_STORE8.code => checkAlignment(opcode, 0);
+				I32_LOAD8_S,
+				I32_LOAD8_U,
+				I64_LOAD8_S,
+				I64_LOAD8_U,
+				I32_STORE8,
+				I64_STORE8 => checkAlignment(opcode, 0);
 
-				Opcode.I32_LOAD16_S.code,
-				Opcode.I32_LOAD16_U.code,
-				Opcode.I64_LOAD16_S.code,
-				Opcode.I64_LOAD16_U.code,
-				Opcode.I32_STORE16.code,
-				Opcode.I64_STORE16.code => checkAlignment(opcode, 1);
+				I32_LOAD16_S,
+				I32_LOAD16_U,
+				I64_LOAD16_S,
+				I64_LOAD16_U,
+				I32_STORE16,
+				I64_STORE16 => checkAlignment(opcode, 1);
 
-				Opcode.I32_LOAD.code,
-				Opcode.F32_LOAD.code,
-				Opcode.I64_LOAD32_S.code,
-				Opcode.I64_LOAD32_U.code,
-				Opcode.I32_STORE.code,
-				Opcode.F32_STORE.code,
-				Opcode.I64_STORE32.code => checkAlignment(opcode, 2);
+				I32_LOAD,
+				F32_LOAD,
+				I64_LOAD32_S,
+				I64_LOAD32_U,
+				I32_STORE,
+				F32_STORE,
+				I64_STORE32 => checkAlignment(opcode, 2);
 
-				Opcode.I64_LOAD.code,
-				Opcode.F64_LOAD.code,
-				Opcode.I64_STORE.code,
-				Opcode.F64_STORE.code => checkAlignment(opcode, 3);
+				I64_LOAD,
+				F64_LOAD,
+				I64_STORE,
+				F64_STORE => checkAlignment(opcode, 3);
 
-				Opcode.MEMORY_SIZE.code,
-				Opcode.MEMORY_GROW.code => {
+				MEMORY_SIZE,
+				MEMORY_GROW => {
 					var index = parser.readMemoryImm();
-					var sig = Opcodes.signatures[opcode];
-					checkSignature(sig);
+					checkSignature(opcode.sig);
 				}
-				Opcode.I32_CONST.code => {
-					parser.decoder.read_sleb32();
+				I32_CONST => {
+					codeptr.read_sleb32();
 					push(ValueType.I32);
 				}
-				Opcode.I64_CONST.code => {
-					parser.decoder.read_sleb64();
+				I64_CONST => {
+					codeptr.read_sleb64();
 					push(ValueType.I64);
 				}
-				Opcode.F32_CONST.code => {
-					parser.decoder.skipN(4);
+				F32_CONST => {
+					codeptr.skipN(4);
 					push(ValueType.F32);
 				}
-				Opcode.F64_CONST.code => {
-					parser.decoder.skipN(8);
+				F64_CONST => {
+					codeptr.skipN(8);
 					push(ValueType.F64);
 				}
-				Opcode.REF_NULL.code => {
+				REF_NULL => {
 					var ht = parser.readHeapType();
 					push(ValueType.Ref(true, ht));
 				}
-				Opcode.REF_IS_NULL.code => {
+				REF_IS_NULL => {
 					popRef();
 					push(ValueType.I32);
 				}
-				Opcode.REF_FUNC.code => {
+				REF_FUNC => {
 					var func = parser.readFuncRef();
 					if (func == null) return;
 					if (!func.reffed) err_atpc().IllegalFuncRef(func);
@@ -381,13 +383,13 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						ValueTypes.FUNCREF);
 					push(ftype);
 				}
-				Opcode.REF_AS_NON_NULL.code => {
+				REF_AS_NON_NULL => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var t = popAny();
 					if (t.1) push(asNonNullRefType(t.0));
 				}
-				Opcode.BR_ON_NULL.code,
-				Opcode.BR_ON_NON_NULL.code => {
+				BR_ON_NULL,
+				BR_ON_NON_NULL => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
 					var depth = parser.readLabel();
 					var target = getControl(depth);
@@ -395,7 +397,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var t = popAny();
 					if (t.1) {
 						var rt = t.0, nonnull = asNonNullRefType(rt);
-						if (opcode == Opcode.BR_ON_NON_NULL.code) {
+						if (opcode.code == Opcode.BR_ON_NON_NULL.code) {
 							push(nonnull);
 							ctlxfer.refS(target, opcode_pos, val_stack);
 							checkTargetArgs(target);
@@ -407,332 +409,346 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						}
 					}
 				}
-				Opcode.REF_EQ.code => {
-					if (!checkExtension(Extension.GC, opcode)) return;
+				REF_EQ => {
+					if (noGC(opcode)) return;
 					popE(ValueTypes.EQREF);
 					popE(ValueTypes.EQREF);
 					push(ValueType.I32);
 				}
-				0xFB => {
-					var b2 = parser.decoder.read_uleb32();
-					if (!checkExtensionP(Extension.GC, opcode, b2)) return;
-					match (b2) {
-						Opcode.STRUCT_NEW_CANON.code => {
-							var st = parser.readStructType();
-							if (st == null) return;
-							checkAndPopFields(st.field_types);
-							push(ValueTypes.RefStruct(false, st));
-						}
-						Opcode.STRUCT_NEW_CANON_DEFAULT.code => {
-							var st = parser.readStructType();
-							if (st == null) return;
-							var stt = ValueTypes.RefStruct(false, st);
-							if (!st.defaultable) err_atpc().ExpectedDefaultableHeapType(stt);
-							push(stt);
-						}
-						Opcode.STRUCT_GET.code => {
-							var st = parser.readStructType();
-							var index = parser.readFieldIndex(st);
-							if (index < 0) return;
-							popE(ValueTypes.RefStruct(true, st));
-							var ft = st.field_types[index];
-							if (ft.packing != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(ft);
-							push(ft.valtype);
-						}
-						Opcode.STRUCT_GET_S.code, // fallthrough
-						Opcode.STRUCT_GET_U.code => {
-							var st = parser.readStructType();
-							var index = parser.readFieldIndex(st);
-							if (index < 0) return;
-							popE(ValueTypes.RefStruct(true, st));
-							var ft = st.field_types[index];
-							if (ft.packing == Packedness.UNPACKED) err_atpc().ExpectedPackedType(ft);
-							push(ft.valtype);
-						}
-						Opcode.STRUCT_SET.code => {
-							var st = parser.readStructType();
-							var index = parser.readFieldIndex(st);
-							if (index < 0) return;
-							var ft = st.field_types[index];
-							var stt = ValueTypes.RefStruct(true, st);
-							if (!ft.mutable) {
-								err_atpc().IllegalAssignmentToImmutableField(stt, u32.view(index));
-							}
-							popE(ft.valtype);
-							popE(stt);
-						}
-						Opcode.ARRAY_NEW_CANON.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							popE(ValueType.I32);
-							checkAndPopFields(at.elem_types);
-							push(ValueTypes.RefArray(false, at));
-						}
-						Opcode.ARRAY_NEW_CANON_DEFAULT.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							var att = ValueTypes.RefArray(false, at);
-							if (!at.defaultable) err_atpc().ExpectedDefaultableHeapType(att);
-							popE(ValueType.I32);
-							push(att);
-						}
-						Opcode.ARRAY_GET.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							popE(ValueType.I32);
-							popE(ValueTypes.RefArray(true, at));
-							for (et in at.elem_types) {
-								if (et.packing != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(et);
-								push(et.valtype);
-							}
-						}
-						Opcode.ARRAY_GET_S.code, // fallthrough
-						Opcode.ARRAY_GET_U.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							popE(ValueType.I32);
-							popE(ValueTypes.RefArray(true, at));
-							for (et in at.elem_types) {
-								if (et.packing == Packedness.UNPACKED) err_atpc().ExpectedPackedType(et);
-								push(et.valtype);
-							}
-						}
-						Opcode.ARRAY_SET.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							for (et in at.elem_types) {
-								if (!et.mutable) err_atpc().IllegalAssignmentToImmutableArray(ValueType.Ref(true, HeapType.Array(at)));
-								popE(et.valtype);
-							}
-							popE(ValueType.I32);
-							popE(ValueTypes.RefArray(true, at));
-						}
-						Opcode.ARRAY_LEN.code => {
-							popE(ValueTypes.ARRAYREF);
-							push(ValueType.I32);
-						}
-						Opcode.ARRAY_NEW_CANON_FIXED.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							var size = parser.decoder.read_uleb32();
-							for (i < size) checkAndPopFields(at.elem_types);
-							push(ValueTypes.RefArray(false, at));
-						}
-						Opcode.ARRAY_NEW_CANON_DATA.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							var index = parser.readDataIndex();
-							for (et in at.elem_types) {
-								if (!ValueTypes.isPrimitive(et.valtype)) err_atpc().IllegalNonPrimitiveArray(at);
-							}
-							popE(ValueType.I32);
-							popE(ValueType.I32);
-							push(ValueTypes.RefArray(false, at));
-						}
-						Opcode.ARRAY_NEW_CANON_ELEM.code => {
-							var at = parser.readArrayType();
-							if (at == null) return;
-							var elem = parser.readElemRef();
-							if (elem == null) return;
-							if (!ValueTypes.isAssignable(elem.elemtype, at.elem_types[0].valtype)) {
-								err_atpc().ElementTypeMismatch(at.elem_types[0].valtype, elem.elemtype);
-							}
-							popE(ValueType.I32);
-							popE(ValueType.I32);
-							push(ValueTypes.RefArray(false, at));
-						}
-						Opcode.I31_NEW.code => {
-							popE(ValueType.I32);
-							push(ValueTypes.I31REF_NONNULL);
-						}
-						Opcode.I31_GET_S.code => {
-							popE(ValueTypes.I31REF);
-							push(ValueType.I32);
-						}
-						Opcode.I31_GET_U.code => {
-							popE(ValueTypes.I31REF);
-							push(ValueType.I32);
-						}
-						Opcode.REF_TEST.code,
-						Opcode.REF_TEST_NULL.code => {
-							var nullable = (b2 == Opcode.REF_TEST_NULL.code);
-							var ht = parser.readHeapType();
-							var ref = popRef();
-							push(ValueType.I32);
-						}
-						Opcode.REF_CAST.code,
-						Opcode.REF_CAST_NULL.code => {
-							var nullable = (b2 == Opcode.REF_CAST_NULL.code);
-							var ht = parser.readHeapType();
-							var ref = popRef();
-							push(ValueType.Ref(nullable, ht));
-						}
-						Opcode.BR_ON_CAST.code,
-						Opcode.BR_ON_CAST_NULL.code => {
-							var nullable = (b2 == Opcode.BR_ON_CAST_NULL.code);
-							var depth = parser.readLabel();
-							var target = getControl(depth);
-							if (target == null) return;
-							var ht = parser.readHeapType();
-							ctlxfer.refS(target, opcode_pos, val_stack);
-							var ref = popRef();
-							push(ValueType.Ref(nullable, ht));
-							checkAndPopArgs(labelArgs(target));
-							push(ref.0);  // leave original value
-						}
-						Opcode.BR_ON_CAST_FAIL.code,
-						Opcode.BR_ON_CAST_FAIL_NULL.code=> {
-							var nullable = (b2 == Opcode.BR_ON_CAST_FAIL_NULL.code);
-							var depth = parser.readLabel();
-							var target = getControl(depth);
-							if (target == null) return;
-							var ht = parser.readHeapType();
-							ctlxfer.refS(target, opcode_pos, val_stack);
-							var ref = popRef();
-							push(ref.0); // leave original value
-							checkAndPopArgs(labelArgs(target));
-							push(ValueType.Ref(nullable, ht));
-						}
-						Opcode.EXTERN_INTERNALIZE.code => {
-							if (!checkExtension(Extension.GC, opcode)) return;
-							var nullable = popRefE(ValueTypes.EXTERNREF);
-							var at = if(nullable, ValueTypes.ANYREF, ValueTypes.ANYREF_NONNULL);
-							push(at);
-						}
-						Opcode.EXTERN_EXTERNALIZE.code => {
-							if (!checkExtension(Extension.GC, opcode)) return;
-							var nullable = popRefE(ValueTypes.ANYREF);
-							var et = if(nullable, ValueTypes.EXTERNREF, ValueTypes.EXTERNREF_NONNULL);
-							push(et);
-						}
-						_ => err_atpc().InvalidOpcode(opcode, b2);
+				STRUCT_NEW_CANON => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					if (st == null) return;
+					checkAndPopFields(st.field_types);
+					push(ValueTypes.RefStruct(false, st));
+				}
+				STRUCT_NEW_CANON_DEFAULT => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					if (st == null) return;
+					var stt = ValueTypes.RefStruct(false, st);
+					if (!st.defaultable) err_atpc().ExpectedDefaultableHeapType(stt);
+					push(stt);
+				}
+				STRUCT_GET => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					popE(ValueTypes.RefStruct(true, st));
+					var ft = st.field_types[index];
+					if (ft.packing != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(ft);
+					push(ft.valtype);
+				}
+				STRUCT_GET_S, // fallthrough
+				STRUCT_GET_U => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					popE(ValueTypes.RefStruct(true, st));
+					var ft = st.field_types[index];
+					if (ft.packing == Packedness.UNPACKED) err_atpc().ExpectedPackedType(ft);
+					push(ft.valtype);
+				}
+				STRUCT_SET => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					var ft = st.field_types[index];
+					var stt = ValueTypes.RefStruct(true, st);
+					if (!ft.mutable) {
+						err_atpc().IllegalAssignmentToImmutableField(stt, u32.view(index));
+					}
+					popE(ft.valtype);
+					popE(stt);
+				}
+				ARRAY_NEW_CANON => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					checkAndPopFields(at.elem_types);
+					push(ValueTypes.RefArray(false, at));
+				}
+				ARRAY_NEW_CANON_DEFAULT => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var att = ValueTypes.RefArray(false, at);
+					if (!at.defaultable) err_atpc().ExpectedDefaultableHeapType(att);
+					popE(ValueType.I32);
+					push(att);
+				}
+				ARRAY_GET => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+					for (et in at.elem_types) {
+						if (et.packing != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(et);
+						push(et.valtype);
 					}
 				}
-				0xFC => {
-					var b2 = parser.decoder.read_uleb32();
-					match (b2) {
-						Opcode.I32_TRUNC_SAT_F32_S.code => checkSignature(Opcode.I32_TRUNC_SAT_F32_S.sig);
-						Opcode.I32_TRUNC_SAT_F32_U.code => checkSignature(Opcode.I32_TRUNC_SAT_F32_U.sig);
-						Opcode.I32_TRUNC_SAT_F64_S.code => checkSignature(Opcode.I32_TRUNC_SAT_F64_S.sig);
-						Opcode.I32_TRUNC_SAT_F64_U.code => checkSignature(Opcode.I32_TRUNC_SAT_F64_U.sig);
-						Opcode.I64_TRUNC_SAT_F32_S.code => checkSignature(Opcode.I64_TRUNC_SAT_F32_S.sig);
-						Opcode.I64_TRUNC_SAT_F32_U.code => checkSignature(Opcode.I64_TRUNC_SAT_F32_U.sig);
-						Opcode.I64_TRUNC_SAT_F64_S.code => checkSignature(Opcode.I64_TRUNC_SAT_F64_S.sig);
-						Opcode.I64_TRUNC_SAT_F64_U.code => checkSignature(Opcode.I64_TRUNC_SAT_F64_U.sig);
-						Opcode.MEMORY_INIT.code => {
-							if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
-							var dindex = parser.readDataIndex();
-							var mindex = parser.readMemoryIndex();
-							checkAndPopArgs(SigCache.arr_iii);
-						}
-						Opcode.DATA_DROP.code => {
-							if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
-							var index = parser.readDataIndex();
-						}
-						Opcode.MEMORY_COPY.code => {
-							var dest = parser.readMemoryIndex();
-							var src = parser.readMemoryIndex();
-							checkAndPopArgs(SigCache.arr_iii);
-						}
-						Opcode.MEMORY_FILL.code => {
-							var index = parser.readMemoryIndex();
-							checkAndPopArgs(SigCache.arr_iii);
-						}
-						Opcode.TABLE_INIT.code => {
-							var elem = parser.readElemRef();
-							var dst = parser.readTableRef();
-							if (dst == null || elem == null) return;
-							if (!ValueTypes.isAssignable(elem.elemtype, dst.elemtype)) {
-								err_atpc().ElementTypeMismatch(dst.elemtype, elem.elemtype);
-							}
-							checkAndPopArgs(SigCache.arr_iii);
-						}
-						Opcode.ELEM_DROP.code => {
-							var index = parser.readElemRef();
-						}
-						Opcode.TABLE_COPY.code => {
-							var dst = parser.readTableRef();
-							var src = parser.readTableRef();
-							if (dst == null || src == null) return;
-							if (!ValueTypes.isAssignable(src.elemtype, dst.elemtype)) {
-								err_atpc().ElementTypeMismatch(dst.elemtype, src.elemtype);
-							}
-							checkAndPopArgs(SigCache.arr_iii);
-						}
-						Opcode.TABLE_GROW.code => {
-							var table = parser.readTableRef();
-							if (table == null) return;
-							popE(ValueType.I32);
-							popE(table.elemtype);
-							push(ValueType.I32);
-						}
-						Opcode.TABLE_SIZE.code => {
-							var table = parser.readTableRef();
-							push(ValueType.I32);
-						}
-						Opcode.TABLE_FILL.code => {
-							var table = parser.readTableRef();
-							if (table == null) return;
-							popE(ValueType.I32);
-							popE(table.elemtype);
-							popE(ValueType.I32);
-						}
-						_ => err_atpc().InvalidOpcode(opcode, b2);
+				ARRAY_GET_S, // fallthrough
+				ARRAY_GET_U => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+					for (et in at.elem_types) {
+						if (et.packing == Packedness.UNPACKED) err_atpc().ExpectedPackedType(et);
+						push(et.valtype);
 					}
 				}
-				0xFD => {
-					var b2 = parser.decoder.read_uleb32();
-					if (b2 >= 256) return err_atpc().InvalidOpcode(opcode, b2);
-					var op = Opcodes.page_FD[b2];
-					match (op) {
-						V128_LOAD_8_SPLAT => checkAlignment2(0);
-						V128_LOAD_16_SPLAT => checkAlignment2(1);
-						V128_LOAD_32_SPLAT => checkAlignment2(2);
-						V128_LOAD_64_SPLAT,
-						V128_LOAD_8X8_S,
-						V128_LOAD_8X8_U,
-						V128_LOAD_16X4_S,
-						V128_LOAD_16X4_U,
-						V128_LOAD_32_ZERO,
-						V128_LOAD_32X2_S,
-						V128_LOAD_32X2_U,
-						V128_LOAD_64_ZERO => checkAlignment2(3);
-						V128_LOAD,
-						V128_STORE => checkAlignment2(4);
-						V128_LOAD_8_LANE,
-						V128_STORE_8_LANE => { checkAlignment2(0); checkLane(15); }
-						V128_LOAD_16_LANE,
-						V128_STORE_16_LANE => { checkAlignment2(1); checkLane(7); }
-						V128_LOAD_32_LANE,
-						V128_STORE_32_LANE => { checkAlignment2(2); checkLane(3); }
-						V128_LOAD_64_LANE,
-						V128_STORE_64_LANE => { checkAlignment2(3);  checkLane(1); }
-						V128_CONST,
-						I8X16_SHUFFLE => parser.decoder.skipN(16);
-						I8X16_EXTRACTLANE_S,
-						I8X16_EXTRACTLANE_U,
-						I8X16_REPLACELANE => checkLane(15);
-						I16X8_EXTRACTLANE_S,
-						I16X8_EXTRACTLANE_U,
-						I16X8_REPLACELANE => checkLane(7);
-						I32X4_EXTRACTLANE,
-						I32X4_REPLACELANE,
-						F32X4_EXTRACTLANE,
-						F32X4_REPLACELANE => checkLane(3);
-						I64X2_EXTRACTLANE,
-						I64X2_REPLACELANE,
-						F64X2_EXTRACTLANE,
-						F64X2_REPLACELANE => checkLane(3);
-
-						UNREACHABLE => return err_atpc().InvalidOpcode(opcode, b2);
-						_ => ;
+				ARRAY_SET => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					for (et in at.elem_types) {
+						if (!et.mutable) err_atpc().IllegalAssignmentToImmutableArray(ValueType.Ref(true, HeapType.Array(at)));
+						popE(et.valtype);
 					}
-					checkSignature(op.sig);
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
 				}
-				_ => err_atpc().InvalidOpcode(opcode, parser.decoder.read1());
+				ARRAY_LEN => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.ARRAYREF);
+					push(ValueType.I32);
+				}
+				ARRAY_NEW_CANON_FIXED => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var size = codeptr.read_uleb32();
+					for (i < size) checkAndPopFields(at.elem_types);
+					push(ValueTypes.RefArray(false, at));
+				}
+				ARRAY_NEW_CANON_DATA => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var index = parser.readDataIndex();
+					for (et in at.elem_types) {
+						if (!ValueTypes.isPrimitive(et.valtype)) err_atpc().IllegalNonPrimitiveArray(at);
+					}
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					push(ValueTypes.RefArray(false, at));
+				}
+				ARRAY_NEW_CANON_ELEM => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var elem = parser.readElemRef();
+					if (elem == null) return;
+					if (!ValueTypes.isAssignable(elem.elemtype, at.elem_types[0].valtype)) {
+						err_atpc().ElementTypeMismatch(at.elem_types[0].valtype, elem.elemtype);
+					}
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					push(ValueTypes.RefArray(false, at));
+				}
+				I31_NEW => {
+					if (noGC(opcode)) return;
+					popE(ValueType.I32);
+					push(ValueTypes.I31REF_NONNULL);
+				}
+				I31_GET_S => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.I31REF);
+					push(ValueType.I32);
+				}
+				I31_GET_U => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.I31REF);
+					push(ValueType.I32);
+				}
+				REF_TEST,
+				REF_TEST_NULL => {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.REF_TEST_NULL.code);
+					var ht = parser.readHeapType();
+					var ref = popRef();
+					push(ValueType.I32);
+				}
+				REF_CAST,
+				REF_CAST_NULL => {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.REF_CAST_NULL.code);
+					var ht = parser.readHeapType();
+					var ref = popRef();
+					push(ValueType.Ref(nullable, ht));
+				}
+				BR_ON_CAST,
+				BR_ON_CAST_NULL => {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.BR_ON_CAST_NULL.code);
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					var ht = parser.readHeapType();
+					ctlxfer.refS(target, opcode_pos, val_stack);
+					var ref = popRef();
+					push(ValueType.Ref(nullable, ht));
+					checkAndPopArgs(labelArgs(target));
+					push(ref.0);  // leave original value
+				}
+				BR_ON_CAST_FAIL,
+				BR_ON_CAST_FAIL_NULL=> {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.BR_ON_CAST_FAIL_NULL.code);
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					var ht = parser.readHeapType();
+					ctlxfer.refS(target, opcode_pos, val_stack);
+					var ref = popRef();
+					push(ref.0); // leave original value
+					checkAndPopArgs(labelArgs(target));
+					push(ValueType.Ref(nullable, ht));
+				}
+				EXTERN_INTERNALIZE => {
+					if (noGC(opcode)) return;
+					if (!checkExtension(Extension.GC, opcode)) return;
+					var nullable = popRefE(ValueTypes.EXTERNREF);
+					var at = if(nullable, ValueTypes.ANYREF, ValueTypes.ANYREF_NONNULL);
+					push(at);
+				}
+				EXTERN_EXTERNALIZE => {
+					if (noGC(opcode)) return;
+					if (!checkExtension(Extension.GC, opcode)) return;
+					var nullable = popRefE(ValueTypes.ANYREF);
+					var et = if(nullable, ValueTypes.EXTERNREF, ValueTypes.EXTERNREF_NONNULL);
+					push(et);
+				}
+				I32_TRUNC_SAT_F32_S => checkSignature(Opcode.I32_TRUNC_SAT_F32_S.sig);
+				I32_TRUNC_SAT_F32_U => checkSignature(Opcode.I32_TRUNC_SAT_F32_U.sig);
+				I32_TRUNC_SAT_F64_S => checkSignature(Opcode.I32_TRUNC_SAT_F64_S.sig);
+				I32_TRUNC_SAT_F64_U => checkSignature(Opcode.I32_TRUNC_SAT_F64_U.sig);
+				I64_TRUNC_SAT_F32_S => checkSignature(Opcode.I64_TRUNC_SAT_F32_S.sig);
+				I64_TRUNC_SAT_F32_U => checkSignature(Opcode.I64_TRUNC_SAT_F32_U.sig);
+				I64_TRUNC_SAT_F64_S => checkSignature(Opcode.I64_TRUNC_SAT_F64_S.sig);
+				I64_TRUNC_SAT_F64_U => checkSignature(Opcode.I64_TRUNC_SAT_F64_U.sig);
+				MEMORY_INIT => {
+					if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
+					var dindex = parser.readDataIndex();
+					var mindex = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				DATA_DROP => {
+					if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
+					var index = parser.readDataIndex();
+				}
+				MEMORY_COPY => {
+					var dest = parser.readMemoryIndex();
+					var src = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				MEMORY_FILL => {
+					var index = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				TABLE_INIT => {
+					var elem = parser.readElemRef();
+					var dst = parser.readTableRef();
+					if (dst == null || elem == null) return;
+					if (!ValueTypes.isAssignable(elem.elemtype, dst.elemtype)) {
+						err_atpc().ElementTypeMismatch(dst.elemtype, elem.elemtype);
+					}
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				ELEM_DROP => {
+					var index = parser.readElemRef();
+				}
+				TABLE_COPY => {
+					var dst = parser.readTableRef();
+					var src = parser.readTableRef();
+					if (dst == null || src == null) return;
+					if (!ValueTypes.isAssignable(src.elemtype, dst.elemtype)) {
+						err_atpc().ElementTypeMismatch(dst.elemtype, src.elemtype);
+					}
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				TABLE_GROW => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(ValueType.I32);
+					popE(table.elemtype);
+					push(ValueType.I32);
+				}
+				TABLE_SIZE => {
+					var table = parser.readTableRef();
+					push(ValueType.I32);
+				}
+				TABLE_FILL => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(ValueType.I32);
+					popE(table.elemtype);
+					popE(ValueType.I32);
+				}
+				V128_LOAD_8_SPLAT => checkAlignment2(0);
+				V128_LOAD_16_SPLAT => checkAlignment2(1);
+				V128_LOAD_32_SPLAT => checkAlignment2(2);
+				V128_LOAD_64_SPLAT,
+				V128_LOAD_8X8_S,
+				V128_LOAD_8X8_U,
+				V128_LOAD_16X4_S,
+				V128_LOAD_16X4_U,
+				V128_LOAD_32_ZERO,
+				V128_LOAD_32X2_S,
+				V128_LOAD_32X2_U,
+				V128_LOAD_64_ZERO => checkAlignment2(3);
+				V128_LOAD,
+				V128_STORE => checkAlignment2(4);
+				V128_LOAD_8_LANE,
+				V128_STORE_8_LANE => { checkAlignment2(0); checkLane(15); }
+				V128_LOAD_16_LANE,
+				V128_STORE_16_LANE => { checkAlignment2(1); checkLane(7); }
+				V128_LOAD_32_LANE,
+				V128_STORE_32_LANE => { checkAlignment2(2); checkLane(3); }
+				V128_LOAD_64_LANE,
+				V128_STORE_64_LANE => { checkAlignment2(3);  checkLane(1); }
+				V128_CONST,
+				I8X16_SHUFFLE => codeptr.skipN(16);
+				I8X16_EXTRACTLANE_S,
+				I8X16_EXTRACTLANE_U,
+				I8X16_REPLACELANE => checkLane(15);
+				I16X8_EXTRACTLANE_S,
+				I16X8_EXTRACTLANE_U,
+				I16X8_REPLACELANE => checkLane(7);
+				I32X4_EXTRACTLANE,
+				I32X4_REPLACELANE,
+				F32X4_EXTRACTLANE,
+				F32X4_REPLACELANE => checkLane(3);
+				I64X2_EXTRACTLANE,
+				I64X2_REPLACELANE,
+				F64X2_EXTRACTLANE,
+				F64X2_REPLACELANE => checkLane(3);
+				INVALID => {
+					codeptr.at(opcode_pos);
+					err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
+				}
+				_ => {
+					if (opcode.sig != null) {
+						checkSignature(opcode.sig);
+						if (Trace.validation) traceStack(false);
+					} else {
+						codeptr.at(opcode_pos);
+						err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
+					}
+				}
 			}
 			if (Trace.validation) traceStack(false);
 		}
+	}
+	def noGC(opcode: Opcode) -> bool {
+		return !checkExtension(Extension.GC, opcode);
 	}
 	def checkInit(index: u32) {
 		if (index >= init_status.length) return;
@@ -756,16 +772,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		if (p.length > 0) checkAndPopArgs(p);
 		if (r.length > 0) pushTypes(r);
 	}
-	def checkExtension(ext: Extension, opcode: byte) -> bool {
+	def checkExtension(ext: Extension, opcode: Opcode) -> bool {
 		if (extensions != (extensions | ext)) {
-			err_atpc().OpcodeRequiresExtension(Opcodes.opcodes[opcode], ext);
-			return false;
-		}
-		return true;
-	}
-	def checkExtensionP(ext: Extension, prefix: byte, opcode: u32) -> bool {
-		if (extensions != (extensions | ext)) {
-			err_atpc().OpcodeRequiresExtension(Opcodes.find(prefix, opcode), ext);
+			err_atpc().OpcodeRequiresExtension(opcode, ext);
 			return false;
 		}
 		return true;
@@ -775,11 +784,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl_top.reachable = false;
 		val_stack.top = ctl_top.val_stack_top;
 	}
-	def checkAlignment(opcode: byte, max: u32) {
+	def checkAlignment(opcode: Opcode, max: u32) {
 		var memarg = parser.readMemoryArg();
 		var align = memarg.0;
 		if (align > max) err_atpc().IllegalAlignment(max, align);
-		var sig = Opcodes.signatures[opcode];
+		var sig = opcode.sig;
 		checkAndPopArgs(sig.params);
 		pushTypes(sig.results);
 	}
@@ -789,12 +798,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		if (align > max) err_atpc().IllegalAlignment(max, align);
 	}
 	def checkLane(max: u32) {
-		var lane = parser.decoder.read1();
+		var lane = codeptr.read1();
 		if (lane > max) err_atpc().IllegalLane(max, lane);
 	}
 	def traceOpcode() {
 		OUT.put2("  %x(+%d): ", opcode_pos, opcode_pos - ctlxfer.start_pos);
-		var codeptr = parser.decoder;
 		var prev = codeptr.pos;
 		codeptr.at(opcode_pos);
 		instrTracer.putInstr(OUT, module, codeptr);
@@ -915,10 +923,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 	def pushTypes(r: Array<ValueType>) {
 		val_stack.pusha(r);
 	}
-	def checkArgsAndPushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>) -> ControlEntry {
+	def checkArgsAndPushControl(opcode: Opcode, params: Array<ValueType>, results: Array<ValueType>) -> ControlEntry {
 		checkAndPopArgs(params);
 		pushTypes(params);
-		return pushControl(opcode, params, results, val_stack.top - params.length);
+		return pushControl(opcode.code, params, results, val_stack.top - params.length);
 	}
 	def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, val_stack_top: int) -> ControlEntry {
 		var ctl = ctl_stack.next();
