@@ -8,26 +8,18 @@ component V3Interpreter {
 	var instrTracer: InstrTracer;
 	def val_stack = ArrayStack<Value>.new();   // XXX: inline value stack array and top
 	def codeptr = CodePtr.new(null);	// pointer into code
-	private var frame: V3Frame;		// cached of top-of-stack frame, TODO: V3Interpreter
+	private var frame: V3Frame;		// cached of top-of-stack frame
 	def call_stack = ArrayStack<V3Frame>.new();
-	private var entry: Function;		// entrypoint function from {run()}
 
 	def run(f: Function, args: Array<Value>) -> Result {
 		// Reset interpreter state
 		reset();
 		// Push arguments onto the stack
-		val_stack.resize(0);
 		if (args != null) for (a in args) val_stack.push(a);
-		// Push synthetic top frame onto the stack
-		entry = f;
-		var synth = FuncDecl.new(f.sig.heaptype_index);
-		synth.sig = f.sig;
-		synth.setOrigCode(SYNTH_CODE);
-		synth.num_locals = if(args != null, u16.!(args.length));
-		pushFrame(WasmFunction.new(null, synth));
 		// Begin execution
 		E.state = ExecState.RUN;
-		loop();
+		doCallFunction(f); // call a host function or push a frame
+		if (frame != null) loop();
 		// Convert internal state into result
 		match (E.state) {
 			FINISHED => return Result.Value(popN(f.sig.results.length));
@@ -59,7 +51,7 @@ component V3Interpreter {
 		// Setup function and code pointer
 		nf.func = f;
 		nf.pc = 0;
-		nf.xip = 0;
+		nf.stp = 0;
 		nf.accessor = null;
 		var code = f.decl.cur_bytecode;
 		codeptr.reset(code, 0, code.length);
@@ -84,29 +76,33 @@ component V3Interpreter {
 		while (E.state == ExecState.RUN) {
 			if (E.probes != null) E.fireProbes(frame.func, frame.pc, TargetFrame(frame));
 			var pc = codeptr.pos;
-			var opcode = codeptr.read1();
-			var origop = execOp(pc, opcode);
-			if (origop == 0) continue;  // instruction executed successfully
-			if (origop < 0) break;  // breakpoint
-			execOp(pc, byte.view(origop)); // breakpoint resumed, execute original code
+			var b = codeptr.peek1();
+			var opcode: Opcode;
+			if (b == InternalOpcode.PROBE.code) {
+				if (!Execute.fireProbesAt(frame.func, pc, TargetFrame(frame))) break;
+				opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
+			} else {
+				opcode = codeptr.read_opcode();
+			}
+			execOp(pc, opcode);
 		}
 	}
 	// Execute the given opcode and return {0} if successfully executed. If a breakpoint
 	// is hit and the state is {RUNNING}, then {-1} is returned. If the state is {RESUME},
 	// then, the original opcode is returned, encoded into the (nonzero) return value.
-	def execOp(pc: int, opcode: byte) -> int {
+	def execOp(pc: int, opcode: Opcode) {
 		match (opcode) {
-			Opcode.UNREACHABLE.code => {
+			UNREACHABLE => {
 				trap(TrapReason.UNREACHABLE);
 			}
-			Opcode.NOP.code => {
+			NOP => {
 				// do nothing
 			}
-			Opcode.BLOCK.code,
-			Opcode.LOOP.code => {
+			BLOCK,
+			LOOP => {
 				codeptr.skip_block_type();
 			}
-			Opcode.IF.code => {
+			IF => {
 				var cond = popi();
 				if (cond == 0) {
 					codeptr.at(doGoto(pc));
@@ -115,45 +111,45 @@ component V3Interpreter {
 					doFallthru();
 				}
 			}
-			Opcode.ELSE.code => {
+			ELSE => {
 				codeptr.at(doGoto(pc));
 			}
-			Opcode.END.code => {
+			END => {
 				if (codeptr.available() == 0) doReturn();
 			}
-			Opcode.BR.code => {
+			BR => {
 				codeptr.at(doGoto(pc));
 			}
-			Opcode.BR_IF.code => {
+			BR_IF => {
 				var cond = popi();
 				doBranch(pc, cond != 0);
 			}
-			Opcode.BR_TABLE.code => {
+			BR_TABLE => {
 				var key = popu();
 				codeptr.at(doSwitch(pc, key));
 			}
-			Opcode.RETURN.code => {
+			RETURN => {
 				doReturn();
 			}
-			Opcode.CALL.code => {
+			CALL => {
 				var func_index = codeptr.read_uleb32();
 				var f = frame.func.instance.functions[func_index];
 				doCallFunction(f);
 			}
-			Opcode.CALL_INDIRECT.code => {
+			CALL_INDIRECT => {
 				var sig_index = codeptr.read_uleb32();
 				var table_index = codeptr.read_uleb32();
 				var func_index = popu();
 				var f = lookupIndirect(sig_index, table_index, func_index);
 				if (f != null) doCallFunction(f);
 			}
-			Opcode.RETURN_CALL.code => {
+			RETURN_CALL => {
 				var func_index = codeptr.read_uleb32();
 				var f = frame.func.instance.functions[func_index];
 				prepareReturnCall(f.sig);
 				doCallFunction(f);
 			}
-			Opcode.RETURN_CALL_INDIRECT.code => {
+			RETURN_CALL_INDIRECT => {
 				var sig_index = codeptr.read_uleb32();
 				var table_index = codeptr.read_uleb32();
 				var func_index = popu();
@@ -163,14 +159,14 @@ component V3Interpreter {
 					doCallFunction(f);
 				}
 			}
-			Opcode.CALL_REF.code => {
+			CALL_REF => {
 				var sig_index = codeptr.read_uleb32();
 				var v = pop();
 				var func = Function.!(Value.Ref.!(v).val);
 				if (func == null) trap(TrapReason.NULL_DEREF);
 				else doCallFunction(func);
 			}
-			Opcode.RETURN_CALL_REF.code => {
+			RETURN_CALL_REF => {
 				var sig_index = codeptr.read_uleb32();
 				var v = pop();
 				var func = Function.!(Value.Ref.!(v).val);
@@ -181,14 +177,14 @@ component V3Interpreter {
 					doCallFunction(func);
 				}
 			}
-			Opcode.DROP.code => {
+			DROP => {
 				pop();
 			}
-			Opcode.SELECT.code => {
+			SELECT => {
 				var cond = popu(), b = pop(), a = pop();
 				push(if(cond != 0, a, b));
 			}
-			Opcode.SELECT_T.code => {
+			SELECT_T => {
 				var count = codeptr.read_value_types();
 				var cond = popu();
 				if (cond != 0) {
@@ -197,27 +193,27 @@ component V3Interpreter {
 					copyVals(count, val_stack.top - (count << 1)); // transfer false values down
 				}
 			}
-			Opcode.LOCAL_GET.code => {
+			LOCAL_GET => {
 				var index = codeptr.read_uleb32();
 				push(val_stack.elems[frame.fp + int.!(index)]);
 			}
-			Opcode.LOCAL_SET.code => {
+			LOCAL_SET => {
 				var index = codeptr.read_uleb32();
 				val_stack.elems[frame.fp + int.!(index)] = pop();
 			}
-			Opcode.LOCAL_TEE.code => {
+			LOCAL_TEE => {
 				var index = codeptr.read_uleb32();
 				val_stack.elems[frame.fp + int.!(index)] = val_stack.peek();
 			}
-			Opcode.GLOBAL_GET.code => {
+			GLOBAL_GET => {
 				var index = codeptr.read_uleb32();
 				push(frame.func.instance.globals[index].value);
 			}
-			Opcode.GLOBAL_SET.code => {
+			GLOBAL_SET => {
 				var index = codeptr.read_uleb32();
 				frame.func.instance.globals[index].value = pop();
 			}
-			Opcode.TABLE_GET.code => {
+			TABLE_GET => {
 				var index = codeptr.read_uleb32();
 				var elems = frame.func.instance.tables[index].elems;
 				var elem = popu();
@@ -227,7 +223,7 @@ component V3Interpreter {
 					push(elems[elem]);
 				}
 			}
-			Opcode.TABLE_SET.code => {
+			TABLE_SET => {
 				var index = codeptr.read_uleb32();
 				var table = frame.func.instance.tables[index];
 				var val = pop();
@@ -239,209 +235,209 @@ component V3Interpreter {
 				}
 			}
 
-			Opcode.I32_LOAD.code => doLoad(do_i32_load);
-			Opcode.I64_LOAD.code => doLoad(do_i64_load);
-			Opcode.F32_LOAD.code => doLoad(do_f32_load);
-			Opcode.F64_LOAD.code => doLoad(do_f64_load);
-			Opcode.I32_LOAD8_S.code => doLoad(do_i32_load8_s);
-			Opcode.I32_LOAD8_U.code => doLoad(do_i32_load8_u);
-			Opcode.I32_LOAD16_S.code => doLoad(do_i32_load16_s);
-			Opcode.I32_LOAD16_U.code => doLoad(do_i32_load16_u);
-			Opcode.I64_LOAD8_S.code => doLoad(do_i64_load8_s);
-			Opcode.I64_LOAD8_U.code => doLoad(do_i64_load8_u);
-			Opcode.I64_LOAD16_S.code => doLoad(do_i64_load16_s);
-			Opcode.I64_LOAD16_U.code => doLoad(do_i64_load16_u);
-			Opcode.I64_LOAD32_S.code => doLoad(do_i64_load32_s);
-			Opcode.I64_LOAD32_U.code => doLoad(do_i64_load32_u);
-			Opcode.I32_STORE.code => doStore(do_i32_store);
-			Opcode.I64_STORE.code => doStore(do_i64_store);
-			Opcode.F32_STORE.code => doStore(do_f32_store);
-			Opcode.F64_STORE.code => doStore(do_f64_store);
-			Opcode.I32_STORE8.code => doStore(do_i32_store8);
-			Opcode.I32_STORE16.code => doStore(do_i32_store16);
-			Opcode.I64_STORE8.code => doStore(do_i64_store8);
-			Opcode.I64_STORE16.code => doStore(do_i64_store16);
-			Opcode.I64_STORE32.code => doStore(do_i64_store32);
+			I32_LOAD => doLoad(do_i32_load);
+			I64_LOAD => doLoad(do_i64_load);
+			F32_LOAD => doLoad(do_f32_load);
+			F64_LOAD => doLoad(do_f64_load);
+			I32_LOAD8_S => doLoad(do_i32_load8_s);
+			I32_LOAD8_U => doLoad(do_i32_load8_u);
+			I32_LOAD16_S => doLoad(do_i32_load16_s);
+			I32_LOAD16_U => doLoad(do_i32_load16_u);
+			I64_LOAD8_S => doLoad(do_i64_load8_s);
+			I64_LOAD8_U => doLoad(do_i64_load8_u);
+			I64_LOAD16_S => doLoad(do_i64_load16_s);
+			I64_LOAD16_U => doLoad(do_i64_load16_u);
+			I64_LOAD32_S => doLoad(do_i64_load32_s);
+			I64_LOAD32_U => doLoad(do_i64_load32_u);
+			I32_STORE => doStore(do_i32_store);
+			I64_STORE => doStore(do_i64_store);
+			F32_STORE => doStore(do_f32_store);
+			F64_STORE => doStore(do_f64_store);
+			I32_STORE8 => doStore(do_i32_store8);
+			I32_STORE16 => doStore(do_i32_store16);
+			I64_STORE8 => doStore(do_i64_store8);
+			I64_STORE16 => doStore(do_i64_store16);
+			I64_STORE32 => doStore(do_i64_store32);
 
-			Opcode.MEMORY_SIZE.code => {
+			MEMORY_SIZE => {
 				var index = codeptr.read_uleb32();
 				var pages = frame.func.instance.memories[index].size();
 				pushu(pages);
 			}
-			Opcode.MEMORY_GROW.code => {
+			MEMORY_GROW => {
 				var index = codeptr.read_uleb32();
 				var result = frame.func.instance.memories[index].grow(popu());
 				pushu(u32.view(result));
 			}
 
-			Opcode.I32_CONST.code => pushi(codeptr.read_sleb32());
-			Opcode.I64_CONST.code => pushl(codeptr.read_sleb64());
-			Opcode.F32_CONST.code => push(Value.F32(codeptr.read_u32()));
-			Opcode.F64_CONST.code => push(Value.F64(codeptr.read_u64()));
+			I32_CONST => pushi(codeptr.read_sleb32());
+			I64_CONST => pushl(codeptr.read_sleb64());
+			F32_CONST => push(Value.F32(codeptr.read_u32()));
+			F64_CONST => push(Value.F64(codeptr.read_u64()));
 
-			Opcode.I32_EQZ.code => pushz(popu() == 0);
-			Opcode.I32_EQ.code => do_uu_z(V3Eval.I32_EQ);
-			Opcode.I32_NE.code => do_uu_z(V3Eval.I32_NE);
-			Opcode.I32_LT_S.code => do_ii_z(V3Eval.I32_LT_S);
-			Opcode.I32_LT_U.code => do_uu_z(V3Eval.I32_LT_U);
-			Opcode.I32_GT_S.code => do_ii_z(V3Eval.I32_GT_S);
-			Opcode.I32_GT_U.code => do_uu_z(V3Eval.I32_GT_U);
-			Opcode.I32_LE_S.code => do_ii_z(V3Eval.I32_LE_S);
-			Opcode.I32_LE_U.code => do_uu_z(V3Eval.I32_LE_U);
-			Opcode.I32_GE_S.code => do_ii_z(V3Eval.I32_GE_S);
-			Opcode.I32_GE_U.code => do_uu_z(V3Eval.I32_GE_U);
+			I32_EQZ => pushz(popu() == 0);
+			I32_EQ => do_uu_z(V3Eval.I32_EQ);
+			I32_NE => do_uu_z(V3Eval.I32_NE);
+			I32_LT_S => do_ii_z(V3Eval.I32_LT_S);
+			I32_LT_U => do_uu_z(V3Eval.I32_LT_U);
+			I32_GT_S => do_ii_z(V3Eval.I32_GT_S);
+			I32_GT_U => do_uu_z(V3Eval.I32_GT_U);
+			I32_LE_S => do_ii_z(V3Eval.I32_LE_S);
+			I32_LE_U => do_uu_z(V3Eval.I32_LE_U);
+			I32_GE_S => do_ii_z(V3Eval.I32_GE_S);
+			I32_GE_U => do_uu_z(V3Eval.I32_GE_U);
 
-			Opcode.I64_EQZ.code => pushz(popw() == 0);
-			Opcode.I64_EQ.code => do_ww_z(V3Eval.I64_EQ);
-			Opcode.I64_NE.code => do_ww_z(V3Eval.I64_NE);
-			Opcode.I64_LT_S.code => do_ll_z(V3Eval.I64_LT_S);
-			Opcode.I64_LT_U.code => do_ww_z(V3Eval.I64_LT_U);
-			Opcode.I64_GT_S.code => do_ll_z(V3Eval.I64_GT_S);
-			Opcode.I64_GT_U.code => do_ww_z(V3Eval.I64_GT_U);
-			Opcode.I64_LE_S.code => do_ll_z(V3Eval.I64_LE_S);
-			Opcode.I64_LE_U.code => do_ww_z(V3Eval.I64_LE_U);
-			Opcode.I64_GE_S.code => do_ll_z(V3Eval.I64_GE_S);
-			Opcode.I64_GE_U.code => do_ww_z(V3Eval.I64_GE_U);
+			I64_EQZ => pushz(popw() == 0);
+			I64_EQ => do_ww_z(V3Eval.I64_EQ);
+			I64_NE => do_ww_z(V3Eval.I64_NE);
+			I64_LT_S => do_ll_z(V3Eval.I64_LT_S);
+			I64_LT_U => do_ww_z(V3Eval.I64_LT_U);
+			I64_GT_S => do_ll_z(V3Eval.I64_GT_S);
+			I64_GT_U => do_ww_z(V3Eval.I64_GT_U);
+			I64_LE_S => do_ll_z(V3Eval.I64_LE_S);
+			I64_LE_U => do_ww_z(V3Eval.I64_LE_U);
+			I64_GE_S => do_ll_z(V3Eval.I64_GE_S);
+			I64_GE_U => do_ww_z(V3Eval.I64_GE_U);
 
-			Opcode.F32_EQ.code => do_ff_z(V3Eval.F32_EQ);
-			Opcode.F32_NE.code => do_ff_z(V3Eval.F32_NE);
-			Opcode.F32_LT.code => do_ff_z(V3Eval.F32_LT);
-			Opcode.F32_GT.code => do_ff_z(V3Eval.F32_GT);
-			Opcode.F32_LE.code => do_ff_z(V3Eval.F32_LE);
-			Opcode.F32_GE.code => do_ff_z(V3Eval.F32_GE);
-			Opcode.F64_EQ.code => do_dd_z(V3Eval.F64_EQ);
-			Opcode.F64_NE.code => do_dd_z(V3Eval.F64_NE);
-			Opcode.F64_LT.code => do_dd_z(V3Eval.F64_LT);
-			Opcode.F64_GT.code => do_dd_z(V3Eval.F64_GT);
-			Opcode.F64_LE.code => do_dd_z(V3Eval.F64_LE);
-			Opcode.F64_GE.code => do_dd_z(V3Eval.F64_GE);
+			F32_EQ => do_ff_z(V3Eval.F32_EQ);
+			F32_NE => do_ff_z(V3Eval.F32_NE);
+			F32_LT => do_ff_z(V3Eval.F32_LT);
+			F32_GT => do_ff_z(V3Eval.F32_GT);
+			F32_LE => do_ff_z(V3Eval.F32_LE);
+			F32_GE => do_ff_z(V3Eval.F32_GE);
+			F64_EQ => do_dd_z(V3Eval.F64_EQ);
+			F64_NE => do_dd_z(V3Eval.F64_NE);
+			F64_LT => do_dd_z(V3Eval.F64_LT);
+			F64_GT => do_dd_z(V3Eval.F64_GT);
+			F64_LE => do_dd_z(V3Eval.F64_LE);
+			F64_GE => do_dd_z(V3Eval.F64_GE);
 
-			Opcode.I32_CLZ.code => do_u_u(V3Eval.I32_CLZ);
-			Opcode.I32_CTZ.code => do_u_u(V3Eval.I32_CTZ);
-			Opcode.I32_POPCNT.code => do_u_u(V3Eval.I32_POPCNT);
-			Opcode.I32_ADD.code => do_uu_u(V3Eval.I32_ADD);
-			Opcode.I32_SUB.code => do_uu_u(V3Eval.I32_SUB);
-			Opcode.I32_MUL.code => do_uu_u(V3Eval.I32_MUL);
-			Opcode.I32_DIV_S.code => do_ii_it(V3Eval.I32_DIV_S);
-			Opcode.I32_DIV_U.code => do_uu_ut(V3Eval.I32_DIV_U);
-			Opcode.I32_REM_S.code => do_ii_it(V3Eval.I32_REM_S);
-			Opcode.I32_REM_U.code => do_uu_ut(V3Eval.I32_REM_U);
-			Opcode.I32_AND.code => do_uu_u(V3Eval.I32_AND);
-			Opcode.I32_OR.code => do_uu_u(V3Eval.I32_OR);
-			Opcode.I32_XOR.code => do_uu_u(V3Eval.I32_XOR);
-			Opcode.I32_SHL.code => do_ii_i(V3Eval.I32_SHL);
-			Opcode.I32_SHR_S.code => do_ii_i(V3Eval.I32_SHR_S);
-			Opcode.I32_SHR_U.code => do_ii_i(V3Eval.I32_SHR_U);
-			Opcode.I32_ROTL.code => do_uu_u(V3Eval.I32_ROTL);
-			Opcode.I32_ROTR.code => do_uu_u(V3Eval.I32_ROTR);
+			I32_CLZ => do_u_u(V3Eval.I32_CLZ);
+			I32_CTZ => do_u_u(V3Eval.I32_CTZ);
+			I32_POPCNT => do_u_u(V3Eval.I32_POPCNT);
+			I32_ADD => do_uu_u(V3Eval.I32_ADD);
+			I32_SUB => do_uu_u(V3Eval.I32_SUB);
+			I32_MUL => do_uu_u(V3Eval.I32_MUL);
+			I32_DIV_S => do_ii_it(V3Eval.I32_DIV_S);
+			I32_DIV_U => do_uu_ut(V3Eval.I32_DIV_U);
+			I32_REM_S => do_ii_it(V3Eval.I32_REM_S);
+			I32_REM_U => do_uu_ut(V3Eval.I32_REM_U);
+			I32_AND => do_uu_u(V3Eval.I32_AND);
+			I32_OR => do_uu_u(V3Eval.I32_OR);
+			I32_XOR => do_uu_u(V3Eval.I32_XOR);
+			I32_SHL => do_ii_i(V3Eval.I32_SHL);
+			I32_SHR_S => do_ii_i(V3Eval.I32_SHR_S);
+			I32_SHR_U => do_ii_i(V3Eval.I32_SHR_U);
+			I32_ROTL => do_uu_u(V3Eval.I32_ROTL);
+			I32_ROTR => do_uu_u(V3Eval.I32_ROTR);
 
-			Opcode.I64_CLZ.code => do_w_w(V3Eval.I64_CLZ);
-			Opcode.I64_CTZ.code => do_w_w(V3Eval.I64_CTZ);
-			Opcode.I64_POPCNT.code => do_w_w(V3Eval.I64_POPCNT);
+			I64_CLZ => do_w_w(V3Eval.I64_CLZ);
+			I64_CTZ => do_w_w(V3Eval.I64_CTZ);
+			I64_POPCNT => do_w_w(V3Eval.I64_POPCNT);
 
-			Opcode.I64_ADD.code => do_ww_w(V3Eval.I64_ADD);
-			Opcode.I64_SUB.code => do_ww_w(V3Eval.I64_SUB);
-			Opcode.I64_MUL.code => do_ww_w(V3Eval.I64_MUL);
-			Opcode.I64_DIV_S.code => do_ll_lt(V3Eval.I64_DIV_S);
-			Opcode.I64_DIV_U.code => do_ww_wt(V3Eval.I64_DIV_U);
-			Opcode.I64_REM_S.code => do_ll_lt(V3Eval.I64_REM_S);
-			Opcode.I64_REM_U.code => do_ww_wt(V3Eval.I64_REM_U);
-			Opcode.I64_AND.code => do_ww_w(V3Eval.I64_AND);
-			Opcode.I64_OR.code => do_ww_w(V3Eval.I64_OR);
-			Opcode.I64_XOR.code => do_ww_w(V3Eval.I64_XOR);
-			Opcode.I64_SHL.code => do_ww_w(V3Eval.I64_SHL);
-			Opcode.I64_SHR_S.code => do_ll_l(V3Eval.I64_SHR_S);
-			Opcode.I64_SHR_U.code => do_ww_w(V3Eval.I64_SHR_U);
-			Opcode.I64_ROTL.code => do_ww_w(V3Eval.I64_ROTL);
-			Opcode.I64_ROTR.code => do_ww_w(V3Eval.I64_ROTR);
+			I64_ADD => do_ww_w(V3Eval.I64_ADD);
+			I64_SUB => do_ww_w(V3Eval.I64_SUB);
+			I64_MUL => do_ww_w(V3Eval.I64_MUL);
+			I64_DIV_S => do_ll_lt(V3Eval.I64_DIV_S);
+			I64_DIV_U => do_ww_wt(V3Eval.I64_DIV_U);
+			I64_REM_S => do_ll_lt(V3Eval.I64_REM_S);
+			I64_REM_U => do_ww_wt(V3Eval.I64_REM_U);
+			I64_AND => do_ww_w(V3Eval.I64_AND);
+			I64_OR => do_ww_w(V3Eval.I64_OR);
+			I64_XOR => do_ww_w(V3Eval.I64_XOR);
+			I64_SHL => do_ww_w(V3Eval.I64_SHL);
+			I64_SHR_S => do_ll_l(V3Eval.I64_SHR_S);
+			I64_SHR_U => do_ww_w(V3Eval.I64_SHR_U);
+			I64_ROTL => do_ww_w(V3Eval.I64_ROTL);
+			I64_ROTR => do_ww_w(V3Eval.I64_ROTR);
 
-			Opcode.F32_ABS.code => do_f_f(V3Eval.F32_ABS);
-			Opcode.F32_NEG.code => do_f_f(V3Eval.F32_NEG);
-			Opcode.F32_CEIL.code => do_f_f(V3Eval.F32_CEIL);
-			Opcode.F32_FLOOR.code => do_f_f(V3Eval.F32_FLOOR);
-			Opcode.F32_TRUNC.code => do_f_f(V3Eval.F32_TRUNC);
-			Opcode.F32_NEAREST.code => do_f_f(V3Eval.F32_NEAREST);
-			Opcode.F32_SQRT.code => do_f_f(V3Eval.F32_SQRT);
-			Opcode.F32_ADD.code => do_ff_f(V3Eval.F32_ADD);
-			Opcode.F32_SUB.code => do_ff_f(V3Eval.F32_SUB);
-			Opcode.F32_MUL.code => do_ff_f(V3Eval.F32_MUL);
-			Opcode.F32_DIV.code => do_ff_f(V3Eval.F32_DIV);
-			Opcode.F32_MIN.code => do_ff_f(V3Eval.F32_MIN);
-			Opcode.F32_MAX.code => do_ff_f(V3Eval.F32_MAX);
-			Opcode.F32_COPYSIGN.code => do_ff_f(V3Eval.F32_COPYSIGN);
+			F32_ABS => do_f_f(V3Eval.F32_ABS);
+			F32_NEG => do_f_f(V3Eval.F32_NEG);
+			F32_CEIL => do_f_f(V3Eval.F32_CEIL);
+			F32_FLOOR => do_f_f(V3Eval.F32_FLOOR);
+			F32_TRUNC => do_f_f(V3Eval.F32_TRUNC);
+			F32_NEAREST => do_f_f(V3Eval.F32_NEAREST);
+			F32_SQRT => do_f_f(V3Eval.F32_SQRT);
+			F32_ADD => do_ff_f(V3Eval.F32_ADD);
+			F32_SUB => do_ff_f(V3Eval.F32_SUB);
+			F32_MUL => do_ff_f(V3Eval.F32_MUL);
+			F32_DIV => do_ff_f(V3Eval.F32_DIV);
+			F32_MIN => do_ff_f(V3Eval.F32_MIN);
+			F32_MAX => do_ff_f(V3Eval.F32_MAX);
+			F32_COPYSIGN => do_ff_f(V3Eval.F32_COPYSIGN);
 
-			Opcode.F64_ABS.code => do_d_d(V3Eval.F64_ABS);
-			Opcode.F64_NEG.code => do_d_d(V3Eval.F64_NEG);
-			Opcode.F64_CEIL.code => do_d_d(V3Eval.F64_CEIL);
-			Opcode.F64_FLOOR.code => do_d_d(V3Eval.F64_FLOOR);
-			Opcode.F64_TRUNC.code => do_d_d(V3Eval.F64_TRUNC);
-			Opcode.F64_NEAREST.code => do_d_d(V3Eval.F64_NEAREST);
-			Opcode.F64_SQRT.code => do_d_d(V3Eval.F64_SQRT);
-			Opcode.F64_ADD.code => do_dd_d(V3Eval.F64_ADD);
-			Opcode.F64_SUB.code => do_dd_d(V3Eval.F64_SUB);
-			Opcode.F64_MUL.code => do_dd_d(V3Eval.F64_MUL);
-			Opcode.F64_DIV.code => do_dd_d(V3Eval.F64_DIV);
-			Opcode.F64_MIN.code => do_dd_d(V3Eval.F64_MIN);
-			Opcode.F64_MAX.code => do_dd_d(V3Eval.F64_MAX);
-			Opcode.F64_COPYSIGN.code => do_dd_d(V3Eval.F64_COPYSIGN);
+			F64_ABS => do_d_d(V3Eval.F64_ABS);
+			F64_NEG => do_d_d(V3Eval.F64_NEG);
+			F64_CEIL => do_d_d(V3Eval.F64_CEIL);
+			F64_FLOOR => do_d_d(V3Eval.F64_FLOOR);
+			F64_TRUNC => do_d_d(V3Eval.F64_TRUNC);
+			F64_NEAREST => do_d_d(V3Eval.F64_NEAREST);
+			F64_SQRT => do_d_d(V3Eval.F64_SQRT);
+			F64_ADD => do_dd_d(V3Eval.F64_ADD);
+			F64_SUB => do_dd_d(V3Eval.F64_SUB);
+			F64_MUL => do_dd_d(V3Eval.F64_MUL);
+			F64_DIV => do_dd_d(V3Eval.F64_DIV);
+			F64_MIN => do_dd_d(V3Eval.F64_MIN);
+			F64_MAX => do_dd_d(V3Eval.F64_MAX);
+			F64_COPYSIGN => do_dd_d(V3Eval.F64_COPYSIGN);
 
-			Opcode.I32_WRAP_I64.code => pushu(V3Eval.I32_WRAP_I64(popw()));
+			I32_WRAP_I64 => pushu(V3Eval.I32_WRAP_I64(popw()));
 
-			Opcode.I32_TRUNC_F32_S.code => trap_or(V3Eval.I32_TRUNC_F32_S(popf()), pushi);
-			Opcode.I32_TRUNC_F32_U.code => trap_or(V3Eval.I32_TRUNC_F32_U(popf()), pushu);
-			Opcode.I32_TRUNC_F64_S.code => trap_or(V3Eval.I32_TRUNC_F64_S(popd()), pushi);
-			Opcode.I32_TRUNC_F64_U.code => trap_or(V3Eval.I32_TRUNC_F64_U(popd()), pushu);
+			I32_TRUNC_F32_S => trap_or(V3Eval.I32_TRUNC_F32_S(popf()), pushi);
+			I32_TRUNC_F32_U => trap_or(V3Eval.I32_TRUNC_F32_U(popf()), pushu);
+			I32_TRUNC_F64_S => trap_or(V3Eval.I32_TRUNC_F64_S(popd()), pushi);
+			I32_TRUNC_F64_U => trap_or(V3Eval.I32_TRUNC_F64_U(popd()), pushu);
 
-			Opcode.I64_EXTEND_I32_S.code => pushl(V3Eval.I64_EXTEND_I32_S(popi()));
-			Opcode.I64_EXTEND_I32_U.code => pushw(V3Eval.I64_EXTEND_I32_U(popu()));
+			I64_EXTEND_I32_S => pushl(V3Eval.I64_EXTEND_I32_S(popi()));
+			I64_EXTEND_I32_U => pushw(V3Eval.I64_EXTEND_I32_U(popu()));
 
-			Opcode.I64_TRUNC_F32_S.code => trap_or(V3Eval.I64_TRUNC_F32_S(popf()), pushl);
-			Opcode.I64_TRUNC_F32_U.code => trap_or(V3Eval.I64_TRUNC_F32_U(popf()), pushw);
-			Opcode.I64_TRUNC_F64_S.code => trap_or(V3Eval.I64_TRUNC_F64_S(popd()), pushl);
-			Opcode.I64_TRUNC_F64_U.code => trap_or(V3Eval.I64_TRUNC_F64_U(popd()), pushw);
+			I64_TRUNC_F32_S => trap_or(V3Eval.I64_TRUNC_F32_S(popf()), pushl);
+			I64_TRUNC_F32_U => trap_or(V3Eval.I64_TRUNC_F32_U(popf()), pushw);
+			I64_TRUNC_F64_S => trap_or(V3Eval.I64_TRUNC_F64_S(popd()), pushl);
+			I64_TRUNC_F64_U => trap_or(V3Eval.I64_TRUNC_F64_U(popd()), pushw);
 
-			Opcode.F32_CONVERT_I32_S.code => pushf(V3Eval.F32_CONVERT_I32_S(popi()));
-			Opcode.F32_CONVERT_I32_U.code => pushf(V3Eval.F32_CONVERT_I32_U(popu()));
-			Opcode.F32_CONVERT_I64_S.code => pushf(V3Eval.F32_CONVERT_I64_S(popl()));
-			Opcode.F32_CONVERT_I64_U.code => pushf(V3Eval.F32_CONVERT_I64_U(popw()));
-			Opcode.F32_DEMOTE_F64.code => pushf(V3Eval.F32_DEMOTE_F64(popd()));
-			Opcode.F64_CONVERT_I32_S.code => pushd(V3Eval.F64_CONVERT_I32_S(popi()));
-			Opcode.F64_CONVERT_I32_U.code => pushd(V3Eval.F64_CONVERT_I32_U(popu()));
-			Opcode.F64_CONVERT_I64_S.code => pushd(V3Eval.F64_CONVERT_I64_S(popl()));
-			Opcode.F64_CONVERT_I64_U.code => pushd(V3Eval.F64_CONVERT_I64_U(popw()));
-			Opcode.F64_PROMOTE_F32.code => pushd(V3Eval.F64_PROMOTE_F32(popf()));
+			F32_CONVERT_I32_S => pushf(V3Eval.F32_CONVERT_I32_S(popi()));
+			F32_CONVERT_I32_U => pushf(V3Eval.F32_CONVERT_I32_U(popu()));
+			F32_CONVERT_I64_S => pushf(V3Eval.F32_CONVERT_I64_S(popl()));
+			F32_CONVERT_I64_U => pushf(V3Eval.F32_CONVERT_I64_U(popw()));
+			F32_DEMOTE_F64 => pushf(V3Eval.F32_DEMOTE_F64(popd()));
+			F64_CONVERT_I32_S => pushd(V3Eval.F64_CONVERT_I32_S(popi()));
+			F64_CONVERT_I32_U => pushd(V3Eval.F64_CONVERT_I32_U(popu()));
+			F64_CONVERT_I64_S => pushd(V3Eval.F64_CONVERT_I64_S(popl()));
+			F64_CONVERT_I64_U => pushd(V3Eval.F64_CONVERT_I64_U(popw()));
+			F64_PROMOTE_F32 => pushd(V3Eval.F64_PROMOTE_F32(popf()));
 
-			Opcode.I32_REINTERPRET_F32.code => pushu(V3Eval.I32_REINTERPRET_F32(popf()));
-			Opcode.F32_REINTERPRET_I32.code => pushf(V3Eval.F32_REINTERPRET_I32(popu()));
-			Opcode.I64_REINTERPRET_F64.code => pushw(V3Eval.I64_REINTERPRET_F64(popd()));
-			Opcode.F64_REINTERPRET_I64.code => pushd(V3Eval.F64_REINTERPRET_I64(popw()));
+			I32_REINTERPRET_F32 => pushu(V3Eval.I32_REINTERPRET_F32(popf()));
+			F32_REINTERPRET_I32 => pushf(V3Eval.F32_REINTERPRET_I32(popu()));
+			I64_REINTERPRET_F64 => pushw(V3Eval.I64_REINTERPRET_F64(popd()));
+			F64_REINTERPRET_I64 => pushd(V3Eval.F64_REINTERPRET_I64(popw()));
 
-			Opcode.I32_EXTEND8_S.code => pushi(V3Eval.I32_EXTEND8_S(popi()));
-			Opcode.I32_EXTEND16_S.code => pushi(V3Eval.I32_EXTEND16_S(popi()));
-			Opcode.I64_EXTEND8_S.code => pushl(V3Eval.I64_EXTEND8_S(popl()));
-			Opcode.I64_EXTEND16_S.code => pushl(V3Eval.I64_EXTEND16_S(popl()));
-			Opcode.I64_EXTEND32_S.code => pushl(V3Eval.I64_EXTEND32_S(popl()));
+			I32_EXTEND8_S => pushi(V3Eval.I32_EXTEND8_S(popi()));
+			I32_EXTEND16_S => pushi(V3Eval.I32_EXTEND16_S(popi()));
+			I64_EXTEND8_S => pushl(V3Eval.I64_EXTEND8_S(popl()));
+			I64_EXTEND16_S => pushl(V3Eval.I64_EXTEND16_S(popl()));
+			I64_EXTEND32_S => pushl(V3Eval.I64_EXTEND32_S(popl()));
 
-			Opcode.REF_NULL.code => {
+			REF_NULL => {
 				var index = codeptr.read_sleb32();
 				push(Values.REF_NULL);
 			}
-			Opcode.REF_IS_NULL.code => {
+			REF_IS_NULL => {
 				var v = pop();
 				var r = Values.isNull(v);
 				pushz(r);
 			}
-			Opcode.REF_FUNC.code => {
+			REF_FUNC => {
 				var index = codeptr.read_uleb32();
 				var func = frame.func.instance.functions[index];
 				push(Value.Ref(func));
 			}
-			Opcode.REF_AS_NON_NULL.code => {
+			REF_AS_NON_NULL => {
 				var v = pop();
 				if (Values.isNull(v)) trap(TrapReason.NULL_DEREF);
 				else push(v);
 			}
-			Opcode.BR_ON_NULL.code => {
+			BR_ON_NULL => {
 				var v = pop();
 				if (Values.isNull(v)) { // XXX: use doBranch
 					codeptr.at(doGoto(pc));
@@ -451,12 +447,12 @@ component V3Interpreter {
 					doFallthru();
 				}
 			}
-			Opcode.REF_EQ.code => {
+			REF_EQ => {
 				var a = pop();
 				var b = pop();
 				pushz(a == b);
 			}
-			Opcode.BR_ON_NON_NULL.code => {
+			BR_ON_NON_NULL => {
 				var v = pop();
 				if (!Values.isNull(v)) {
 					push(v);
@@ -466,363 +462,319 @@ component V3Interpreter {
 					doFallthru();
 				}
 			}
-
-			InternalOpcode.START.code => {
-				doCallFunction(entry);
+			STRUCT_NEW_CANON => {
+				var index = codeptr.read_uleb32();
+				var rtt = StructDecl.!(frame.func.instance.heaptypes[index]);
+				var fields = popN(rtt.field_types.length);
+				push(Value.Ref(HeapStruct.new(rtt, fields)));
 			}
-			InternalOpcode.PROBE.code => {
-				frame.pc = pc;
-				if (Execute.fireProbesAt(frame.func, pc, TargetFrame(frame))) {
-					var orig_opcode = frame.func.decl.orig_bytecode[pc];
-					return orig_opcode | 0x100;
+			STRUCT_NEW_CANON_DEFAULT => {
+				var index = codeptr.read_uleb32();
+				var rtt = StructDecl.!(frame.func.instance.heaptypes[index]);
+				var fieldTypes = rtt.field_types;
+				var fields = Array<Value>.new(fieldTypes.length);
+				for (i < fields.length) fields[i] = Values.default(fieldTypes[i].valtype);
+				push(Value.Ref(HeapStruct.new(rtt, fields)));
+			}
+			STRUCT_GET => {
+				var index = codeptr.read_uleb32();
+				var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				var findex = codeptr.read_uleb32();
+				var obj = HeapStruct.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else push(obj.vals[findex]);
+			}
+			STRUCT_GET_S => {
+				var index = codeptr.read_uleb32();
+				var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				var findex = codeptr.read_uleb32();
+				var obj = HeapStruct.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else push(signExtend(decl.field_types[findex], obj.vals[findex]));
+			}
+			STRUCT_GET_U => {
+				var index = codeptr.read_uleb32();
+				var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				var findex = codeptr.read_uleb32();
+				var obj = HeapStruct.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else push(zeroExtend(decl.field_types[findex], obj.vals[findex]));
+			}
+			STRUCT_SET => {
+				var index = codeptr.read_uleb32();
+				var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				var findex = codeptr.read_uleb32();
+				var val = pop();
+				var obj = HeapStruct.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else obj.vals[findex] = val; // TODO: narrow on store?
+			}
+			ARRAY_NEW_CANON => {
+				var index = codeptr.read_uleb32();
+				var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
+				var len = popu();
+				var elem = pop();
+				if (len > Execute.limits.max_array_length) {
+					trap(TrapReason.OOM);
 				} else {
-					codeptr.at(pc);
-					return -1;
+					var length = int.view(len);
+					var vals = Array<Value>.new(length);
+					for (i < vals.length) vals[i] = elem;
+					push(Value.Ref(HeapArray.new(rtt, vals)));
 				}
 			}
-
-			0xFB => {
-				var b2 = codeptr.read_uleb32();
-				match (b2) {
-					Opcode.STRUCT_NEW_CANON.code => {
-						var index = codeptr.read_uleb32();
-						var rtt = StructDecl.!(frame.func.instance.heaptypes[index]);
-						var fields = popN(rtt.field_types.length);
-						push(Value.Ref(HeapStruct.new(rtt, fields)));
-					}
-					Opcode.STRUCT_NEW_CANON_DEFAULT.code => {
-						var index = codeptr.read_uleb32();
-						var rtt = StructDecl.!(frame.func.instance.heaptypes[index]);
-						var fieldTypes = rtt.field_types;
-						var fields = Array<Value>.new(fieldTypes.length);
-						for (i < fields.length) fields[i] = Values.default(fieldTypes[i].valtype);
-						push(Value.Ref(HeapStruct.new(rtt, fields)));
-					}
-					Opcode.STRUCT_GET.code => {
-						var index = codeptr.read_uleb32();
-						var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						var findex = codeptr.read_uleb32();
-						var obj = HeapStruct.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else push(obj.vals[findex]);
-					}
-					Opcode.STRUCT_GET_S.code => {
-						var index = codeptr.read_uleb32();
-						var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						var findex = codeptr.read_uleb32();
-						var obj = HeapStruct.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else push(signExtend(decl.field_types[findex], obj.vals[findex]));
-					}
-					Opcode.STRUCT_GET_U.code => {
-						var index = codeptr.read_uleb32();
-						var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						var findex = codeptr.read_uleb32();
-						var obj = HeapStruct.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else push(zeroExtend(decl.field_types[findex], obj.vals[findex]));
-					}
-					Opcode.STRUCT_SET.code => {
-						var index = codeptr.read_uleb32();
-						var decl = StructDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						var findex = codeptr.read_uleb32();
-						var val = pop();
-						var obj = HeapStruct.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else obj.vals[findex] = val; // TODO: narrow on store?
-					}
-					Opcode.ARRAY_NEW_CANON.code => {
-						var index = codeptr.read_uleb32();
-						var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
-						var len = popu();
-						var elem = pop();
-						if (len > Execute.limits.max_array_length) {
-							trap(TrapReason.OOM);
-						} else {
-							var length = int.view(len);
-							var vals = Array<Value>.new(length);
-							for (i < vals.length) vals[i] = elem;
-							push(Value.Ref(HeapArray.new(rtt, vals)));
-						}
-					}
-					Opcode.ARRAY_NEW_CANON_DEFAULT.code => {
-						var index = codeptr.read_uleb32();
-						var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
-						var len = popu();
-						if (len > Execute.limits.max_array_length) {
-							trap(TrapReason.OOM);
-						} else {
-							var length = int.view(len);
-							var elem = Values.default(rtt.elem_types[0].valtype);
-							var vals = Array<Value>.new(length);
-							for (i < vals.length) vals[i] = elem;
-							push(Value.Ref(HeapArray.new(rtt, vals)));
-						}
-					}
-					Opcode.ARRAY_GET.code => {
-						var ignore = codeptr.read_uleb32();
-						var index = popu();
-						var obj = HeapArray.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
-						else push(obj.vals[index]);
-					}
-					Opcode.ARRAY_GET_S.code => {
-						var index = codeptr.read_uleb32();
-						var array = ArrayDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						index = popu();
-						var obj = HeapArray.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
-						else push(signExtend(array.elem_types[0], obj.vals[index]));
-					}
-					Opcode.ARRAY_GET_U.code => {
-						var index = codeptr.read_uleb32();
-						var array = ArrayDecl.!(frame.func.instance.heaptypes[int.view(index)]);
-						index = popu();
-						var obj = HeapArray.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
-						else push(zeroExtend(array.elem_types[0], obj.vals[index]));
-					}
-					Opcode.ARRAY_SET.code => {
-						var ignore = codeptr.read_uleb32();
-						var val = pop();
-						var index = popu();
-						var obj = HeapArray.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
-						else obj.vals[index] = val;
-					}
-					Opcode.ARRAY_LEN.code => {
-						var obj = HeapArray.!(popr().val);
-						if (obj == null) trap(TrapReason.NULL_DEREF);
-						else push(Value.I32(u32.view(obj.vals.length)));
-					}
-					Opcode.ARRAY_NEW_CANON_FIXED.code => {
-						var index = codeptr.read_uleb32();
-						var len = codeptr.read_uleb32();
-						var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
-						if (len > Execute.limits.max_array_length) {
-							trap(TrapReason.OOM);
-						} else {
-							var length = int.view(len);
-							var vals = Array<Value>.new(length);
-							for (i = vals.length - 1; i >= 0; i--) vals[i] = pop();
-							push(Value.Ref(HeapArray.new(rtt, vals)));
-						}
-					}
-					Opcode.ARRAY_NEW_CANON_DATA.code => {
-						var index = codeptr.read_uleb32();
-						var dindex = codeptr.read_uleb32();
-						var i = frame.func.instance;
-						if (!i.dropped_data[dindex]) {
-							var rtt = ArrayDecl.!(i.heaptypes[index]);
-							var len = popu();
-							var offset = popu();
-							var ddecl = i.module.data[int.!(dindex)];
-							if (len <= Execute.limits.max_array_length) {
-								var t = Execute.bytesToVals(rtt.elem_types[0], ddecl.data, offset, len);
-								if (t.0) push(Value.Ref(HeapArray.new(rtt, t.1)));
-								else trap(TrapReason.MEM_OUT_OF_BOUNDS);
-							} else {
-								trap(TrapReason.OOM);
-							}
-						} else {
-							trap(TrapReason.MEM_OUT_OF_BOUNDS);
-						}
-					}
-					Opcode.ARRAY_NEW_CANON_ELEM.code => {
-						var index = codeptr.read_uleb32();
-						var eindex = codeptr.read_uleb32();
-						var i = frame.func.instance;
-						if (!i.dropped_elems[eindex]) {
-							var rtt = ArrayDecl.!(i.heaptypes[index]);
-							var len = popu();
-							var offset = popu();
-							var edecl = i.module.elems[int.!(eindex)];
-							if (len <= Execute.limits.max_array_length) {
-								var vals = Array<Value>.new(int.!(len));
-								var r = Execute.copyElemsInto(vals, i, 0, edecl, offset, len);
-								if (r) push(Value.Ref(HeapArray.new(rtt, vals)));
-								else trap(TrapReason.TABLE_OUT_OF_BOUNDS); // TODO: elem out of bounds
-							} else {
-								trap(TrapReason.OOM);
-							}
-
-						} else {
-							trap(TrapReason.MEM_OUT_OF_BOUNDS);
-						}
-					}
-					Opcode.I31_NEW.code => {
-						push(Value.I31(u31.view(popu())));
-					}
-					Opcode.I31_GET_S.code => {
-						var v = pop();
-						if (v == Values.REF_NULL) trap(TrapReason.NULL_DEREF);
-						else pushi(i31.view(Value.I31.!(v).val));
-					}
-					Opcode.I31_GET_U.code => {
-						var v = pop();
-						if (v == Values.REF_NULL) trap(TrapReason.NULL_DEREF);
-						else pushu(Value.I31.!(v).val);
-					}
-					Opcode.REF_TEST.code,
-					Opcode.REF_TEST_NULL.code => {
-						var nullable = (b2 == Opcode.REF_TEST_NULL.code);
-						var htcode = codeptr.read_sleb32();
-						var result = Execute.doCast(frame.func.instance, nullable, htcode, pop());
-						pushz(result);
-					}
-					Opcode.REF_CAST.code,
-					Opcode.REF_CAST_NULL.code => {
-						var nullable = (b2 == Opcode.REF_CAST_NULL.code);
-						var htcode = codeptr.read_sleb32();
-						var val = pop();
-						var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
-						if (!result) trap(TrapReason.FAILED_CAST);
-						else push(val);
-					}
-					Opcode.BR_ON_CAST.code,
-					Opcode.BR_ON_CAST_NULL.code => {
-						var nullable = (b2 == Opcode.BR_ON_CAST_NULL.code);
-						codeptr.skip_label();
-						var htcode = codeptr.read_sleb32();
-						var val = pop();
-						var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
-						push(val);
-						if (result) codeptr.at(doGoto(pc));
-						else doFallthru();
-					}
-					Opcode.BR_ON_CAST_FAIL.code,
-					Opcode.BR_ON_CAST_FAIL_NULL.code => {
-						var nullable = (b2 == Opcode.BR_ON_CAST_FAIL_NULL.code);
-						codeptr.skip_label();
-						var htcode = codeptr.read_sleb32();
-						var val = pop();
-						var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
-						push(val);
-						if (!result) codeptr.at(doGoto(pc));
-						else doFallthru();
-					}
-					Opcode.EXTERN_INTERNALIZE.code, Opcode.EXTERN_EXTERNALIZE.code => {
-						// nop
-					}
-					_ => unhandled2(opcode, b2);
+			ARRAY_NEW_CANON_DEFAULT => {
+				var index = codeptr.read_uleb32();
+				var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
+				var len = popu();
+				if (len > Execute.limits.max_array_length) {
+					trap(TrapReason.OOM);
+				} else {
+					var length = int.view(len);
+					var elem = Values.default(rtt.elem_types[0].valtype);
+					var vals = Array<Value>.new(length);
+					for (i < vals.length) vals[i] = elem;
+					push(Value.Ref(HeapArray.new(rtt, vals)));
 				}
 			}
-			0xFC => {
-				var b2 = codeptr.read_uleb32();
-				match (b2) {
-					Opcode.I32_TRUNC_SAT_F32_S.code => pushi(i32.truncf(popf()));
-					Opcode.I32_TRUNC_SAT_F32_U.code => pushu(u32.truncf(popf()));
-					Opcode.I32_TRUNC_SAT_F64_S.code => pushi(i32.truncd(popd()));
-					Opcode.I32_TRUNC_SAT_F64_U.code => pushu(u32.truncd(popd()));
-					Opcode.I64_TRUNC_SAT_F32_S.code => pushl(i64.truncf(popf()));
-					Opcode.I64_TRUNC_SAT_F32_U.code => pushw(u64.truncf(popf()));
-					Opcode.I64_TRUNC_SAT_F64_S.code => pushl(i64.truncd(popd()));
-					Opcode.I64_TRUNC_SAT_F64_U.code => pushw(u64.truncd(popd()));
-					Opcode.MEMORY_INIT.code => {
-						var i = frame.func.instance;
-						var dindex = codeptr.read_uleb32();
-						var ddecl = if(!i.dropped_data[dindex], i.module.data[int.!(dindex)]);
-						var mem = i.memories[codeptr.read_uleb32()];
-						var size = popu();
-						var src_offset = popu();
-						var dst_offset = popu();
-						var t = mem.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					Opcode.DATA_DROP.code => {
-						var dindex = codeptr.read_uleb32();
-						frame.func.instance.dropped_data[dindex] = true;
-					}
-					Opcode.MEMORY_COPY.code => {
-						var i = frame.func.instance;
-						var dst = i.memories[codeptr.read_uleb32()];
-						var src = i.memories[codeptr.read_uleb32()];
-						var size = popu(), src_offset = popu(), dst_offset = popu();
-						var t = dst.copyM(dst_offset, src, src_offset, size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					Opcode.MEMORY_FILL.code => {
-						var i = frame.func.instance;
-						var mem = i.memories[codeptr.read_uleb32()];
-						var size = popu();
-						var val = popu();
-						var dest = popu();
-						var t = mem.fill(dest, u8.view(val), size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					Opcode.TABLE_INIT.code => {
-						var i = frame.func.instance;
-						var eindex = codeptr.read_uleb32();
-						var elem = if (!i.dropped_elems[eindex], i.module.elems[int.!(eindex)]);
-						var table = i.tables[codeptr.read_uleb32()];
-						var size = popu();
-						var src_offset = popu();
-						var dst_offset = popu();
-						var t = table.copyE(i, dst_offset, elem, src_offset, size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					Opcode.ELEM_DROP.code => {
-						var index = codeptr.read_uleb32();
-						frame.func.instance.dropped_elems[index] = true;
-					}
-					Opcode.TABLE_COPY.code => {
-						var i = frame.func.instance;
-						var dst = i.tables[codeptr.read_uleb32()];
-						var src = i.tables[codeptr.read_uleb32()];
-						var size = popu(), src_offset = popu(), dst_offset = popu();
-						var t = dst.copyT(dst_offset, src, src_offset, size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					Opcode.TABLE_GROW.code => {
-						var i = frame.func.instance;
-						var table = i.tables[codeptr.read_uleb32()];
-						var size = popu();
-						var val = pop();
-						var r = table.grow(size, val);
-						pushi(r);
-					}
-					Opcode.TABLE_SIZE.code => {
-						var i = frame.func.instance;
-						var table = i.tables[codeptr.read_uleb32()];
-						pushi(table.elems.length);
-					}
-					Opcode.TABLE_FILL.code => {
-						var i = frame.func.instance;
-						var table = i.tables[codeptr.read_uleb32()];
-						var size = popu();
-						var val = pop();
-						var dest = popu();
-						var t = table.fill(dest, val, size);
-						if (t != TrapReason.NONE) trap(t);
-					}
-					_ => unhandled2(opcode, b2);
+			ARRAY_GET => {
+				var ignore = codeptr.read_uleb32();
+				var index = popu();
+				var obj = HeapArray.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
+				else push(obj.vals[index]);
+			}
+			ARRAY_GET_S => {
+				var index = codeptr.read_uleb32();
+				var array = ArrayDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				index = popu();
+				var obj = HeapArray.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
+				else push(signExtend(array.elem_types[0], obj.vals[index]));
+			}
+			ARRAY_GET_U => {
+				var index = codeptr.read_uleb32();
+				var array = ArrayDecl.!(frame.func.instance.heaptypes[int.view(index)]);
+				index = popu();
+				var obj = HeapArray.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
+				else push(zeroExtend(array.elem_types[0], obj.vals[index]));
+			}
+			ARRAY_SET => {
+				var ignore = codeptr.read_uleb32();
+				var val = pop();
+				var index = popu();
+				var obj = HeapArray.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else if (index >= u32.view(obj.vals.length)) trap(TrapReason.ARRAY_INDEX_OOB);
+				else obj.vals[index] = val;
+			}
+			ARRAY_LEN => {
+				var obj = HeapArray.!(popr().val);
+				if (obj == null) trap(TrapReason.NULL_DEREF);
+				else push(Value.I32(u32.view(obj.vals.length)));
+			}
+			ARRAY_NEW_CANON_FIXED => {
+				var index = codeptr.read_uleb32();
+				var len = codeptr.read_uleb32();
+				var rtt = ArrayDecl.!(frame.func.instance.heaptypes[index]);
+				if (len > Execute.limits.max_array_length) {
+					trap(TrapReason.OOM);
+				} else {
+					var length = int.view(len);
+					var vals = Array<Value>.new(length);
+					for (i = vals.length - 1; i >= 0; i--) vals[i] = pop();
+					push(Value.Ref(HeapArray.new(rtt, vals)));
 				}
 			}
-			_ => unhandled(opcode);
+			ARRAY_NEW_CANON_DATA => {
+				var index = codeptr.read_uleb32();
+				var dindex = codeptr.read_uleb32();
+				var i = frame.func.instance;
+				if (!i.dropped_data[dindex]) {
+					var rtt = ArrayDecl.!(i.heaptypes[index]);
+					var len = popu();
+					var offset = popu();
+					var ddecl = i.module.data[int.!(dindex)];
+					if (len <= Execute.limits.max_array_length) {
+						var t = Execute.bytesToVals(rtt.elem_types[0], ddecl.data, offset, len);
+						if (t.0) push(Value.Ref(HeapArray.new(rtt, t.1)));
+						else trap(TrapReason.MEM_OUT_OF_BOUNDS);
+					} else {
+						trap(TrapReason.OOM);
+					}
+				} else {
+					trap(TrapReason.MEM_OUT_OF_BOUNDS);
+				}
+			}
+			ARRAY_NEW_CANON_ELEM => {
+				var index = codeptr.read_uleb32();
+				var eindex = codeptr.read_uleb32();
+				var i = frame.func.instance;
+				if (!i.dropped_elems[eindex]) {
+					var rtt = ArrayDecl.!(i.heaptypes[index]);
+					var len = popu();
+					var offset = popu();
+					var edecl = i.module.elems[int.!(eindex)];
+					if (len <= Execute.limits.max_array_length) {
+						var vals = Array<Value>.new(int.!(len));
+						var r = Execute.copyElemsInto(vals, i, 0, edecl, offset, len);
+						if (r) push(Value.Ref(HeapArray.new(rtt, vals)));
+						else trap(TrapReason.TABLE_OUT_OF_BOUNDS); // TODO: elem out of bounds
+					} else {
+						trap(TrapReason.OOM);
+					}
+					} else {
+					trap(TrapReason.MEM_OUT_OF_BOUNDS);
+				}
+			}
+			I31_NEW => {
+				push(Value.I31(u31.view(popu())));
+			}
+			I31_GET_S => {
+				var v = pop();
+				if (v == Values.REF_NULL) trap(TrapReason.NULL_DEREF);
+				else pushi(i31.view(Value.I31.!(v).val));
+			}
+			I31_GET_U => {
+				var v = pop();
+				if (v == Values.REF_NULL) trap(TrapReason.NULL_DEREF);
+				else pushu(Value.I31.!(v).val);
+			}
+			REF_TEST,
+			REF_TEST_NULL => {
+				var nullable = (opcode == Opcode.REF_TEST_NULL);
+				var htcode = codeptr.read_sleb32();
+				var result = Execute.doCast(frame.func.instance, nullable, htcode, pop());
+				pushz(result);
+			}
+			REF_CAST,
+			REF_CAST_NULL => {
+				var nullable = (opcode == Opcode.REF_CAST_NULL);
+				var htcode = codeptr.read_sleb32();
+				var val = pop();
+				var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
+				if (!result) trap(TrapReason.FAILED_CAST);
+				else push(val);
+			}
+			BR_ON_CAST,
+			BR_ON_CAST_NULL => {
+				var nullable = (opcode == Opcode.BR_ON_CAST_NULL);
+				codeptr.skip_label();
+				var htcode = codeptr.read_sleb32();
+				var val = pop();
+				var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
+				push(val);
+				if (result) codeptr.at(doGoto(pc));
+				else doFallthru();
+			}
+			BR_ON_CAST_FAIL,
+			BR_ON_CAST_FAIL_NULL => {
+				var nullable = (opcode == Opcode.BR_ON_CAST_FAIL_NULL);
+				codeptr.skip_label();
+				var htcode = codeptr.read_sleb32();
+				var val = pop();
+				var result = Execute.doCast(frame.func.instance, nullable, htcode, val);
+				push(val);
+				if (!result) codeptr.at(doGoto(pc));
+				else doFallthru();
+			}
+			EXTERN_INTERNALIZE, EXTERN_EXTERNALIZE => {
+				// nop
+			}
+			I32_TRUNC_SAT_F32_S => pushi(i32.truncf(popf()));
+			I32_TRUNC_SAT_F32_U => pushu(u32.truncf(popf()));
+			I32_TRUNC_SAT_F64_S => pushi(i32.truncd(popd()));
+			I32_TRUNC_SAT_F64_U => pushu(u32.truncd(popd()));
+			I64_TRUNC_SAT_F32_S => pushl(i64.truncf(popf()));
+			I64_TRUNC_SAT_F32_U => pushw(u64.truncf(popf()));
+			I64_TRUNC_SAT_F64_S => pushl(i64.truncd(popd()));
+			I64_TRUNC_SAT_F64_U => pushw(u64.truncd(popd()));
+			MEMORY_INIT => {
+				var i = frame.func.instance;
+				var dindex = codeptr.read_uleb32();
+				var ddecl = if(!i.dropped_data[dindex], i.module.data[int.!(dindex)]);
+				var mem = i.memories[codeptr.read_uleb32()];
+				var size = popu();
+				var src_offset = popu();
+				var dst_offset = popu();
+				var t = mem.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			DATA_DROP => {
+				var dindex = codeptr.read_uleb32();
+				frame.func.instance.dropped_data[dindex] = true;
+			}
+			MEMORY_COPY => {
+				var i = frame.func.instance;
+				var dst = i.memories[codeptr.read_uleb32()];
+				var src = i.memories[codeptr.read_uleb32()];
+				var size = popu(), src_offset = popu(), dst_offset = popu();
+				var t = dst.copyM(dst_offset, src, src_offset, size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			MEMORY_FILL => {
+				var i = frame.func.instance;
+				var mem = i.memories[codeptr.read_uleb32()];
+				var size = popu();
+				var val = popu();
+				var dest = popu();
+				var t = mem.fill(dest, u8.view(val), size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			TABLE_INIT => {
+				var i = frame.func.instance;
+				var eindex = codeptr.read_uleb32();
+				var elem = if (!i.dropped_elems[eindex], i.module.elems[int.!(eindex)]);
+				var table = i.tables[codeptr.read_uleb32()];
+				var size = popu();
+				var src_offset = popu();
+				var dst_offset = popu();
+				var t = table.copyE(i, dst_offset, elem, src_offset, size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			ELEM_DROP => {
+				var index = codeptr.read_uleb32();
+				frame.func.instance.dropped_elems[index] = true;
+			}
+			TABLE_COPY => {
+				var i = frame.func.instance;
+				var dst = i.tables[codeptr.read_uleb32()];
+				var src = i.tables[codeptr.read_uleb32()];
+				var size = popu(), src_offset = popu(), dst_offset = popu();
+				var t = dst.copyT(dst_offset, src, src_offset, size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			TABLE_GROW => {
+				var i = frame.func.instance;
+				var table = i.tables[codeptr.read_uleb32()];
+				var size = popu();
+				var val = pop();
+				var r = table.grow(size, val);
+				pushi(r);
+			}
+			TABLE_SIZE => {
+				var i = frame.func.instance;
+				var table = i.tables[codeptr.read_uleb32()];
+				pushi(table.elems.length);
+			}
+			TABLE_FILL => {
+				var i = frame.func.instance;
+				var table = i.tables[codeptr.read_uleb32()];
+				var size = popu();
+				var val = pop();
+				var dest = popu();
+				var t = table.fill(dest, val, size);
+				if (t != TrapReason.NONE) trap(t);
+			}
+			INVALID => trap(TrapReason.INVALID_OPCODE);
+			_ => {
+			}
 		}
 		if (frame != null) frame.pc = codeptr.pos;
-		return 0;
-	}
-	def unhandled(opcode: byte) {
-		if (Opcodes.attributes[opcode].VALID) {
-			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
-		} else if (Opcodes.attributes[opcode].PREFIX &&
-			Opcodes.find(opcode, codeptr.read_uleb32()) != Opcode.INVALID) {
-			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
-		} else {
-			trap(TrapReason.INVALID_OPCODE);
-		}
-	}
-	def unhandled2(opcode: byte, b2: u32) {
-		if (Opcodes.find(opcode, b2) != Opcode.INVALID) {
-			trap(TrapReason.UNIMPLEMENTED); // better error message than "invalid opcode"
-		} else {
-			trap(TrapReason.INVALID_OPCODE);
-		}
 	}
 	def doLoad(load: (Memory, u32, u32) -> (TrapReason, Value)) {
 		var flags = codeptr.read1();
@@ -929,7 +881,7 @@ component V3Interpreter {
 		return memory.write_u32(offset, index, u32.view(Value.I64.!(val).val));
 	}
 	def doFallthru() {
-		frame.xip += 4;
+		frame.stp += 4;
 	}
 	def doBranch(pc: int, cond: bool) -> bool {
 		if (cond) {
@@ -941,23 +893,23 @@ component V3Interpreter {
 		return cond;
 	}
 	def doGoto(pc: int) -> int {
-		var xip = frame.xip, sidetable = frame.func.decl.sidetable;
-		return doCtlXfer(pc, xip, sidetable);
+		var stp = frame.stp, sidetable = frame.func.decl.sidetable;
+		return doCtlXfer(pc, stp, sidetable);
 	}
 	def doSwitch(pc: int, key: u32) -> int {
-		var xip = frame.xip, sidetable = frame.func.decl.sidetable;
-		var max = sidetable[xip];
+		var stp = frame.stp, sidetable = frame.func.decl.sidetable;
+		var max = sidetable[stp];
 		var index = if(key >= max, max, 1 + int.!(key));
-		xip += index << 2;
+		stp += index << 2;
 		pc += index;
-		return doCtlXfer(pc, xip, sidetable);
+		return doCtlXfer(pc, stp, sidetable);
 	}
-	def doCtlXfer(pc: int, xip: int, sidetable: Array<int>) -> int {
-		var pc_delta = sidetable[xip];
-		var valcount = sidetable[xip + 1];
-		var popcount = sidetable[xip + 2];
-		var xip_delta = sidetable[xip + 3];
-		frame.xip = xip + xip_delta;
+	def doCtlXfer(pc: int, stp: int, sidetable: Array<int>) -> int {
+		var pc_delta = sidetable[stp];
+		var valcount = sidetable[stp + 1];
+		var popcount = sidetable[stp + 2];
+		var stp_delta = sidetable[stp + 3];
+		frame.stp = stp + stp_delta;
 		if (popcount > 0) {
 			copyVals(valcount, val_stack.top - int.!(popcount + valcount));
 		}
@@ -1020,16 +972,19 @@ component V3Interpreter {
 				hf: HostFunction => {
 					var result = doInvokeHostFunction(hf);
 					match (result) {
-						Trap(reason) => return trap(reason);
+						Trap(reason) => {
+							return trap(reason);
+						}
 						Error(msg) => {
 							Execute.error_msg = msg;
 							return trap(TrapReason.ERROR);
 						}
-						Value0 => return;
-						Value1(val) => return val_stack.push(val);
+						Value0 => ;
+						Value1(val) => {
+							val_stack.push(val);
+						}
 						ValueN(vals) => {
 							for (a in vals) val_stack.push(a);
-							return;
 						}
 						TailCall(f, args) => {
 							func = f;
@@ -1037,6 +992,11 @@ component V3Interpreter {
 							continue; // execute a tail call to a new function
 						}
 					}
+					if (frame == null) {  // popped top frame, finished execution
+						E.state = ExecState.FINISHED;
+						codeptr.reset(null, 0, 0);
+					}
+					return;
 				}
 				_ => return trap(TrapReason.FUNC_INVALID);
 			}
@@ -1319,17 +1279,11 @@ component V3Interpreter {
 	}
 }
 
-def SYNTH_CODE: Array<byte> = [
-	0, // no locals
-	InternalOpcode.START.code,
-	Opcode.END.code
-];
-
 class V3Frame {
 	var func: WasmFunction;
 	var fp: int;
 	var pc: int;
-	var xip: int;
+	var stp: int;
 	var accessor: V3FrameAccessor;
 }
 
