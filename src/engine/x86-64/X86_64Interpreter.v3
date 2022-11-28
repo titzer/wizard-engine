@@ -20,11 +20,11 @@ component X86_64Interpreter {
 		if (args != null) for (v in args) valueStack.push(v);
 
 		// Call the main loop which handles tail calls.
-		var abrupt = runWithTailCalls(f);
+		var ret = runWithTailCalls(f, Pointer.NULL);
 		// Unpack the abrupt return value into a {Result}.
-		match (abrupt) {
+		match (ret) {
 			null => return popResult(f.sig);
-			x: Trap => return Result.Trap(x.reason);
+			x: Trap => return Result.Trap(x);
 			_ => return Result.Break;
 		}
 	}
@@ -87,76 +87,80 @@ component X86_64Interpreter {
 	def inCode(p: Pointer) -> bool {
 		return p >= interpreterCode.start && p < interpreterCode.end;
 	}
-	private def runWithTailCalls(f: Function) -> AbruptReturn {
+	private def runWithTailCalls(f: Function, sp: Pointer) -> AbruptReturn {
 		var state = FINISHED;
 		while (true) { // handle repeated tail calls
 			var result: HostResult;
 			match (f) {
 				wf: WasmFunction => {
 					var sp = valueStack.sp;
-					state = invoke(wf, sp);
-					if (state == null) {
+					var ret = invoke(wf, sp);
+					if (ret == null) {
 						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.valuerep.slot_size);
 					}
-					break;
+					return ret;
 				}
-				hf: HostFunction0 => {
+				hf: HostFunction => {
 					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					result = hf.invoke0();
-				}
-				hf: HostFunction1 => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var a0 = valueStack.pop(hf.sig.params[0]);
-					result = hf.invoke1(a0);
-				}
-				hf: HostFunction2 => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var a1 = valueStack.pop(hf.sig.params[1]);
-					var a0 = valueStack.pop(hf.sig.params[0]);
-					result = hf.invoke2(a0, a1);
-				}
-				hf: HostFunction3 => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var a2 = valueStack.pop(hf.sig.params[2]);
-					var a1 = valueStack.pop(hf.sig.params[1]);
-					var a0 = valueStack.pop(hf.sig.params[0]);
-					result = hf.invoke3(a0, a1, a2);
-				}
-				hf: HostFunctionN => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var aN = valueStack.popN(hf.sig.params);
-					result = hf.invokeN(aN);
-				}
-			}
-			match (result) {
-				Trap(reason) => {
-					state = doTrap(reason);
-					break;
-				}
-				Error(msg) => {
-					state = doTrap(TrapReason.ERROR);
-					Execute.error_msg = msg;
-					break;
-				}
-				Value0 => {
-					break;
-				}
-				Value1(val) => {
-					valueStack.push(val);
-					break;
-				}
-				ValueN(vals) => {
-					for (a in vals) valueStack.push(a);
-					break;
-				}
-				TailCall(target, args) => {
-					for (a in args) valueStack.push(a);
-					f = target;
-					continue; // continue with next tail call
+					var result = doInvokeHostFunction(hf);
+					match (result) {
+						Trap(trap) => {
+							if (sp != Pointer.NULL) prependFrames(trap, hf, sp);
+							state = trap;
+							break;
+						}
+						Value0 => {
+							break;
+						}
+						Value1(val) => {
+							valueStack.push(val);
+							break;
+						}
+						ValueN(vals) => {
+							for (a in vals) valueStack.push(a);
+							break;
+						}
+						TailCall(target, args) => {
+							for (a in args) valueStack.push(a);
+							f = target;
+							continue; // continue with next tail call
+						}
+					}
 				}
 			}
 		}
 		return state;
+	}
+	private def doInvokeHostFunction(hf: HostFunction) -> HostResult {
+		var result: HostResult;
+		match (hf) {
+			hf: HostFunction0 => {
+				result = hf.invoke0();
+			}
+			hf: HostFunction1 => {
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke1(a0);
+			}
+			hf: HostFunction2 => {
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke2(a0, a1);
+			}
+			hf: HostFunction3 => {
+				var a2 = valueStack.pop(hf.sig.params[2]);
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke3(a0, a1, a2);
+			}
+			hf: HostFunctionN => {
+				var aN = valueStack.popN(hf.sig.params);
+				result = hf.invokeN(aN);
+			}
+			_ => {
+				return HostResult.Trap(Trap.new(TrapReason.ERROR, "invalid host function", null));
+			}
+		}
+		return result;
 	}
 	private def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
 		if (wf.decl.target_code.spc_entry != Pointer.NULL) {
@@ -174,7 +178,7 @@ component X86_64Interpreter {
 	// INTERPRETER RUNTIME CALLBACKS
 	// =======================================================================================
 	def runtime_callHost(f: Function) -> AbruptReturn {
-		var state = runWithTailCalls(f);
+		var state = runWithTailCalls(f, CiRuntime.callerSp());
 		return state;
 	}
 	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
@@ -190,7 +194,7 @@ component X86_64Interpreter {
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> AbruptReturn { // XXX: inline
@@ -200,7 +204,7 @@ component X86_64Interpreter {
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = dst.copyM(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> AbruptReturn {
@@ -209,7 +213,7 @@ component X86_64Interpreter {
 		var val = valueStack.popu();
 		var dest = valueStack.popu();
 		var t = memory.fill(dest, u8.view(val), size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
@@ -224,7 +228,7 @@ component X86_64Interpreter {
 	def runtime_TABLE_GET(instance: Instance, index: u32) -> AbruptReturn { // XXX: inline when Value rep known
 		var table = instance.tables[index];
 		var elem = Values.v_u(valueStack.pop(ValueType.I32));
-		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS);
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		var val = table.elems[elem];
 		valueStack.push(val);
 		return FINISHED;
@@ -233,7 +237,7 @@ component X86_64Interpreter {
 		var table = instance.tables[index];
 		var val = valueStack.pop(table.elemtype);
 		var elem = Values.v_u(valueStack.pop(ValueType.I32));
-		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS);
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		table[int.view(elem)] = val;
 		return FINISHED;
 	}
@@ -244,7 +248,7 @@ component X86_64Interpreter {
 		var src_offset = valueStack.popu();
 		var dst_offset = valueStack.popu();
 		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> AbruptReturn {
@@ -252,7 +256,7 @@ component X86_64Interpreter {
 		var src = instance.tables[t2];
 		var size = valueStack.popu(), src_offset = valueStack.popu(), dst_offset = valueStack.popu();
 		var t = dst.copyT(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
@@ -268,30 +272,70 @@ component X86_64Interpreter {
 		var val = valueStack.pop(table.elemtype);
 		var dest = valueStack.popu();
 		var t = table.fill(dest, val, size);
-		if (t != TrapReason.NONE) return doTrap(t);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> AbruptReturn {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		if (Execute.fireProbes(func, pc, frame)) return FINISHED;
-		return doTrap(Execute.trap_reason);
+		var ret = Execute.fireProbes(func, pc, frame);
+		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		return ret;
 	}
 	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> AbruptReturn {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		if (Execute.fireProbesAt(func, pc, frame)) return FINISHED;
-		return doTrap(Execute.trap_reason);
+		var ret = Execute.fireProbesAt(func, pc, frame);
+		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		return ret;
 	}
 	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> AbruptReturn {
-		return Trap.new(reason, StackSegment.new(null, null, [(func, pc)]));
+		if (DEBUG) Trace.OUT.put3("runtime_TRAP(%q, @+%d, %s)", func.render, pc, reason.name).outln();
+		var trap = Trap.new(reason, null, null);
+		return prependFrames(trap, null, CiRuntime.callerSp());
 	}
-	def doTrap(reason: TrapReason) -> AbruptReturn {
-		return Trap.new(reason, null);
+	def prependFrames(trap: Trap, hf: HostFunction, sp: Pointer) -> Trap {
+		var frame = TargetFrame(sp);
+		var trace = Vector<(WasmFunction, int)>.new();
+		var accessor = frame.getFrameAccessor();
+		while (accessor != null) {
+			trace.put(accessor.func(), accessor.pc());
+			var c = accessor.caller();
+			if (c.func == null) break;
+			accessor = c.frame.getFrameAccessor(); // XXX: get frame without inflating accessor
+		}
+		var result = Array<(WasmFunction, int)>.new(trace.length); // reverse frames
+		for (i < result.length) {
+			result[i] = trace[result.length - i - 1];
+		}
+		trap.prepend(result, hf);
+		return trap;
+	}
+	def doTrap(reason: TrapReason, sp: Pointer) -> AbruptReturn {
+		var trap = Trap.new(reason, null, null);
+		return prependFrames(trap, null, sp);
 	}
 }
 def computePCFromFrame(sp: Pointer) -> int {
+	if (DEBUG) dumpFrame(sp);
+	if (tuning.recordCurIpForTraps) return (sp + IVarConfig.frame.CURPC.disp).load<int>();
 	var ip   = (sp + IVarConfig.frame.IP.disp).load<Pointer>();
 	var code = Pointer.atContents((sp + IVarConfig.frame.CODE.disp).load<Array<byte>>());
 	return int.!(ip - code - 1);
+}
+def dumpFrame(sp: Pointer) {
+	Trace.OUT.put1("WASM_FUNC = %x\n", (sp + IVarConfig.frame.WASM_FUNC.disp).load<u64>());
+	Trace.OUT.put1("MEM0_BASE = %x\n", (sp + IVarConfig.frame.MEM0_BASE.disp).load<u64>());
+	Trace.OUT.put1("VFP       = %x\n", (sp + IVarConfig.frame.VFP.disp).load<u64>());
+	Trace.OUT.put1("VSP       = %x\n", (sp + IVarConfig.frame.VSP.disp).load<u64>());
+	Trace.OUT.put1("SIDETABLE = %x\n", (sp + IVarConfig.frame.SIDETABLE.disp).load<u64>());
+	Trace.OUT.put1("STP       = %x\n", (sp + IVarConfig.frame.STP.disp).load<u64>());
+	Trace.OUT.put1("CODE      = %x\n", (sp + IVarConfig.frame.CODE.disp).load<u64>());
+	Trace.OUT.put1("IP        = %x\n", (sp + IVarConfig.frame.IP.disp).load<u64>());
+	Trace.OUT.put1("EIP       = %x\n", (sp + IVarConfig.frame.EIP.disp).load<u64>());
+	Trace.OUT.put1("FUNC_DECL = %x\n", (sp + IVarConfig.frame.FUNC_DECL.disp).load<u64>());
+	Trace.OUT.put1("INSTANCE  = %x\n", (sp + IVarConfig.frame.INSTANCE.disp).load<u64>());
+	Trace.OUT.put1("CURPC     = %x\n", (sp + IVarConfig.frame.CURPC.disp).load<u64>());
+	Trace.OUT.put1("ACCESSOR  = %x\n", (sp + IVarConfig.frame.ACCESSOR.disp).load<u64>());
+	Trace.OUT.outln();
 }
 
 // FrameAccessor for probing and debugging.
@@ -340,7 +384,14 @@ class X86_64InterpreterFrameAccessor(sp: Pointer) extends FrameAccessor {
 		return 0;
 	}
 	// Get the caller frame. If none, then {Frame.func} will be {null}.
-	def caller() -> ProbeFrame; // TODO
+	def caller() -> ProbeFrame {
+		checkNotUnwound();
+		var callerSp = sp + IVarConfig.frame.size + Pointer.SIZE;
+		var frame = TargetFrame(callerSp);
+		var accessor = frame.getFrameAccessor();
+		if (accessor == null) return ProbeFrame(null, -1, frame);
+		return ProbeFrame(accessor.func(), accessor.pc(), frame);
+	}
 	// Get the number of local variables in this frame.
 	def numLocals() -> int {
 		checkNotUnwound();
@@ -641,7 +692,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def ivar_EIP		= (regs.EIP, frame.EIP);
 	def ivar_FUNC_DECL	= (regs.FUNC_DECL, frame.FUNC_DECL);
 	def ivar_INSTANCE	= (regs.INSTANCE, frame.INSTANCE);
-	def ivar_CURIP		= (regs.CURIP, frame.CURIP);
+	def ivar_CURPC		= (regs.CURPC, frame.CURPC);
 
 	def mutable_ivars = [
 		ivar_VSP,
@@ -656,7 +707,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		ivar_IP,
 		ivar_EIP,
 		ivar_FUNC_DECL,
-		ivar_INSTANCE
+		ivar_INSTANCE,
+		ivar_CURPC
 	];
 
 	new() {
@@ -1174,7 +1226,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			bindHandler(Opcode.CALL);
 			computeCurIpForTrap(-1);
-			// XXX: save ip prior to call for stack traces?
 			genReadUleb32(regs.tmp1);
 
 			asm.movq_r_m(regs.tmp0, regs.INSTANCE.plus(offsets.Instance_functions));
@@ -1182,6 +1233,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			// call_indirect jumps here
 			asm.bind(callFunction);
+			computePcFromCurIp();
 			saveCallerIVars();
 			var call_host = X86_64Label.new();
 			asm.d.cmp_m_i(targetFunc.plus(0), offsets.WasmFunction_typeId);
@@ -2043,7 +2095,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			computePcFromCurIp();
 			saveCallerIVars();
 			asm.movq_r_m(regs.tmp0, frame.WASM_FUNC); // XXX: compute func and pc directly in the right regs
-			callRuntime(refRuntimeCall(this.i.runtime_PROBE_instr), [regs.tmp0, regs.CURIP], true);
+			callRuntime(refRuntimeCall(this.i.runtime_PROBE_instr), [regs.tmp0, regs.CURPC], true);
 			restoreCallerIVars();
 			// Compute a pointer to the original code at this pc offset
 			var pc = regs.tmp1; // = IP - CODE
@@ -2064,7 +2116,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			computePcFromCurIp();
 			saveCallerIVars();
 			asm.movq_r_m(regs.tmp0, frame.WASM_FUNC); // XXX: compute func and pc directly in the right regs
-			callRuntime(refRuntimeCall(this.i.runtime_PROBE_loop), [regs.tmp0, regs.CURIP], true);
+			callRuntime(refRuntimeCall(this.i.runtime_PROBE_loop), [regs.tmp0, regs.CURPC], true);
 			restoreCallerIVars();
 			// TODO: reload code from function, as local probes may have been inserted or removed
 			asm.sub_r_i(regs.IP, 1);
@@ -2427,7 +2479,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def saveCallerIVars() {
 		saveIVar(regs.IP);
 		saveIVar(regs.STP);
-		if (tuning.recordCurIpForTraps) saveIVar(regs.CURIP);
+		if (tuning.recordCurIpForTraps) saveIVar(regs.CURPC);
 	}
 	def restoreCallerIVars() {
 		restoreReg(regs.IP);
@@ -2739,15 +2791,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (destRcx) asm.movd_r_r(R.RCX, dest);
 		else asm.movd_r_r(R.RCX, regs.tmp3);	// restore RCX
 	}
-	// Runtime calls and traps need CURIP register to be valid.
+	// Runtime calls and traps need CURPC register to be valid.
 	def computeCurIpForTrap(delta: int) {
 		if (tuning.recordCurIpForTraps) computeCurIpFromIp(delta);
 	}
 	def computeCurIpFromIp(delta: int) {
-		asm.q.lea(regs.CURIP, X86_64Addr.new(regs.IP, null, 1, delta - offsets.Array_contents));
+		asm.q.lea(regs.CURPC, X86_64Addr.new(regs.IP, null, 1, delta - offsets.Array_contents));
 	}
 	def computePcFromCurIp() {
-		asm.q.sub_r_m(regs.CURIP, frame.CODE);
+		if (tuning.recordCurIpForTraps) asm.q.sub_r_m(regs.CURPC, frame.CODE);
 	}
 	// All traps are generated out-of-line and call into the runtime.
 	def genTraps() {
@@ -2755,21 +2807,32 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		var call_runtime_TRAP = X86_64Label.new();
 		asm.bind(call_runtime_TRAP);
-		asm.q.sub_r_m(regs.CURIP, frame.CODE);
+		computePcFromCurIp();
 		saveCallerIVars();
 		asm.movq_r_m(regs.tmp1, frame.WASM_FUNC);
-		callRuntime(refRuntimeCall(this.i.runtime_TRAP), [regs.tmp1, regs.CURIP, regs.tmp4], true);
+		// XXX: load runtime arg registers directly
+		callRuntime(refRuntimeCall(this.i.runtime_TRAP), [regs.tmp1, regs.CURPC, regs.tmp4], true);
 		asm.bind(abruptRetLabel);
 		genPopFrameAndRet();
 
 		for (reason in TrapReason) {
 			if (reason == TrapReason.STACK_OVERFLOW) continue; // must be special
+			if (reason == TrapReason.DIV_BY_ZERO) continue; // must be special
 			asm.bind(trap_labels[reason.tag]);
 			asm.movd_r_i(regs.tmp4, reason.tag);
 			asm.jmp_rel_near(call_runtime_TRAP);
 		}
-		ic.oobMemoryHandlerOffset = trap_labels[TrapReason.MEM_OUT_OF_BOUNDS.tag].pos;
-		ic.divZeroHandlerOffset = trap_labels[TrapReason.DIV_BY_ZERO.tag].pos;
+		// divide by zero happens when RAX and RDX are clobbered
+		var divzero_label = trap_labels[TrapReason.DIV_BY_ZERO.tag];
+		asm.bind(divzero_label);
+		computePcFromCurIp();
+		saveIVar(regs.STP);
+		if (tuning.recordCurIpForTraps) saveIVar(regs.CURPC);
+		// XXX: load runtime arg registers directly
+		asm.movq_r_m(regs.tmp1, frame.WASM_FUNC);
+		asm.movd_r_i(regs.tmp4, TrapReason.DIV_BY_ZERO.tag);
+		callRuntime(refRuntimeCall(this.i.runtime_TRAP), [regs.tmp1, regs.CURPC, regs.tmp4], true);
+		asm.jmp_rel_near(abruptRetLabel);
 
 		// stack overflow cannot call into runtime, because it might be out of stack (!)
 		var stackoverflow_label = trap_labels[TrapReason.STACK_OVERFLOW.tag];
@@ -2778,6 +2841,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movd_r_i(Target.V3_RET_GPRS[0], int.view(u32.!(addr)));
 		asm.jmp_rel_near(abruptRetLabel);
 		ic.stackOverflowHandlerOffset = stackoverflow_label.pos;
+		ic.oobMemoryHandlerOffset = trap_labels[TrapReason.MEM_OUT_OF_BOUNDS.tag].pos;
+		ic.divZeroHandlerOffset = trap_labels[TrapReason.DIV_BY_ZERO.tag].pos;
+
 	}
 	def refRuntimeCall<P, R>(f: P -> R) -> Pointer {
 		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(f).0;

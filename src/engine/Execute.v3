@@ -17,13 +17,14 @@ component Execute {
 	var state: ExecState;			// current execution state
 	var trap_reason: TrapReason;		// trap reason, if any
 	var error_msg: string;			// error message associated with trap
-	var exit_code = 0;
+	var exit_code: int;
 	var handleTrap = defaultTrap;		// how to handle traps
 	var mode = Mode.INTERPRETER;
 	def trapObjects = Array<Trap>.new(TrapReason.ERROR.tag + 1);
+	def NO_FRAMES = Array<(WasmFunction, int)>.new(0);
 
 	new() {
-		for (r in TrapReason) trapObjects[r.tag] = Trap.new(r, null);
+		for (r in TrapReason) trapObjects[r.tag] = Trap.new(r, null, null);
 	}
 
 	// Reset internal states.
@@ -37,62 +38,41 @@ component Execute {
 	}
 	// Call a given function with the given arguments.
 	def call(func: Function, args: Array<Value>) -> Result {
-		while (true) {  // host function may tail-call another function
-			match (func) {
-				wf: WasmFunction => return Target.call(wf, args);
-				hf: HostFunction => {
-					var result = doInvokeHostFunction(hf, args);
-					match (result) {
-						Trap(reason) => return trap(reason);
-						Error(msg) => {
-							error_msg = msg;
-							return trap(TrapReason.ERROR);
-						}
-						Value0 => return Result.Value(Values.NONE);
-						Value1(val) => return Result.Value([val]);
-						ValueN(vals) => return Result.Value(vals);
-						TailCall(f, a) => {
-							func = f;
-							args = a;
-							continue; // execute a tail call to a new function
-						}
-					}
-				}
-				_ => return trap(TrapReason.FUNC_INVALID);
-			}
-		}
-		return Result.Trap(TrapReason.UNREACHABLE);
+		return Target.call(func, args);
 	}
-	def trap(reason: TrapReason) -> Result {
-		return Result.Trap(reason); // TODO: invoke onTrap()
-	}
-	private def MISMATCH = HostResult.Trap(TrapReason.FUNC_SIG_MISMATCH);
 	private def doInvokeHostFunction(hf: HostFunction, args: Array<Value>) -> HostResult {
 		if (Trace.interpreter) traceCallHostFunction(hf);
 		var result: HostResult;
 		match (hf) {
 			hf0: HostFunction0 => {
-				if (args.length != 0) return MISMATCH;
+				if (args.length != 0) return funcSigMismatch();
 				result = hf0.invoke0();
 			}
 			hf1: HostFunction1 => {
-				if (args.length != 1) return MISMATCH;
+				if (args.length != 1) return funcSigMismatch();
 				result = hf1.invoke1(args[0]);
 			}
 			hf2: HostFunction2 => {
-				if (args.length != 2) return MISMATCH;
+				if (args.length != 2) return funcSigMismatch();
 				result = hf2.invoke2(args[0], args[1]);
 			}
 			hf3: HostFunction3 => {
-				if (args.length != 3) return MISMATCH;
+				if (args.length != 3) return funcSigMismatch();
 				result = hf3.invoke3(args[0], args[1], args[2]);
 			}
 			hfN: HostFunctionN => {
-				if (args.length != hf.sig.params.length) return MISMATCH;
+				if (args.length != hf.sig.params.length) return funcSigMismatch();
 				result = hfN.invokeN(args);
 			}
 		}
 		return result;
+	}
+	def funcSigMismatch() -> HostResult.Trap {
+		return HostResult.Trap(Trap.new(TrapReason.FUNC_SIG_MISMATCH, null, null));
+	}
+	def trap(reason: TrapReason, hf: HostFunction) -> Result.Trap {
+		var segment = if(hf != null, StackSegment.new(null, hf, NO_FRAMES));
+		return Result.Trap(Trap.new(reason, null, segment));
 	}
 	// General routines that are implemented by target-specific code.
 	def setMode = Target.setMode;
@@ -105,34 +85,34 @@ component Execute {
 		Trace.OUT.put2("callHost(\"%q\": %q)", hf.render, hf.sig.render).outln();
 	}
 	// Fires probes on the global interpreter loop
-	def fireProbes(func: WasmFunction, pc: int, frame: TargetFrame) -> bool {
+	def fireProbes(func: WasmFunction, pc: int, frame: TargetFrame) -> AbruptReturn {
 		state = ExecState.PROBING;
 		var r = Execute.probes.fire(func, pc, frame);
 		return resume(r);
 	}
 	// Fires probes on a specific instruction
-	def fireProbesAt(func: WasmFunction, pc: int, frame: TargetFrame) -> bool {
+	def fireProbesAt(func: WasmFunction, pc: int, frame: TargetFrame) -> AbruptReturn {
 		var probes = func.instance.module.probes;
-		if (probes == null) return true;
+		if (probes == null) return null;
 		var map = probes[func.decl.func_index];
-		if (map == null) return true;
+		if (map == null) return null;
 		var list = map[pc];
-		if (list == null) return true;
+		if (list == null) return null;
 		state = ExecState.PROBING;
 		var r = list.fire(func, pc, frame);
 		if (list.elem == null) map[pc] = null;
 		return resume(r);
 	}
-	def resume(r: Resumption) -> bool {
+	def resume(r: Resumption) -> AbruptReturn {
 		match (r) {
 			Continue => {
 				state = ExecState.RUN;
-				return true;
+				return null;
 			}
 			Trap(reason, trace) => { // TODO: add exception backtrace
 				trap_reason = reason;
 				state = ExecState.TRAPPED;
-				return false;
+				return Trap.new(reason, null, null);
 			}
 		}
 	}
@@ -243,41 +223,11 @@ component Execute {
 		}
 	}
 }
-// Reasons a WebAssembly execution has trapped.
-enum TrapReason {
-	NONE,
-	EXIT,
-	UNREACHABLE,
-	MEM_OUT_OF_BOUNDS,
-	DIV_BY_ZERO,
-	DIV_UNREPRESENTABLE,
-	FLOAT_UNREPRESENTABLE,
-	FUNC_INVALID,
-	FUNC_SIG_MISMATCH,
-	DATA_SEGMENT_DROPPED,
-	ELEM_SEGMENT_DROPPED,
-	TABLE_OUT_OF_BOUNDS,
-	STACK_OVERFLOW,
-	NULL_DEREF,
-	UNIMPLEMENTED,
-	ARRAY_INDEX_OOB,
-	OOM,
-	FAILED_CAST,
-	INVALID_OPCODE,
-	TIMEOUT,
-	BREAK,
-	ERROR
-}
-
-// Abrupt return objects are returned to the interpreter or JIT code to signal to unwind their frames.
-class AbruptReturn { }
-class Trap(reason: TrapReason, stacktrace: StackSegment) extends AbruptReturn { }
-class StackSegment(prev: StackSegment, hostCall: HostFunction, stack: Array<(WasmFunction, int)>) { }
 
 type Result {
 	case Break {}
 	case Value(vals: Array<Value>) {}
-	case Trap(reason: TrapReason) {}
+	case Trap(trap: Trap) {}
 	def equals(that: Result) -> bool {
 		if (this == that) return true;
 		if (Result.Value.?(this) && Result.Value.?(that)) {
@@ -289,6 +239,9 @@ type Result {
 			if (a.length != b.length) return false;
 			for (i < a.length) if (a[i] != b[i]) return false;
 			return true;
+		}
+		if (Result.Trap.?(this) && Result.Trap.?(that)) {
+			return Result.Trap.!(this).trap.reason == Result.Trap.!(that).trap.reason;
 		}
 		return false;
 	}
@@ -304,7 +257,7 @@ type Result {
 					Values.renderVals(buf, vals);
 				}
 			}
-			Trap(reason) => buf.put1("trap %s", reason.name);
+			Trap(trap) => buf.put1("trap %s", trap.reason.name);
 		}
 		return buf;
 	}
