@@ -656,6 +656,10 @@ class VspHelper(vsp: X86_64Gpr, valuerep: Tagging, depth: int) {
 		return slots[0 - i]; // so caller can supply -1
 	}
 }
+def TYPE_HAS_IMM: byte = 0x80;
+def TYPE_IS_LEB: byte = 0x40;
+def TYPE_IS_ABSTRACT: byte = 0x20;
+def LEB_UPPER_BIT: byte = 0x80;
 // Generates {X86_64InterpreterCode} for X86-64.
 class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def i: X86_64Interpreter;
@@ -676,7 +680,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var abruptRetLabel = X86_64Label.new();
 	var probedDispatchTableRef: IcCodeRef;
 	var typeTagTableOffset: int;
-	var useTypeTagTable = false;
 	var trap_labels = Array<X86_64Label>.new(TrapReason.ERROR.tag + 1);
 
 	def vsp = regs.VSP;
@@ -727,27 +730,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// Record code start
 		ic.codeStart = w.atEnd().pos; // XXX: don't make dispatch tables executable
 
-		if (tuning.useTypeTagTable) {
-			// Reserve space for the type tag table and fill it out
-			typeTagTableOffset = w.pos;
-			w.skipN(256);
-			for (t in BpTypeCode) {
-				var offset = typeTagTableOffset + t.code;
-				w.at(offset).putb(t.code);
-				w.at(offset + 0x80).putb(t.code);
-			}
-			for (t in [BpTypeCode.REF_NULL, BpTypeCode.REF]) { // set upper bit
-				var offset = typeTagTableOffset + t.code;
-				w.at(offset).putb(t.code | 0x80);
-				w.at(offset + 0x80).putb(t.code | 0x80);
-			}
-			for (t in [BpTypeCode.ABS]) { // TODO: load default value from instance
-				var offset = typeTagTableOffset + t.code;
-				w.at(offset).putb(BpTypeCode.REF_NULL.code | 0x80);
-				w.at(offset + 0x80).putb(BpTypeCode.REF_NULL.code | 0x80);
-			}
-		}
-
+		// Reserve the type tag table.
+		genTypeTagTable();
 		// Reserve space for the dispatch tables.
 		reserveDispatchTables();
 		// Begin code generation
@@ -773,6 +757,27 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				.outln();
 		}
 		if (w.pos > TOTAL_SIZE) fatal(Strings.format2("need %d bytes for interpreter code, only allocated %d", w.pos, TOTAL_SIZE));
+	}
+	def genTypeTagTable() {
+		if (!tuning.useTypeTagTable) return;
+		// Reserve space for the type tag table and fill it out
+		typeTagTableOffset = w.pos;
+		w.skipN(256);
+		for (t in BpTypeCode) {
+			var offset = typeTagTableOffset + t.code;
+			w.at(offset + LEB_UPPER_BIT).putb(TYPE_IS_LEB);
+		}
+		for (t in [BpTypeCode.REF_NULL, BpTypeCode.REF]) {
+			var offset = typeTagTableOffset + t.code;
+			w.at(offset).putb(TYPE_HAS_IMM);
+			w.at(offset + LEB_UPPER_BIT).putb(TYPE_HAS_IMM | TYPE_IS_LEB);
+		}
+		for (t in [BpTypeCode.ABS]) {
+			var offset = typeTagTableOffset + t.code;
+			w.at(offset).putb(TYPE_HAS_IMM | TYPE_IS_ABSTRACT);
+			w.at(offset + LEB_UPPER_BIT).putb(TYPE_IS_ABSTRACT | TYPE_HAS_IMM | TYPE_IS_LEB);
+		}
+		w.atEnd();
 	}
 	def reserveDispatchTables() {
 		{ // table #0
@@ -896,22 +901,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var numGpr = regs.tmp1;
 		genReadUleb32(numGpr);
 		// gen: var type = read_type();
-		var type_leb_done = X86_64Label.new(), type_done = X86_64Label.new();
+		var type_done = X86_64Label.new();
 		var typeGpr = regs.tmp2;
 		asm.d.movbzx_r_m(typeGpr, regs.IP_ptr);	// load first byte
 		asm.q.inc_r(regs.IP);			// increment pointer
-		asm.d.test_r_i(typeGpr, 0x80);		// test most-significant bit
-		asm.jc_rel_near(C.Z, type_leb_done);	// more type LEB bytes?
-		genSkipLeb();				// only first byte matters
-		asm.bind(type_leb_done);
-		// gen: if((type = typeTags[type]) < 0) skip_leb()
-		if (tuning.useTypeTagTable) {
-			// TODO: AbstractT requires a load of the default value from the instance
-			asm.q.lea(regs.scratch, IcCodeRef.new(typeTagTableOffset));   // materialize type tag table address
-			asm.d.movbsx_r_m(typeGpr, typeGpr.plusR(regs.scratch, 1, 0)); // load from type tag table
-			asm.jc_rel_near(C.NC, type_done);	// check upper bit of entry
-			genSkipLeb();				// skip LEB if upper bit of entry set
-		}
+		// check for extended LEB, abstract type, or type with immediate
+		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
+		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
+		var complex_type_decode = X86_64Label.new();
+		asm.jc_rel_far(C.NZ, complex_type_decode);
 		asm.bind(type_done);
 
 		// gen: if(num != 0) do
@@ -933,6 +931,24 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		// execute first instruction
 		genDispatchOrJumpToDispatch();
+
+		// handle extended LEB, types with immediates, and abstract types
+		var type_not_leb = X86_64Label.new();
+		asm.bind(complex_type_decode);
+		asm.d.test_r_i(typeGpr, LEB_UPPER_BIT);		// check for LEB first
+		asm.jc_rel_near(C.Z, type_not_leb);
+		genSkipLeb0(regs.tmp3);
+		asm.bind(type_not_leb);
+		// check for types that have an immediate
+		asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
+		asm.jc_rel_near(C.Z, type_done);
+		genReadUleb32(regs.tmp3);			// decode offset
+		asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_IS_ABSTRACT);
+		asm.jc_rel_near(C.Z, type_done);
+		// typeGpr = instance.abscodes[index]
+		asm.movq_r_m(regs.tmp4, regs.INSTANCE.plus(offsets.Instance_abscodes));
+		asm.movbzx_r_m(typeGpr, regs.tmp4.plusR(regs.tmp3, 1, offsets.Array_contents));
+		asm.jmp_rel_near(type_done);
 	}
 
 	// Generate all the opcode handlers.
@@ -1046,7 +1062,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		bindHandler(Opcode.BLOCK);
 		bindHandler(Opcode.LOOP);
 		bindHandler(Opcode.TRY);
-		genSkipLeb();
+		genSkipBlockType();
 		endHandler();
 
 		var ctl_fallthru = X86_64Label.new();
@@ -1059,7 +1075,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.d.cmp_m_i(vsph[0].value, 0);
 		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
 		asm.bind(ctl_fallthru);
-		genSkipLeb();
+		genSkipBlockType();
 		asm.add_r_i(regs.STP, offsets.STP_entry_size);
 		endHandler();
 
@@ -2663,7 +2679,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var asm = this.asm.d;
 		asm.movbzx_r_m(dest, regs.IP_ptr);	// load first byte
 		asm.q.inc_r(regs.IP);			// increment pointer
-		asm.test_r_i(dest, 0x80);		// test most-significant bit
+		asm.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
 		if (tuning.inlineAllLEBs) {
 			var leb_done = X86_64Label.new();
 			asm.jc_rel_near(C.Z, leb_done);
@@ -2683,7 +2699,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(loop);
 		asm.movbzx_r_m(regs.scratch, regs.IP_ptr);	// load byte
 		asm.q.inc_r(regs.IP);			// increment pointer
-		asm.d.test_r_i(regs.scratch, 0x80);	// test most-significant bit
+		asm.d.test_r_i(regs.scratch, LEB_UPPER_BIT);	// test most-significant bit
 		asm.jc_rel_near(C.Z, sext);		// break if not set
 		asm.d.and_r_i(regs.scratch, 0x7F);	// mask off upper bit
 		asm.d.shl_r_cl(regs.scratch);		// shift byte into correct bit pos
@@ -2710,7 +2726,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(loop);
 		asm.movbzx_r_m(regs.scratch, regs.IP_ptr);	// load byte
 		asm.q.inc_r(regs.IP);			// increment pointer
-		asm.d.test_r_i(regs.scratch, 0x80);	// test most-significant bit
+		asm.d.test_r_i(regs.scratch, LEB_UPPER_BIT);	// test most-significant bit
 		asm.jc_rel_near(C.Z, sext);		// break if not set
 		asm.d.and_r_i(regs.scratch, 0x7F);	// mask off upper bit
 		asm.q.shl_r_cl(regs.scratch);		// shift byte into correct bit pos
@@ -2728,13 +2744,19 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.q.sar_r_cl(dest);
 		asm.bind(done);
 	}
+	def genSkipBlockType() {
+		genSkipLeb(); // TODO: skip value types with immediates
+	}
 	// Generate code which skips over an LEB.
 	def genSkipLeb() {
+		genSkipLeb0(regs.scratch);
+	}
+	def genSkipLeb0(scratch: X86_64Gpr) {
 		var more = X86_64Label.new();
 		asm.bind(more);
-		asm.movbzx_r_m(regs.scratch, regs.IP_ptr);	// load first byte
+		asm.movbzx_r_m(scratch, regs.IP_ptr);	// load first byte
 		asm.q.inc_r(regs.IP);			// increment pointer
-		asm.test_r_i(regs.scratch, 0x80);	// test most-significant bit
+		asm.test_r_i(scratch, LEB_UPPER_BIT);	// test most-significant bit
 		asm.jc_rel_near(C.NZ, more);
 	}
 	// End the handler for the current bytecode
