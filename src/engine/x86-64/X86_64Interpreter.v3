@@ -678,6 +678,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var callReentryRef: IcCodeRef;
 	var tailCallReentryRef: IcCodeRef;
 	var abruptRetLabel = X86_64Label.new();
+	var controlFallThruLabel = X86_64Label.new();
+	var controlTransferLabel = X86_64Label.new();
+	var controlSkipSidetableAndDispatchLabel = X86_64Label.new();
 	var probedDispatchTableRef: IcCodeRef;
 	var typeTagTableOffset: int;
 	var trap_labels = Array<X86_64Label>.new(TrapReason.ERROR.tag + 1);
@@ -1065,8 +1068,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSkipBlockType();
 		endHandler();
 
-		var ctl_fallthru = X86_64Label.new();
-		var ctl_xfer = X86_64Label.new();
 		var ctl_xfer_nostack = X86_64Label.new();
 
 		// IF: check condition and either fall thru to next bytecode or ctl xfer (without stack copying)
@@ -1074,21 +1075,22 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.d.cmp_m_i(vsph[0].value, 0);
 		asm.jc_rel_near(C.Z, ctl_xfer_nostack);
-		asm.bind(ctl_fallthru);
+		asm.bind(controlFallThruLabel);
 		genSkipBlockType();
-		asm.add_r_i(regs.STP, offsets.STP_entry_size);
+		asm.bind(controlSkipSidetableAndDispatchLabel);
+		genSkipSidetableEntry();
 		endHandler();
 
 		// BR_IF: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
 		bindHandler(Opcode.BR_IF);
 		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.d.cmp_m_i(vsph[0].value, 0);
-		asm.jc_rel_near(C.Z, ctl_fallthru);
+		asm.jc_rel_near(C.Z, controlFallThruLabel);
 		// fallthru to BR
 
 		// BR: unconditional ctl xfer with stack copying
 		bindHandlerNoAlign(Opcode.BR);
-		asm.bind(ctl_xfer);
+		asm.bind(controlTransferLabel);
 		var popcount = regs.tmp0;
 		var valcount = regs.tmp1;
 		// if popcount > 0
@@ -1136,21 +1138,21 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.q.add_r_r(regs.IP, max);
 		asm.shl_r_i(max, offsets.STP_entry_size_log);
 		asm.q.add_r_r(regs.STP, max);
-		asm.jmp_rel_near(ctl_xfer);
+		asm.jmp_rel_near(controlTransferLabel);
 
 		// BR_ON_NULL: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
 		bindHandler(Opcode.BR_ON_NULL);
 		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.q.cmp_m_i(vsph[0].value, 0);
-		asm.jc_rel_near(C.NZ, ctl_fallthru);
-		asm.jmp_rel_near(ctl_xfer);
+		asm.jc_rel_near(C.NZ, controlFallThruLabel);
+		asm.jmp_rel_near(controlTransferLabel);
 
 		// BR_ON_NON_NULL: check condition and either fall thru to next bytecode or ctl xfer (with stack copying)
 		bindHandler(Opcode.BR_ON_NON_NULL);
 		asm.sub_r_i(vsp, valuerep.slot_size);
 		asm.q.cmp_m_i(vsph[0].value, 0);
-		asm.jc_rel_near(C.Z, ctl_fallthru);
-		asm.jmp_rel_near(ctl_xfer);
+		asm.jc_rel_near(C.Z, controlFallThruLabel);
+		asm.jmp_rel_near(controlTransferLabel);
 
 		bindHandler(Opcode.SELECT); {
 			var label = X86_64Label.new();
@@ -2117,6 +2119,25 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movd_r_i(nullable_reg, 1);
 			asm.jmp_rel_near(shared);
 		}
+		bindHandler(Opcode.BR_ON_CAST); {
+			var nullable_reg = regs.tmp3;
+			var shared = X86_64Label.new();
+			asm.movd_r_i(nullable_reg, 0);
+			asm.bind(shared); // shared code between br_on_cast and br_on_cast_null
+			genSkipLeb();             // skip target label to get to heap type
+			genReadUleb32(regs.tmp1); // read heaptype
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(X86_64Gc.runtime_doCast), [regs.INSTANCE, nullable_reg, regs.tmp1], false);
+			asm.cmpb_r_i(Target.V3_RET_GPRS[0], 0);
+			restoreCallerIVars();
+			asm.jc_rel_far(C.Z, controlSkipSidetableAndDispatchLabel); // XXX: relies on no changes to flags
+			restoreIpFromCurIp(-1); // TODO: sidetable entries are relative to current IP; we are at nextIP
+			asm.jmp_rel_far(controlTransferLabel);
+			// br_on_cast_null jumps back to br_on_cast
+			bindHandler(Opcode.BR_ON_CAST_NULL);
+			asm.movd_r_i(nullable_reg, 1);
+			asm.jmp_rel_near(shared);
+		}
 		bindHandler(Opcode.REF_AS_NON_NULL); {
 			asm.q.cmp_m_i(vsph[-1].value, 0);
 			asm.jc_rel_far(C.Z, trap_labels[TrapReason.NULL_DEREF.tag]);
@@ -2787,6 +2808,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genSkipBlockType() {
 		genSkipLeb(); // TODO: skip value types with immediates
 	}
+	def genSkipSidetableEntry() {
+		asm.add_r_i(regs.STP, offsets.STP_entry_size);
+	}
 	// Generate code which skips over an LEB.
 	def genSkipLeb() {
 		genSkipLeb0(regs.scratch);
@@ -2914,6 +2938,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def computeCurIpFromIp(delta: int) {
 		asm.q.lea(regs.CURPC, X86_64Addr.new(regs.IP, null, 1, delta - offsets.Array_contents));
+	}
+	def restoreIpFromCurIp(delta: int) {
+		asm.q.lea(regs.IP, regs.CURPC.plus(0 - (delta - offsets.Array_contents)));
 	}
 	def computePcFromCurIp() {
 		if (tuning.recordCurIpForTraps) asm.q.sub_r_m(regs.CURPC, frame.CODE);
