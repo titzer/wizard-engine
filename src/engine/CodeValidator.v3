@@ -120,24 +120,17 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var pr = parser.readBlockType();
 					popE(ValueType.I32);
 					var ctl = checkArgsAndPushControl(opcode, pr.0, pr.1);
-					ctlxfer.ref0(ctl, opcode_pos);
+					ctlxfer.refElse(ctl, opcode_pos);
 					ctl_top.reachable = true; // true block now reachable
 				}
 				ELSE => {
-					if (ctl_top.start_opcode != Opcode.IF.code) {
-						return err_atpc().MismatchedElse();
-					}
+					if (ctl_top.start_opcode != Opcode.IF.code) return err_atpc().MismatchedElse();
 					checkArgsAndTransfer();
 					resetInit();
-					var if_branch = ctl_top.ctl_refs[0];
-					ctl_top.ctl_refs[0] = -1;
-					// branches within if-true block go to "else"...
-					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.sidetable.length);
-					// ... except false target of "if"
-					ctl_top.ctl_refs.put(if_branch);
-					ctlxfer.bind(ctl_top, opcode_pos + 1, ctlxfer.sidetable.length + 4);
 					// "else" implicitly goes to end
 					ctlxfer.ref0(ctl_top, opcode_pos);
+					// branch from "if" will go to instruction after else
+					ctlxfer.bindElse(ctl_top, opcode_pos + 1);
 
 					ctl_top.start_opcode = opcode.code;
 					ctl_top.reachable = true;
@@ -156,7 +149,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 					var tag = parser.readTagRef();
 					if (tag == null) return;
 					if (ctl_top.start_opcode != Opcode.TRY.code) return err_atpc().MismatchedCatch();
-					// TODO: bind labels in each catch clause
+					ctlxfer.ref0(ctl_top, opcode_pos);
 					checkArgsAndTransfer();
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
@@ -185,8 +178,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 						// one-armed if; simulate an empty else clause
 						val_stack.top = ctl_top.val_stack_top;
 						ctl_top.reachable = true;
-						pushTypes(ctl.params);
+						pushTypes(ctl.params); // TODO: write spec test for {if[t] end}
 						checkArgsAndTransfer();
+						ctlxfer.bindElse(ctl_top, opcode_pos);
 						ctlxfer.bind(ctl, next_pos, ctlxfer.sidetable.length);
 					} else if (ctl.start_opcode == Opcode.BLOCK.code) {
 						ctlxfer.bind(ctl, next_pos, ctlxfer.sidetable.length);
@@ -287,11 +281,18 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 				DELEGATE => {
 					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
 					if (ctl_top.start_opcode != Opcode.TRY.code) return err_atpc().MismatchedDelegate();
+					var label = parser.readLabel();
+					checkArgsAndTransfer();
+					ctlxfer.bind(ctl_top, codeptr.pos, ctlxfer.sidetable.length);
+					resetInit();
+					ctl_stack.pop();
+					ctl_top = ctl_stack.peek();
 				}
 				CATCH_ALL => {
 					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
 					if (ctl_top.start_opcode != Opcode.TRY.code) return err_atpc().MismatchedCatch();
 					checkArgsAndTransfer();
+					ctlxfer.ref0(ctl_top, opcode_pos);
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
 				}
@@ -985,7 +986,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits,
 		ctl.results = results;
 		ctl.val_stack_top = val_stack_top;
 		ctl.reachable = true;
-		ctl.ctl_refs.resize(0);
+		ctl.first_ref = -1;
+		ctl.else_ref = -1;
 		ctl.undo_init_list = null;
 		return ctl;
 	}
@@ -1042,7 +1044,8 @@ class ControlEntry {
 	var results: Array<ValueType>;
 	var reachable = true;
 	var val_stack_top: int;
-	def ctl_refs = Vector<int>.new(); // XXX: thread control refs through sidetable
+	var first_ref: int = -1;
+	var else_ref: int = -1;
 	var undo_init_list: List<int>;
 }
 // Utility for building the sidetable for a function, which contains control transfer information.
@@ -1056,6 +1059,20 @@ class SidetableBuilder {
 	def ref0(target: ControlEntry, pos: int) {
 		refV(target, pos, 0, 0);
 	}
+	def refElse(target: ControlEntry, pos: int) {
+		var pc = rel(pos);
+		var stp = sidetable.length;
+		if (Trace.validation) {
+			OUT.put3("    refElse(@+%d (stp=%d) to +%d.else", pc, stp, rel(target.start_pos));
+			OUT.outln();
+		}
+		target.else_ref = stp;
+		sidetable.put(pc).put(0).put(0).put(-1);
+	}
+	def bindElse(target: ControlEntry, pos: int) {
+		bind0(target, target.else_ref, pos, sidetable.length);
+		target.else_ref = -1;
+	}
 	def refS(target: ControlEntry, pos: int, val_stack_top: int) {
 		var valcount = labelArgs(target).length;
 		var popcount = val_stack_top - valcount - target.val_stack_top;
@@ -1063,32 +1080,36 @@ class SidetableBuilder {
 	}
 	def refV(target: ControlEntry, pos: int, valcount: int, popcount: int) {
 		var pc = rel(pos);
-		var xi = sidetable.length;
+		var stp = sidetable.length;
 		if (Trace.validation) {
-			OUT.put3("    refV(@+%d (xip=%d) to +%d.label, ", pc, xi, rel(target.start_pos));
+			OUT.put3("    refV(@+%d (stp=%d) to +%d.label, ", pc, stp, rel(target.start_pos));
 			OUT.put2("valcount=%d, popcount=%d)",	valcount, popcount);
 			OUT.outln();
 		}
-		target.ctl_refs.put(xi);
-		sidetable.put(pc).put(valcount).put(popcount).put(0);
+		sidetable.put(pc).put(valcount).put(popcount).put(target.first_ref);
+		target.first_ref = stp;
 	}
 	def bind(target: ControlEntry, pos: int, sidetable_pos: int) {
+		bind0(target, target.first_ref, pos, sidetable_pos);
+		target.first_ref = -1;
+	}
+	def bind0(target: ControlEntry, stp: int, pos: int, sidetable_pos: int) {
 		target.sidetable_pos = sidetable_pos;
-		var refs = target.ctl_refs, pc = rel(pos);
-		for (i = refs.length - 1; i >= 0; i--) {
-			var xi = refs[i];
-			if (xi < 0) continue; // entry was deleted (if)
-			var pos = sidetable[xi];
+		var pc = rel(pos);
+		while (stp >= 0) {
+			var ni = sidetable[stp + 3];
+			if (Trace.validation) OUT.put2("    resolve(stp=%d, next=%d)", stp, ni).outln();
+			var pos = sidetable[stp];
 			var pc_delta = pc - pos;
-			sidetable[xi] = pc_delta;
-			sidetable[xi + 3] = sidetable_pos - xi;
+			sidetable[stp] = pc_delta;
+			sidetable[stp + 3] = sidetable_pos - stp;
 
 			if (Trace.validation) {
-				OUT.put3("    resolve(@+%d to +%d) (stp_delta=%d)", pos, pc, sidetable_pos - xi);
+				OUT.put3("    resolve(@+%d to +%d) (\xCE\x94stp=%d)", pos, pc, sidetable_pos - stp);
 				OUT.outln();
 			}
+			stp = ni;
 		}
-		refs.resize(0);
 	}
 	def rel(pos: int) -> int {
 		return pos - start_pos;
