@@ -14,12 +14,25 @@ def X = [
 	()
 ];
 
+class OpcodeAndImmPosGatherer(it: BytecodeIterator) extends BytecodeVisitor {
+	var pc: int;
+	var op: Opcode;
+	var immpos: int;
+	
+	def visitOp(opcode: Opcode) {
+		this.pc = it.pc;
+		this.op = opcode;
+		this.immpos = it.immptr().pos;
+	}
+}
+
 class BytecodeIteratorTester(t: Tester) extends ModuleBuilder {
 	def iterator() -> BytecodeIterator {
-		return BytecodeIterator.new(func);
+		return BytecodeIterator.new().reset(func);
 	}
 	def assert_bytecodes(expected: Array<Opcode>) {
 		var it = iterator();
+		var gather = OpcodeAndImmPosGatherer.new(it);
 		for (i < expected.length) {
 			var e = expected[i];
 			if (Trace.test) Trace.OUT.put2("@+%d: expecting %s", it.pc, e.name).outln();
@@ -28,11 +41,10 @@ class BytecodeIteratorTester(t: Tester) extends ModuleBuilder {
 			var op = it.current();
 			if (Trace.test) Trace.OUT.put2("  @+%d: got %s", it.pc, op.name).outln();
 			if (op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
-			// test current2()
-			var r = it.current2();
-			op = r.0;
+			// test dispatch()
+			it.dispatch(gather);
 			if (Trace.test) Trace.OUT.put2("  @+%d: got %s", it.pc, op.name).outln();
-			if (op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
+			if (gather.op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
 			// advance
 			it.next();
 			if (Trace.test) Trace.OUT.put1("  next=+%d", it.pc).outln();
@@ -41,6 +53,7 @@ class BytecodeIteratorTester(t: Tester) extends ModuleBuilder {
 	}
 	def assert_pcs(expected: Array<(int, Opcode, int)>) {
 		var it = iterator();
+		var gather = OpcodeAndImmPosGatherer.new(it);
 		for (i < expected.length) {
 			var p = expected[i], pc = p.0, e = p.1;
 			if (Trace.test) Trace.OUT.put3("@+%d: expecting %s @+%d", it.pc, e.name, pc).outln();
@@ -50,14 +63,20 @@ class BytecodeIteratorTester(t: Tester) extends ModuleBuilder {
 			if (Trace.test) Trace.OUT.put2("  got %s @+%d", op.name, it.pc).outln();
 			if (it.pc != pc) return t.fail(Strings.format3("index=%d, expected @+%d, got @+%d", i, pc, it.pc));
 			if (op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
-			// test current2()
-			var r = it.current2();
+			// test current() and immptr together
+			var r = (it.current(), it.immptr());
 			op = r.0;
 			if (Trace.test) Trace.OUT.put2("  got %s @+%d", op.name, it.pc).outln();
 			if (it.pc != pc) return t.fail(Strings.format3("index=%d, expected @+%d, got @+%d", i, pc, it.pc));
 			if (op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
 			var immptr = r.1;
 			if (immptr.pos != p.2) return t.fail(Strings.format3("index=%d, expected immptr=+%d, got +%d", i, p.2, immptr.pos));
+			// test dispatch()
+			it.dispatch(gather);
+			if (it.pc != pc) return t.fail(Strings.format3("index=%d, expected @+%d, got @+%d", i, pc, it.pc));
+			if (gather.pc != pc) return t.fail(Strings.format3("index=%d, expected @+%d, got @+%d", i, pc, it.pc));
+			if (gather.op != e) return t.fail(Strings.format3("index=%d, expected %s, got %s", i, e.mnemonic, op.mnemonic));
+			if (gather.immpos != p.2) return t.fail(Strings.format3("index=%d, expected immptr=+%d, got +%d", i, p.2, immptr.pos));
 			// advance
 			it.next();
 			if (Trace.test) Trace.OUT.put1("  next=+%d", it.pc).outln();
@@ -160,30 +179,37 @@ def test_imm1(t: BytecodeIteratorTester) {
 	]);
 }
 
+class LocalCollectorVisitor extends BytecodeVisitor {
+	def got = Vector<(u32, ValueTypeCode)>.new();
+	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
+		got.put(count, vtc);
+	}
+}
+
 def test_locals1(t: BytecodeIteratorTester) {
-	var expected: Array<(u32, ValueType)> = [
-		(3, ValueType.I32),
-		(4, ValueType.I64),
-		(5, ValueType.F32),
-		(6, ValueType.F64),
-		(7, ValueType.V128)
+	var expected: Array<(u32, ValueType, ValueTypeCode)> = [
+		(3, ValueType.I32, ValueTypeCode(BpTypeCode.I32.val, 0)),
+		(4, ValueType.I64, ValueTypeCode(BpTypeCode.I64.val, 0)),
+		(5, ValueType.F32, ValueTypeCode(BpTypeCode.F32.val, 0)),
+		(6, ValueType.F64, ValueTypeCode(BpTypeCode.F64.val, 0)),
+		(7, ValueType.V128, ValueTypeCode(BpTypeCode.V128.val, 0))
 	];
 
 	for (e in expected) t.addLocals(int.!(e.0), e.1);
 	t.code([]);
 
 	var extensions: Extension.set;
-	var p = WasmParser.new(extensions, Limits.new(), t.module, ErrorGen.new("<BytecodeIteratorTest>"), null);
-	var v = Vector<(u32, ValueType)>.new().grow(expected.length);
 	var it = t.iterator();
-	it.parseLocalTypes(p, v.put);
+	var collector = LocalCollectorVisitor.new();
+	var v = collector.got;
+	it.dispatch(collector);
 
 	if (v.length != expected.length) return t.t.fail2("expected %d pairs of locals, got %d", expected.length, v.length);
 
 	for (i < expected.length) {
 		var e = expected[i], g = v[i];
 		if (e.0 != g.0) return t.t.fail3("locals[%d], expected %d, got %d", i, e.0, g.0);
-		if (e.1 != g.1) return t.t.fail3("locals[%d], expected %q, got %q", i, e.1.render, g.1.render);
+		if (e.2 != g.1) return t.t.fail2("locals[%d], expected %q", i, e.1.render); // TODO: error message
 	}
 
 	if (it.pc != 11) return t.t.fail2("expected pc=+%d, got +%d", 10, it.pc);

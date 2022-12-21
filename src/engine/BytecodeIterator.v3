@@ -9,52 +9,58 @@
 // upon the first call to {more(), current(), or next()}.
 // The iterator does not automatically advance itself--clients must call {next()}--thus,
 // {pc} is always the current program counter.
-class BytecodeIterator(func: FuncDecl) {
-	private def codeptr = CodePtr.new(func.orig_bytecode);
-	private var skipped_locals: bool;
-	def var pc: int = codeptr.pos;
+class BytecodeIterator {
+	def var pc: int;
+	private def codeptr = CodePtr.new(null);
+	private def origptr = CodePtr.new(null);
+	private def imm = CodePtr.new(null);
+	private var imm_pos: int;
+	private var end_pos: int;
 
-	// Read any local declarations and apply the callback {f} to each pair.
-	def parseLocalTypes<T>(parser: WasmParser, f: (u32, ValueType) -> T) {
-		if (skipped_locals) return;
-		var cp = codeptr;
-		parser.decoder = cp;
-		var max = parser.limits.max_num_locals;
-		var dcount = parser.readU32("local decl count", max);
-		for (i < dcount) {
-			var count = parser.readU32("local count", max);
-			var vtype = parser.readValueType();
-			f(count, vtype);
-		}
-		pc = cp.pos;
-		skipped_locals = true;
+	// Resets the internal code pointer to the code in the given function.
+	def reset(func: FuncDecl) -> this {
+		this.pc = 0;
+		this.codeptr.reset(func.cur_bytecode, 0, func.cur_bytecode.length);
+		this.origptr.reset(func.orig_bytecode, 0, func.orig_bytecode.length);
+		this.imm.reset(null, 0, 0);
 	}
-	// Return {true} if there are more bytecodes remaining.
-	def more() -> bool {
-		if (!skipped_locals) {
-			skipped_locals = true;
+
+	// Returns the current opcode without advancing. If the local declarations have
+	// not been decoded, they will be skipped, returning the first bytecode.
+	def current() -> Opcode {
+		// reset code pointer to current pc
+		codeptr.at(pc);
+		if (codeptr.done()) return Opcode.INVALID;
+
+		// Visit local declarations at the start of the function.
+		if (pc == 0) {
 			codeptr.skip_local_decls();
 			pc = codeptr.pos;
 		}
-		return pc < func.orig_bytecode.length;
-	}
-	// Return the current opcode; {Opcode.INVALID} if there are no more.
-	def current() -> Opcode {
-		var cp = origptr();
-		if (cp == null) return Opcode.INVALID; // no more bytecodes
-		return cp.read_opcode();
-	}
-	// Return the current opcode and a {DataReader} ready to read any immediates;
-	// {Opcode.INVALID} if there are no more.
-	def current2() -> (Opcode, CodePtr) {
-		var cp = origptr();
-		if (cp == null) return (Opcode.INVALID, codeptr); // no more bytecodes
-		return (cp.read_opcode(), cp);
-	}
-	// Advance to the next opcode.
-	def next() {
-		var t = current2(), cp = t.1;
-		for (imm in t.0.imms) {
+
+		// Read the first byte of the code
+		var b = codeptr.read1();
+		if (b == InternalOpcode.PROBE.code) { // probe is inserted here
+			b = origptr.at(pc).read1();
+		}
+		// Query opcode attributes array
+		var opcode: Opcode;
+		if (Opcodes.attributes[b].PREFIX) {
+			// prefixed opcode, read LEB
+			opcode = Opcodes.find(b, codeptr.read_uleb32());
+		} else {
+			// single byte opcode
+			opcode = Opcodes.opcodes[b];
+		}
+
+		// Check for decode errors
+		if (!codeptr.ok) return Opcode.INVALID;
+
+		// Remember the immediate position, in case it is requested by immptr().
+		imm_pos = codeptr.pos;
+
+		// Skip immediates.
+		for (imm in opcode.imms) {
 			match (imm) {
 				ARRAY_TYPE_INDEX,
 				BLOCK_TYPE,
@@ -72,38 +78,660 @@ class BytecodeIterator(func: FuncDecl) {
 				TABLE_INDEX,
 				U32,
 				I32,
-				I64 => cp.skip_leb();
+				I64 => codeptr.skip_leb();
 				VALUE_TYPES => codeptr.skip_value_types();
 				LABELS => {
-					var count = cp.read_uleb32();
-					for (i < count + 1) cp.skip_leb();
+					var count = codeptr.read_uleb32();
+					for (i < count + 1) codeptr.skip_leb();
 				}
 				MEMARG => {
-					cp.skip_leb();
-					cp.skip_leb();
+					codeptr.skip_leb();
+					codeptr.skip_leb();
 				}
 				HEAP_TYPE,
-				LANE_INDEX => cp.skipN(1);
-				F32 => cp.skipN(4);
-				F64 => cp.skipN(8);
-				V128 => cp.skipN(16);
-				ZERO_BYTE => cp.skipN(1);
+				LANE_INDEX => codeptr.skipN(1);
+				F32 => codeptr.skipN(4);
+				F64 => codeptr.skipN(8);
+				V128 => codeptr.skipN(16);
+				ZERO_BYTE => codeptr.skipN(1);
 			}
 		}
-		pc = cp.pos;
+		return opcode;
 	}
-	// Skip locals, check if any more bytecodes, and reset codeptr to function's original code.
-	private def origptr() -> CodePtr {
-		var orig = func.orig_bytecode;
-		if (pc >= orig.length) return null;
-		var cp = codeptr;
-		if (!skipped_locals) {
-			skipped_locals = true;
-			cp.at(pc).skip_local_decls();
-			pc = cp.pos;
+
+	// Dispatches on the current bytecode, decoding immediates and calling the appropriate
+	// {visit_OP()} method on the visitor.
+	def dispatch(v: BytecodeVisitor) {
+		// reset code pointer to current pc
+		codeptr.at(pc);
+		if (codeptr.done()) return;
+
+		// Visit local declarations at the start of the function.
+		if (pc == 0) {
+			codeptr.iterate_local_codes(v.visitLocalDecl);
+			pc = codeptr.pos;
 		}
-		if (cp.data != orig) cp.reset(orig, pc, orig.length);
-		else if (cp.pos != pc) cp.at(pc);
-		return cp;
+
+		// Read the first byte of the code
+		var b = codeptr.read1();
+		if (b == InternalOpcode.PROBE.code) { // probe is inserted here
+			v.visitProbe();
+			b = origptr.at(pc).read1();
+		}
+		// Query opcode attributes array
+		var opcode: Opcode;
+		if (Opcodes.attributes[b].PREFIX) {
+			// prefixed opcode, read LEB
+			opcode = Opcodes.find(b, codeptr.read_uleb32());
+		} else {
+			// single byte opcode
+			opcode = Opcodes.opcodes[b];
+		}
+
+		// Check for decode errors
+		if (!codeptr.ok) return;
+
+		// Remember the immediate position, in case it is requested by immptr().
+		imm_pos = codeptr.pos;
+		// Perform dispatch to visitor
+		dispatch0(opcode, v);
+	}
+
+	// Advances the iterator to the next bytecode.
+	def next() -> this {
+		if (codeptr.pos > pc) pc = codeptr.pos;
+		else if (more()) current();
+		if (codeptr.pos > pc) pc = codeptr.pos;
+	}
+
+	// Returns a "pointer" to the immediates for the current bytecode. This pointer does
+	// not alias the code pointer, so it does not affect iteration.
+	def immptr() -> CodePtr {
+		return imm.reset(codeptr.data, imm_pos, end_pos);
+	}
+
+	// Returns {true} if there are more bytecodes remaining.
+	def more() -> bool {
+		return pc < codeptr.limit;
+	}
+
+	private def dispatch0(opcode: Opcode, v: BytecodeVisitor) {
+		// Define delegates that read the various types of immediates, for better readability dispatching below.
+		var cp = codeptr;
+		def read_ileb = cp.read_sleb32;
+		def read_uleb = cp.read_uleb32;
+		def read_u8 = cp.read1;
+		def read_BLOCKT = cp.read_block_type_code;
+		def read_MEMARG = cp.read_MemArg;
+		def read_GLOBAL = read_uleb;
+		def read_LOCAL = read_uleb;
+		def read_LABEL = read_uleb;
+		def read_TABLE = read_uleb;
+		def read_ELEM = read_uleb;
+		def read_DATA = read_uleb;
+		def read_MEMORY = read_uleb;
+		def read_STRUCTT = read_uleb;
+		def read_ARRAYT = read_uleb;
+		def read_HEAPT = read_uleb;
+		def read_SIG = read_uleb;
+		def read_FUNC = read_uleb;
+		def read_FIELD = read_uleb;
+		def read_TAG = read_uleb;
+		def read_LANE = read_u8;
+		def read_ZEROB = read_u8;
+		def read_VALTS = cp.read_value_codes;
+
+		// Dispatch to appropriate visit_OP() method.
+		// XXX: generate match on operator and read of immediates from Opcodes table.
+		match (opcode) {
+			INVALID =>			v.visit_INVALID(0, 0); // TODO: pass correct prefix and opcode
+			UNREACHABLE =>			v.visit_UNREACHABLE();
+			NOP =>				v.visit_NOP();
+			BLOCK =>			v.visit_BLOCK(read_BLOCKT());
+			LOOP =>				v.visit_LOOP(read_BLOCKT());
+			IF =>				v.visit_IF(read_BLOCKT());
+			ELSE =>				v.visit_ELSE();
+			TRY =>				v.visit_TRY(read_BLOCKT());
+			CATCH =>			v.visit_CATCH(read_TAG());
+			THROW =>			v.visit_THROW(read_TAG());
+			RETHROW =>			v.visit_RETHROW(read_LABEL());
+			END =>				v.visit_END();
+			BR =>				v.visit_BR(read_LABEL());
+			BR_IF =>			v.visit_BR_IF(read_LABEL());
+			BR_TABLE =>			v.visit_BR_TABLE(cp.read_labels());
+			RETURN =>			v.visit_RETURN();
+			CALL =>				v.visit_CALL(read_FUNC());
+			CALL_INDIRECT =>		v.visit_CALL_INDIRECT(read_SIG(), read_TABLE());
+			RETURN_CALL =>			v.visit_RETURN_CALL(read_FUNC());
+			RETURN_CALL_INDIRECT =>		v.visit_RETURN_CALL_INDIRECT(read_SIG(), read_TABLE());
+			CALL_REF =>			v.visit_CALL_REF(read_SIG());
+			RETURN_CALL_REF =>		v.visit_RETURN_CALL_REF(read_SIG());
+			DELEGATE =>			v.visit_DELEGATE(read_LABEL());
+			CATCH_ALL =>			v.visit_CATCH_ALL();
+			DROP =>				v.visit_DROP();
+			SELECT =>			v.visit_SELECT();
+			SELECT_T =>			v.visit_SELECT_T(read_VALTS());
+			LOCAL_GET =>			v.visit_LOCAL_GET(read_LOCAL());
+			LOCAL_SET =>			v.visit_LOCAL_SET(read_LOCAL());
+			LOCAL_TEE =>			v.visit_LOCAL_TEE(read_LOCAL());
+			GLOBAL_GET =>			v.visit_GLOBAL_GET(read_GLOBAL());
+			GLOBAL_SET =>			v.visit_GLOBAL_SET(read_GLOBAL());
+			TABLE_GET =>			v.visit_TABLE_GET(read_TABLE());
+			TABLE_SET =>			v.visit_TABLE_SET(read_TABLE());
+			I32_LOAD =>			v.visit_I32_LOAD(read_MEMARG());
+			I64_LOAD =>			v.visit_I64_LOAD(read_MEMARG());
+			F32_LOAD =>			v.visit_F32_LOAD(read_MEMARG());
+			F64_LOAD =>			v.visit_F64_LOAD(read_MEMARG());
+			I32_LOAD8_S =>			v.visit_I32_LOAD8_S(read_MEMARG());
+			I32_LOAD8_U =>			v.visit_I32_LOAD8_U(read_MEMARG());
+			I32_LOAD16_S =>			v.visit_I32_LOAD16_S(read_MEMARG());
+			I32_LOAD16_U =>			v.visit_I32_LOAD16_U(read_MEMARG());
+			I64_LOAD8_S =>			v.visit_I64_LOAD8_S(read_MEMARG());
+			I64_LOAD8_U =>			v.visit_I64_LOAD8_U(read_MEMARG());
+			I64_LOAD16_S =>			v.visit_I64_LOAD16_S(read_MEMARG());
+			I64_LOAD16_U =>			v.visit_I64_LOAD16_U(read_MEMARG());
+			I64_LOAD32_S =>			v.visit_I64_LOAD32_S(read_MEMARG());
+			I64_LOAD32_U =>			v.visit_I64_LOAD32_U(read_MEMARG());
+			I32_STORE =>			v.visit_I32_STORE(read_MEMARG());
+			I64_STORE =>			v.visit_I64_STORE(read_MEMARG());
+			F32_STORE =>			v.visit_F32_STORE(read_MEMARG());
+			F64_STORE =>			v.visit_F64_STORE(read_MEMARG());
+			I32_STORE8 =>			v.visit_I32_STORE8(read_MEMARG());
+			I32_STORE16 =>			v.visit_I32_STORE16(read_MEMARG());
+			I64_STORE8 =>			v.visit_I64_STORE8(read_MEMARG());
+			I64_STORE16 =>			v.visit_I64_STORE16(read_MEMARG());
+			I64_STORE32 =>			v.visit_I64_STORE32(read_MEMARG());
+			MEMORY_SIZE =>			v.visit_MEMORY_SIZE(read_MEMORY());
+			MEMORY_GROW =>			v.visit_MEMORY_GROW(read_MEMORY());
+			I32_CONST =>			v.visit_I32_CONST(cp.read_sleb32());
+			I64_CONST =>			v.visit_I64_CONST(cp.read_sleb64());
+			F32_CONST =>			v.visit_F32_CONST(cp.read_u32());
+			F64_CONST =>			v.visit_F64_CONST(cp.read_u64());
+			I32_EQZ =>			v.visit_I32_EQZ();
+			I32_EQ =>			v.visit_I32_EQ();
+			I32_NE =>			v.visit_I32_NE();
+			I32_LT_S =>			v.visit_I32_LT_S();
+			I32_LT_U =>			v.visit_I32_LT_U();
+			I32_GT_S =>			v.visit_I32_GT_S();
+			I32_GT_U =>			v.visit_I32_GT_U();
+			I32_LE_S =>			v.visit_I32_LE_S();
+			I32_LE_U =>			v.visit_I32_LE_U();
+			I32_GE_S =>			v.visit_I32_GE_S();
+			I32_GE_U =>			v.visit_I32_GE_U();
+			I64_EQZ =>			v.visit_I64_EQZ();
+			I64_EQ =>			v.visit_I64_EQ();
+			I64_NE =>			v.visit_I64_NE();
+			I64_LT_S =>			v.visit_I64_LT_S();
+			I64_LT_U =>			v.visit_I64_LT_U();
+			I64_GT_S =>			v.visit_I64_GT_S();
+			I64_GT_U =>			v.visit_I64_GT_U();
+			I64_LE_S =>			v.visit_I64_LE_S();
+			I64_LE_U =>			v.visit_I64_LE_U();
+			I64_GE_S =>			v.visit_I64_GE_S();
+			I64_GE_U =>			v.visit_I64_GE_U();
+			F32_EQ =>			v.visit_F32_EQ();
+			F32_NE =>			v.visit_F32_NE();
+			F32_LT =>			v.visit_F32_LT();
+			F32_GT =>			v.visit_F32_GT();
+			F32_LE =>			v.visit_F32_LE();
+			F32_GE =>			v.visit_F32_GE();
+			F64_EQ =>			v.visit_F64_EQ();
+			F64_NE =>			v.visit_F64_NE();
+			F64_LT =>			v.visit_F64_LT();
+			F64_GT =>			v.visit_F64_GT();
+			F64_LE =>			v.visit_F64_LE();
+			F64_GE =>			v.visit_F64_GE();
+			I32_CLZ =>			v.visit_I32_CLZ();
+			I32_CTZ =>			v.visit_I32_CTZ();
+			I32_POPCNT =>			v.visit_I32_POPCNT();
+			I32_ADD =>			v.visit_I32_ADD();
+			I32_SUB =>			v.visit_I32_SUB();
+			I32_MUL =>			v.visit_I32_MUL();
+			I32_DIV_S =>			v.visit_I32_DIV_S();
+			I32_DIV_U =>			v.visit_I32_DIV_U();
+			I32_REM_S =>			v.visit_I32_REM_S();
+			I32_REM_U =>			v.visit_I32_REM_U();
+			I32_AND =>			v.visit_I32_AND();
+			I32_OR =>			v.visit_I32_OR();
+			I32_XOR =>			v.visit_I32_XOR();
+			I32_SHL =>			v.visit_I32_SHL();
+			I32_SHR_S =>			v.visit_I32_SHR_S();
+			I32_SHR_U =>			v.visit_I32_SHR_U();
+			I32_ROTL =>			v.visit_I32_ROTL();
+			I32_ROTR =>			v.visit_I32_ROTR();
+			I64_CLZ =>			v.visit_I64_CLZ();
+			I64_CTZ =>			v.visit_I64_CTZ();
+			I64_POPCNT =>			v.visit_I64_POPCNT();
+			I64_ADD =>			v.visit_I64_ADD();
+			I64_SUB =>			v.visit_I64_SUB();
+			I64_MUL =>			v.visit_I64_MUL();
+			I64_DIV_S =>			v.visit_I64_DIV_S();
+			I64_DIV_U =>			v.visit_I64_DIV_U();
+			I64_REM_S =>			v.visit_I64_REM_S();
+			I64_REM_U =>			v.visit_I64_REM_U();
+			I64_AND =>			v.visit_I64_AND();
+			I64_OR =>			v.visit_I64_OR();
+			I64_XOR =>			v.visit_I64_XOR();
+			I64_SHL =>			v.visit_I64_SHL();
+			I64_SHR_S =>			v.visit_I64_SHR_S();
+			I64_SHR_U =>			v.visit_I64_SHR_U();
+			I64_ROTL =>			v.visit_I64_ROTL();
+			I64_ROTR =>			v.visit_I64_ROTR();
+			F32_ABS =>			v.visit_F32_ABS();
+			F32_NEG =>			v.visit_F32_NEG();
+			F32_CEIL =>			v.visit_F32_CEIL();
+			F32_FLOOR =>			v.visit_F32_FLOOR();
+			F32_TRUNC =>			v.visit_F32_TRUNC();
+			F32_NEAREST =>			v.visit_F32_NEAREST();
+			F32_SQRT =>			v.visit_F32_SQRT();
+			F32_ADD =>			v.visit_F32_ADD();
+			F32_SUB =>			v.visit_F32_SUB();
+			F32_MUL =>			v.visit_F32_MUL();
+			F32_DIV =>			v.visit_F32_DIV();
+			F32_MIN =>			v.visit_F32_MIN();
+			F32_MAX =>			v.visit_F32_MAX();
+			F32_COPYSIGN =>			v.visit_F32_COPYSIGN();
+			F64_ABS =>			v.visit_F64_ABS();
+			F64_NEG =>			v.visit_F64_NEG();
+			F64_CEIL =>			v.visit_F64_CEIL();
+			F64_FLOOR =>			v.visit_F64_FLOOR();
+			F64_TRUNC =>			v.visit_F64_TRUNC();
+			F64_NEAREST =>			v.visit_F64_NEAREST();
+			F64_SQRT =>			v.visit_F64_SQRT();
+			F64_ADD =>			v.visit_F64_ADD();
+			F64_SUB =>			v.visit_F64_SUB();
+			F64_MUL =>			v.visit_F64_MUL();
+			F64_DIV =>			v.visit_F64_DIV();
+			F64_MIN =>			v.visit_F64_MIN();
+			F64_MAX =>			v.visit_F64_MAX();
+			F64_COPYSIGN =>			v.visit_F64_COPYSIGN();
+			I32_WRAP_I64 =>			v.visit_I32_WRAP_I64();
+			I32_TRUNC_F32_S =>		v.visit_I32_TRUNC_F32_S();
+			I32_TRUNC_F32_U =>		v.visit_I32_TRUNC_F32_U();
+			I32_TRUNC_F64_S =>		v.visit_I32_TRUNC_F64_S();
+			I32_TRUNC_F64_U =>		v.visit_I32_TRUNC_F64_U();
+			I64_EXTEND_I32_S =>		v.visit_I64_EXTEND_I32_S();
+			I64_EXTEND_I32_U =>		v.visit_I64_EXTEND_I32_U();
+			I64_TRUNC_F32_S =>		v.visit_I64_TRUNC_F32_S();
+			I64_TRUNC_F32_U =>		v.visit_I64_TRUNC_F32_U();
+			I64_TRUNC_F64_S =>		v.visit_I64_TRUNC_F64_S();
+			I64_TRUNC_F64_U =>		v.visit_I64_TRUNC_F64_U();
+			F32_CONVERT_I32_S =>		v.visit_F32_CONVERT_I32_S();
+			F32_CONVERT_I32_U =>		v.visit_F32_CONVERT_I32_U();
+			F32_CONVERT_I64_S =>		v.visit_F32_CONVERT_I64_S();
+			F32_CONVERT_I64_U =>		v.visit_F32_CONVERT_I64_U();
+			F32_DEMOTE_F64 =>		v.visit_F32_DEMOTE_F64();
+			F64_CONVERT_I32_S =>		v.visit_F64_CONVERT_I32_S();
+			F64_CONVERT_I32_U =>		v.visit_F64_CONVERT_I32_U();
+			F64_CONVERT_I64_S =>		v.visit_F64_CONVERT_I64_S();
+			F64_CONVERT_I64_U =>		v.visit_F64_CONVERT_I64_U();
+			F64_PROMOTE_F32 =>		v.visit_F64_PROMOTE_F32();
+			I32_REINTERPRET_F32 =>		v.visit_I32_REINTERPRET_F32();
+			I64_REINTERPRET_F64 =>		v.visit_I64_REINTERPRET_F64();
+			F32_REINTERPRET_I32 =>		v.visit_F32_REINTERPRET_I32();
+			F64_REINTERPRET_I64 =>		v.visit_F64_REINTERPRET_I64();
+			I32_EXTEND8_S =>		v.visit_I32_EXTEND8_S();
+			I32_EXTEND16_S =>		v.visit_I32_EXTEND16_S();
+			I64_EXTEND8_S =>		v.visit_I64_EXTEND8_S();
+			I64_EXTEND16_S =>		v.visit_I64_EXTEND16_S();
+			I64_EXTEND32_S =>		v.visit_I64_EXTEND32_S();
+			REF_NULL =>			v.visit_REF_NULL(read_HEAPT());
+			REF_IS_NULL =>			v.visit_REF_IS_NULL();
+			REF_FUNC =>			v.visit_REF_FUNC(read_FUNC());
+			REF_AS_NON_NULL =>		v.visit_REF_AS_NON_NULL();
+			BR_ON_NULL =>			v.visit_BR_ON_NULL(read_LABEL());
+			REF_EQ =>			v.visit_REF_EQ();
+			BR_ON_NON_NULL =>		v.visit_BR_ON_NON_NULL(read_LABEL());
+			STRUCT_NEW_CANON =>		v.visit_STRUCT_NEW_CANON(read_STRUCTT());
+			STRUCT_NEW_CANON_DEFAULT =>	v.visit_STRUCT_NEW_CANON_DEFAULT(read_STRUCTT());
+			STRUCT_GET =>			v.visit_STRUCT_GET(read_STRUCTT(), read_FIELD());
+			STRUCT_GET_S =>			v.visit_STRUCT_GET_S(read_STRUCTT(), read_FIELD());
+			STRUCT_GET_U =>			v.visit_STRUCT_GET_U(read_STRUCTT(), read_FIELD());
+			STRUCT_SET =>			v.visit_STRUCT_SET(read_STRUCTT(), read_FIELD());
+			ARRAY_NEW_CANON =>		v.visit_ARRAY_NEW_CANON(read_ARRAYT());
+			ARRAY_NEW_CANON_DEFAULT =>	v.visit_ARRAY_NEW_CANON_DEFAULT(read_ARRAYT());
+			ARRAY_GET =>			v.visit_ARRAY_GET(read_ARRAYT());
+			ARRAY_GET_S =>			v.visit_ARRAY_GET_S(read_ARRAYT());
+			ARRAY_GET_U =>			v.visit_ARRAY_GET_U(read_ARRAYT());
+			ARRAY_SET =>			v.visit_ARRAY_SET(read_ARRAYT());
+			ARRAY_LEN =>			v.visit_ARRAY_LEN();
+			ARRAY_NEW_CANON_FIXED =>	v.visit_ARRAY_NEW_CANON_FIXED(read_ARRAYT(), cp.read_uleb32());
+			ARRAY_NEW_CANON_DATA =>		v.visit_ARRAY_NEW_CANON_DATA(read_ARRAYT(), read_DATA());
+			ARRAY_NEW_CANON_ELEM =>		v.visit_ARRAY_NEW_CANON_ELEM(read_ARRAYT(), read_ELEM());
+			I31_NEW =>			v.visit_I31_NEW();
+			I31_GET_S =>			v.visit_I31_GET_S();
+			I31_GET_U =>			v.visit_I31_GET_U();
+			REF_TEST =>			v.visit_REF_TEST(read_HEAPT());
+			REF_CAST =>			v.visit_REF_CAST(read_HEAPT());
+			BR_ON_CAST =>			v.visit_BR_ON_CAST(read_LABEL(), read_HEAPT());
+			BR_ON_CAST_FAIL =>		v.visit_BR_ON_CAST_FAIL(read_LABEL(), read_HEAPT());
+			REF_TEST_NULL =>		v.visit_REF_TEST_NULL(read_HEAPT());
+			REF_CAST_NULL =>		v.visit_REF_CAST_NULL(read_HEAPT());
+			BR_ON_CAST_NULL =>		v.visit_BR_ON_CAST_NULL(read_LABEL(), read_HEAPT());
+			BR_ON_CAST_FAIL_NULL =>		v.visit_BR_ON_CAST_FAIL_NULL(read_LABEL(), read_HEAPT());
+			EXTERN_INTERNALIZE =>		v.visit_EXTERN_INTERNALIZE();
+			EXTERN_EXTERNALIZE =>		v.visit_EXTERN_EXTERNALIZE();
+			I32_TRUNC_SAT_F32_S =>		v.visit_I32_TRUNC_SAT_F32_S();
+			I32_TRUNC_SAT_F32_U =>		v.visit_I32_TRUNC_SAT_F32_U();
+			I32_TRUNC_SAT_F64_S =>		v.visit_I32_TRUNC_SAT_F64_S();
+			I32_TRUNC_SAT_F64_U =>		v.visit_I32_TRUNC_SAT_F64_U();
+			I64_TRUNC_SAT_F32_S =>		v.visit_I64_TRUNC_SAT_F32_S();
+			I64_TRUNC_SAT_F32_U =>		v.visit_I64_TRUNC_SAT_F32_U();
+			I64_TRUNC_SAT_F64_S =>		v.visit_I64_TRUNC_SAT_F64_S();
+			I64_TRUNC_SAT_F64_U =>		v.visit_I64_TRUNC_SAT_F64_U();
+			MEMORY_INIT =>			v.visit_MEMORY_INIT(read_DATA(), read_MEMORY());
+			DATA_DROP =>			v.visit_DATA_DROP(read_DATA());
+			MEMORY_COPY =>			v.visit_MEMORY_COPY(read_MEMORY(), read_MEMORY());
+			MEMORY_FILL =>			v.visit_MEMORY_FILL(read_MEMORY());
+			TABLE_INIT =>			v.visit_TABLE_INIT(read_ELEM(), read_TABLE());
+			ELEM_DROP =>			v.visit_ELEM_DROP(read_ELEM());
+			TABLE_COPY =>			v.visit_TABLE_COPY(read_TABLE(), read_TABLE());
+			TABLE_GROW =>			v.visit_TABLE_GROW(read_TABLE());
+			TABLE_SIZE =>			v.visit_TABLE_SIZE(read_TABLE());
+			TABLE_FILL =>			v.visit_TABLE_FILL(read_TABLE());
+			V128_LOAD =>			v.visit_V128_LOAD(read_MEMARG());
+			V128_LOAD_8X8_S =>		v.visit_V128_LOAD_8X8_S(read_MEMARG());
+			V128_LOAD_8X8_U =>		v.visit_V128_LOAD_8X8_U(read_MEMARG());
+			V128_LOAD_16X4_S =>		v.visit_V128_LOAD_16X4_S(read_MEMARG());
+			V128_LOAD_16X4_U =>		v.visit_V128_LOAD_16X4_U(read_MEMARG());
+			V128_LOAD_32X2_S =>		v.visit_V128_LOAD_32X2_S(read_MEMARG());
+			V128_LOAD_32X2_U =>		v.visit_V128_LOAD_32X2_U(read_MEMARG());
+			V128_LOAD_8_SPLAT =>		v.visit_V128_LOAD_8_SPLAT(read_MEMARG());
+			V128_LOAD_16_SPLAT =>		v.visit_V128_LOAD_16_SPLAT(read_MEMARG());
+			V128_LOAD_32_SPLAT =>		v.visit_V128_LOAD_32_SPLAT(read_MEMARG());
+			V128_LOAD_64_SPLAT =>		v.visit_V128_LOAD_64_SPLAT(read_MEMARG());
+			V128_LOAD_32_ZERO =>		v.visit_V128_LOAD_32_ZERO(read_MEMARG());
+			V128_LOAD_64_ZERO =>		v.visit_V128_LOAD_64_ZERO(read_MEMARG());
+			V128_STORE =>			v.visit_V128_STORE(read_MEMARG());
+			V128_LOAD_8_LANE =>		v.visit_V128_LOAD_8_LANE(read_MEMARG(), read_LANE());
+			V128_LOAD_16_LANE =>		v.visit_V128_LOAD_16_LANE(read_MEMARG(), read_LANE());
+			V128_LOAD_32_LANE =>		v.visit_V128_LOAD_32_LANE(read_MEMARG(), read_LANE());
+			V128_LOAD_64_LANE =>		v.visit_V128_LOAD_64_LANE(read_MEMARG(), read_LANE());
+			V128_STORE_8_LANE =>		v.visit_V128_STORE_8_LANE(read_MEMARG(), read_LANE());
+			V128_STORE_16_LANE =>		v.visit_V128_STORE_16_LANE(read_MEMARG(), read_LANE());
+			V128_STORE_32_LANE =>		v.visit_V128_STORE_32_LANE(read_MEMARG(), read_LANE());
+			V128_STORE_64_LANE =>		v.visit_V128_STORE_64_LANE(read_MEMARG(), read_LANE());
+			V128_CONST =>			v.visit_V128_CONST(cp.read_u64(), cp.read_u64());
+			I8X16_SHUFFLE =>		v.visit_I8X16_SHUFFLE(cp.readN(16));
+			I8X16_EXTRACTLANE_S =>		v.visit_I8X16_EXTRACTLANE_S(read_LANE());
+			I8X16_EXTRACTLANE_U =>		v.visit_I8X16_EXTRACTLANE_U(read_LANE());
+			I8X16_REPLACELANE =>		v.visit_I8X16_REPLACELANE(read_LANE());
+			I16X8_EXTRACTLANE_S =>		v.visit_I16X8_EXTRACTLANE_S(read_LANE());
+			I16X8_EXTRACTLANE_U =>		v.visit_I16X8_EXTRACTLANE_U(read_LANE());
+			I16X8_REPLACELANE =>		v.visit_I16X8_REPLACELANE(read_LANE());
+			I32X4_EXTRACTLANE =>		v.visit_I32X4_EXTRACTLANE(read_LANE());
+			I32X4_REPLACELANE =>		v.visit_I32X4_REPLACELANE(read_LANE());
+			I64X2_EXTRACTLANE =>		v.visit_I64X2_EXTRACTLANE(read_LANE());
+			I64X2_REPLACELANE =>		v.visit_I64X2_REPLACELANE(read_LANE());
+			F32X4_EXTRACTLANE =>		v.visit_F32X4_EXTRACTLANE(read_LANE());
+			F32X4_REPLACELANE =>		v.visit_F32X4_REPLACELANE(read_LANE());
+			F64X2_EXTRACTLANE =>		v.visit_F64X2_EXTRACTLANE(read_LANE());
+			F64X2_REPLACELANE =>		v.visit_F64X2_REPLACELANE(read_LANE());
+			I8X16_SWIZZLE =>		v.visit_I8X16_SWIZZLE();
+			I8X16_SPLAT =>			v.visit_I8X16_SPLAT();
+			I16X8_SPLAT =>			v.visit_I16X8_SPLAT();
+			I32X4_SPLAT =>			v.visit_I32X4_SPLAT();
+			I64X2_SPLAT =>			v.visit_I64X2_SPLAT();
+			F32X4_SPLAT =>			v.visit_F32X4_SPLAT();
+			F64X2_SPLAT =>			v.visit_F64X2_SPLAT();
+			I8X16_EQ =>			v.visit_I8X16_EQ();
+			I8X16_NE =>			v.visit_I8X16_NE();
+			I8X16_LT_S =>			v.visit_I8X16_LT_S();
+			I8X16_LT_U =>			v.visit_I8X16_LT_U();
+			I8X16_GT_S =>			v.visit_I8X16_GT_S();
+			I8X16_GT_U =>			v.visit_I8X16_GT_U();
+			I8X16_LE_S =>			v.visit_I8X16_LE_S();
+			I8X16_LE_U =>			v.visit_I8X16_LE_U();
+			I8X16_GE_S =>			v.visit_I8X16_GE_S();
+			I8X16_GE_U =>			v.visit_I8X16_GE_U();
+			I16X8_EQ =>			v.visit_I16X8_EQ();
+			I16X8_NE =>			v.visit_I16X8_NE();
+			I16X8_LT_S =>			v.visit_I16X8_LT_S();
+			I16X8_LT_U =>			v.visit_I16X8_LT_U();
+			I16X8_GT_S =>			v.visit_I16X8_GT_S();
+			I16X8_GT_U =>			v.visit_I16X8_GT_U();
+			I16X8_LE_S =>			v.visit_I16X8_LE_S();
+			I16X8_LE_U =>			v.visit_I16X8_LE_U();
+			I16X8_GE_S =>			v.visit_I16X8_GE_S();
+			I16X8_GE_U =>			v.visit_I16X8_GE_U();
+			I32X4_EQ =>			v.visit_I32X4_EQ();
+			I32X4_NE =>			v.visit_I32X4_NE();
+			I32X4_LT_S =>			v.visit_I32X4_LT_S();
+			I32X4_LT_U =>			v.visit_I32X4_LT_U();
+			I32X4_GT_S =>			v.visit_I32X4_GT_S();
+			I32X4_GT_U =>			v.visit_I32X4_GT_U();
+			I32X4_LE_S =>			v.visit_I32X4_LE_S();
+			I32X4_LE_U =>			v.visit_I32X4_LE_U();
+			I32X4_GE_S =>			v.visit_I32X4_GE_S();
+			I32X4_GE_U =>			v.visit_I32X4_GE_U();
+			I64X2_EQ =>			v.visit_I64X2_EQ();
+			I64X2_NE =>			v.visit_I64X2_NE();
+			I64X2_LT_S =>			v.visit_I64X2_LT_S();
+			I64X2_GT_S =>			v.visit_I64X2_GT_S();
+			I64X2_LE_S =>			v.visit_I64X2_LE_S();
+			I64X2_GE_S =>			v.visit_I64X2_GE_S();
+			F32X4_EQ =>			v.visit_F32X4_EQ();
+			F32X4_NE =>			v.visit_F32X4_NE();
+			F32X4_LT =>			v.visit_F32X4_LT();
+			F32X4_GT =>			v.visit_F32X4_GT();
+			F32X4_LE =>			v.visit_F32X4_LE();
+			F32X4_GE =>			v.visit_F32X4_GE();
+			F64X2_EQ =>			v.visit_F64X2_EQ();
+			F64X2_NE =>			v.visit_F64X2_NE();
+			F64X2_LT =>			v.visit_F64X2_LT();
+			F64X2_GT =>			v.visit_F64X2_GT();
+			F64X2_LE =>			v.visit_F64X2_LE();
+			F64X2_GE =>			v.visit_F64X2_GE();
+			V128_NOT =>			v.visit_V128_NOT();
+			V128_AND =>			v.visit_V128_AND();
+			V128_ANDNOT =>			v.visit_V128_ANDNOT();
+			V128_OR =>			v.visit_V128_OR();
+			V128_XOR =>			v.visit_V128_XOR();
+			V128_BITSELECT =>		v.visit_V128_BITSELECT();
+			V128_ANYTRUE =>			v.visit_V128_ANYTRUE();
+			I8X16_ABS =>			v.visit_I8X16_ABS();
+			I8X16_NEG =>			v.visit_I8X16_NEG();
+			I8X16_POPCNT =>			v.visit_I8X16_POPCNT();
+			I8X16_ALLTRUE =>		v.visit_I8X16_ALLTRUE();
+			I8X16_BITMASK =>		v.visit_I8X16_BITMASK();
+			I8X16_NARROW_I16X8_S =>		v.visit_I8X16_NARROW_I16X8_S();
+			I8X16_NARROW_I16X8_U =>		v.visit_I8X16_NARROW_I16X8_U();
+			I8X16_SHL =>			v.visit_I8X16_SHL();
+			I8X16_SHR_S =>			v.visit_I8X16_SHR_S();
+			I8X16_SHR_U =>			v.visit_I8X16_SHR_U();
+			I8X16_ADD =>			v.visit_I8X16_ADD();
+			I8X16_ADD_SAT_S =>		v.visit_I8X16_ADD_SAT_S();
+			I8X16_ADD_SAT_U =>		v.visit_I8X16_ADD_SAT_U();
+			I8X16_SUB =>			v.visit_I8X16_SUB();
+			I8X16_SUB_SAT_S =>		v.visit_I8X16_SUB_SAT_S();
+			I8X16_SUB_SAT_U =>		v.visit_I8X16_SUB_SAT_U();
+			I8X16_MIN_S =>			v.visit_I8X16_MIN_S();
+			I8X16_MIN_U =>			v.visit_I8X16_MIN_U();
+			I8X16_MAX_S =>			v.visit_I8X16_MAX_S();
+			I8X16_MAX_U =>			v.visit_I8X16_MAX_U();
+			I8X16_AVGR_U =>			v.visit_I8X16_AVGR_U();
+			I16X8_EXTADDPAIRWISE_I8X16_S =>	v.visit_I16X8_EXTADDPAIRWISE_I8X16_S();
+			I16X8_EXTADDPAIRWISE_I8X16_U =>	v.visit_I16X8_EXTADDPAIRWISE_I8X16_U();
+			I16X8_ABS =>			v.visit_I16X8_ABS();
+			I16X8_NEG =>			v.visit_I16X8_NEG();
+			I16X8_Q15MULRSAT_S =>		v.visit_I16X8_Q15MULRSAT_S();
+			I16X8_ALLTRUE =>		v.visit_I16X8_ALLTRUE();
+			I16X8_BITMASK =>		v.visit_I16X8_BITMASK();
+			I16X8_NARROW_I32X4_S =>		v.visit_I16X8_NARROW_I32X4_S();
+			I16X8_NARROW_I32X4_U =>		v.visit_I16X8_NARROW_I32X4_U();
+			I16X8_EXTEND_LOW_I8X16_S =>	v.visit_I16X8_EXTEND_LOW_I8X16_S();
+			I16X8_EXTEND_HIGH_I8X16_S =>	v.visit_I16X8_EXTEND_HIGH_I8X16_S();
+			I16X8_EXTEND_LOW_I8X16_U =>	v.visit_I16X8_EXTEND_LOW_I8X16_U();
+			I16X8_EXTEND_HIGH_I8X16_U =>	v.visit_I16X8_EXTEND_HIGH_I8X16_U();
+			I16X8_SHL =>			v.visit_I16X8_SHL();
+			I16X8_SHR_S =>			v.visit_I16X8_SHR_S();
+			I16X8_SHR_U =>			v.visit_I16X8_SHR_U();
+			I16X8_ADD =>			v.visit_I16X8_ADD();
+			I16X8_ADD_SAT_S =>		v.visit_I16X8_ADD_SAT_S();
+			I16X8_ADD_SAT_U =>		v.visit_I16X8_ADD_SAT_U();
+			I16X8_SUB =>			v.visit_I16X8_SUB();
+			I16X8_SUB_SAT_S =>		v.visit_I16X8_SUB_SAT_S();
+			I16X8_SUB_SAT_U =>		v.visit_I16X8_SUB_SAT_U();
+			I16X8_MUL =>			v.visit_I16X8_MUL();
+			I16X8_MIN_S =>			v.visit_I16X8_MIN_S();
+			I16X8_MIN_U =>			v.visit_I16X8_MIN_U();
+			I16X8_MAX_S =>			v.visit_I16X8_MAX_S();
+			I16X8_MAX_U =>			v.visit_I16X8_MAX_U();
+			I16X8_AVGR_U =>			v.visit_I16X8_AVGR_U();
+			I16X8_EXTMUL_LOW_I8X16_S =>	v.visit_I16X8_EXTMUL_LOW_I8X16_S();
+			I16X8_EXTMUL_HIGH_I8X16_S =>	v.visit_I16X8_EXTMUL_HIGH_I8X16_S();
+			I16X8_EXTMUL_LOW_I8X16_U =>	v.visit_I16X8_EXTMUL_LOW_I8X16_U();
+			I16X8_EXTMUL_HIGH_I8X16_U =>	v.visit_I16X8_EXTMUL_HIGH_I8X16_U();
+			I32X4_EXTADDPAIRWISE_I16X8_S =>	v.visit_I32X4_EXTADDPAIRWISE_I16X8_S();
+			I32X4_EXTADDPAIRWISE_I16X8_U =>	v.visit_I32X4_EXTADDPAIRWISE_I16X8_U();
+			I32X4_ABS =>			v.visit_I32X4_ABS();
+			I32X4_NEG =>			v.visit_I32X4_NEG();
+			I32X4_ALLTRUE =>		v.visit_I32X4_ALLTRUE();
+			I32X4_BITMASK =>		v.visit_I32X4_BITMASK();
+			I32X4_EXTEND_LOW_I16X8_S =>	v.visit_I32X4_EXTEND_LOW_I16X8_S();
+			I32X4_EXTEND_HIGH_I16X8_S =>	v.visit_I32X4_EXTEND_HIGH_I16X8_S();
+			I32X4_EXTEND_LOW_I16X8_U =>	v.visit_I32X4_EXTEND_LOW_I16X8_U();
+			I32X4_EXTEND_HIGH_I16X8_U =>	v.visit_I32X4_EXTEND_HIGH_I16X8_U();
+			I32X4_SHL =>			v.visit_I32X4_SHL();
+			I32X4_SHR_S =>			v.visit_I32X4_SHR_S();
+			I32X4_SHR_U =>			v.visit_I32X4_SHR_U();
+			I32X4_ADD =>			v.visit_I32X4_ADD();
+			I32X4_SUB =>			v.visit_I32X4_SUB();
+			I32X4_MUL =>			v.visit_I32X4_MUL();
+			I32X4_MIN_S =>			v.visit_I32X4_MIN_S();
+			I32X4_MIN_U =>			v.visit_I32X4_MIN_U();
+			I32X4_MAX_S =>			v.visit_I32X4_MAX_S();
+			I32X4_MAX_U =>			v.visit_I32X4_MAX_U();
+			I32X4_DOT_I16X8_S =>		v.visit_I32X4_DOT_I16X8_S();
+			I32X4_EXTMUL_LOW_I16X8_S =>	v.visit_I32X4_EXTMUL_LOW_I16X8_S();
+			I32X4_EXTMUL_HIGH_I16X8_S =>	v.visit_I32X4_EXTMUL_HIGH_I16X8_S();
+			I32X4_EXTMUL_LOW_I16X8_U =>	v.visit_I32X4_EXTMUL_LOW_I16X8_U();
+			I32X4_EXTMUL_HIGH_I16X8_U =>	v.visit_I32X4_EXTMUL_HIGH_I16X8_U();
+			I64X2_ABS =>			v.visit_I64X2_ABS();
+			I64X2_NEG =>			v.visit_I64X2_NEG();
+			I64X2_ALLTRUE =>		v.visit_I64X2_ALLTRUE();
+			I64X2_BITMASK =>		v.visit_I64X2_BITMASK();
+			I64X2_EXTEND_LOW_I32X4_S =>	v.visit_I64X2_EXTEND_LOW_I32X4_S();
+			I64X2_EXTEND_HIGH_I32X4_S =>	v.visit_I64X2_EXTEND_HIGH_I32X4_S();
+			I64X2_EXTEND_LOW_I32X4_U =>	v.visit_I64X2_EXTEND_LOW_I32X4_U();
+			I64X2_EXTEND_HIGH_I32X4_U =>	v.visit_I64X2_EXTEND_HIGH_I32X4_U();
+			I64X2_SHL =>			v.visit_I64X2_SHL();
+			I64X2_SHR_S =>			v.visit_I64X2_SHR_S();
+			I64X2_SHR_U =>			v.visit_I64X2_SHR_U();
+			I64X2_ADD =>			v.visit_I64X2_ADD();
+			I64X2_SUB =>			v.visit_I64X2_SUB();
+			I64X2_MUL =>			v.visit_I64X2_MUL();
+			I64X2_EXTMUL_LOW_I32X4_S =>	v.visit_I64X2_EXTMUL_LOW_I32X4_S();
+			I64X2_EXTMUL_HIGH_I32X4_S =>	v.visit_I64X2_EXTMUL_HIGH_I32X4_S();
+			I64X2_EXTMUL_LOW_I32X4_U =>	v.visit_I64X2_EXTMUL_LOW_I32X4_U();
+			I64X2_EXTMUL_HIGH_I32X4_U =>	v.visit_I64X2_EXTMUL_HIGH_I32X4_U();
+			F32X4_CEIL =>			v.visit_F32X4_CEIL();
+			F32X4_FLOOR =>			v.visit_F32X4_FLOOR();
+			F32X4_TRUNC =>			v.visit_F32X4_TRUNC();
+			F32X4_NEAREST =>		v.visit_F32X4_NEAREST();
+			F32X4_ABS =>			v.visit_F32X4_ABS();
+			F32X4_NEG =>			v.visit_F32X4_NEG();
+			F32X4_SQRT =>			v.visit_F32X4_SQRT();
+			F32X4_ADD =>			v.visit_F32X4_ADD();
+			F32X4_SUB =>			v.visit_F32X4_SUB();
+			F32X4_MUL =>			v.visit_F32X4_MUL();
+			F32X4_DIV =>			v.visit_F32X4_DIV();
+			F32X4_MIN =>			v.visit_F32X4_MIN();
+			F32X4_MAX =>			v.visit_F32X4_MAX();
+			F32X4_PMIN =>			v.visit_F32X4_PMIN();
+			F32X4_PMAX =>			v.visit_F32X4_PMAX();
+			F64X2_CEIL =>			v.visit_F64X2_CEIL();
+			F64X2_FLOOR =>			v.visit_F64X2_FLOOR();
+			F64X2_TRUNC =>			v.visit_F64X2_TRUNC();
+			F64X2_NEAREST =>		v.visit_F64X2_NEAREST();
+			F64X2_ABS =>			v.visit_F64X2_ABS();
+			F64X2_NEG =>			v.visit_F64X2_NEG();
+			F64X2_SQRT =>			v.visit_F64X2_SQRT();
+			F64X2_ADD =>			v.visit_F64X2_ADD();
+			F64X2_SUB =>			v.visit_F64X2_SUB();
+			F64X2_MUL =>			v.visit_F64X2_MUL();
+			F64X2_DIV =>			v.visit_F64X2_DIV();
+			F64X2_MIN =>			v.visit_F64X2_MIN();
+			F64X2_MAX =>			v.visit_F64X2_MAX();
+			F64X2_PMIN =>			v.visit_F64X2_PMIN();
+			F64X2_PMAX =>			v.visit_F64X2_PMAX();
+			I32X4_TRUNC_SAT_F32X4_S =>	v.visit_I32X4_TRUNC_SAT_F32X4_S();
+			I32X4_TRUNC_SAT_F32X4_U =>	v.visit_I32X4_TRUNC_SAT_F32X4_U();
+			F32X4_CONVERT_I32X4_S =>	v.visit_F32X4_CONVERT_I32X4_S();
+			F32X4_CONVERT_I32X4_U =>	v.visit_F32X4_CONVERT_I32X4_U();
+			I32X4_TRUNC_SAT_F64X2_S_ZERO =>	v.visit_I32X4_TRUNC_SAT_F64X2_S_ZERO();
+			I32X4_TRUNC_SAT_F64X2_U_ZERO =>	v.visit_I32X4_TRUNC_SAT_F64X2_U_ZERO();
+			F64X2_CONVERT_LOW_I32X4_S =>	v.visit_F64X2_CONVERT_LOW_I32X4_S();
+			F64X2_CONVERT_LOW_I32X4_U =>	v.visit_F64X2_CONVERT_LOW_I32X4_U();
+			F32X4_DEMOTE_F64X2_ZERO =>	v.visit_F32X4_DEMOTE_F64X2_ZERO();
+			F64X2_PROMOTE_LOW_F32X4 =>	v.visit_F64X2_PROMOTE_LOW_F32X4();
+			MEMORY_ATOMIC_NOTIFY =>		v.visit_MEMORY_ATOMIC_NOTIFY(read_MEMARG());
+			MEMORY_ATOMIC_WAIT32 =>		v.visit_MEMORY_ATOMIC_WAIT32(read_MEMARG());
+			MEMORY_ATOMIC_WAIT64 =>		v.visit_MEMORY_ATOMIC_WAIT64(read_MEMARG());
+			ATOMIC_FENCE =>			v.visit_ATOMIC_FENCE(read_ZEROB());
+			I32_ATOMIC_LOAD =>		v.visit_I32_ATOMIC_LOAD(read_MEMARG());
+			I64_ATOMIC_LOAD =>		v.visit_I64_ATOMIC_LOAD(read_MEMARG());
+			I32_ATOMIC_LOAD8_U =>		v.visit_I32_ATOMIC_LOAD8_U(read_MEMARG());
+			I32_ATOMIC_LOAD16_U =>		v.visit_I32_ATOMIC_LOAD16_U(read_MEMARG());
+			I64_ATOMIC_LOAD8_U =>		v.visit_I64_ATOMIC_LOAD8_U(read_MEMARG());
+			I64_ATOMIC_LOAD16_U =>		v.visit_I64_ATOMIC_LOAD16_U(read_MEMARG());
+			I64_ATOMIC_LOAD32_U =>		v.visit_I64_ATOMIC_LOAD32_U(read_MEMARG());
+			I32_ATOMIC_STORE =>		v.visit_I32_ATOMIC_STORE(read_MEMARG());
+			I64_ATOMIC_STORE =>		v.visit_I64_ATOMIC_STORE(read_MEMARG());
+			I32_ATOMIC_STORE8 =>		v.visit_I32_ATOMIC_STORE8(read_MEMARG());
+			I32_ATOMIC_STORE16 =>		v.visit_I32_ATOMIC_STORE16(read_MEMARG());
+			I64_ATOMIC_STORE8 =>		v.visit_I64_ATOMIC_STORE8(read_MEMARG());
+			I64_ATOMIC_STORE16 =>		v.visit_I64_ATOMIC_STORE16(read_MEMARG());
+			I64_ATOMIC_STORE32 =>		v.visit_I64_ATOMIC_STORE32(read_MEMARG());
+			I32_ATOMIC_RMW_ADD =>		v.visit_I32_ATOMIC_RMW_ADD(read_MEMARG());
+			I64_ATOMIC_RMW_ADD =>		v.visit_I64_ATOMIC_RMW_ADD(read_MEMARG());
+			I32_ATOMIC_RMW8_ADD_U =>	v.visit_I32_ATOMIC_RMW8_ADD_U(read_MEMARG());
+			I32_ATOMIC_RMW16_ADD_U =>	v.visit_I32_ATOMIC_RMW16_ADD_U(read_MEMARG());
+			I64_ATOMIC_RMW8_ADD_U =>	v.visit_I64_ATOMIC_RMW8_ADD_U(read_MEMARG());
+			I64_ATOMIC_RMW16_ADD_U =>	v.visit_I64_ATOMIC_RMW16_ADD_U(read_MEMARG());
+			I64_ATOMIC_RMW32_ADD_U =>	v.visit_I64_ATOMIC_RMW32_ADD_U(read_MEMARG());
+			I32_ATOMIC_RMW_SUB =>		v.visit_I32_ATOMIC_RMW_SUB(read_MEMARG());
+			I64_ATOMIC_RMW_SUB =>		v.visit_I64_ATOMIC_RMW_SUB(read_MEMARG());
+			I32_ATOMIC_RMW8_SUB_U =>	v.visit_I32_ATOMIC_RMW8_SUB_U(read_MEMARG());
+			I32_ATOMIC_RMW16_SUB_U =>	v.visit_I32_ATOMIC_RMW16_SUB_U(read_MEMARG());
+			I64_ATOMIC_RMW8_SUB_U =>	v.visit_I64_ATOMIC_RMW8_SUB_U(read_MEMARG());
+			I64_ATOMIC_RMW16_SUB_U =>	v.visit_I64_ATOMIC_RMW16_SUB_U(read_MEMARG());
+			I64_ATOMIC_RMW32_SUB_U =>	v.visit_I64_ATOMIC_RMW32_SUB_U(read_MEMARG());
+			I32_ATOMIC_RMW_AND =>		v.visit_I32_ATOMIC_RMW_AND(read_MEMARG());
+			I64_ATOMIC_RMW_AND =>		v.visit_I64_ATOMIC_RMW_AND(read_MEMARG());
+			I32_ATOMIC_RMW8_AND_U =>	v.visit_I32_ATOMIC_RMW8_AND_U(read_MEMARG());
+			I32_ATOMIC_RMW16_AND_U =>	v.visit_I32_ATOMIC_RMW16_AND_U(read_MEMARG());
+			I64_ATOMIC_RMW8_AND_U =>	v.visit_I64_ATOMIC_RMW8_AND_U(read_MEMARG());
+			I64_ATOMIC_RMW16_AND_U =>	v.visit_I64_ATOMIC_RMW16_AND_U(read_MEMARG());
+			I64_ATOMIC_RMW32_AND_U =>	v.visit_I64_ATOMIC_RMW32_AND_U(read_MEMARG());
+			I32_ATOMIC_RMW_OR =>		v.visit_I32_ATOMIC_RMW_OR(read_MEMARG());
+			I64_ATOMIC_RMW_OR =>		v.visit_I64_ATOMIC_RMW_OR(read_MEMARG());
+			I32_ATOMIC_RMW8_OR_U =>		v.visit_I32_ATOMIC_RMW8_OR_U(read_MEMARG());
+			I32_ATOMIC_RMW16_OR_U =>	v.visit_I32_ATOMIC_RMW16_OR_U(read_MEMARG());
+			I64_ATOMIC_RMW8_OR_U =>		v.visit_I64_ATOMIC_RMW8_OR_U(read_MEMARG());
+			I64_ATOMIC_RMW16_OR_U =>	v.visit_I64_ATOMIC_RMW16_OR_U(read_MEMARG());
+			I64_ATOMIC_RMW32_OR_U =>	v.visit_I64_ATOMIC_RMW32_OR_U(read_MEMARG());
+			I32_ATOMIC_RMW_XOR =>		v.visit_I32_ATOMIC_RMW_XOR(read_MEMARG());
+			I64_ATOMIC_RMW_XOR =>		v.visit_I64_ATOMIC_RMW_XOR(read_MEMARG());
+			I32_ATOMIC_RMW8_XOR_U =>	v.visit_I32_ATOMIC_RMW8_XOR_U(read_MEMARG());
+			I32_ATOMIC_RMW16_XOR_U =>	v.visit_I32_ATOMIC_RMW16_XOR_U(read_MEMARG());
+			I64_ATOMIC_RMW8_XOR_U =>	v.visit_I64_ATOMIC_RMW8_XOR_U(read_MEMARG());
+			I64_ATOMIC_RMW16_XOR_U =>	v.visit_I64_ATOMIC_RMW16_XOR_U(read_MEMARG());
+			I64_ATOMIC_RMW32_XOR_U =>	v.visit_I64_ATOMIC_RMW32_XOR_U(read_MEMARG());
+			I32_ATOMIC_RMW_XCHG =>		v.visit_I32_ATOMIC_RMW_XCHG(read_MEMARG());
+			I64_ATOMIC_RMW_XCHG =>		v.visit_I64_ATOMIC_RMW_XCHG(read_MEMARG());
+			I32_ATOMIC_RMW8_XCHG_U =>	v.visit_I32_ATOMIC_RMW8_XCHG_U(read_MEMARG());
+			I32_ATOMIC_RMW16_XCHG_U =>	v.visit_I32_ATOMIC_RMW16_XCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW8_XCHG_U =>	v.visit_I64_ATOMIC_RMW8_XCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW16_XCHG_U =>	v.visit_I64_ATOMIC_RMW16_XCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW32_XCHG_U =>	v.visit_I64_ATOMIC_RMW32_XCHG_U(read_MEMARG());
+			I32_ATOMIC_RMW_CMPXCHG =>	v.visit_I32_ATOMIC_RMW_CMPXCHG(read_MEMARG());
+			I64_ATOMIC_RMW_CMPXCHG =>	v.visit_I64_ATOMIC_RMW_CMPXCHG(read_MEMARG());
+			I32_ATOMIC_RMW8_CMPXCHG_U =>	v.visit_I32_ATOMIC_RMW8_CMPXCHG_U(read_MEMARG());
+			I32_ATOMIC_RMW16_CMPXCHG_U =>	v.visit_I32_ATOMIC_RMW16_CMPXCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW8_CMPXCHG_U =>	v.visit_I64_ATOMIC_RMW8_CMPXCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW16_CMPXCHG_U =>	v.visit_I64_ATOMIC_RMW16_CMPXCHG_U(read_MEMARG());
+			I64_ATOMIC_RMW32_CMPXCHG_U =>	v.visit_I64_ATOMIC_RMW32_CMPXCHG_U(read_MEMARG());
+		}
 	}
 }
