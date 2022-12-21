@@ -232,7 +232,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
 		masm.emit_read_v3_array_r_i(regs.func_arg, regs.func_arg, func.func_index, ValueKind.REF);
 		emit_compute_vsp(state.sp);
-		
+
 		var tmp = regs.ip; // TODO: more robust register choice for indirect call
 		if (func.imp != null) {
 			// call to imported function must first check for WasmFunction
@@ -283,7 +283,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_read_v3_array_r_r(regs.func_arg, tmp2, regs.func_arg, ValueKind.REF);
 
 		emit_compute_vsp(state.sp);
-		
+
 		// check for WasmFunction
 		masm.emit_mov_r_m(tmp1, ValueKind.I32, MasmAddr(regs.func_arg, 0));
 		masm.emit_breq_r_i(tmp1, offsets.WasmFunction_typeId, wasmcall_label);
@@ -602,7 +602,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_REF_EQ() { emitBinop(SpcBinop.REF_EQ); }
 	def visit_EXTERN_INTERNALIZE() { }
 	def visit_EXTERN_EXTERNALIZE() { }
-	
+
 	def emitSelect1(sv: SpcAbstractVal, fv: SpcAbstractVal, tv: SpcAbstractVal) {
 		var tagStored = tv.flags & TAG_STORED;
 		var label = masm.newLabel(it.pc);
@@ -937,6 +937,79 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var cp = it.immptr();
 		err.rel(cp, it.pc).set(msg);
 	}
+	// Fold an unary operation if a constant is on the top of the stack.
+	def tryFold1(kind: ValueKind, f: i32 -> i32) -> bool {
+		var sv = state.peek();
+		if (sv.isConst()) {
+			var r = f(sv.const);
+			if (r != sv.const) {
+				freeVal(sv);
+				state.overwrite(sv.kindFlagsMatching(kind, IS_CONST), NO_REG, r);
+			}
+			return true;
+		}
+		return false;
+	}
+	// Fold an unary operation if a constant is on the top of the stack, handling possible traps or
+	// other reasons why folding might not work.
+	def tryMaybeFold1(kind: ValueKind, f: i32 -> (i32, TrapReason)) -> bool {
+		var sv = state.peek();
+		if (sv.isConst()) {
+			var r = f(sv.const);
+			if (r.1 == TrapReason.CANNOT_FOLD) return false;
+			if (r.1 != TrapReason.NONE) {
+				freeVal(sv);
+				emitTrap(r.1);
+				return true;
+			}
+			if (r.0 != sv.const) {
+				freeVal(sv);
+				state.overwrite(sv.kindFlagsMatching(kind, IS_CONST), NO_REG, r.0);
+			}
+			return true;
+		}
+		return false;
+	}
+	// Fold a binary operation if two constants are on the top of the stack.
+	def tryFold2(kind: ValueKind, f: (i32, i32) -> i32) -> bool {
+		var sv = state.peek2(), a = sv.0, b = sv.1;
+		if (a.isConst() && b.isConst()) {
+			var r = f(a.const, b.const);
+			freeVal(b);
+			state.pop();
+			state.overwrite(a.kindFlagsMatching(kind, IS_CONST), NO_REG, r);
+			freeVal(a);
+			return true;
+		}
+		return false;
+	}
+	// Fold a binary operation if two constants are on the top of the stack, handling possible traps.
+	def tryMaybeFold2(kind: ValueKind, f: (i32, i32) -> (i32, TrapReason)) -> bool {
+		var sv = state.peek2(), a = sv.0, b = sv.1;
+		if (a.isConst() && b.isConst()) {
+			var r = f(a.const, b.const);
+			if (r.1 == TrapReason.CANNOT_FOLD) return false;
+			if (r.1 != TrapReason.NONE) {
+				freeVal(a);
+				freeVal(b);
+				emitTrap(r.1);
+				return true;
+			}
+			freeVal(b);
+			state.pop();
+			state.overwrite(a.kindFlagsMatching(kind, IS_CONST), NO_REG, r.0);
+			freeVal(a);
+			return true;
+		}
+		return false;
+	}
+
+	def match_r() -> (bool, Reg);
+	def match_k() -> (bool, int);
+	def match_r_r() -> (bool, Reg, Reg);
+	def match_r_k() -> (bool, Reg, int);
+	def match_r_m() -> (bool, Reg, u32);
+	def popReg() -> SpcAbstractVal;
 
 	//====================================================================
 	// codegen operations
@@ -1080,6 +1153,12 @@ type SpcAbstractVal(flags: byte, reg: Reg, const: int) #unboxed {
 	}
 	def kindFlags(add: byte) -> byte {
 		return (flags & KIND_MASK) | add;
+	}
+	def kindFlagsMatching(kind: ValueKind, add: byte) -> byte {
+		var okind = (flags & KIND_MASK);
+		var nkind = kindToFlags(kind);
+		if (okind == nkind) nkind |= (flags & TAG_STORED);
+		return nkind | add;
 	}
 	def isStored() -> bool {
 		return (flags & IS_STORED) != 0;
@@ -1427,10 +1506,13 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 		}
 	}
 	def peek() -> SpcAbstractVal {
-		return state[this.sp - 1];
+		return state[sp - 1];
+	}
+	def peek2() -> (SpcAbstractVal, SpcAbstractVal) {
+		return (state[sp - 2], state[sp - 1]);
 	}
 	def overwrite(flags: byte, reg: Reg, const: int) {
-		state[this.sp - 1] = SpcAbstractVal(flags, reg, const);
+		state[sp - 1] = SpcAbstractVal(flags, reg, const);
 	}
 	def set(slot: u32, flags: byte, reg: Reg, const: int) {
 		state[slot] = SpcAbstractVal(flags, reg, const);
@@ -1499,4 +1581,12 @@ component Fold_ii_i {
 	def I32_LE_U = do_uu_z(u32.<=, _, _);
 	def I32_GE_S = do_ii_z(int.>=, _, _);
 	def I32_GE_U = do_uu_z(u32.>=, _, _);
+}
+
+// Versions of instructions that only fold if their result is properly representable in i32.
+component V3FoldI32 {
+	def I64_EXTEND_I32_U(val: i32) -> (i32, TrapReason) {
+		if (val >= 0) return (val, TrapReason.NONE);
+		return (val, TrapReason.CANNOT_FOLD);
+	}
 }
