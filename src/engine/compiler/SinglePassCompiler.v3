@@ -8,19 +8,18 @@ def OUT = Trace.OUT;
 // TODO: unreachable
 // TODO: traps in JIT code
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
-class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits: Limits, module: Module) {
+class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits: Limits, module: Module) extends BytecodeVisitor {
 	def err = ErrorGen.new(module.name);
-	def codeptr = CodePtr.new(null);
-	def parser = WasmParser.new(extensions, limits, module, err, codeptr);
+	def it = BytecodeIterator.new();
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def regs = masm.regAlloc.regConfig.regs;
 
 	// Abstract state of the value stack
 	def state = SpcAbstractState.new(masm.regAlloc);
 	// Other state
+	var start_pos = 0;
+	var func: FuncDecl;
 	var sig: SigDecl;
-	var start_pos: int;
-	var opcode_pos: int;
 	var success = true;
 	var unwind_label: MasmLabel;
 
@@ -33,25 +32,28 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 	def gen(func: FuncDecl) -> bool {
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).outln();
-		var d = codeptr.reset(func.cur_bytecode, 0, func.cur_bytecode.length);
+		this.func = func;
+		it.reset(func);
 
-		start_pos = 0;
 		sig = func.sig;
 		unwind_label = null;
+		success = true;
 
 		// Initialize parameters, locals, and first control stack entry.
 		var ret_label = masm.newLabel(func.cur_bytecode.length);
 		state.reset(sig, ret_label);
-		initLocals();
-		opcode_pos = codeptr.pos;
+
+		// Visit all local declarations.
+		it.dispatchLocalDecls(this);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
 
 		// Emit instructions.
-		success = true;
-		while (d.pos < d.limit) {
-			emitInstr();
+		while (it.more() && success) {
+			if (Trace.compiler) { traceStack(); traceOpcode(); }
+			it.dispatch(this);
+			it.next();
 		}
 		return success;
 	}
@@ -86,521 +88,492 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			masm.emit_mov_m_r(MasmAddr(regs.sp, c.mem_offset), regs.mem0, ValueKind.REF);
 		}
 	}
-	def initLocals() {
-		var max = limits.max_num_locals;
-		var dcount = parser.readU32("local decl count", max);
-		for (i < dcount) {
-			var count = parser.readU32("local count", max);
-			var ltype = parser.readValueType();
-			state.addLocals(count, ltype);
-		}
-		state.num_locals = u16.!(state.sp);
+	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
+		state.addLocals(count, vtc.toAbstractValueType(module));
 	}
-	def emitInstr() {
-		opcode_pos = codeptr.pos;
-		var opcode = codeptr.read_opcode();
-		if (Trace.compiler) { traceStack(); traceOpcode(); }
-		match (opcode) {
-			UNREACHABLE => {
-				emitTrap(TrapReason.UNREACHABLE);
-				state.setUnreachable();
-			}
-			NOP => {
-				// emit nothing
-			}
-			BLOCK => {
-				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				state.pushBlock(params, results, masm.newLabel(opcode_pos));
-			}
-			LOOP => {
-				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				state.pushLoop(params, results, masm.newLabel(opcode_pos));
-				var ctl_top = state.ctl_stack.peek();
-				state.prepareLoop(emitSlotTransfer);
-				masm.bindLabel(ctl_top.label);
-			}
-			IF => {
-				var pr = parser.readBlockType(), params = pr.0, results = pr.1;
-				var sv = state.pop();
-				state.pushIf(params, results, masm.newLabel(opcode_pos), masm.newLabel(opcode_pos));
-				var ctl_top = state.ctl_stack.peek();
-				emitBrIf(sv, MasmBrCond.I32_ZERO, ctl_top.else_label, null, true);
-			}
-			ELSE => {
-				var ctl_top = state.ctl_stack.peek();
-				state.emitFallthru(emitSlotTransfer);
-				masm.emit_br(ctl_top.label);
-				masm.bindLabel(ctl_top.else_label);
-				state.doElse();
-				ctl_top.opcode = Opcode.ELSE.code;
-			}
-			END => {
-				var ctl_top = state.ctl_stack.peek();
-				if (ctl_top.opcode == Opcode.LOOP.code) {
-					state.ctl_stack.pop();
-					state.ctl_stack.peek().reachable = ctl_top.reachable;
-				} else if (ctl_top.opcode == Opcode.IF.code) {
-					// simulate empty if-true block
-					state.emitFallthru(emitSlotTransfer);
-					masm.emit_br(ctl_top.label);
-					masm.bindLabel(ctl_top.else_label);
-					state.doElse();
-					ctl_top.opcode = Opcode.ELSE.code;
-					state.emitFallthru(emitSlotTransfer);
-					masm.bindLabel(ctl_top.label);
-					state.resetToMerge(ctl_top);
-					state.ctl_stack.pop();
-				} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
-					state.emitFallthru(emitSlotTransfer);
-					masm.bindLabel(ctl_top.label);
-					state.resetToMerge(ctl_top);
-					state.ctl_stack.pop();
-				} else if (ctl_top.opcode == Opcode.RETURN.code) {
-					state.emitFallthru(emitSlotTransfer);
-					masm.bindLabel(ctl_top.label);
-					if (ctl_top.merge_count > 1) emitReturn(ctl_top);
-					state.ctl_stack.pop();
-				}
-			}
-			BR => {
-				var depth = parser.readLabel();
-				var target = state.getControl(depth);
-				state.emitTransfer(target, emitSlotTransfer);
-				masm.emit_br(target.label);
-				state.setUnreachable();
-			}
-			BR_IF => {
-				var depth = parser.readLabel();
-				var target = state.getControl(depth);
-				var sv = state.pop();
-				emitBrIf(sv, MasmBrCond.I32_NONZERO, target.label, target, state.isTransferEmpty(target));
-			}
-			BR_ON_NULL => {
-				var depth = parser.readLabel();
-				var target = state.getControl(depth);
-				var sv = state.pop();
-				emitBrIf(sv, MasmBrCond.REF_NULL, target.label, target, state.isTransferEmpty(target));
-			}
-			BR_ON_NON_NULL => {
-				var depth = parser.readLabel();
-				var target = state.getControl(depth);
-				var sv = state.pop();
-				emitBrIf(sv, MasmBrCond.REF_NONNULL, target.label, target, state.isTransferEmpty(target));
-			}
-			BR_TABLE => {
-				var depths = parser.readLabels();
-				var sv = state.pop();
-				emitBrTable(sv, depths);
-				state.setUnreachable();
-			}
-			RETURN => {
-				var target = state.ctl_stack.elems[0];
-				state.emitTransfer(target, emitSlotTransfer);
-				masm.emit_br(target.label);
-				state.setUnreachable();
-			}
-			CALL => {
-				var func = parser.readFuncRef();
-				var offsets = masm.getOffsets();
-				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
-				state.emitSpill(emitSlotTransfer);
-				var c = masm.regAlloc.regConfig;
-				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
-				// XXX: skip loading the target function for direct intra-module calls?
-				masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
-				masm.emit_read_v3_array_r_i(regs.func_arg, regs.func_arg, func.func_index, ValueKind.REF);
+	def visitOp(opcode: Opcode) {
+		bailout(Strings.format1("unsupported opcode: %s", opcode.name));
+	}
 
-				emit_compute_vsp(state.sp);
-
-				var tmp = regs.ip; // TODO: more robust register choice for indirect call
-				if (func.imp != null) {
-					// call to imported function must first check for WasmFunction
-					masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
-					masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
-					masm.emit_write_runtime_vsp(regs.vsp);
-					masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
-					masm.emit_call_runtime_callHost(regs.func_arg);
-					masm.emit_br(retpt);
-				}
-				masm.bindLabel(wasmcall_label);
-				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
-				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_target_code));
-				masm.emit_call_r(tmp);
-				masm.bindLabel(retpt);
-				emit_unwind_check();
-				emit_reload_regs();
-
-				state.popArgsAndPushResults(func.sig);
-			}
-			CALL_INDIRECT => {
-				var sig = parser.readSigRef();
-				var offsets = masm.getOffsets();
-				var table_index = codeptr.read_uleb32();
-				var sv = state.pop();
-				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
-				state.emitSpill(emitSlotTransfer);
-				ensure_reg(sv, state.sp, regs.func_arg);
-				// reload instance from frame
-				var c = masm.regAlloc.regConfig;
-				masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
-
-				var tmp1 = regs.stp; // TODO: allocate and release temp regs
-				var tmp2 = regs.ip;
-
-				// load table[table_index] from instance
-				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_tables));
-				masm.emit_read_v3_array_r_i(tmp1, tmp1, int.!(table_index), ValueKind.REF);
-				// bounds check
-				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
-				masm.emit_bounds_check_v3_array(tmp2, regs.func_arg, masm.newTrapLabel(TrapReason.FUNC_INVALID));
-				// signature check
-				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
-				masm.emit_read_v3_array_r_r(tmp2, tmp2, regs.func_arg, ValueKind.I32);
-				masm.emit_breq_r_i(tmp2, -1, masm.newTrapLabel(TrapReason.FUNC_INVALID));
-				masm.emit_brne_r_i(tmp2, sig.canon_id, masm.newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
-				// load from table
-				masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_funcs));
-				masm.emit_read_v3_array_r_r(regs.func_arg, tmp2, regs.func_arg, ValueKind.REF);
-
-				emit_compute_vsp(state.sp);
-
-				// check for WasmFunction
-				masm.emit_mov_r_m(tmp1, ValueKind.I32, MasmAddr(regs.func_arg, 0));
-				masm.emit_breq_r_i(tmp1, offsets.WasmFunction_typeId, wasmcall_label);
-				masm.emit_write_runtime_vsp(regs.vsp);
-				masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
-				masm.emit_call_runtime_callHost(regs.func_arg);
-				masm.emit_br(retpt);
-
-				masm.bindLabel(wasmcall_label);
-				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
-				masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(tmp1, offsets.FuncDecl_target_code));
-				masm.emit_call_r(tmp1);
-				// merge point for both returns
-				masm.bindLabel(retpt);
-				emit_unwind_check();
-				emit_reload_regs();
-
-				state.popArgsAndPushResults(sig);
-				freeVal(sv);
-			}
-			CALL_REF => {
-				var sig = parser.readSigRef();
-				var offsets = masm.getOffsets();
-				var regs = masm.regAlloc.regConfig.regs;
-				var sv = state.pop();
-				var c = masm.regAlloc.regConfig;
-				if (sv.isConst() && sv.const == 0) {
-					emitTrap(TrapReason.NULL_DEREF);
-					state.setUnreachable();
-					return;
-				}
-				ensure_reg(sv, state.sp, regs.func_arg);
-				var retpt = masm.newLabel(opcode_pos), wasmcall_label = masm.newLabel(opcode_pos);
-				state.emitSpill(emitSlotTransfer);
-
-				emit_compute_vsp(state.sp);
-				// check for null
-				masm.emit_breq_r_l(regs.func_arg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
-
-				var tmp = regs.ip; // TODO: allocate and release tmp regs
-				masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
-				masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
-				// not a WasmFunction
-				masm.emit_write_runtime_vsp(regs.vsp);
-				masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
-				masm.emit_call_runtime_callHost(regs.func_arg);
-				masm.emit_br(retpt);
-
-				// WasmFunction
-				masm.bindLabel(wasmcall_label);
-				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
-				masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_target_code));
-				masm.emit_call_r(tmp);
-
-				masm.bindLabel(retpt);
-				emit_unwind_check();
-				emit_reload_regs();
-
-				state.popArgsAndPushResults(sig);
-				freeVal(sv);
-			}
-			DROP => {
-				state.sp--;
-			}
-			SELECT => {
-				var sv = state.pop();
-				var fv = state.pop();
-				var tv = state.pop();
-				emitSelect1(sv, fv, tv);
-				freeVal(sv);
-			}
-			LOCAL_GET => {
-				var index = codeptr.read_uleb32();
-				var lv = state.get(index);
-				if (lv.isConst()) {
-					if (lv.inReg()) {
-						state.push(lv.kindFlags(IS_CONST | IN_REG), lv.reg, lv.const); // steal reg
-						state.setNoReg(index);
-					} else {
-						state.push(lv.kindFlags(IS_CONST), NO_REG, lv.const);
-					}
-				} else if (lv.inReg()) {
-					if (!lv.isStored()) {
-						masm.emit_mov_s_r(index, lv.reg, lv.kind());
-						state.setStored(index);
-					}
-					state.setNoReg(index); // steal reg
-					state.push(lv.kindFlags(IN_REG), lv.reg, 0);
-				} else {
-					var reg = allocReg(lv.kind());
-					emit_read_slot_r(index, reg);
-					state.push(lv.kindFlags(IN_REG), reg.reg, 0);
-				}
-			}
-			LOCAL_SET => {
-				var index = codeptr.read_uleb32();
-				var lv = state.get(index);
-				var sv = state.pop();
-				if (sv.isConst() || sv.inReg()) {
-					var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | (sv.flags & (IN_REG | IS_CONST));
-					state.set(index, flags, sv.reg, sv.const);
-				} else {
-					var reg = allocReg(lv.kind());
-					emit_read_slot_r(state.sp, reg);
-					var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | IN_REG;
-					state.set(index, flags, reg.reg, 0);
-				}
-			}
-			LOCAL_TEE => {
-				var index = codeptr.read_uleb32();
-				var lv = state.get(index);
-				var sv = state.peek();
-				if (sv.isConst()) {
-					var flags = lv.kindFlags(TAG_STORED | IS_CONST);
-					state.set(index, flags, NO_REG, sv.const);
-				} else if (sv.inReg()) {
-					masm.emit_mov_s_r(index, sv.reg, sv.kind());
-					var flags = lv.kindFlags(TAG_STORED | IS_STORED);
-					state.set(index, flags, NO_REG, 0);
-				} else {
-					var tos = state.sp - 1;
-					var reg = allocReg(lv.kind());
-					emit_read_slot_r(tos, reg);
-					emit_write_slot_r(index, reg);
-					var flags = lv.kindFlags(TAG_STORED | IS_STORED);
-					state.set(index, flags, NO_REG, 0);
-					state.overwrite(lv.kindFlags(IN_REG), reg.reg, 0);
-				}
-			}
-			GLOBAL_GET => {
-				var global = parser.readGlobalRef();
-				if (!global.mutable && global.imp == null && global.valtype == ValueType.I32) {
-					state.push(KIND_I32 | IS_CONST, NO_REG, InitExpr.I32.!(global.init).val);
-				} else {
-					var c = masm.regAlloc.regConfig;
-					state.emitSpill(emitSlotTransfer);
-					emit_compute_vsp(state.sp);
-					masm.emit_write_runtime_vsp(regs.vsp);
-					masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
-					masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
-					masm.emit_call_runtime_GLOBAL_GET();
-					emit_reload_regs();
-					state.push(typeToKindFlags(global.valtype) | TAG_STORED | IS_STORED, NO_REG, 0);
-				}
-			}
-			GLOBAL_SET => {
-				var global = parser.readGlobalRef();
-				var c = masm.regAlloc.regConfig;
-				state.emitSpill(emitSlotTransfer);
-				emit_compute_vsp(state.sp);
-				masm.emit_write_runtime_vsp(regs.vsp);
-				masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
-				masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
-				masm.emit_call_runtime_GLOBAL_SET();
-				emit_reload_regs();
-				var sv = state.pop();
-				freeVal(sv);
-			}
-
-			I32_LOAD => emitLoad(ValueKind.I32, masm.emit_load_r_r_r_i);
-			I64_LOAD => emitLoad(ValueKind.I64, masm.emit_load_r_r_r_i);
-			F32_LOAD => emitLoad(ValueKind.F32, masm.emit_load_r_r_r_i);
-			F64_LOAD => emitLoad(ValueKind.F64, masm.emit_load_r_r_r_i);
-			I32_LOAD8_S => emitLoad(ValueKind.I32, masm.emit_loadbsx_r_r_r_i);
-			I32_LOAD8_U => emitLoad(ValueKind.I32, masm.emit_loadbzx_r_r_r_i);
-			I32_LOAD16_S => emitLoad(ValueKind.I32, masm.emit_loadwsx_r_r_r_i);
-			I32_LOAD16_U => emitLoad(ValueKind.I32, masm.emit_loadwzx_r_r_r_i);
-			I64_LOAD8_S => emitLoad(ValueKind.I64, masm.emit_loadbsx_r_r_r_i);
-			I64_LOAD8_U => emitLoad(ValueKind.I64, masm.emit_loadbzx_r_r_r_i);
-			I64_LOAD16_S => emitLoad(ValueKind.I64, masm.emit_loadwsx_r_r_r_i);
-			I64_LOAD16_U => emitLoad(ValueKind.I64, masm.emit_loadwzx_r_r_r_i);
-			I64_LOAD32_S => emitLoad(ValueKind.I64, masm.emit_loaddsx_r_r_r_i);
-			I64_LOAD32_U => emitLoad(ValueKind.I64, masm.emit_loaddzx_r_r_r_i);
-			I32_STORE => emitStore(ValueKind.I32, masm.emit_store_r_r_r_i);
-			I64_STORE => emitStore(ValueKind.I64, masm.emit_store_r_r_r_i);
-			F32_STORE => emitStore(ValueKind.F32, masm.emit_store_r_r_r_i);
-			F64_STORE => emitStore(ValueKind.F64, masm.emit_store_r_r_r_i);
-			I32_STORE8 => emitStore(ValueKind.I32, masm.emit_storeb_r_r_r_i);
-			I32_STORE16 => emitStore(ValueKind.I32, masm.emit_storew_r_r_r_i);
-			I64_STORE8 => emitStore(ValueKind.I64, masm.emit_storeb_r_r_r_i);
-			I64_STORE16 => emitStore(ValueKind.I64, masm.emit_storew_r_r_r_i);
-			I64_STORE32 => emitStore(ValueKind.I32, masm.emit_store_r_r_r_i);
-			I32_CONST => {
-				var val = codeptr.read_sleb32();
-				state.push(KIND_I32 | IS_CONST, NO_REG, val);
-			}
-			I64_CONST => {
-				var val = codeptr.read_sleb64();
-				if (i32.view(val) == val) {
-					state.push(KIND_I64 | IS_CONST, NO_REG, i32.view(val));
-				} else {
-					var tos = state.sp;
-					var addr = masm.slotAddr(tos);
-					masm.emit_mov_m_i(addr, int.view(val));
-					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					state.push(KIND_I64 | IS_STORED, NO_REG, 0);
-				}
-			}
-			F32_CONST => {
-				var val = codeptr.read_u32();
-				if (val == 0 && config_TrackFloatZeroConst) {
-					state.push(KIND_F32 | IS_CONST, NO_REG, 0);
-				} else {
-					var tos = state.sp;
-					masm.emit_mov_m_i(masm.slotAddr(tos), int.view(val));
-					state.push(KIND_F32 | IS_STORED, NO_REG, 0);
-				}
-			}
-			F64_CONST => {
-				var val = codeptr.read_u64();
-				if (val == 0 && config_TrackFloatZeroConst) {
-					state.push(KIND_F64 | IS_CONST, NO_REG, 0);
-				} else {
-					var tos = state.sp;
-					var addr = masm.slotAddr(tos);
-					masm.emit_mov_m_i(addr, int.view(val));
-					masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
-					state.push(KIND_F64 | IS_STORED, NO_REG, 0);
-				}
-			}
-			I32_CLZ 	=> emitUnop(SpcUnop.I32_CLZ);
-			I32_CTZ 	=> emitUnop(SpcUnop.I32_CTZ);
-			I32_POPCNT 	=> emitUnop(SpcUnop.I32_POPCNT);
-			I32_ADD 	=> emitBinop(SpcBinop.I32_ADD);
-			I32_SUB 	=> emitBinop(SpcBinop.I32_SUB);
-			I32_MUL 	=> emitBinop(SpcBinop.I32_MUL);
-			I32_DIV_S 	=> emitBinop(SpcBinop.I32_DIV_S);
-			I32_DIV_U 	=> emitBinop(SpcBinop.I32_DIV_U);
-			I32_REM_S 	=> emitBinop(SpcBinop.I32_REM_S);
-			I32_REM_U 	=> emitBinop(SpcBinop.I32_REM_U);
-			I32_AND 	=> emitBinop(SpcBinop.I32_AND);
-			I32_XOR 	=> emitBinop(SpcBinop.I32_XOR);
-			I32_OR 	=> emitBinop(SpcBinop.I32_OR);
-			I32_SHL 	=> emitBinop(SpcBinop.I32_SHL);
-			I32_SHR_S 	=> emitBinop(SpcBinop.I32_SHR_S);
-			I32_SHR_U 	=> emitBinop(SpcBinop.I32_SHR_U);
-			I32_ROTL 	=> emitBinop(SpcBinop.I32_ROTL);
-			I32_ROTR 	=> emitBinop(SpcBinop.I32_ROTR);
-
-			I32_EQZ	=> emitUnop(SpcUnop.I32_EQZ);
-			I32_EQ 	=> emitBinop(SpcBinop.I32_EQ);
-			I32_NE 	=> emitBinop(SpcBinop.I32_NE);
-			I32_LT_S 	=> emitBinop(SpcBinop.I32_LT_S);
-			I32_LT_U 	=> emitBinop(SpcBinop.I32_LT_U);
-			I32_GT_S 	=> emitBinop(SpcBinop.I32_GT_S);
-			I32_GT_U 	=> emitBinop(SpcBinop.I32_GT_U);
-			I32_LE_S 	=> emitBinop(SpcBinop.I32_LE_S);
-			I32_LE_U 	=> emitBinop(SpcBinop.I32_LE_U);
-			I32_GE_S 	=> emitBinop(SpcBinop.I32_GE_S);
-			I32_GE_U 	=> emitBinop(SpcBinop.I32_GE_U);
-
-			I64_CLZ 	=> emitUnop(SpcUnop.I64_CLZ);
-			I64_CTZ 	=> emitUnop(SpcUnop.I64_CTZ);
-			I64_POPCNT 	=> emitUnop(SpcUnop.I64_POPCNT);
-			I64_ADD 	=> emitBinop(SpcBinop.I64_ADD);
-			I64_SUB 	=> emitBinop(SpcBinop.I64_SUB);
-			I64_MUL 	=> emitBinop(SpcBinop.I64_MUL);
-			I64_DIV_S 	=> emitBinop(SpcBinop.I64_DIV_S);
-			I64_DIV_U 	=> emitBinop(SpcBinop.I64_DIV_U);
-			I64_REM_S 	=> emitBinop(SpcBinop.I64_REM_S);
-			I64_REM_U 	=> emitBinop(SpcBinop.I64_REM_U);
-			I64_AND 	=> emitBinop(SpcBinop.I64_AND);
-			I64_XOR 	=> emitBinop(SpcBinop.I64_XOR);
-			I64_OR 	=> emitBinop(SpcBinop.I64_OR);
-			I64_SHL 	=> emitBinop(SpcBinop.I64_SHL);
-			I64_SHR_S 	=> emitBinop(SpcBinop.I64_SHR_S);
-			I64_SHR_U 	=> emitBinop(SpcBinop.I64_SHR_U);
-			I64_ROTL 	=> emitBinop(SpcBinop.I64_ROTL);
-			I64_ROTR 	=> emitBinop(SpcBinop.I64_ROTR);
-
-			I64_EQZ	=> emitUnop(SpcUnop.I64_EQZ);
-			I64_EQ 	=> emitBinop(SpcBinop.I64_EQ);
-			I64_NE 	=> emitBinop(SpcBinop.I64_NE);
-			I64_LT_S 	=> emitBinop(SpcBinop.I64_LT_S);
-			I64_LT_U 	=> emitBinop(SpcBinop.I64_LT_U);
-			I64_GT_S 	=> emitBinop(SpcBinop.I64_GT_S);
-			I64_GT_U 	=> emitBinop(SpcBinop.I64_GT_U);
-			I64_LE_S 	=> emitBinop(SpcBinop.I64_LE_S);
-			I64_LE_U 	=> emitBinop(SpcBinop.I64_LE_U);
-			I64_GE_S 	=> emitBinop(SpcBinop.I64_GE_S);
-			I64_GE_U 	=> emitBinop(SpcBinop.I64_GE_U);
-
-			I32_WRAP_I64	=> emitUnop(SpcUnop.I32_WRAP_I64);
-			I64_EXTEND_I32_S	=> emitUnop(SpcUnop.I64_EXTEND_I32_S);
-			I64_EXTEND_I32_U	=> emitUnop(SpcUnop.I64_EXTEND_I32_U);
-			I32_EXTEND8_S	=> emitUnop(SpcUnop.I32_EXTEND8_S);
-			I32_EXTEND16_S	=> emitUnop(SpcUnop.I32_EXTEND16_S);
-			I64_EXTEND8_S	=> emitUnop(SpcUnop.I64_EXTEND8_S);
-			I64_EXTEND16_S	=> emitUnop(SpcUnop.I64_EXTEND16_S);
-			I64_EXTEND32_S	=> emitUnop(SpcUnop.I64_EXTEND32_S);
-			REF_NULL => {
-				var vt = codeptr.read_sleb32();
-				state.push(KIND_REF | IS_CONST, NO_REG, 0);
-			}
-			REF_IS_NULL => emitUnop(SpcUnop.REF_IS_NULL);
-			REF_FUNC => {
-				var c = masm.regAlloc.regConfig;
-				var offsets = masm.getOffsets();
-				var func_index = codeptr.read_uleb32();
-				var reg = allocReg(ValueKind.REF).reg;
-				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
-				// XXX: skip loading the target function for direct intra-module calls?
-				masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_functions));
-				masm.emit_read_v3_array_r_i(reg, reg, int.!(func_index), ValueKind.REF);
-				state.push(KIND_REF | IN_REG, reg, 0);
-			}
-			REF_AS_NON_NULL => {
-				var sv = state.peek();
-				if (sv.isConst()) {
-					if (sv.const == 0) {
-						masm.emit_br(masm.newTrapLabel(TrapReason.NULL_DEREF)); // statically null
-					} else {
-						// nop
-					}
-				} else if (sv.inReg()) {
-					masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
-				} else {
-					var reg = allocReg(ValueKind.REF);
-					emit_read_slot_r(state.sp - 1, reg);
-					masm.emit_br_r(reg.reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
-					state.overwrite(sv.kindFlags(IN_REG | (sv.flags & IS_STORED)), reg.reg, 0);
-				}
-			}
-			REF_EQ => emitBinop(SpcBinop.REF_EQ);
-			EXTERN_INTERNALIZE,
-			EXTERN_EXTERNALIZE => ; // nops
-			_ => unhandled(opcode);
+	def visit_UNREACHABLE() {
+		emitTrap(TrapReason.UNREACHABLE);
+		state.setUnreachable();
+	}
+	def visit_NOP() {
+		// emit nothing
+	}
+	def visit_BLOCK(btc: BlockTypeCode) {
+		var pr = btc.toAbstractBlockType(module), params = pr.0, results = pr.1;
+		state.pushBlock(params, results, masm.newLabel(it.pc));
+	}
+	def visit_LOOP(btc: BlockTypeCode) {
+		var pr = btc.toAbstractBlockType(module), params = pr.0, results = pr.1;
+		state.pushLoop(params, results, masm.newLabel(it.pc));
+		var ctl_top = state.ctl_stack.peek();
+		state.prepareLoop(emitSlotTransfer);
+		masm.bindLabel(ctl_top.label);
+	}
+	def visit_IF(btc: BlockTypeCode) {
+		var pr = btc.toAbstractBlockType(module), params = pr.0, results = pr.1;
+		var sv = state.pop();
+		state.pushIf(params, results, masm.newLabel(it.pc), masm.newLabel(it.pc));
+		var ctl_top = state.ctl_stack.peek();
+		emitBrIf(sv, MasmBrCond.I32_ZERO, ctl_top.else_label, null, true);
+	}
+	def visit_ELSE() {
+		var ctl_top = state.ctl_stack.peek();
+		state.emitFallthru(emitSlotTransfer);
+		masm.emit_br(ctl_top.label);
+		masm.bindLabel(ctl_top.else_label);
+		state.doElse();
+		ctl_top.opcode = Opcode.ELSE.code;
+	}
+	def visit_END() {
+		var ctl_top = state.ctl_stack.peek();
+		if (ctl_top.opcode == Opcode.LOOP.code) {
+			state.ctl_stack.pop();
+			state.ctl_stack.peek().reachable = ctl_top.reachable;
+		} else if (ctl_top.opcode == Opcode.IF.code) {
+			// simulate empty if-true block
+			state.emitFallthru(emitSlotTransfer);
+			masm.emit_br(ctl_top.label);
+			masm.bindLabel(ctl_top.else_label);
+			state.doElse();
+			ctl_top.opcode = Opcode.ELSE.code;
+			state.emitFallthru(emitSlotTransfer);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
+			state.emitFallthru(emitSlotTransfer);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.RETURN.code) {
+			state.emitFallthru(emitSlotTransfer);
+			masm.bindLabel(ctl_top.label);
+			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+			state.ctl_stack.pop();
 		}
 	}
-	def unhandled(opcode: Opcode) {
-		bailout(Strings.format1("unimplemented opcode: %s", opcode.name));
+	def visit_BR(depth: u31) {
+		var target = state.getControl(depth);
+		state.emitTransfer(target, emitSlotTransfer);
+		masm.emit_br(target.label);
+		state.setUnreachable();
 	}
+	def visit_BR_IF(depth: u31) {
+		var target = state.getControl(depth);
+		var sv = state.pop();
+		emitBrIf(sv, MasmBrCond.I32_NONZERO, target.label, target, state.isTransferEmpty(target));
+	}
+	def visit_BR_ON_NULL(depth: u31) {
+		var target = state.getControl(depth);
+		var sv = state.pop();
+		emitBrIf(sv, MasmBrCond.REF_NULL, target.label, target, state.isTransferEmpty(target));
+	}
+	def visit_BR_ON_NON_NULL(depth: u31) {
+		var target = state.getControl(depth);
+		var sv = state.pop();
+		emitBrIf(sv, MasmBrCond.REF_NONNULL, target.label, target, state.isTransferEmpty(target));
+	}
+	def visit_BR_TABLE(depths: Range<u31>) {
+		var sv = state.pop();
+		emitBrTable(sv, depths);
+		state.setUnreachable();
+	}
+	def visit_RETURN() {
+		var target = state.ctl_stack.elems[0];
+		state.emitTransfer(target, emitSlotTransfer);
+		masm.emit_br(target.label);
+		state.setUnreachable();
+	}
+	def visit_CALL(index: u31) {
+		var func = module.functions[index];
+		var offsets = masm.getOffsets();
+		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
+		state.emitSpill(emitSlotTransfer);
+		var c = masm.regAlloc.regConfig;
+		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		// XXX: skip loading the target function for direct intra-module calls?
+		masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
+		masm.emit_read_v3_array_r_i(regs.func_arg, regs.func_arg, func.func_index, ValueKind.REF);
+		emit_compute_vsp(state.sp);
+		
+		var tmp = regs.ip; // TODO: more robust register choice for indirect call
+		if (func.imp != null) {
+			// call to imported function must first check for WasmFunction
+			masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+			masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
+			masm.emit_write_runtime_vsp(regs.vsp);
+			masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
+			masm.emit_call_runtime_callHost(regs.func_arg);
+			masm.emit_br(retpt);
+		}
+		masm.bindLabel(wasmcall_label);
+		masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+		masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_target_code));
+		masm.emit_call_r(tmp);
+		masm.bindLabel(retpt);
+		emit_unwind_check();
+		emit_reload_regs();
+
+		state.popArgsAndPushResults(func.sig);
+	}
+	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
+		var sig = SigDecl.!(module.heaptypes[sig_index]);
+		var offsets = masm.getOffsets();
+		var sv = state.pop();
+		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
+		state.emitSpill(emitSlotTransfer);
+		ensure_reg(sv, state.sp, regs.func_arg);
+		// reload instance from frame
+		var c = masm.regAlloc.regConfig;
+		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+
+		var tmp1 = regs.stp; // TODO: allocate and release temp regs
+		var tmp2 = regs.ip;
+
+		// load table[table_index] from instance
+		masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_tables));
+		masm.emit_read_v3_array_r_i(tmp1, tmp1, int.!(table_index), ValueKind.REF);
+		// bounds check
+		masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
+		masm.emit_bounds_check_v3_array(tmp2, regs.func_arg, masm.newTrapLabel(TrapReason.FUNC_INVALID));
+		// signature check
+		masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_ids));
+		masm.emit_read_v3_array_r_r(tmp2, tmp2, regs.func_arg, ValueKind.I32);
+		masm.emit_breq_r_i(tmp2, -1, masm.newTrapLabel(TrapReason.FUNC_INVALID));
+		masm.emit_brne_r_i(tmp2, sig.canon_id, masm.newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
+		// load from table
+		masm.emit_mov_r_m(tmp2, ValueKind.REF, MasmAddr(tmp1, offsets.Table_funcs));
+		masm.emit_read_v3_array_r_r(regs.func_arg, tmp2, regs.func_arg, ValueKind.REF);
+
+		emit_compute_vsp(state.sp);
+		
+		// check for WasmFunction
+		masm.emit_mov_r_m(tmp1, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+		masm.emit_breq_r_i(tmp1, offsets.WasmFunction_typeId, wasmcall_label);
+		masm.emit_write_runtime_vsp(regs.vsp);
+		masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
+		masm.emit_call_runtime_callHost(regs.func_arg);
+		masm.emit_br(retpt);
+
+		masm.bindLabel(wasmcall_label);
+		masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+		masm.emit_mov_r_m(tmp1, ValueKind.REF, MasmAddr(tmp1, offsets.FuncDecl_target_code));
+		masm.emit_call_r(tmp1);
+		// merge point for both returns
+		masm.bindLabel(retpt);
+		emit_unwind_check();
+		emit_reload_regs();
+
+		state.popArgsAndPushResults(sig);
+		freeVal(sv);
+	}
+	def visit_CALL_REF(index: u31) {
+		var sig = SigDecl.!(module.heaptypes[index]);
+		var offsets = masm.getOffsets();
+		var regs = masm.regAlloc.regConfig.regs;
+		var sv = state.pop();
+		var c = masm.regAlloc.regConfig;
+		if (sv.isConst() && sv.const == 0) {
+			emitTrap(TrapReason.NULL_DEREF);
+			state.setUnreachable();
+			return;
+		}
+		ensure_reg(sv, state.sp, regs.func_arg);
+		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
+		state.emitSpill(emitSlotTransfer);
+
+		emit_compute_vsp(state.sp);
+		// check for null
+		masm.emit_breq_r_l(regs.func_arg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
+
+		var tmp = regs.ip; // TODO: allocate and release tmp regs
+		masm.emit_mov_r_m(tmp, ValueKind.I32, MasmAddr(regs.func_arg, 0));
+		masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
+		// not a WasmFunction
+		masm.emit_write_runtime_vsp(regs.vsp);
+		masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
+		masm.emit_call_runtime_callHost(regs.func_arg);
+		masm.emit_br(retpt);
+
+		// WasmFunction
+		masm.bindLabel(wasmcall_label);
+		masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
+		masm.emit_mov_r_m(tmp, ValueKind.REF, MasmAddr(tmp, offsets.FuncDecl_target_code));
+		masm.emit_call_r(tmp);
+
+		masm.bindLabel(retpt);
+		emit_unwind_check();
+		emit_reload_regs();
+
+		state.popArgsAndPushResults(sig);
+		freeVal(sv);
+	}
+	def visit_DROP() {
+		state.sp--;
+	}
+	def visit_SELECT() {
+		var sv = state.pop();
+		var fv = state.pop();
+		var tv = state.pop();
+		emitSelect1(sv, fv, tv);
+		freeVal(sv);
+	}
+	def visit_LOCAL_GET(index: u31) {
+		var lv = state.get(index);
+		if (lv.isConst()) {
+			if (lv.inReg()) {
+				state.push(lv.kindFlags(IS_CONST | IN_REG), lv.reg, lv.const); // steal reg
+				state.setNoReg(index);
+			} else {
+				state.push(lv.kindFlags(IS_CONST), NO_REG, lv.const);
+			}
+		} else if (lv.inReg()) {
+			if (!lv.isStored()) {
+				masm.emit_mov_s_r(index, lv.reg, lv.kind());
+				state.setStored(index);
+			}
+			state.setNoReg(index); // steal reg
+			state.push(lv.kindFlags(IN_REG), lv.reg, 0);
+		} else {
+			var reg = allocReg(lv.kind());
+			emit_read_slot_r(index, reg);
+			state.push(lv.kindFlags(IN_REG), reg.reg, 0);
+		}
+	}
+	def visit_LOCAL_SET(index: u31) {
+		var lv = state.get(index);
+		var sv = state.pop();
+		if (sv.isConst() || sv.inReg()) {
+			var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | (sv.flags & (IN_REG | IS_CONST));
+			state.set(index, flags, sv.reg, sv.const);
+		} else {
+			var reg = allocReg(lv.kind());
+			emit_read_slot_r(state.sp, reg);
+			var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | IN_REG;
+			state.set(index, flags, reg.reg, 0);
+		}
+	}
+	def visit_LOCAL_TEE(index: u31) {
+		var lv = state.get(index);
+		var sv = state.peek();
+		if (sv.isConst()) {
+			var flags = lv.kindFlags(TAG_STORED | IS_CONST);
+			state.set(index, flags, NO_REG, sv.const);
+		} else if (sv.inReg()) {
+			masm.emit_mov_s_r(index, sv.reg, sv.kind());
+			var flags = lv.kindFlags(TAG_STORED | IS_STORED);
+			state.set(index, flags, NO_REG, 0);
+		} else {
+			var tos = state.sp - 1;
+			var reg = allocReg(lv.kind());
+			emit_read_slot_r(tos, reg);
+			emit_write_slot_r(index, reg);
+			var flags = lv.kindFlags(TAG_STORED | IS_STORED);
+			state.set(index, flags, NO_REG, 0);
+			state.overwrite(lv.kindFlags(IN_REG), reg.reg, 0);
+		}
+	}
+	def visit_GLOBAL_GET(index: u31) {
+		var global = module.globals[index];
+		if (!global.mutable && global.imp == null && global.valtype == ValueType.I32) {
+			state.push(KIND_I32 | IS_CONST, NO_REG, InitExpr.I32.!(global.init).val);
+		} else {
+			var c = masm.regAlloc.regConfig;
+			state.emitSpill(emitSlotTransfer);
+			emit_compute_vsp(state.sp);
+			masm.emit_write_runtime_vsp(regs.vsp);
+			masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+			masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
+			masm.emit_call_runtime_GLOBAL_GET();
+			emit_reload_regs();
+			state.push(typeToKindFlags(global.valtype) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+	}
+	def visit_GLOBAL_SET(index: u31) {
+		var global = module.globals[index];
+		var c = masm.regAlloc.regConfig;
+		state.emitSpill(emitSlotTransfer);
+		emit_compute_vsp(state.sp);
+		masm.emit_write_runtime_vsp(regs.vsp);
+		masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
+		masm.emit_call_runtime_GLOBAL_SET();
+		emit_reload_regs();
+		var sv = state.pop();
+		freeVal(sv);
+	}
+
+	def visit_I32_LOAD(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_load_r_r_r_i); }
+	def visit_I64_LOAD(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_load_r_r_r_i); }
+	def visit_F32_LOAD(imm: MemArg) { emitLoad(imm, ValueKind.F32, masm.emit_load_r_r_r_i); }
+	def visit_F64_LOAD(imm: MemArg) { emitLoad(imm, ValueKind.F64, masm.emit_load_r_r_r_i); }
+	def visit_I32_LOAD8_S(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_loadbsx_r_r_r_i); }
+	def visit_I32_LOAD8_U(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_loadbzx_r_r_r_i); }
+	def visit_I32_LOAD16_S(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_loadwsx_r_r_r_i); }
+	def visit_I32_LOAD16_U(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_loadwzx_r_r_r_i); }
+	def visit_I64_LOAD8_S(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loadbsx_r_r_r_i); }
+	def visit_I64_LOAD8_U(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loadbzx_r_r_r_i); }
+	def visit_I64_LOAD16_S(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loadwsx_r_r_r_i); }
+	def visit_I64_LOAD16_U(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loadwzx_r_r_r_i); }
+	def visit_I64_LOAD32_S(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loaddsx_r_r_r_i); }
+	def visit_I64_LOAD32_U(imm: MemArg) { emitLoad(imm, ValueKind.I64, masm.emit_loaddzx_r_r_r_i); }
+	def visit_I32_STORE(imm: MemArg) { emitStore(imm, ValueKind.I32, masm.emit_store_r_r_r_i); }
+	def visit_I64_STORE(imm: MemArg) { emitStore(imm, ValueKind.I64, masm.emit_store_r_r_r_i); }
+	def visit_F32_STORE(imm: MemArg) { emitStore(imm, ValueKind.F32, masm.emit_store_r_r_r_i); }
+	def visit_F64_STORE(imm: MemArg) { emitStore(imm, ValueKind.F64, masm.emit_store_r_r_r_i); }
+	def visit_I32_STORE8(imm: MemArg) { emitStore(imm, ValueKind.I32, masm.emit_storeb_r_r_r_i); }
+	def visit_I32_STORE16(imm: MemArg) { emitStore(imm, ValueKind.I32, masm.emit_storew_r_r_r_i); }
+	def visit_I64_STORE8(imm: MemArg) { emitStore(imm, ValueKind.I64, masm.emit_storeb_r_r_r_i); }
+	def visit_I64_STORE16(imm: MemArg) { emitStore(imm, ValueKind.I64, masm.emit_storew_r_r_r_i); }
+	def visit_I64_STORE32(imm: MemArg) { emitStore(imm, ValueKind.I32, masm.emit_store_r_r_r_i); }
+	def visit_I32_CONST(val: i32) {
+		state.push(KIND_I32 | IS_CONST, NO_REG, val);
+	}
+	def visit_I64_CONST(val: i64) {
+		if (i32.view(val) == val) {
+			state.push(KIND_I64 | IS_CONST, NO_REG, i32.view(val));
+		} else {
+			var tos = state.sp;
+			var addr = masm.slotAddr(tos);
+			masm.emit_mov_m_i(addr, int.view(val));
+			masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
+			state.push(KIND_I64 | IS_STORED, NO_REG, 0);
+		}
+	}
+	def visit_F32_CONST(val: u32) {
+		if (val == 0 && config_TrackFloatZeroConst) {
+			state.push(KIND_F32 | IS_CONST, NO_REG, 0);
+		} else {
+			var tos = state.sp;
+			masm.emit_mov_m_i(masm.slotAddr(tos), int.view(val));
+			state.push(KIND_F32 | IS_STORED, NO_REG, 0);
+		}
+	}
+	def visit_F64_CONST(val: u64) {
+		if (val == 0 && config_TrackFloatZeroConst) {
+			state.push(KIND_F64 | IS_CONST, NO_REG, 0);
+		} else {
+			var tos = state.sp;
+			var addr = masm.slotAddr(tos);
+			masm.emit_mov_m_i(addr, int.view(val));
+			masm.emit_mov_m_i(addr.plus(4), int.view(val >> 32));
+			state.push(KIND_F64 | IS_STORED, NO_REG, 0);
+		}
+	}
+	def visit_I32_CLZ() { emitUnop(SpcUnop.I32_CLZ); }
+	def visit_I32_CTZ() { emitUnop(SpcUnop.I32_CTZ); }
+	def visit_I32_POPCNT() { emitUnop(SpcUnop.I32_POPCNT); }
+	def visit_I32_ADD() { emitBinop(SpcBinop.I32_ADD); }
+	def visit_I32_SUB() { emitBinop(SpcBinop.I32_SUB); }
+	def visit_I32_MUL() { emitBinop(SpcBinop.I32_MUL); }
+	def visit_I32_DIV_S() { emitBinop(SpcBinop.I32_DIV_S); }
+	def visit_I32_DIV_U() { emitBinop(SpcBinop.I32_DIV_U); }
+	def visit_I32_REM_S() { emitBinop(SpcBinop.I32_REM_S); }
+	def visit_I32_REM_U() { emitBinop(SpcBinop.I32_REM_U); }
+	def visit_I32_AND() { emitBinop(SpcBinop.I32_AND); }
+	def visit_I32_XOR() { emitBinop(SpcBinop.I32_XOR); }
+	def visit_I32_OR() { emitBinop(SpcBinop.I32_OR); }
+	def visit_I32_SHL() { emitBinop(SpcBinop.I32_SHL); }
+	def visit_I32_SHR_S() { emitBinop(SpcBinop.I32_SHR_S); }
+	def visit_I32_SHR_U() { emitBinop(SpcBinop.I32_SHR_U); }
+	def visit_I32_ROTL() { emitBinop(SpcBinop.I32_ROTL); }
+	def visit_I32_ROTR() { emitBinop(SpcBinop.I32_ROTR); }
+
+	def visit_I32_EQZ() { emitUnop(SpcUnop.I32_EQZ); }
+	def visit_I32_EQ() { emitBinop(SpcBinop.I32_EQ); }
+	def visit_I32_NE() { emitBinop(SpcBinop.I32_NE); }
+	def visit_I32_LT_S() { emitBinop(SpcBinop.I32_LT_S); }
+	def visit_I32_LT_U() { emitBinop(SpcBinop.I32_LT_U); }
+	def visit_I32_GT_S() { emitBinop(SpcBinop.I32_GT_S); }
+	def visit_I32_GT_U() { emitBinop(SpcBinop.I32_GT_U); }
+	def visit_I32_LE_S() { emitBinop(SpcBinop.I32_LE_S); }
+	def visit_I32_LE_U() { emitBinop(SpcBinop.I32_LE_U); }
+	def visit_I32_GE_S() { emitBinop(SpcBinop.I32_GE_S); }
+	def visit_I32_GE_U() { emitBinop(SpcBinop.I32_GE_U); }
+
+	def visit_I64_CLZ() { emitUnop(SpcUnop.I64_CLZ); }
+	def visit_I64_CTZ() { emitUnop(SpcUnop.I64_CTZ); }
+	def visit_I64_POPCNT() { emitUnop(SpcUnop.I64_POPCNT); }
+	def visit_I64_ADD() { emitBinop(SpcBinop.I64_ADD); }
+	def visit_I64_SUB() { emitBinop(SpcBinop.I64_SUB); }
+	def visit_I64_MUL() { emitBinop(SpcBinop.I64_MUL); }
+	def visit_I64_DIV_S() { emitBinop(SpcBinop.I64_DIV_S); }
+	def visit_I64_DIV_U() { emitBinop(SpcBinop.I64_DIV_U); }
+	def visit_I64_REM_S() { emitBinop(SpcBinop.I64_REM_S); }
+	def visit_I64_REM_U() { emitBinop(SpcBinop.I64_REM_U); }
+	def visit_I64_AND() { emitBinop(SpcBinop.I64_AND); }
+	def visit_I64_XOR() { emitBinop(SpcBinop.I64_XOR); }
+	def visit_I64_OR() { emitBinop(SpcBinop.I64_OR); }
+	def visit_I64_SHL() { emitBinop(SpcBinop.I64_SHL); }
+	def visit_I64_SHR_S() { emitBinop(SpcBinop.I64_SHR_S); }
+	def visit_I64_SHR_U() { emitBinop(SpcBinop.I64_SHR_U); }
+	def visit_I64_ROTL() { emitBinop(SpcBinop.I64_ROTL); }
+	def visit_I64_ROTR() { emitBinop(SpcBinop.I64_ROTR); }
+
+	def visit_I64_EQZ() { emitUnop(SpcUnop.I64_EQZ); }
+	def visit_I64_EQ() { emitBinop(SpcBinop.I64_EQ); }
+	def visit_I64_NE() { emitBinop(SpcBinop.I64_NE); }
+	def visit_I64_LT_S() { emitBinop(SpcBinop.I64_LT_S); }
+	def visit_I64_LT_U() { emitBinop(SpcBinop.I64_LT_U); }
+	def visit_I64_GT_S() { emitBinop(SpcBinop.I64_GT_S); }
+	def visit_I64_GT_U() { emitBinop(SpcBinop.I64_GT_U); }
+	def visit_I64_LE_S() { emitBinop(SpcBinop.I64_LE_S); }
+	def visit_I64_LE_U() { emitBinop(SpcBinop.I64_LE_U); }
+	def visit_I64_GE_S() { emitBinop(SpcBinop.I64_GE_S); }
+	def visit_I64_GE_U() { emitBinop(SpcBinop.I64_GE_U); }
+
+	def visit_I32_WRAP_I64() { emitUnop(SpcUnop.I32_WRAP_I64); }
+	def visit_I64_EXTEND_I32_S() { emitUnop(SpcUnop.I64_EXTEND_I32_S); }
+	def visit_I64_EXTEND_I32_U() { emitUnop(SpcUnop.I64_EXTEND_I32_U); }
+	def visit_I32_EXTEND8_S() { emitUnop(SpcUnop.I32_EXTEND8_S); }
+	def visit_I32_EXTEND16_S() { emitUnop(SpcUnop.I32_EXTEND16_S); }
+	def visit_I64_EXTEND8_S() { emitUnop(SpcUnop.I64_EXTEND8_S); }
+	def visit_I64_EXTEND16_S() { emitUnop(SpcUnop.I64_EXTEND16_S); }
+	def visit_I64_EXTEND32_S() { emitUnop(SpcUnop.I64_EXTEND32_S); }
+	def visit_REF_NULL(ht_index: u31) {
+		state.push(KIND_REF | IS_CONST, NO_REG, 0);
+	}
+	def visit_REF_IS_NULL() { emitUnop(SpcUnop.REF_IS_NULL); }
+	def visit_REF_FUNC(func_index: u31) {
+		var c = masm.regAlloc.regConfig;
+		var offsets = masm.getOffsets();
+		var reg = allocReg(ValueKind.REF).reg;
+		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		// XXX: skip loading the target function for direct intra-module calls?
+		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_functions));
+		masm.emit_read_v3_array_r_i(reg, reg, int.!(func_index), ValueKind.REF);
+		state.push(KIND_REF | IN_REG, reg, 0);
+	}
+	def visit_REF_AS_NON_NULL() {
+		var sv = state.peek();
+		if (sv.isConst()) {
+			if (sv.const == 0) {
+				masm.emit_br(masm.newTrapLabel(TrapReason.NULL_DEREF)); // statically null
+			} else {
+				// nop
+			}
+		} else if (sv.inReg()) {
+			masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
+		} else {
+			var reg = allocReg(ValueKind.REF);
+			emit_read_slot_r(state.sp - 1, reg);
+			masm.emit_br_r(reg.reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
+			state.overwrite(sv.kindFlags(IN_REG | (sv.flags & IS_STORED)), reg.reg, 0);
+		}
+	}
+	def visit_REF_EQ() { emitBinop(SpcBinop.REF_EQ); }
+	def visit_EXTERN_INTERNALIZE() { }
+	def visit_EXTERN_EXTERNALIZE() { }
+	
 	def emitSelect1(sv: SpcAbstractVal, fv: SpcAbstractVal, tv: SpcAbstractVal) {
 		var tagStored = tv.flags & TAG_STORED;
-		var label = masm.newLabel(opcode_pos);
+		var label = masm.newLabel(it.pc);
 		if (tv.isConst() && fv.isConst() && tv.const == fv.const) {
-			// select K K v => K
+			// select K K v() K
 			freeVal(tv);
 			freeVal(fv);
 			state.push(tv.kindFlags(IS_CONST), NO_REG, tv.const);
@@ -672,7 +645,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			if (emptyTransfer) {
 				masm.emit_br_r(sv.reg, cond, label);
 			} else {
-				var skip = masm.newLabel(opcode_pos);
+				var skip = masm.newLabel(it.pc);
 				masm.emit_br_r(sv.reg, masm.negate(cond), skip);
 				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(label);
@@ -682,7 +655,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			if (emptyTransfer) {
 				masm.emit_br_m(masm.slotAddr(state.sp), cond, label);
 			} else {
-				var skip = masm.newLabel(opcode_pos);
+				var skip = masm.newLabel(it.pc);
 				masm.emit_br_m(masm.slotAddr(state.sp), masm.negate(cond), skip);
 				state.emitTransfer(target, emitSlotTransfer);
 				masm.emit_br(label);
@@ -691,13 +664,13 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		}
 		freeVal(sv);
 	}
-	def emitBrTable(sv: SpcAbstractVal, depths: Array<u32>) {
+	def emitBrTable(sv: SpcAbstractVal, depths: Range<u31>) {
 		var labels = Array<MasmLabel>.new(state.ctl_stack.top);
 		var targets = Array<MasmLabel>.new(depths.length);
 		for (i < targets.length) { // create labels for all targets involved in this br_table
 			var depth = depths[i];
 			var l = labels[depth];
-			if (l == null) l = labels[depth] = masm.newLabel(opcode_pos);
+			if (l == null) l = labels[depth] = masm.newLabel(it.pc);
 			targets[i] = l;
 		}
 		if (sv.isConst()) {
@@ -757,11 +730,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def emitSlotTransfer(to: (u32, SpcAbstractVal), from: (u32, SpcAbstractVal)) {
 		if (Trace.compiler) {
-			Trace.OUT.put1("    emitSlotTransfer slot=%d ", to.0);
+			OUT.put1("    emitSlotTransfer slot=%d ", to.0);
 			traceAbstractVal(to.1);
-			Trace.OUT.put1(" <- slot=%d ", from.0);
+			OUT.put1(" <- slot=%d ", from.0);
 			traceAbstractVal(from.1);
-			Trace.OUT.outln();
+			OUT.outln();
 		}
 		var tv = to.1, fv = from.1;
 		if (masm.valuerep.tagged && tv.tagStored()) {
@@ -923,13 +896,12 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def unsupported() {
 		success = false; // XXX: add opcode
-		codeptr.atl(codeptr.pos, codeptr.pos); // set limit to break out of loop
 	}
 	def bailout(msg: string) {
 		success = false;
 		if (Trace.compiler) Trace.OUT.put1("------------ bailout: %s", msg).outln();
-		codeptr.atl(codeptr.pos, codeptr.pos); // set limit to break out of loop
-		err.rel(codeptr, codeptr.pos).set(msg);
+		var cp = it.immptr();
+		err.rel(cp, it.pc).set(msg);
 	}
 
 	//====================================================================
@@ -942,7 +914,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_s_r(slot, reg.reg, reg.kind);
 	}
 	def emit_unwind_check() {
-		if (unwind_label == null) unwind_label = masm.newLabel(codeptr.limit);
+		if (unwind_label == null) unwind_label = masm.newLabel(func.cur_bytecode.length);
 		masm.emit_brne_r_i(regs.ret_Abrupt, 0, unwind_label);
 	}
 	def emit_compute_vsp(slots: u32) {
@@ -967,13 +939,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_r(reg, sv.reg);
 		return reg;
 	}
-	def emitLoad(kind: ValueKind, meth: (Reg, Reg, Reg, u32, ValueKind) -> ())  {
-		var flags = codeptr.read1();
-		var mem_index = if((flags & BpConstants.MEMARG_INDEX_FLAG) != 0, codeptr.read_uleb32());
-		if (mem_index != 0) bailout("unsupported multi-memory operation");
-		var offset = codeptr.read_uleb32();
+	def emitLoad(imm: MemArg, kind: ValueKind, meth: (Reg, Reg, Reg, u32, ValueKind) -> ())  {
+		if (imm.memory_index != 0) bailout("unsupported multi-memory operation");
 		var iv = state.pop();
 		var index_reg: Reg;
+		var offset = imm.offset;
 		if (iv.isConst()) {
 			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
 			if (sum > u32.max) {
@@ -994,11 +964,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
 	}
-	def emitStore(kind: ValueKind, meth: (Reg, Reg, Reg, u32, ValueKind) -> ()) {
-		var flags = codeptr.read1();
-		var mem_index = if((flags & BpConstants.MEMARG_INDEX_FLAG) != 0, codeptr.read_uleb32());
-		if (mem_index != 0) bailout("unsupported multi-memory operation");
-		var offset = codeptr.read_uleb32();
+	def emitStore(imm: MemArg, kind: ValueKind, meth: (Reg, Reg, Reg, u32, ValueKind) -> ()) {
+		if (imm.memory_index != 0) bailout("unsupported multi-memory operation");
+		var offset = imm.offset;
 		var sv = state.pop();
 		var val_reg = ensure_reg(sv, state.sp, NO_REG); // XXX: support store immediate
 		var iv = state.pop();
@@ -1043,11 +1011,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		else return ctl.results;
 	}
 	def traceOpcode() {
-		OUT.put2("  %x(+%d): ", opcode_pos, opcode_pos - start_pos);
-		var prev = codeptr.pos;
-		codeptr.at(opcode_pos);
-		instrTracer.putInstr(OUT, module, codeptr);
-		codeptr.at(prev);
+		OUT.put2("  %x(+%d): ", it.pc, it.pc - start_pos);
+		it.trace(OUT, module, instrTracer);
 		OUT.outln();
 	}
 	def traceStack() {
@@ -1394,6 +1359,7 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 			ctl_stack.top++;
 			ctl.clearMerge();
 			ctl.clearReset();
+			ctl.else_label = null;
 		} else { // allocate and cache new SpcControl object
 			ctl = SpcControl.new();
 			ctl_stack.push(ctl);
