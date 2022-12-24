@@ -59,9 +59,7 @@ function make_build_file() {
 		local build_data="$target $build_time by ${USER}@${HOST}"
 	fi
 
-	echo "component Build { new() { " > $build_file
-	echo "Version.buildData = \"$build_data\";" >> $build_file
-	echo " } }" >> $build_file
+	echo "var unused__ = Version.buildData = \"$build_data\";" > $build_file
 
 	echo $build_file
 }
