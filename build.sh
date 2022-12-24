@@ -48,6 +48,25 @@ JAWA="src/jawa/*.v3"
 PROGRAM=$1
 TARGET=$2
 
+function make_build_file() {
+	local target=$TARGET
+
+	local build_time=$(date "+%Y-%m-%d %H:%M:%S")
+	build_file="bin/Build-${TARGET}.v3"
+	if [ "$release" == "release" ]; then
+		local build_data="$target $build_time Release"
+	else
+		local build_data="$target $build_time by ${USER}@${HOST}"
+	fi
+
+	echo "component Build { new() { " > $build_file
+	echo "Version.buildData = \"$build_data\";" >> $build_file
+	echo " } }" >> $build_file
+
+	echo $build_file
+}
+
+
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
     SOURCES="$ENGINE $WIZENG $WAVE $WASI $MONITORS"
@@ -69,12 +88,15 @@ else
     exit_usage
 fi
 
+# make build file with target
+BUILD_FILE=$(make_build_file)
+
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $TARGET_V3
+    v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $TARGET_X86_64
+    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
         cp $E $E.genint
@@ -85,9 +107,9 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         rm $E.genint
     fi
 elif [ "$TARGET" = "jvm" ]; then
-    v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $TARGET_V3
+    v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "wave" ]; then
-    v3c-wave -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $TARGET_V3
+    v3c-wave -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "int" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
