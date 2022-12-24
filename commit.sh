@@ -44,4 +44,4 @@ if [ ! -z "$(cat $T/rejects)" ]; then
 fi
 
 
-try git commit $@
+try git commit "$@"
