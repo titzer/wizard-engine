@@ -4,6 +4,8 @@
 var config_TrackFloatZeroConst = false;
 def INITIAL = 16;
 def OUT = Trace.OUT;
+def DEBUG = false;
+def regRefCounts = Array<int>.new(128);
 
 // Expose constants outside this file.
 component SpcConsts {
@@ -88,11 +90,39 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 		// Emit instructions.
 		while (it.more() && success) {
-			if (Trace.compiler) { traceStack(); traceOpcode(); }
+			if (Trace.compiler) traceOpcodeAndStack();
 			it.dispatch(this);
+			if (DEBUG) checkRegAlloc();
 			it.next();
 		}
 		return success;
+	}
+	def checkRegAlloc() {
+		if (Trace.compiler) OUT.puts("checkRegAlloc ");
+		traceStack();
+		for (i < regRefCounts.length) regRefCounts[i] = 0;
+		var c = masm.regAlloc.regConfig;
+		for (i < state.sp) {
+			var sv = state.state[i];
+			if (sv.inReg())  {
+				var ri = sv.reg.index;
+				assert1(ri != 0, "state[%d].inReg but reg == 0", i);
+				assert1(ri < c.regSet.length, "state[%d], has invalid register", i);
+				var pool = c.regToPool[ri];
+				assert1(pool >= 0 && pool < c.numRegPools, "state[%d] has invalid register pool", i);
+				var poolk = c.kindToPool[sv.kind().tag];
+				assert1(pool == poolk, "state[%d] differs on pool membership", i);
+				regRefCounts[ri]++;
+			}
+		}
+		for (i = 1; i < c.regSet.length; i++) {
+			var r = Reg(byte.view(i));
+			if (regRefCounts[i] == 0) assert1(masm.regAlloc.isFree(r), "%s should be free", c.regSet.getName(r));
+			else assert1(!masm.regAlloc.isFree(Reg(byte.view(i))), "%s should be allocated", c.regSet.getName(r));
+		}
+	}
+	def assert1<T>(cond: bool, msg: string, param: T) {
+		if (!cond) bailout(Strings.format1(msg, param));
 	}
 	def emitPrologue() {
 		var c = masm.regAlloc.regConfig;
@@ -228,7 +258,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var func = module.functions[index];
 		var offsets = masm.getOffsets();
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		state.emitSpill(emitSlotTransfer);
+		state.emitKill(emitSlotTransfer);
 		var c = masm.regAlloc.regConfig;
 		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
 		// XXX: skip loading the target function for direct intra-module calls?
@@ -261,7 +291,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var offsets = masm.getOffsets();
 		var sv = state.pop();
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		state.emitSpill(emitSlotTransfer);
+		state.emitKill(emitSlotTransfer);
 		ensure_reg(sv, state.sp, regs.func_arg);
 		// reload instance from frame
 		var c = masm.regAlloc.regConfig;
@@ -320,7 +350,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		}
 		ensure_reg(sv, state.sp, regs.func_arg);
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		state.emitSpill(emitSlotTransfer);
+		state.emitKill(emitSlotTransfer);
 
 		emit_compute_vsp(state.sp);
 		// check for null
@@ -387,6 +417,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (sv.isConst() || sv.inReg()) {
 			var flags = (lv.flags & (KIND_MASK | TAG_STORED)) | (sv.flags & (IN_REG | IS_CONST));
 			state.set(index, flags, sv.reg, sv.const);
+			freeVal(lv);
 		} else {
 			var reg = allocReg(lv.kind());
 			emit_read_slot_r(state.sp, reg);
@@ -420,7 +451,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			state.push(KIND_I32 | IS_CONST, NO_REG, InitExpr.I32.!(global.init).val);
 		} else {
 			var c = masm.regAlloc.regConfig;
-			state.emitSpill(emitSlotTransfer);
+			state.emitKill(emitSlotTransfer);
 			emit_compute_vsp(state.sp);
 			masm.emit_write_runtime_vsp(regs.vsp);
 			masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
@@ -433,7 +464,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_GLOBAL_SET(index: u31) {
 		var global = module.globals[index];
 		var c = masm.regAlloc.regConfig;
-		state.emitSpill(emitSlotTransfer);
+		state.emitKill(emitSlotTransfer);
 		emit_compute_vsp(state.sp);
 		masm.emit_write_runtime_vsp(regs.vsp);
 		masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
@@ -941,23 +972,28 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var reg = allocReg(kind).reg;
 		if (sv.isConst()) masm.emit_mov_r_k(reg, kind, sv.const);
 		else masm.emit_mov_r_s(reg, kind, state.sp);
-		return SpcAbstractVal(sv.flags, reg, sv.const);
+		return SpcAbstractVal(sv.flags | IN_REG, reg, sv.const);
 	}
 	// Pop the top of the stack into {reg}, spilling any value(s) in {reg} first.
 	def popFixedReg(reg: Reg) -> SpcAbstractVal {
 		var sv = state.pop();
 		if (sv.inReg()) {
 			if (sv.reg == reg) return sv;
-			spillReg(reg);
+			reassignReg(reg, int.!(state.sp));
 			masm.emit_mov_r_r(reg, sv.reg);
+			freeReg(sv.reg);
 			return SpcAbstractVal(sv.flags, reg, sv.const);
 		}
 		var kind = sv.kind();
-		spillReg(reg);
-		masm.regAlloc.unfree(reg, int.!(state.sp));
+		reassignReg(reg, int.!(state.sp));
 		if (sv.isConst()) masm.emit_mov_r_k(reg, kind, sv.const);
 		else masm.emit_mov_r_s(reg, kind, state.sp);
-		return SpcAbstractVal(sv.flags, reg, sv.const);
+		return SpcAbstractVal(sv.flags | IN_REG, reg, sv.const);
+	}
+	def reassignReg(reg: Reg, slot: int) {
+		spillReg(reg);
+		freeReg(reg);
+		masm.regAlloc.unfree(reg, int.!(state.sp));
 	}
 	// Pop the top of stack into a register and prepare for it to be overwritten.
 	def popRegToOverwrite() -> SpcAbstractVal {
@@ -970,26 +1006,35 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var sv = state.state[slot];
 		masm.emit_mov_s_r(u32.!(slot), reg, sv.kind());
 		state.state[slot] = SpcAbstractVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
-		freeReg(sv.reg);
 	}
-	def traceOpcode() {
+	def traceOpcodeAndStack() {
+		OUT.out(Trace.STDOUT);
 		OUT.put2("  %x(+%d): ", it.pc, it.pc - start_pos);
 		it.trace(OUT, module, instrTracer);
-		OUT.outln();
+		while (OUT.length < 32) OUT.puts(" ");
+		traceStack();
 	}
 	def traceStack() {
-		OUT.put1("sp=%d ", state.sp);
+		OUT.put1("sp=%d |", state.sp);
 		for (i < state.sp) traceAbstractVal(state.state[i]);
 		OUT.outln();
 	}
 	def traceAbstractVal(sv: SpcAbstractVal) {
-		OUT.put3("[%s %s%s: ",
-			sv.kind().name,
+		match (sv.kind()) {
+			I32 => OUT.puts("i");
+			I64 => OUT.puts("l");
+			F32 => OUT.puts("f");
+			F64 => OUT.puts("d");
+			V128 => OUT.puts("v");
+			REF => OUT.puts("r");
+			ABS => OUT.puts("a");
+		}
+		OUT.put2("%s%s",
 			if(sv.tagStored(), "T", ""),
 			if(sv.isStored(), "S", ""));
-		if (sv.inReg()) OUT.put1(" @%s", masm.regAlloc.regConfig.regSet.getName(sv.reg));
-		if (sv.isConst()) OUT.put1(" $%d", sv.const);
-		OUT.puts("]");
+		if (sv.inReg()) OUT.put1("@%s", masm.regAlloc.regConfig.regSet.getName(sv.reg));
+		if (sv.isConst()) OUT.put1("=%d", sv.const);
+		OUT.puts("|");
 	}
 }
 
@@ -1248,16 +1293,18 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 			}
 		}
 	}
-	def emitSpill(emitSlotTransfer: ((u32, SpcAbstractVal), (u32, SpcAbstractVal)) -> void) {
-		if (Trace.compiler) OUT.puts("    spill all").outln();
+	def emitKill(emitSlotTransfer: ((u32, SpcAbstractVal), (u32, SpcAbstractVal)) -> void) {
+		if (Trace.compiler) OUT.puts("    kill all").outln();
 		for (i < sp) {
-			var sv = state[i];
+			var sv = state[i], oflags = sv.flags;
+			if ((oflags & IN_REG) != 0) regAlloc.free(sv.reg);
 			var stored = IS_STORED | TAG_STORED;
-			if (stored == (sv.flags & stored)) continue;
-			var tv = SpcAbstractVal(sv.kindFlags(stored), NO_REG, 0);
+			var nflags = (oflags & ~IN_REG) | stored;
+			var nv = SpcAbstractVal(nflags, NO_REG, sv.const);
+			state[i] = nv;
+			if (stored == (oflags & stored)) continue;
 			var slot = u32.view(i);
-			emitSlotTransfer((slot, tv), (slot, sv));
-			if (sv.inReg()) regAlloc.free(sv.reg);
+			emitSlotTransfer((slot, nv), (slot, sv));
 		}
 	}
 	private def toMergeVal(from: SpcAbstractVal) -> SpcAbstractVal {
