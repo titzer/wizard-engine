@@ -1,0 +1,371 @@
+// Copyright 2022 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def FINISHED: AbruptReturn = null;
+def I: X86_64Interpreter;
+// Shared runtime routines that are called by both the fast interpreter and JITed code.
+component X86_64Runtime {
+	var valueStack: ValueStack;
+
+	def run(f: Function, args: Array<Value>) -> Result {
+		if (I.interpreterCode == null) I.genInterpreterCode();
+		// Unpack arguments into value stack format.
+		if (args != null) for (v in args) valueStack.push(v);
+
+		// Call the main loop which handles tail calls.
+		var ret = runWithTailCalls(f, Pointer.NULL);
+		// Unpack the abrupt return value into a {Result}.
+		match (ret) {
+			null => return popResult(f.sig);
+			x: Trap => return Result.Throw(x);
+			_ => return Result.Break;
+		}
+	}
+	private def runWithTailCalls(f: Function, sp: Pointer) -> AbruptReturn {
+		var state = FINISHED;
+		while (true) { // handle repeated tail calls
+			var result: HostResult;
+			match (f) {
+				wf: WasmFunction => {
+					var sp = valueStack.sp;
+					var ret = invoke(wf, sp);
+					if (ret == null) {
+						valueStack.sp = sp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.valuerep.slot_size);
+					}
+					return ret;
+				}
+				hf: HostFunction => {
+					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
+					var result = doInvokeHostFunction(hf);
+					match (result) {
+						Throw(thrown) => {
+							if (sp != Pointer.NULL) prependFrames(thrown, hf, sp);
+							state = thrown;
+							break;
+						}
+						Value0 => {
+							break;
+						}
+						Value1(val) => {
+							valueStack.push(val);
+							break;
+						}
+						ValueN(vals) => {
+							for (a in vals) valueStack.push(a);
+							break;
+						}
+						TailCall(target, args) => {
+							for (a in args) valueStack.push(a);
+							f = target;
+							continue; // continue with next tail call
+						}
+					}
+				}
+			}
+		}
+		return state;
+	}
+	private def doInvokeHostFunction(hf: HostFunction) -> HostResult {
+		var result: HostResult;
+		match (hf) {
+			hf: HostFunction0 => {
+				result = hf.invoke0();
+			}
+			hf: HostFunction1 => {
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke1(a0);
+			}
+			hf: HostFunction2 => {
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke2(a0, a1);
+			}
+			hf: HostFunction3 => {
+				var a2 = valueStack.pop(hf.sig.params[2]);
+				var a1 = valueStack.pop(hf.sig.params[1]);
+				var a0 = valueStack.pop(hf.sig.params[0]);
+				result = hf.invoke3(a0, a1, a2);
+			}
+			hf: HostFunctionN => {
+				var aN = valueStack.popN(hf.sig.params);
+				result = hf.invokeN(aN);
+			}
+			_ => {
+				return HostResult.Throw(Trap.new(TrapReason.ERROR, "invalid host function", null));
+			}
+		}
+		return result;
+	}
+	private def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
+		if (wf.decl.target_code.spc_entry != Pointer.NULL) {
+			return Target.callSpcEntry(wf);
+		}
+		return I.asmEntry(wf, sp);
+	}
+	private def popResult(sig: SigDecl) -> Result {
+		var rt = sig.results;
+		var r = Array<Value>.new(rt.length);
+		for (i = r.length - 1; i >= 0; i--) r[i] = valueStack.pop(rt[i]);
+		return Result.Value(r);
+	}
+
+	//=====================================================================
+	// Standard callbacks for complex bytecodes
+	//=====================================================================
+	def runtime_callHost(f: Function) -> AbruptReturn {
+		var state = runWithTailCalls(f, CiRuntime.callerSp());
+		return state;
+	}
+	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
+		var memory = instance.memories[index];
+		var pages = Values.v_u(valueStack.pop(ValueType.I32));
+		var result = memory.grow(pages);
+		valueStack.push(Values.i_v(result));
+	}
+	def runtime_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32) -> AbruptReturn {
+		var memory = instance.memories[mindex];
+		var ddecl = if(!instance.dropped_data[dindex], instance.module.data[int.!(dindex)]);
+		var size = valueStack.popu();
+		var src_offset = valueStack.popu();
+		var dst_offset = valueStack.popu();
+		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> AbruptReturn { // XXX: inline
+		var dst = instance.memories[mindex1];
+		var src = instance.memories[mindex2];
+		var size = valueStack.popu();
+		var src_offset = valueStack.popu();
+		var dst_offset = valueStack.popu();
+		var t = dst.copyM(dst_offset, src, src_offset, size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> AbruptReturn {
+		var memory = instance.memories[mindex];
+		var size = valueStack.popu();
+		var val = valueStack.popu();
+		var dest = valueStack.popu();
+		var t = memory.fill(dest, u8.view(val), size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
+		var val = instance.globals[index].value;
+		valueStack.push(val);
+	}
+	def runtime_GLOBAL_SET(instance: Instance, index: u32) { // XXX: inline when Value rep known
+		var g = instance.globals[index];
+		var val = valueStack.pop(g.valtype);
+		g.value = val;
+	}
+	def runtime_TABLE_GET(instance: Instance, index: u32) -> AbruptReturn { // XXX: inline when Value rep known
+		var table = instance.tables[index];
+		var elem = Values.v_u(valueStack.pop(ValueType.I32));
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
+		var val = table.elems[elem];
+		valueStack.push(val);
+		return FINISHED;
+	}
+	def runtime_TABLE_SET(instance: Instance, index: u32) -> AbruptReturn {
+		var table = instance.tables[index];
+		var val = valueStack.pop(table.elemtype);
+		var elem = Values.v_u(valueStack.pop(ValueType.I32));
+		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
+		table[int.view(elem)] = val;
+		return FINISHED;
+	}
+	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> AbruptReturn {
+		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var src_offset = valueStack.popu();
+		var dst_offset = valueStack.popu();
+		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> AbruptReturn {
+		var dst = instance.tables[t1];
+		var src = instance.tables[t2];
+		var size = valueStack.popu(), src_offset = valueStack.popu(), dst_offset = valueStack.popu();
+		var t = dst.copyT(dst_offset, src, src_offset, size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var val = valueStack.pop(table.elemtype);
+		var r = table.grow(size, val);
+		valueStack.push(Values.i_v(r));
+	}
+	def runtime_TABLE_FILL(instance: Instance, tindex: u32) -> AbruptReturn { // XXX: inline when Value rep known
+		var table = instance.tables[tindex];
+		var size = valueStack.popu();
+		var val = valueStack.pop(table.elemtype);
+		var dest = valueStack.popu();
+		var t = table.fill(dest, val, size);
+		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
+		return FINISHED;
+	}
+	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> AbruptReturn {
+		var frame = TargetFrame(CiRuntime.callerSp());
+		var ret = Execute.fireProbes(func, pc, frame);
+		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		return ret;
+	}
+	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> AbruptReturn {
+		var frame = TargetFrame(CiRuntime.callerSp());
+		var ret = Execute.fireProbesAt(func, pc, frame);
+		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		return ret;
+	}
+	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> AbruptReturn {
+		if (Debug.runtime) Trace.OUT.put3("runtime_TRAP(%q, @+%d, %s)", func.render, pc, reason.name).outln();
+		var trap = Trap.new(reason, null, null);
+		return prependFrames(trap, null, CiRuntime.callerSp());
+	}
+	def prependFrames(thrown: Throwable, hf: HostFunction, sp: Pointer) -> Throwable {
+		var frame = TargetFrame(sp);
+		var trace = Vector<(WasmFunction, int)>.new();
+		var accessor = frame.getFrameAccessor();
+		while (accessor != null) {
+			trace.put(accessor.func(), accessor.pc());
+			var c = accessor.caller();
+			if (c.func == null) break;
+			accessor = c.frame.getFrameAccessor(); // XXX: get frame without inflating accessor
+		}
+		var result = Array<(WasmFunction, int)>.new(trace.length); // reverse frames
+		for (i < result.length) {
+			result[i] = trace[result.length - i - 1];
+		}
+		thrown.prepend(result, hf);
+		return thrown;
+	}
+	def doTrap(reason: TrapReason, sp: Pointer) -> AbruptReturn {
+		var trap = Trap.new(reason, null, null);
+		return prependFrames(trap, null, sp);
+	}
+
+	//=====================================================================
+	// GC proposal callbacks
+	//=====================================================================
+	def runtime_STRUCT_NEW_CANON(instance: Instance, index: u32) { // XXX: unify with V3Interpreter
+		var decl = StructDecl.!(instance.heaptypes[index]);
+		var fields = Array<Value>.new(decl.field_types.length);
+		for (i = fields.length - 1; i >= 0; i--) {
+			fields[i] = valueStack.pop(decl.field_types[i].valtype);
+		}
+		valueStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	}
+	def runtime_STRUCT_NEW_CANON_DEFAULT(instance: Instance, index: u32) { // XXX: unify with V3Interpreter
+		var decl = StructDecl.!(instance.heaptypes[index]);
+		var fields = Array<Value>.new(decl.field_types.length);
+		for (i < fields.length) {
+			fields[i] = Values.default(decl.field_types[i].valtype);
+		}
+		valueStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	}
+	def runtime_STRUCT_GET(instance: Instance, sindex: u32, findex: u32) -> AbruptReturn { // XXX: unify with V3Interpreter
+		var obj = HeapStruct.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		valueStack.push(obj.vals[findex]);
+		return null;
+	}
+	def runtime_STRUCT_GET_S(instance: Instance, sindex: u32, findex: u32) -> AbruptReturn { // XXX: unify with V3Interpreter
+		var obj = HeapStruct.!(valueStack.popObject());
+		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		valueStack.push(V3Eval.signExtend(decl.field_types[findex], obj.vals[findex]));
+		return null;
+	}
+	def runtime_STRUCT_GET_U(instance: Instance, sindex: u32, findex: u32) -> AbruptReturn { // XXX: unify with V3Interpreter
+		var obj = HeapStruct.!(valueStack.popObject());
+		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		valueStack.push(V3Eval.zeroExtend(decl.field_types[findex], obj.vals[findex]));
+		return null;
+	}
+	def runtime_STRUCT_SET(instance: Instance, sindex: u32, findex: u32) -> AbruptReturn { // XXX: unify with V3Interpreter
+		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
+		var val = valueStack.pop(decl.field_types[findex].valtype);
+		var obj = HeapStruct.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		obj.vals[findex] = val;
+		return null;
+	}
+	def runtime_ARRAY_NEW_CANON(instance: Instance, index: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[index]);
+		var len = valueStack.popu();
+		var elem = valueStack.pop(decl.elem_types[0].valtype);
+		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
+		var length = int.view(len);
+		var vals = Array<Value>.new(length);
+		for (i < vals.length) vals[i] = elem;
+		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def runtime_ARRAY_NEW_CANON_DEFAULT(instance: Instance, index: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[index]);
+		var len = valueStack.popu();
+		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
+		var length = int.view(len);
+		var vals = Array<Value>.new(length);
+		var elem = Values.default(decl.elem_types[0].valtype);
+		for (i < vals.length) vals[i] = elem;
+		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def runtime_ARRAY_GET(instance: Instance, ignore: u32) -> AbruptReturn {
+		var index = valueStack.popu();
+		var obj = HeapArray.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
+		valueStack.push(obj.vals[index]);
+		return null;
+	}
+	def runtime_ARRAY_GET_S(instance: Instance, aindex: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
+		var index = valueStack.popu();
+		var obj = HeapArray.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
+		valueStack.push(V3Eval.signExtend(decl.elem_types[0], obj.vals[index]));
+		return null;
+	}
+	def runtime_ARRAY_GET_U(instance: Instance, aindex: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
+		var index = valueStack.popu();
+		var obj = HeapArray.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
+		valueStack.push(V3Eval.zeroExtend(decl.elem_types[0], obj.vals[index]));
+		return null;
+	}
+	def runtime_ARRAY_SET(instance: Instance, aindex: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
+		var val = valueStack.pop(decl.elem_types[0].valtype);
+		var index = valueStack.popu();
+		var obj = HeapArray.!(valueStack.popObject());
+		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
+		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
+		obj.vals[index] = val;
+		return null;
+	}
+	def runtime_ARRAY_NEW_CANON_FIXED(instance: Instance, index: u32, len: u32) -> AbruptReturn {
+		var decl = ArrayDecl.!(instance.heaptypes[index]);
+		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
+		var length = int.view(len);
+		var vals = Array<Value>.new(length);
+		var t = decl.elem_types[0].valtype;
+		for (i = vals.length - 1; i >= 0; i--) vals[i] = valueStack.pop(t);
+		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def runtime_doCast(instance: Instance, nullable: bool, htcode: int) -> bool {
+		var val = valueStack.peekRef();
+		return Execute.doCast(instance, nullable, htcode, val);
+	}
+}
