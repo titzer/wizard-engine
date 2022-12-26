@@ -59,6 +59,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	var sig: SigDecl;
 	var success = true;
 	var unwind_label: MasmLabel;
+	var last_probe = 0;
 
 	new() {
 		masm.unimplemented = unsupported;
@@ -90,6 +91,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		// Emit instructions.
 		while (it.more() && success) {
 			if (Trace.compiler) traceOpcodeAndStack();
+			last_probe = 0;
 			it.dispatch(this);
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
@@ -134,6 +136,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 		// Spill VSP
 		masm.emit_mov_m_r(MasmAddr(regs.sp, c.vsp_offset), regs.vsp, ValueKind.REF); // XXX: track VSP-spilled state
+		// Spill WasmFunction
+		masm.emit_mov_m_r(MasmAddr(regs.sp, c.wasm_func_offset), regs.func_arg, ValueKind.REF);
 		// Load wf.instance and spill
 		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.func_arg, offsets.WasmFunction_instance));
 		masm.emit_mov_m_r(MasmAddr(regs.sp, c.instance_offset), regs.instance, ValueKind.REF);
@@ -163,6 +167,25 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		bailout(Strings.format1("unsupported opcode: %s", opcode.name));
 	}
 
+	def visitProbe() {
+		var b = func.orig_bytecode[it.pc];
+		if (b == Opcode.LOOP.code || b == Opcode.END.code || b == Opcode.ELSE.code) {
+			last_probe = it.pc;
+		} else {
+			emitProbe();
+		}
+	}
+	def emitProbe() {
+		var c = masm.regAlloc.regConfig;
+		// spill everything
+		state.emitKill(emitSlotTransfer);
+		// reload WasmFunction
+		masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.wasm_func_offset));
+		// load PC
+		masm.emit_mov_r_i(regs.runtime_arg_1, it.pc);
+		// call runtime
+		masm.emit_call_runtime_Probe_instr();
+	}
 	def visit_UNREACHABLE() {
 		emitTrap(TrapReason.UNREACHABLE);
 		state.setUnreachable();
@@ -180,6 +203,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var ctl_top = state.ctl_stack.peek();
 		state.prepareLoop(emitSlotTransfer);
 		masm.bindLabel(ctl_top.label);
+		if (last_probe > 0) emitProbe();
 	}
 	def visit_IF(btc: BlockTypeCode) {
 		var pr = btc.toAbstractBlockType(module), params = pr.0, results = pr.1;
@@ -194,6 +218,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.bindLabel(ctl_top.else_label);
 		state.doElse();
 		ctl_top.opcode = Opcode.ELSE.code;
+		if (last_probe > 0) emitProbe();
 	}
 	def visit_END() {
 		var ctl_top = state.ctl_stack.peek();
@@ -222,6 +247,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
 			state.ctl_stack.pop();
 		}
+		if (last_probe > 0) emitProbe();
 	}
 	def visit_BR(depth: u31) {
 		var target = state.getControl(depth);
