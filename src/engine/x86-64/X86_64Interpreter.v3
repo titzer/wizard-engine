@@ -57,18 +57,6 @@ component X86_64Interpreter {
 	def reset() {
 		if (RT.valueStack != null) RT.valueStack.sp = RT.valueStack.mapping.range.start;
 	}
-	def getFrameAccessor(sp: Pointer) -> X86_64InterpreterFrameAccessor {
-		var retip = (sp + -Pointer.SIZE).load<Pointer>();
-		if (!inCode(retip)) return null;
-		if (tuning.cacheFrameAccessor) {
-			var prev = (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
-			if (prev != null) return prev;
-			var n = X86_64InterpreterFrameAccessor.new(sp);
-			(sp + IVarConfig.frame.ACCESSOR.disp).store<X86_64InterpreterFrameAccessor>(n);
-			return n;
-		}
-		return X86_64InterpreterFrameAccessor.new(sp);
-	}
 	def inCode(p: Pointer) -> bool {
 		return p >= interpreterCode.start && p < interpreterCode.end;
 	}
@@ -101,95 +89,25 @@ def dumpFrame(sp: Pointer) {
 }
 
 // FrameAccessor for probing and debugging.
-class X86_64InterpreterFrameAccessor(sp: Pointer) extends FrameAccessor {
-	var cached_depth = -1;
-	var decl: FuncDecl;
-
-	new() {
+class X86_64InterpreterFrameAccessor extends X86_64BaseFrameAccessor {
+	new(sp: Pointer) super(sp) {
 		decl = (sp + IVarConfig.frame.FUNC_DECL.disp).load<FuncDecl>();
 	}
+
 	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
 	def isUnwound() -> bool {
 		if (!tuning.cacheFrameAccessor) return false; // TODO: proper unwound check
 		return this != (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
-	}
-	// Returns the Wasm function in this frame.
-	def func() -> WasmFunction {
-		checkNotUnwound();
-		return (sp + IVarConfig.frame.WASM_FUNC.disp).load<WasmFunction>();
 	}
 	// Returns the current program counter.
 	def pc() -> int {
 		checkNotUnwound();
 		return computePCFromFrame(sp);
 	}
-	// Returns {true} if this frame is currently the top executing frame, {false} if the
-	// frame has called another function or been unwound.
-	def isTop() -> bool {
-		return true; // TODO?
-	}
-	// Returns the call depth of this frame within its segment, with the bottom frame being #0.
-	def depth() -> int {
-		checkNotUnwound();
-		if (cached_depth < 0) cached_depth = computeDepth();
-		return cached_depth;
-	}
-	private def computeDepth() -> int {
-		var depth = 0;
-		var next_sp = sp;
-		while (true) {
-			next_sp = next_sp + IVarConfig.frame.size + Pointer.SIZE;
-			var retip = (next_sp + -Pointer.SIZE).load<Pointer>();
-			if (!X86_64Interpreter.inCode(retip)) return depth;
-			depth++;
-		}
-		return 0;
-	}
-	// Get the caller frame. If none, then {Frame.func} will be {null}.
-	def caller() -> ProbeFrame {
-		checkNotUnwound();
-		var callerSp = sp + IVarConfig.frame.size + Pointer.SIZE;
-		var frame = TargetFrame(callerSp);
-		var accessor = frame.getFrameAccessor();
-		if (accessor == null) return ProbeFrame(null, -1, frame);
-		return ProbeFrame(accessor.func(), accessor.pc(), frame);
-	}
-	// Get the number of local variables in this frame.
-	def numLocals() -> int {
-		checkNotUnwound();
-		return decl.num_locals;
-	}
-	// Get the value of local variable {i}.
-	def getLocal(i: int) -> Value {
-		checkNotUnwound();
-		if (u32.view(i) >= decl.num_locals) System.error("FrameAccessorError", "local index out-of-bounds");
-		var vfp = (sp + IVarConfig.frame.VFP.disp).load<Pointer>();
-		return RT.valueStack.readValue(vfp, i);
-	}
 	// Set the value of a local variable. (dynamically typechecked).
 	def setLocal(i: int, v: Value);
-	// Get the number of operand stack elements.
-	def numOperands() -> int {
-		checkNotUnwound();
-		if (!isTop()) System.error("FrameAccessorError", "numOperands only supported for top frame"); // TODO
-		var vfp = (sp + IVarConfig.frame.VFP.disp).load<Pointer>();
-		var vsp = (sp + IVarConfig.frame.VSP.disp).load<Pointer>();
-		var diff = int.!((vsp - vfp) / Target.tagging.slot_size);
-		return diff - decl.num_locals;
-	}
-	// Get operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc.
-	def getOperand(i: int) -> Value {
-		checkNotUnwound();
-		if (!isTop()) System.error("FrameAccessorError", "numOperands only supported for top frame"); // TODO
-		var vsp = (sp + IVarConfig.frame.VSP.disp).load<Pointer>();
-		return RT.valueStack.readValue(vsp, i - 1);
-	}
 	// Set operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc. (dynamically typechecked).
 	def setOperand(i: int, v: Value);
-
-	private def checkNotUnwound() {
-		if (isUnwound()) System.error("FrameAccessorError", "frame has been unwound");
-	}
 }
 
 // Signal-handling for traps
@@ -312,6 +230,19 @@ class X86_64InterpreterCode extends RiUserCode {
 		w.put_b32(divZeroHandlerOffset);
 		w.put_b32(stackOverflowHandlerOffset);
 		w.put_b32(codeEnd);
+	}
+	// Get a frame accessor for the probe API.
+	def getFrameAccessor(sp: Pointer) -> X86_64InterpreterFrameAccessor {
+		var retip = (sp + -Pointer.SIZE).load<Pointer>();
+		if (!X86_64Interpreter.inCode(retip)) return null;
+		if (tuning.cacheFrameAccessor) {
+			var prev = (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
+			if (prev != null) return prev;
+			var n = X86_64InterpreterFrameAccessor.new(sp);
+			(sp + IVarConfig.frame.ACCESSOR.disp).store<X86_64InterpreterFrameAccessor>(n);
+			return n;
+		}
+		return X86_64InterpreterFrameAccessor.new(sp);
 	}
 }
 
