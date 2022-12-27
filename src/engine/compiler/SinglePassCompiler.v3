@@ -177,6 +177,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var c = masm.regAlloc.regConfig;
 		// spill everything
 		state.emitKill(emitSlotTransfer);
+		// compute VSP for potential frame access
+		emit_compute_vsp(state.sp);
+		masm.emit_write_runtime_vsp(regs.vsp);
 		// reload WasmFunction
 		masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.wasm_func_offset));
 		// load PC
@@ -286,8 +289,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var offsets = masm.getOffsets();
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		state.emitKill(emitSlotTransfer);
-		var c = masm.regAlloc.regConfig;
-		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		emit_load_instance(regs.instance);
 		// XXX: skip loading the target function for direct intra-module calls?
 		masm.emit_mov_r_m(regs.func_arg, ValueKind.REF, MasmAddr(regs.instance, offsets.Instance_functions));
 		masm.emit_read_v3_array_r_i(regs.func_arg, regs.func_arg, func.func_index, ValueKind.REF);
@@ -320,9 +322,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		state.emitKill(emitSlotTransfer);
 		ensure_reg(sv, state.sp, regs.func_arg);
-		// reload instance from frame
-		var c = masm.regAlloc.regConfig;
-		masm.emit_mov_r_m(regs.instance, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		emit_load_instance(regs.instance);
 
 		var tmp1 = regs.stp; // TODO: allocate and release temp regs
 		var tmp2 = regs.ip;
@@ -369,7 +369,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var offsets = masm.getOffsets();
 		var regs = masm.regAlloc.regConfig.regs;
 		var sv = state.pop();
-		var c = masm.regAlloc.regConfig;
 		if (sv.isConst() && sv.const == 0) {
 			emitTrap(TrapReason.NULL_DEREF);
 			state.setUnreachable();
@@ -477,11 +476,10 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (!global.mutable && global.imp == null && InitExpr.I32.?(global.init)) {
 			state.push(KIND_I32 | IS_CONST, NO_REG, InitExpr.I32.!(global.init).val);
 		} else {
-			var c = masm.regAlloc.regConfig;
 			state.emitKill(emitSlotTransfer);
 			emit_compute_vsp(state.sp);
 			masm.emit_write_runtime_vsp(regs.vsp);
-			masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+			emit_load_instance(regs.runtime_arg_0);
 			masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
 			masm.emit_call_runtime_GLOBAL_GET();
 			emit_reload_regs();
@@ -490,16 +488,40 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def visit_GLOBAL_SET(index: u31) {
 		var global = module.globals[index];
-		var c = masm.regAlloc.regConfig;
 		state.emitKill(emitSlotTransfer);
 		emit_compute_vsp(state.sp);
 		masm.emit_write_runtime_vsp(regs.vsp);
-		masm.emit_mov_r_m(regs.runtime_arg_0, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		emit_load_instance(regs.runtime_arg_0);
 		masm.emit_mov_r_i(regs.runtime_arg_1, global.global_index);
 		masm.emit_call_runtime_GLOBAL_SET();
 		emit_reload_regs();
 		var sv = state.pop();
 		freeVal(sv);
+	}
+	def visit_TABLE_GET(index: u31) {
+		var table = module.tables[index];
+		state.emitKill(emitSlotTransfer);
+		emit_compute_vsp(state.sp);
+		masm.emit_write_runtime_vsp(regs.vsp);
+		emit_load_instance(regs.runtime_arg_0);
+		masm.emit_mov_r_i(regs.runtime_arg_1, index);
+		masm.emit_call_runtime_TABLE_GET();
+		emit_unwind_check();
+		emit_reload_regs();
+		state.pop(); // pop index
+		state.push(typeToKindFlags(table.elemtype) | TAG_STORED | IS_STORED, NO_REG, 0);
+	}
+	def visit_TABLE_SET(index: u31) {
+		state.emitKill(emitSlotTransfer);
+		emit_compute_vsp(state.sp);
+		masm.emit_write_runtime_vsp(regs.vsp);
+		emit_load_instance(regs.runtime_arg_0);
+		masm.emit_mov_r_i(regs.runtime_arg_1, index);
+		masm.emit_call_runtime_TABLE_SET();
+		emit_unwind_check();
+		emit_reload_regs();
+		state.pop(); // pop value
+		state.pop(); // pop index
 	}
 
 	def visit_I32_LOAD(imm: MemArg) { emitLoad(imm, ValueKind.I32, masm.emit_load_r_r_r_i); }
@@ -527,12 +549,11 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_I64_STORE32(imm: MemArg) { emitStore(imm, ValueKind.I32, masm.emit_store_r_r_r_i); }
 
 	def visit_MEMORY_SIZE(memory_index: u31) {
-		var c = masm.regAlloc.regConfig;
 		var offsets = masm.getOffsets();
 		var reg = allocReg(ValueKind.REF).reg;
 		var r1 = allocReg(ValueKind.I64).reg;
 		var r2 = allocReg(ValueKind.I64).reg;
-		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		emit_load_instance(reg);
 		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_memories));
 		masm.emit_read_v3_array_r_i(reg, reg, int.!(memory_index), ValueKind.REF);
 		masm.emit_mov_r_m(r2, ValueKind.REF, MasmAddr(reg, offsets.X86_64Memory_start));
@@ -542,6 +563,17 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		freeReg(r2);
 		freeReg(reg);
 		state.push(KIND_I32 | IN_REG, r1, 0);
+	}
+	def visit_MEMORY_GROW(memory_index: u31) {
+		state.emitKill(emitSlotTransfer);
+		emit_compute_vsp(state.sp);
+		masm.emit_write_runtime_vsp(regs.vsp);
+		emit_load_instance(regs.runtime_arg_0);
+		masm.emit_mov_r_i(regs.runtime_arg_1, memory_index);
+		masm.emit_call_runtime_MEMORY_GROW();
+		emit_reload_regs();
+		state.pop();
+		state.push(KIND_I32 | TAG_STORED | IS_STORED, NO_REG, 0);
 	}
 
 	def visit_I32_CONST(val: i32) {
@@ -583,10 +615,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		state.push(KIND_REF | IS_CONST, NO_REG, 0);
 	}
 	def visit_REF_FUNC(func_index: u31) {
-		var c = masm.regAlloc.regConfig;
 		var offsets = masm.getOffsets();
 		var reg = allocReg(ValueKind.REF).reg;
-		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, c.instance_offset));
+		emit_load_instance(reg);
 		// XXX: skip loading the target function for direct intra-module calls?
 		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(reg, offsets.Instance_functions));
 		masm.emit_read_v3_array_r_i(reg, reg, int.!(func_index), ValueKind.REF);
@@ -908,6 +939,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (module.memories.length > 0) {
 			masm.emit_mov_r_m(regs.mem0, ValueKind.REF, MasmAddr(regs.sp, masm.regAlloc.regConfig.mem_offset));
 		}
+	}
+	def emit_load_instance(reg: Reg) {
+		masm.emit_mov_r_m(reg, ValueKind.REF, MasmAddr(regs.sp, masm.regAlloc.regConfig.instance_offset));
 	}
 	def ensure_reg(sv: SpcAbstractVal, slot: u32, reg: Reg) -> Reg {
 		if (!sv.inReg()) {
