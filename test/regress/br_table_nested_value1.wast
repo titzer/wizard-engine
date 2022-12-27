@@ -3,7 +3,6 @@
     (i32.add
       (i32.const 1)
       (block (result i32)
-        (drop (i32.const 2))
         (br_table 0
           (block (result i32)
             (drop (br_if 1 (i32.const 8) (local.get 0))) (i32.const 4)
