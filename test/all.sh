@@ -30,6 +30,11 @@ for target in $TEST_TARGETS; do
     fi
 done
 
+# Regression tests
+for target in $TEST_TARGETS; do
+    TEST_TARGET=$target $SCRIPT_LOC/regress.sh
+done
+
 # Spec tests
 for target in $TEST_TARGETS; do
     if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
