@@ -1,0 +1,10 @@
+(module
+  (func (export "m0") (param i64) (result i64)
+    (i64.clz (local.get 0))
+  )
+)
+(assert_return (invoke "m0" (i64.const 0)) (i64.const 64))
+(assert_return (invoke "m0" (i64.const 32768)) (i64.const 48))
+(assert_return (invoke "m0" (i64.const 2147483648)) (i64.const 32))
+(assert_return (invoke "m0" (i64.const 9223372036854775808)) (i64.const 0))
+(assert_return (invoke "m0" (i64.const 1)) (i64.const 63))

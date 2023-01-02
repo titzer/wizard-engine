@@ -1,0 +1,10 @@
+(module
+  (func (export "m0") (param ) (result f64)
+    (f64.sqrt (f64.const 0))
+  )
+  (func (export "m1") (param ) (result f64)
+    (f64.sqrt (f64.const 0x1.2000000000000p3))
+  )
+)
+(assert_return (invoke "m0" ) (f64.const 0))
+(assert_return (invoke "m1" ) (f64.const 0x1.8000000000000p1))

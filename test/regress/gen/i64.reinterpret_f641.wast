@@ -1,0 +1,10 @@
+(module
+  (func (export "m0") (param ) (result i64)
+    (i64.reinterpret_f64 (f64.const 0))
+  )
+  (func (export "m1") (param ) (result i64)
+    (i64.reinterpret_f64 (f64.const -0x1.CDE0123456781p955))
+  )
+)
+(assert_return (invoke "m0" ) (i64.const 0))
+(assert_return (invoke "m1" ) (i64.const 18135113895982229377))

@@ -1,0 +1,10 @@
+(module
+  (func (export "m0") (param i32 i32) (result i32)
+    (i32.gt_s (local.get 0)(local.get 1))
+  )
+)
+(assert_return (invoke "m0" (i32.const 55)(i32.const 54)) (i32.const 1))
+(assert_return (invoke "m0" (i32.const 55)(i32.const 55)) (i32.const 0))
+(assert_return (invoke "m0" (i32.const 55)(i32.const 56)) (i32.const 0))
+(assert_return (invoke "m0" (i32.const 4294967240)(i32.const 4294967241)) (i32.const 0))
+(assert_return (invoke "m0" (i32.const 4294967241)(i32.const 56)) (i32.const 0))

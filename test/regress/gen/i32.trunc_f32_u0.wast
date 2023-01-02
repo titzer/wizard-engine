@@ -1,0 +1,12 @@
+(module
+  (func (export "m0") (param f32) (result i32)
+    (i32.trunc_f32_u (local.get 0))
+  )
+)
+(assert_return (invoke "m0" (f32.const 0)) (i32.const 0))
+(assert_return (invoke "m0" (f32.const -0)) (i32.const 0))
+(assert_return (invoke "m0" (f32.const -0x1.000002p-127)) (i32.const 0))
+(assert_return (invoke "m0" (f32.const 0x1.390000p10)) (i32.const 1252))
+(assert_trap (invoke "m0" (f32.const -0x1.000000p31)) "")
+(assert_return (invoke "m0" (f32.const 0x1.000000p31)) (i32.const 2147483648))
+(assert_trap (invoke "m0" (f32.const 0x1.000000p32)) "")

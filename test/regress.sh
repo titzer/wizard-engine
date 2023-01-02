@@ -30,8 +30,10 @@ function run_tests() {
 TESTS="$@"
 
 if [ "$TESTS" =  "" ]; then
-    TESTS=$(ls test/regress/core/*.bin.wast)
-    run_tests core
+    for dir in core gen; do
+	TESTS=$(ls test/regress/$dir/*.bin.wast)
+	run_tests $dir
+    done
     
     for ext in $(find test/regress -type d) ; do
 	if [[ $ext =~ test/regress/(ext:.*) ]]; then

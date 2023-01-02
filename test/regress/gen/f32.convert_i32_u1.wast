@@ -1,0 +1,10 @@
+(module
+  (func (export "m0") (param ) (result f32)
+    (f32.convert_i32_u (i32.const 2147483648))
+  )
+  (func (export "m1") (param ) (result f32)
+    (f32.convert_i32_u (i32.const 3000000000))
+  )
+)
+(assert_return (invoke "m0" ) (f32.const 0x1.000000p31))
+(assert_return (invoke "m1" ) (f32.const 0x1.65A0BCp31))
