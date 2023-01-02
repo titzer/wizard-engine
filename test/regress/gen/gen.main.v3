@@ -1,0 +1,1008 @@
+// Copyright 2022 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def OUT = Trace.OUT;
+def genMap = Array<bool>.new(2000);
+def matchers = Vector<GlobMatcher>.new();
+def main(args: Array<string>) -> int {
+	for (i < args.length) {
+		var arg = args[i];
+		if (TraceOptions.parse(arg)) {
+			args[i] = null;
+		} else if (arg.length > 0 && arg[0] == '-') {
+			System.puts("Unknown option: ");
+			System.puts(arg);
+			System.ln();
+			return 1;
+		} else {
+			matchers.put(GlobMatcher.new(arg));
+		}
+	}
+	OUT.puts("Regression test generator").outln();
+	genAll();
+	for (op in Opcode) {
+		if (op.sig != null && !genMap[op.tag]) {
+			OUT.put1("missing? %s", op.mnemonic).outln();
+		}
+	}
+	return 0;
+}
+
+def renderVal(buf: StringBuilder, v: Value) {
+	match (v) {
+		I32(val) => buf.put1("(i32.const %d)", val);
+		I64(val) => buf.put1("(i64.const %d)", val);
+		F32(bits) => {
+			buf.puts("(f32.const ");
+			if (bits == 0) buf.puts("0");
+			else if (Floats.isNan32(bits)) buf.puts("nan"); // TODO: payload
+			else if (bits == Floats.f_infinity) buf.puts("inf");
+			else if (bits == Values.F32_minus_infinity.bits) buf.puts("-inf");
+			else if (bits == Floats.f_minus0) buf.puts("-0");
+			else {
+				var f = float.view(bits);
+				if (f.sign != 0) buf.puts("-");
+				if (f.exponent == -126) buf.puts("0x0."); // subnormal
+				else buf.puts("0x1.");
+				var v = u32.view(f.fraction) << 1;
+				for (i < 6) {
+					var bits = (v >> 20) & 0xF;
+					buf.putc(Chars.hexMap_u[bits]);
+					v = v << 4;
+				}
+				buf.puts("p");
+				buf.putd(int.!(f.exponent));
+			}
+			buf.puts(")");
+		}
+		F64(bits) => {
+			buf.puts("(f64.const ");
+			if (bits == 0) buf.puts("0");
+			else if (Floats.isNan64(bits)) buf.puts("nan"); // TODO: payload
+			else if (bits == Floats.d_infinity) buf.puts("inf");
+			else if (bits == Values.F64_minus_infinity.bits) buf.puts("-inf");
+			else if (bits == Floats.d_minus0) buf.puts("-0");
+			else {
+				var d = double.view(bits);
+				if (d.sign != 0) buf.puts("-");
+				if (d.exponent == -1022) buf.puts("0x0."); // subnormal
+				else buf.puts("0x1.");
+				var v = u64.view(d.fraction);
+				for (i < 13) {
+					var bits = (v >> 48) & 0xF;
+					buf.putc(Chars.hexMap_u[bits]);
+					v = v << 4;
+				}
+				buf.puts("p");
+				buf.putd(int.!(d.exponent));
+			}
+			buf.puts(")");
+		}
+		_ => ;
+	}
+}
+
+def renderResultAssert(buf: StringBuilder, r: Result) {
+	match (r) {
+		Value(vals) => buf.puts("(assert_return ");
+		Throw(thrown) => buf.puts("(assert_trap ");
+		_ => ; // TODO
+	}
+}
+
+def renderResultVal(buf: StringBuilder, r: Result) {
+	match (r) {
+		Value(vals) => {
+			for (v in vals) renderVal(buf, v);
+			buf.puts(")");
+		}
+		Throw(thrown) => buf.puts("\"\")");
+		_ => ; // TODO
+	}
+	buf.ln();
+}
+
+def skip(opcode: Opcode) -> bool {
+	if (opcode.sig == null) System.error("Error", Strings.format1("null sig for %s", opcode.name));
+	if (matchers.length == 0) return false;
+	for (i < matchers.length) {
+		if (matchers[i].matches(opcode.mnemonic)) return false;
+	}
+	return true;
+}
+
+def globalBuf = TraceBuilder.new();
+var globalFd = -1;
+def close() {
+	globalBuf.out(System.fileWriteK(globalFd, _, _, _));
+	System.fileClose(globalFd);
+	OUT.puts("##-ok").outln();
+}
+
+def open0(opcode: Opcode) -> StringBuilder {
+	genMap[opcode.tag] = true;
+	var name = Strings.format1("%s0.wast", opcode.mnemonic);
+	OUT.put1("##+gen %s", name).outln();
+	globalFd = System.fileOpen(name, false);
+	return globalBuf.reset();
+}
+
+def genModule(opcode: Opcode) {
+	var buf = globalBuf;
+	var sig = opcode.sig;
+	buf.puts("(module").ln();
+	buf.puts("  (func (export \"main\")");
+	if (sig.params.length > 0) {
+		buf.puts(" (param ");
+		for (i < sig.params.length) {
+			if (i > 0) buf.sp();
+			sig.params[i].render(buf);
+		}
+		buf.puts(")");
+	}
+	if (sig.results.length > 0) {
+		buf.puts(" (result ");
+		for (i < sig.results.length) {
+			if (i > 0) buf.sp();
+			sig.results[i].render(buf);
+		}
+		buf.puts(")");
+	}
+	buf.ln();
+	buf.put1("    (%s ", opcode.mnemonic);
+	for (i < sig.params.length) {
+		buf.put1("(local.get %d)", i);
+	}
+	buf.puts(")").ln();
+	buf.puts("  )").ln();
+	buf.puts(")").ln();
+}
+
+// Runs a "unop" opcode test
+def test_x_z<X, Z>(opcode: Opcode, cases: Array<(X, Z)>, xv: X -> Value, zv: Z -> Value) {
+	if (skip(opcode)) return;
+	var buf = open0(opcode);
+	genModule(opcode);
+	for (c in cases) {
+		buf.puts("(assert_return (invoke \"main\" ");
+		renderVal(buf, xv(c.0));
+		buf.puts(") ");
+		renderVal(buf, zv(c.1));
+		buf.puts(")").ln();
+	}
+	close();
+}
+// Runs a "unop" opcode test that can generate traps
+def test_x_r<X>(opcode: Opcode, cases: Array<(X, Result)>, xv: X -> Value) {
+	if (skip(opcode)) return;
+	var buf = open0(opcode);
+	genModule(opcode);
+
+	for (c in cases) {
+		renderResultAssert(buf, c.1);
+		buf.puts("(invoke \"main\" ");
+		renderVal(buf, xv(c.0));
+		buf.puts(") ");
+		renderResultVal(buf, c.1);
+	}
+	close();
+}
+// Runs a "binop" opcode test that returns values
+def test_xy_z<X, Y, Z>(opcode: Opcode, cases: Array<((X, Y), Z)>, xv: X -> Value, yv: Y -> Value, zv: Z -> Value) {
+	if (skip(opcode)) return;
+	var buf = open0(opcode);
+	genModule(opcode);
+	for (c in cases) {
+		buf.puts("(assert_return (invoke \"main\" ");
+		renderVal(buf, xv(c.0.0));
+		renderVal(buf, yv(c.0.1));
+		buf.puts(") ");
+		renderVal(buf, zv(c.1));
+		buf.puts(")").ln();
+	}
+	close();
+}
+// Runs a "binop" opcode test that may generate traps
+def test_xy_r<X, Y>(opcode: Opcode, cases: Array<((X, Y), Result)>, xv: X -> Value, yv: Y -> Value) {
+	if (skip(opcode)) return;
+	var buf = open0(opcode);
+	genModule(opcode);
+	for (c in cases) {
+		renderResultAssert(buf, c.1);
+		buf.puts("(invoke \"main\" ");
+		renderVal(buf, xv(c.0.0));
+		renderVal(buf, yv(c.0.1));
+		buf.puts(") ");
+		renderResultVal(buf, c.1);
+	}
+	close();
+}
+
+def T_u_u = test_x_z(_, _, Values.u_v, Values.u_v);
+def T_w_w = test_x_z(_, _, Values.w_v, Values.w_v);
+def T_w_u = test_x_z(_, _, Values.w_v, Values.u_v);
+def T_u_w = test_x_z(_, _, Values.u_v, Values.w_v);
+def T_f_f = test_x_z(_, _, Value.F32, Value.F32);
+def T_d_d = test_x_z(_, _, Value.F64, Value.F64);
+def T_i_f = test_x_z(_, _, Values.i_v, Value.F32);
+def T_i_i = test_x_z(_, _, Values.i_v, Values.i_v);
+def T_l_l = test_x_z(_, _, Values.l_v, Values.l_v);
+def T_f_i = test_x_z(_, _, Value.F32, Values.i_v);
+def T_f_l = test_x_z(_, _, Value.F32, Values.l_v);
+def T_l_f = test_x_z(_, _, Values.l_v, Value.F32);
+def T_i_d = test_x_z(_, _, Values.i_v, Value.F64);
+def T_d_i = test_x_z(_, _, Value.F64, Values.i_v);
+def T_d_l = test_x_z(_, _, Value.F64, Values.l_v);
+def T_l_d = test_x_z(_, _, Values.l_v, Value.F64);
+def T_f_d = test_x_z(_, _, Value.F32, Value.F64);
+def T_d_f = test_x_z(_, _, Value.F64, Value.F32);
+
+def T_d_r = test_x_r(_, _, Value.F64);
+def T_f_r = test_x_r(_, _, Value.F32);
+
+def T_ii_i = test_xy_z(_, _, Values.i_v, Values.i_v, Values.i_v);
+def T_uu_u = test_xy_z(_, _, Values.u_v, Values.u_v, Values.u_v);
+def T_ii_r = test_xy_r(_, _, Values.i_v, Values.i_v);
+def T_ll_l = test_xy_z(_, _, Values.l_v, Values.l_v, Values.l_v);
+def T_ll_r = test_xy_r(_, _, Values.l_v, Values.l_v);
+def T_ww_w = test_xy_z(_, _, Values.w_v, Values.w_v, Values.w_v);
+def T_ll_u = test_xy_z(_, _, Values.l_v, Values.l_v, Values.u_v);
+
+def T_ff_f = test_xy_z(_, _, Value.F32, Value.F32, Value.F32);
+def T_dd_d = test_xy_z(_, _, Value.F64, Value.F64, Value.F64);
+def T_ff_i = test_xy_z(_, _, Value.F32, Value.F32, Value.I32);
+def T_dd_i = test_xy_z(_, _, Value.F64, Value.F64, Value.I32);
+
+def R_FUNREP = Traps.result(TrapReason.FLOAT_UNREPRESENTABLE);
+
+def i_r(val: i32) -> Result {
+	return Result.Value([Value.I32(u32.view(val))]);
+}
+def u_r(val: u32) -> Result {
+	return Result.Value([Value.I32(val)]);
+}
+def l_r(val: i64) -> Result {
+	return Result.Value([Value.I64(u64.view(val))]);
+}
+def w_r(val: u64) -> Result {
+	return Result.Value([Value.I64(val)]);
+}
+
+def T<X, Y>(x: X, y: Y) -> (X, Y) { return (x, y); }
+
+def genAll() {
+	T_u_u(Opcode.I32_EQZ, [
+		(0, 1),
+		(0xFACEDEAD, 0),
+		(1, 0)]);
+	T_ii_i(Opcode.I32_EQ, [
+		((0, 0), 1),
+		((0xFACEDEAD, 0xFACEDEAD), 1),
+		((0xEACEEACE, 0xFACEEACE), 0)]);
+	T_ii_i(Opcode.I32_NE, [
+		((99, 99), 0),
+		((0xFAEEDEAD, 0xFACEDEAD), 1),
+		((0xFACEEACE, 0xFACEEACE), 0)]);
+	T_ii_i(Opcode.I32_LT_S, [
+		((55, 54), 0),
+		((55, 55), 0),
+		((55, 56), 1),
+		((-56, -55), 1),
+		((-55, 56), 1)]);
+	T_ii_i(Opcode.I32_LT_U, [
+		((55, 54), 0),
+		((55, 55), 0),
+		((55, 56), 1),
+		((-56, -55), 1),
+		((-55, 56), 0)]);
+	T_ii_i(Opcode.I32_GT_S, [
+		((55, 54), 1),
+		((55, 55), 0),
+		((55, 56), 0),
+		((-56, -55), 0),
+		((-55, 56), 0)]);
+	T_ii_i(Opcode.I32_GT_U, [
+		((55, 54), 1),
+		((55, 55), 0),
+		((55, 56), 0),
+		((-56, -55), 0),
+		((-55, 56), 1)]);
+	T_ii_i(Opcode.I32_LE_S, [
+		((55, 54), 0),
+		((55, 55), 1),
+		((55, 56), 1),
+		((-56, -55), 1),
+		((-55, 56), 1)]);
+	T_ii_i(Opcode.I32_LE_U, [
+		((55, 54), 0),
+		((55, 55), 1),
+		((55, 56), 1),
+		((-56, -55), 1),
+		((-55, 56), 0)]);
+	T_ii_i(Opcode.I32_GE_S, [
+		((55, 54), 1),
+		((55, 55), 1),
+		((55, 56), 0),
+		((-56, -55), 0),
+		((-55, 56), 0)]);
+	T_ii_i(Opcode.I32_GE_U, [
+		((55, 54), 1),
+		((55, 55), 1),
+		((55, 56), 0),
+		((-56, -55), 0),
+		((-55, 56), 1)]);
+
+	T_w_u(Opcode.I64_EQZ, [
+		(0, 1),
+		(0xFACEDEAD, 0),
+		(0x00300000000, 0),
+		(1, 0)]);
+	T_ll_u(Opcode.I64_EQ, [
+		((0, 0), 1),
+		((0xFACEDEAD, 0xFACEDEAD), 1),
+		((0x10000000FACEDEAD, 0x20000000FACEDEAD), 0),
+		((0xEACEEACE, 0xFACEEACE), 0)]);
+	T_ll_u(Opcode.I64_NE, [
+		((99, 99), 0),
+		((0xFAEEDEAD55, 0xFACEDEAD55), 1),
+		((0xFACEEACE11223344, 0xFACEEACE11223344), 0)]);
+	T_ll_u(Opcode.I64_LT_S, [
+		((55000000000, 54000000000), 0),
+		((55000000000, 55000000000), 0),
+		((55000000000, 56000000000), 1),
+		((-56000000000, -55000000000), 1),
+		((-55000000000, 56000000000), 1)]);
+	T_ll_u(Opcode.I64_LT_U, [
+		((55111111111, 54111111111), 0),
+		((55111111111, 55111111111), 0),
+		((55111111111, 56111111111), 1),
+		((-56111111111, -55111111111), 1),
+		((-55111111111, 56111111111), 0)]);
+	T_ll_u(Opcode.I64_GT_S, [
+		((55222222222, 54222222222), 1),
+		((55222222222, 55222222222), 0),
+		((55222222222, 56222222222), 0),
+		((-56222222222, -55222222222), 0),
+		((-55222222222, 56222222222), 0)]);
+	T_ll_u(Opcode.I64_GT_U, [
+		((55333333333, 54333333333), 1),
+		((55333333333, 55333333333), 0),
+		((55333333333, 56333333333), 0),
+		((-56333333333, -55333333333), 0),
+		((-55333333333, 56333333333), 1)]);
+	T_ll_u(Opcode.I64_LE_S, [
+		((55444444444, 54444444444), 0),
+		((55444444444, 55444444444), 1),
+		((55444444444, 56444444444), 1),
+		((-56444444444, -55444444444), 1),
+		((-55444444444, 56444444444), 1)]);
+	T_ll_u(Opcode.I64_LE_U, [
+		((55555555555, 54555555555), 0),
+		((55555555555, 55555555555), 1),
+		((55555555555, 56555555555), 1),
+		((-56555555555, -55555555555), 1),
+		((-55555555555, 56555555555), 0)]);
+	T_ll_u(Opcode.I64_GE_S, [
+		((55666666666, 54666666666), 1),
+		((55666666666, 55666666666), 1),
+		((55666666666, 56666666666), 0),
+		((-56666666666, -55666666666), 0),
+		((-55666666666, 56666666666), 0)]);
+	T_ll_u(Opcode.I64_GE_U, [
+		((55777777777, 54777777777), 1),
+		((55777777777, 55777777777), 1),
+		((55777777777, 56777777777), 0),
+		((-56777777777, -55777777777), 0),
+		((-55777777777, 56777777777), 1)]);
+	T_ff_i(Opcode.F32_EQ, [
+		((0, 0), 1),
+		((Floats.f_1p31, Floats.f_minus1p31), 0),
+		((Floats.f_minus0, 0), 1),
+		((Floats.f_nan, 0), 0)]);
+	T_ff_i(Opcode.F32_NE, [
+		((0, 0), 0),
+		((Floats.f_1p31, Floats.f_minus1p31), 1),
+		((Floats.f_minus0, 0), 0),
+		((Floats.f_nan, 0), 1)]);
+	T_ff_i(Opcode.F32_LT, [
+		((0, 0), 0),
+		((Floats.f_1p31, Floats.f_minus1p31), 0),
+		((Floats.f_minus1p31, Floats.f_1p31), 1),
+		((Floats.f_minus0, 0), 0),
+		((Floats.f_nan, 0), 0)]);
+	T_ff_i(Opcode.F32_GT, [
+		((0, 0), 0),
+		((Floats.f_1p31, Floats.f_minus1p31), 1),
+		((Floats.f_minus1p31, Floats.f_1p31), 0),
+		((Floats.f_minus0, 0), 0),
+		((Floats.f_nan, 0), 0)]);
+	T_ff_i(Opcode.F32_GE, [
+		((0, 0), 1),
+		((Floats.f_1p31, Floats.f_minus1p31), 1),
+		((Floats.f_minus1p31, Floats.f_1p31), 0),
+		((Floats.f_minus0, 0), 1),
+		((Floats.f_nan, 0), 0)]);
+	T_ff_i(Opcode.F32_LE, [
+		((0, 0), 1),
+		((Floats.f_1p31, Floats.f_minus1p31), 0),
+		((Floats.f_minus1p31, Floats.f_1p31), 1),
+		((Floats.f_minus0, 0), 1),
+		((Floats.f_nan, 0), 0)]);
+	T_dd_i(Opcode.F64_EQ, [
+		((0, 0), 1),
+		((Floats.d_1p31, Floats.d_minus1p31), 0),
+		((Floats.d_minus0, 0), 1),
+		((Floats.d_nan, 0), 0)]);
+	T_dd_i(Opcode.F64_NE, [
+		((0, 0), 0),
+		((Floats.d_1p31, Floats.d_minus1p31), 1),
+		((Floats.d_minus0, 0), 0),
+		((Floats.d_nan, 0), 1)]);
+	T_dd_i(Opcode.F64_LT, [
+		((0, 0), 0),
+		((Floats.d_1p31, Floats.d_minus1p31), 0),
+		((Floats.d_minus1p31, Floats.d_1p31), 1),
+		((Floats.d_minus0, 0), 0),
+		((Floats.d_nan, 0), 0)]);
+	T_dd_i(Opcode.F64_GT, [
+		((0, 0), 0),
+		((Floats.d_1p31, Floats.d_minus1p31), 1),
+		((Floats.d_minus1p31, Floats.d_1p31), 0),
+		((Floats.d_minus0, 0), 0),
+		((Floats.d_nan, 0), 0)]);
+	T_dd_i(Opcode.F64_GE, [
+		((0, 0), 1),
+		((Floats.d_1p31, Floats.d_minus1p31), 1),
+		((Floats.d_minus1p31, Floats.d_1p31), 0),
+		((Floats.d_minus0, 0), 1),
+		((Floats.d_nan, 0), 0)]);
+	T_dd_i(Opcode.F64_LE, [
+		((0, 0), 1),
+		((Floats.d_1p31, Floats.d_minus1p31), 0),
+		((Floats.d_minus1p31, Floats.d_1p31), 1),
+		((Floats.d_minus0, 0), 1),
+		((Floats.d_nan, 0), 0)]);
+	T_u_u(Opcode.I32_CLZ, [
+		(0, 32),
+		(0x8000, 16),
+		(0x80000000, 0),
+		(1, 31)]);
+	T_u_u(Opcode.I32_CTZ, [
+		(0, 32),
+		(0x8000, 15),
+		(0x80000000, 31),
+		(1, 0)]);
+	T_u_u(Opcode.I32_POPCNT, [
+		(0, 0),
+		(1, 1),
+		(0xF, 4),
+		(0xFFFFFFFF, 32)]);
+	T_ii_i(Opcode.I32_ADD, [
+		((4312, 9921), 14233),
+		((0xffff0000, 0x00010000), 0x00000000),
+		((0x0fff0000, 0x00010000), 0x10000000),
+		((0xffff0000, 0x0000ffff), 0xffffffff)]);
+	T_ii_i(Opcode.I32_SUB, [
+		((76324872, 7623891), 68700981),
+		((0, 1), 0xFFFFFFFF),
+		((444, 444), 0)]);
+	T_ii_i(Opcode.I32_MUL, [
+		((8122, 67), 544174),
+		((0xffff0000, 0), 0),
+		((0x87234878, 0x1124783), 0x80975D68)]);
+	T_ii_r(Opcode.I32_DIV_S, [
+		((99, 3), u_r(33)),
+		((99, -3), i_r(-33)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((i32.min, -1), Traps.result(TrapReason.DIV_UNREPRESENTABLE))]);
+	T_ii_r(Opcode.I32_DIV_U, [
+		((99, 3), u_r(33)),
+		((99, -3), u_r(0)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((0x80000000, 0xFFFFFFFF), u_r(0))]);
+	T_ii_r(Opcode.I32_REM_S, [
+		((99, 10), u_r(9)),
+		((107, -10), i_r(7)),
+		((-107, -10), i_r(-7)),
+		((-107, 10), i_r(-7)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((5559823, 1), u_r(0)),
+		((0x80000000, 0xFFFFFFFF), u_r(0))]);
+	T_ii_r(Opcode.I32_REM_U, [
+		((13338, 10), u_r(8)),
+		((99, -3), u_r(99)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((555, 1), u_r(0)),
+		((0x80000000, 0xFFFFFFFF), u_r(0x80000000))]);
+	T_uu_u(Opcode.I32_AND, [
+		((0xFFFFF000, 0x000FFFFF), 0x000FF000)]);
+	T_uu_u(Opcode.I32_OR, [
+		((0x0FFFF000, 0x000FFFFF), 0x0FFFFFFF)]);
+	T_uu_u(Opcode.I32_XOR, [
+		((0x0FFFF000, 0x000FFFFF), 0x0FF00FFF)]);
+	T_uu_u(Opcode.I32_SHL, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF000),
+		((0xFFFFFFFF, 31), 0x80000000),
+		((0x000FF000, 36), 0x00FF0000)]);
+	T_uu_u(Opcode.I32_SHR_S, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF000),
+		((0x0FFFFFFF, 27), 0x00000001),
+		((0xFFFFFF00, 4), 0xFFFFFFF0),
+		((0x000FF000, 36), 0x0000FF00)]);
+	T_uu_u(Opcode.I32_SHR_U, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF000),
+		((0xFFFFFFFF, 31), 0x00000001),
+		((0x000FF000, 36), 0x0000FF00)]);
+	T_uu_u(Opcode.I32_ROTL, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF000),
+		((0xABCD0123, 36), 0xBCD0123A)]);
+	T_uu_u(Opcode.I32_ROTR, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF000),
+		((0xABCD0123, 36), 0x3ABCD012)]);
+
+	T_w_w(Opcode.I64_CLZ, [
+		(0, 64),
+		(0x8000, 48),
+		(0x80000000, 32),
+		(0x8000000000000000, 0),
+		(1, 63)]);
+	T_w_w(Opcode.I64_CTZ, [
+		(0, 64),
+		(0x8000, 15),
+		(0x80000000, 31),
+		(0x8000000000000000, 63),
+		(1, 0)]);
+	T_w_w(Opcode.I64_POPCNT, [
+		(0, 0),
+		(1, 1),
+		(0xF, 4),
+		(0xF00000000F0, 8),
+		(0x3333333333333333, 32),
+		(0xFFFFFFFFFFFFFFFF, 64),
+		(0xFFFFFFFF, 32)]);
+	T_ww_w(Opcode.I64_ADD, [
+		((4312000111000, 9921111000111), 14233111111111),
+		((0xffff0000, 0x00010000), 0x100000000),
+		((0x0fff0000, 0x00010000), 0x10000000),
+		((0xffff0000, 0x0000ffff), 0xffffffff)]);
+	T_ll_l(Opcode.I64_SUB, [
+		((76324872010101, 7623891010101), 68700981000000),
+		((0, 1), -1),
+		((4449988776655, 4449988776655), 0)]);
+	T_ww_w(Opcode.I64_MUL, [
+		((8122000, 67000), 544174000000),
+		((0xffff0000, 0), 0),
+		((0x87234878, 0x1124783), 0x90C98380975D68)]);
+	T_ll_r(Opcode.I64_DIV_S, [
+		((99, 3), w_r(33)),
+		((99, -3), l_r(-33)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((i64.min, -1), Traps.result(TrapReason.DIV_UNREPRESENTABLE))]);
+	T_ll_r(Opcode.I64_DIV_U, [
+		((99, 3), w_r(33)),
+		((99, -3), w_r(0)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((i64.min, -1), w_r(0))]);
+	T_ll_r(Opcode.I64_REM_S, [
+		((99, 10), w_r(9)),
+		((107, -10), l_r(7)),
+		((-107, -10), l_r(-7)),
+		((-107, 10), l_r(-7)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((5559823, 1), w_r(0)),
+		((i64.min, -1), w_r(0))]);
+	T_ll_r(Opcode.I64_REM_U, [
+		((13338, 10), w_r(8)),
+		((99, -3), w_r(99)),
+		((1, 0), Traps.result(TrapReason.DIV_BY_ZERO)),
+		((555, 1), w_r(0)),
+		((Floats.f_minus0, -1), w_r(Floats.f_minus0))]);
+	T_ww_w(Opcode.I64_AND, [
+		((0xFFFFFFFFFF00FF00, 0xFF00FF00FFFFFFFF), 0xFF00FF00FF00FF00)]);
+	T_ww_w(Opcode.I64_OR, [
+		((0x0FFFFFFFF0000000, 0x0000000FFFFFFFFF), 0x0FFFFFFFFFFFFFFF)]);
+	T_ww_w(Opcode.I64_XOR, [
+		((0xFFFFFFFFFF00FF00, 0xFF00FF00FFFFFFFF), 0x00FF00FF00FF00FF)]);
+	T_ww_w(Opcode.I64_SHL, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 64), 0x000FF000),
+		((0x000FF000, 32), 0x000FF00000000000),
+		((0xFFFFFFFF, 31), 0x7FFFFFFF80000000),
+		((0x000FF000, 68), 0x00FF0000),
+		((0x000FF000, 36), 0x00FF000000000000)]);
+	T_ww_w(Opcode.I64_SHR_S, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 64), 0x000FF000),
+		((0x000FF00000000000, 32), 0x000FF000),
+		((0x0FFFFFFF, 27), 0x00000001),
+		((0xFFFFFFFFFFFFFF00, 4), 0xFFFFFFFFFFFFFFF0),
+		((0x000FF000, 68), 0x0000FF00)]);
+	T_ww_w(Opcode.I64_SHR_U, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF00011223344, 32), 0x000FF000),
+		((0x000FF000, 64), 0x000FF000),
+		((0xFFFFFFFFFFFFFFFF, 63), 0x00000001),
+		((0x000FF000, 68), 0x0000FF00)]);
+	T_ww_w(Opcode.I64_ROTL, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF00000000000, 32), 0x000FF000),
+		((0x000FF000, 64), 0x000FF000),
+		((0x0123456789ABCDEF, 68), 0x123456789ABCDEF0)]);
+	T_ww_w(Opcode.I64_ROTR, [
+		((0x000FF000, 0), 0x000FF000),
+		((0x000FF000, 32), 0x000FF00000000000),
+		((0x000FF000, 64), 0x000FF000),
+		((0x0123456789ABCDEF, 68), 0xF0123456789ABCDE)]);
+	T_f_f(Opcode.F32_ABS, [
+		(0xc0b00000, 0x40b00000),
+		(0x55555555, 0x55555555),
+		(0, 0)]);
+	T_f_f(Opcode.F32_NEG, [
+		(0xc0b00000, 0x40b00000),
+		(0x55555555, 0xd5555555),
+		(0x80000000, 0)]);
+	T_ff_f(Opcode.F32_ADD, [ // TODO: -0 and NaN cases for all floats
+		((0x40b00000, 0xc0600000), 0x40000000),
+		((0, 0), 0)]);
+	T_ff_f(Opcode.F32_SUB, [
+		((0x40b00000, 0xc0600000), 0x41100000),
+		((0, 0), 0)]);
+	T_ff_f(Opcode.F32_MUL, [
+		((0x40b00000, 0xc0600000), 0xc19a0000),
+		((0, 0), 0)]);
+	T_ff_f(Opcode.F32_DIV, [
+		((0x40b00000, 0xc0600000), 0xBFC92492),
+		((0x4080000, 0), 0x7f800000)]);
+	T_ff_f(Opcode.F32_MIN, [
+		((0, Floats.f_1p31), 0),
+		((Floats.f_1p31, 0), 0),
+		((Floats.f_minus1p31, Floats.f_1p31), Floats.f_minus1p31),
+		((0, Floats.f_minus0), Floats.f_minus0),
+		((Floats.f_minus0, 0), Floats.f_minus0),
+		((0x42280000, Floats.f_nan), Floats.f_nan),
+		((Floats.f_nan, 0x42280000), Floats.f_nan)]);
+	T_ff_f(Opcode.F32_MAX, [
+		((0, Floats.f_1p31), Floats.f_1p31),
+		((Floats.f_1p31, 0), Floats.f_1p31),
+		((Floats.f_minus1p31, Floats.f_1p31), Floats.f_1p31),
+		((0, Floats.f_minus0), 0),
+		((Floats.f_minus0, 0), 0),
+		((0x42280000, Floats.f_nan), Floats.f_nan),
+		((Floats.f_nan, 0x42280000), Floats.f_nan)]);
+	T_f_f(Opcode.F32_CEIL, [
+		(0x3fc00000, 0x40000000),
+		(0x3fd9999a, 0x40000000),
+		(0xbfd9999a, 0xbf800000),
+		(0xbfc00000, 0xbf800000)]);
+	T_f_f(Opcode.F32_FLOOR, [
+		(0x3fc00000, 0x3f800000),
+		(0x3fd9999a, 0x3f800000),
+		(0xbfd9999a, 0xC0000000),
+		(0xbfc00000, 0xC0000000)]);
+	T_f_f(Opcode.F32_TRUNC, [
+		(0x3fc00000, 0x3f800000),
+		(0x3fd9999a, 0x3f800000),
+		(0xbfd9999a, 0xbf800000),
+		(0xbfc00000, 0xbf800000)]);
+	T_f_f(Opcode.F32_NEAREST, [
+		(0, 0),
+		(0x3fa66666, 0x3f800000),
+		(0xbfd9999a, 0xc0000000)]);
+	T_f_f(Opcode.F32_SQRT, [
+		(0, 0),
+		(0x40800000, 0x40000000)]);
+	T_ff_f(Opcode.F32_COPYSIGN, [
+		((u32.max, 0), 0x7fffffff),
+		((0x87654321, 0x06666666), 0x07654321),
+		((0x07654321, 0xA6666666), 0x87654321)]);
+	T_d_d(Opcode.F64_ABS, [
+		(0xc0b0000012345678, 0x40b0000012345678),
+		(0x5555555598765432, 0x5555555598765432),
+		(0, 0)]);
+	T_d_d(Opcode.F64_NEG, [
+		(0xc0b00000aabbccdd, 0x40b00000aabbccdd),
+		(0x55555555eeff2233, 0xd5555555eeff2233),
+		(0x8000000000000000, 0)]);
+	T_dd_d(Opcode.F64_ADD, [ // TODO: -0 and NaN cases for all floats
+		((0x401a000000000000, 0x4026800000000000), 0x4031c00000000000),
+		((0, 0), 0)]);
+	T_dd_d(Opcode.F64_SUB, [
+		((0x401a000000000000, 0x4026800000000000), 0xc013000000000000),
+		((0, 0), 0)]);
+	T_dd_d(Opcode.F64_MUL, [
+		((0x401a000000000000, 0x4026800000000000), 0x4052480000000000),
+		((0, 0), 0)]);
+	T_dd_d(Opcode.F64_DIV, [
+		((0x401a000000000000, 0x4026800000000000), 0x3FE27D27D27D27D2),
+		((0x401a000000000000, 0), 0x7ff0000000000000)]);
+	T_dd_d(Opcode.F64_MIN, [
+		((0, Floats.d_1p31), 0),
+		((Floats.d_1p31, 0), 0),
+		((Floats.d_minus1p31, Floats.d_1p31), Floats.d_minus1p31),
+		((0, Floats.d_minus0), Floats.d_minus0),
+		((Floats.d_minus0, 0), Floats.d_minus0),
+		((0x42280000, Floats.d_nan), Floats.d_nan),
+		((Floats.d_nan, 0x42280000), Floats.d_nan)]);
+	T_dd_d(Opcode.F64_MAX, [
+		((0, Floats.d_1p31), Floats.d_1p31),
+		((Floats.d_1p31, 0), Floats.d_1p31),
+		((Floats.d_minus1p31, Floats.d_1p31), Floats.d_1p31),
+		((0, Floats.d_minus0), 0),
+		((Floats.d_minus0, 0), 0),
+		((0x42280000, Floats.d_nan), Floats.d_nan),
+		((Floats.d_nan, 0x42280000), Floats.d_nan)]);
+	T_d_d(Opcode.F64_CEIL, [
+		(0x3ff8000000000000, 0x4000000000000000),
+		(0xbffb333333333333, 0xbff0000000000000),
+		(0xbff8000000000000, 0xbff0000000000000),
+		(0x3ffb333333333333, 0x4000000000000000)]);
+	T_d_d(Opcode.F64_FLOOR, [
+		(0x3ff8000000000000, 0x3ff0000000000000),
+		(0xbffb333333333333, 0xC000000000000000),
+		(0xbff8000000000000, 0xC000000000000000),
+		(0x3ffb333333333333, 0x3ff0000000000000)]);
+	T_d_d(Opcode.F64_TRUNC, [
+		(0x3ff8000000000000, 0x3ff0000000000000),
+		(0xbffb333333333333, 0xbff0000000000000),
+		(0xbff8000000000000, 0xbff0000000000000),
+		(0x3ffb333333333333, 0x3ff0000000000000)]);
+	T_d_d(Opcode.F64_NEAREST, [
+		(0, 0),
+		(0xc058c010624dd2f2, 0xc058c00000000000),
+		(0x40968f8f5c28f5c3, 0x4096900000000000)]);
+	T_d_d(Opcode.F64_SQRT, [
+		(0, 0),
+		(0x4022000000000000, 0x4008000000000000)]);
+	T_dd_d(Opcode.F64_COPYSIGN, [
+		((u64.max, 0), 0x7fffffffFFFFffff),
+		((0x8765432199887766, 0x0666666677778888), 0x0765432199887766),
+		((0x0765432199887766, 0xA666666677778888), 0x8765432199887766)]);
+	T_w_u(Opcode.I32_WRAP_I64, [
+		(1, 1),
+		(0xFACEDEAD, 0xFACEDEAD),
+		(0x17ACEDEAD, 0x7ACEDEAD),
+		(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF),
+		(99889988, 99889988)]);
+	T_f_r(Opcode.I32_TRUNC_F32_S, [
+		(0, u_r(0)),
+		(0x449c8000, i_r(1252)),
+		(Floats.f_minus1p31, i_r(i32.min)),
+		(Floats.f_1p31, R_FUNREP),
+		(Floats.f_1p32, R_FUNREP)]);
+	T_f_r(Opcode.I32_TRUNC_F32_U, [
+		(0, u_r(0)),
+		(Floats.f_minus0, u_r(0)),
+		(0x80000001, u_r(0)),
+		(0x449c8000, i_r(1252)),
+		(Floats.f_minus1p31, R_FUNREP),
+		(Floats.f_1p31, i_r(1 << 31)),
+		(Floats.f_1p32, R_FUNREP)]);
+	T_d_r(Opcode.I32_TRUNC_F64_S, [
+		(0, u_r(0)),
+		(0x4093900000000000, i_r(1252)),
+		(Floats.d_minus1p31, i_r(i32.min)),
+		(Floats.d_1p31, R_FUNREP),
+		(Floats.d_1p32, R_FUNREP)]);
+	T_d_r(Opcode.I32_TRUNC_F64_U, [
+		(0, u_r(0)),
+		(0x4093900000000000, i_r(1252)),
+		(Floats.d_minus1p31, R_FUNREP),
+		(Floats.d_1p31, i_r(1 << 31)),
+		(Floats.d_1p32, R_FUNREP)]);
+	T_f_r(Opcode.I64_TRUNC_F32_S, [
+		(0, l_r(0)),
+		(0x449c8000, l_r(1252)),
+		(Floats.f_minus1p31, l_r(i32.min)),
+		(Floats.f_minus1p32, l_r(i33.min)),
+		(Floats.f_minus1p33, l_r(i34.min)),
+		(Floats.f_1p31, l_r(1L << 31)),
+		(Floats.f_1p32, l_r(1L << 32)),
+		(Floats.f_1p33, l_r(1L << 33)),
+		(Floats.f_1p63, R_FUNREP),
+		(Floats.f_1p64, R_FUNREP)]);
+	T_f_r(Opcode.I64_TRUNC_F32_U, [
+		(0, l_r(0)),
+		(0x449c8000, l_r(1252)),
+		(Floats.f_minus1p31, R_FUNREP),
+		(Floats.f_minus1p32, R_FUNREP),
+		(Floats.f_minus1p33, R_FUNREP),
+		(Floats.f_1p31, l_r(1L << 31)),
+		(Floats.f_1p32, l_r(1L << 32)),
+		(Floats.f_1p33, l_r(1L << 33)),
+		(Floats.f_1p63, l_r(1L << 63)),
+		(Floats.f_1p64, R_FUNREP)]);
+	T_d_r(Opcode.I64_TRUNC_F64_S, [
+		(0, l_r(0)),
+		(0x4093900000000000, l_r(1252)),
+		(Floats.d_minus1p31, l_r(i32.min)),
+		(Floats.d_minus1p32, l_r(i33.min)),
+		(Floats.d_minus1p33, l_r(i34.min)),
+		(Floats.d_1p31, l_r(1L << 31)),
+		(Floats.d_1p32, l_r(1L << 32)),
+		(Floats.d_1p33, l_r(1L << 33)),
+		(Floats.d_1p63, R_FUNREP),
+		(Floats.d_1p64, R_FUNREP)]);
+	T_d_r(Opcode.I64_TRUNC_F64_U, [
+		(0, l_r(0)),
+		(0x4093900000000000, l_r(1252)),
+		(Floats.d_minus1p31, R_FUNREP),
+		(Floats.d_minus1p32, R_FUNREP),
+		(Floats.d_minus1p33, R_FUNREP),
+		(Floats.d_1p31, l_r(1L << 31)),
+		(Floats.d_1p32, l_r(1L << 32)),
+		(Floats.d_1p33, l_r(1L << 33)),
+		(Floats.d_1p63, l_r(1L << 63)),
+		(Floats.d_1p64, R_FUNREP)]);
+	T_u_w(Opcode.I64_EXTEND_I32_U, [
+		(1, 1),
+		(0xFACEDEAD, 0xFACEDEAD),
+		(0x7ACEDEAD, 0x7ACEDEAD),
+		(0xFFFFFFFF, 0xFFFFFFFF),
+		(99889988, 99889988)]);
+	T_u_w(Opcode.I64_EXTEND_I32_S, [
+		(1, 1),
+		(0xFACEDEAD, 0xFFFFFFFFFACEDEAD),
+		(0x7ACEDEAD, 0x7ACEDEAD),
+		(0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+		(99889988, 99889988)]);
+	T_i_f(Opcode.F32_CONVERT_I32_S, [
+		(46, 0x42380000),
+		(-469999999, 0xcde01d0c),
+		(-2147483000, 0xcefffffb),
+		(2147483001, 0x4efffffb)]);
+	T_i_f(Opcode.F32_CONVERT_I32_U, [
+		(i32.view(2147483648u), 0x4f000000),
+		(i32.view(3000000000u), 0x4f32d05e)]);
+	T_l_f(Opcode.F32_CONVERT_I64_S, [
+		(-6000, 0xc5bb8000),
+		(-2147483648, Floats.f_minus1p31),
+		(9223372036854775802, Floats.f_1p63)]);
+	T_l_f(Opcode.F32_CONVERT_I64_U, [
+		(0, 0),
+		(u31.max, Floats.f_1p31),
+		(u32.max, Floats.f_1p32),
+		(u33.max, Floats.f_1p33),
+		(u63.max, Floats.f_1p63),
+		(-1, Floats.f_1p64)]);
+	T_d_f(Opcode.F32_DEMOTE_F64, [
+		(Floats.d_infinity, Floats.f_infinity),
+		(Floats.d_nan, Floats.f_nan), // nan
+		(0x8000000000000000, 0x80000000), // -0
+		(0x4018000000000000, 0x40c00000)]);
+	T_i_d(Opcode.F64_CONVERT_I32_S, [
+		(47, 0x4047800000000000),
+		(-469999999, 0xc1bc03a17f000000),
+		(-2147483000, 0xc1dfffff5e000000),
+		(2147483001, 0x41dfffff5e400000)]);
+	T_i_d(Opcode.F64_CONVERT_I32_U, [
+		(i32.view(2147483648u), Floats.d_1p31),
+		(i32.view(3000000000u), 0x41e65a0bc0000000)]);
+	T_l_d(Opcode.F64_CONVERT_I64_S, [
+		(-6000, 0xc0b7700000000000),
+		(-2147483648, 0xc1e0000000000000),
+		(9223372036854775802, Floats.d_1p63)]);
+	T_l_d(Opcode.F64_CONVERT_I64_U, [
+		(0, 0),
+		(1L << 31, Floats.d_1p31),
+		(1L << 32, Floats.d_1p32),
+		(1L << 33, Floats.d_1p33),
+		(1L << 63, Floats.d_1p63),
+		(-1, Floats.d_1p64)]);
+	T_f_d(Opcode.F64_PROMOTE_F32, [
+		(Floats.f_infinity, Floats.d_infinity), // infinity
+		(Floats.f_nan, Floats.d_nan), // nan
+		(0x80000000, 0x8000000000000000), // -0
+		(0x40c00000, 0x4018000000000000)]);
+	T_f_i(Opcode.I32_REINTERPRET_F32, [
+		(0, 0),
+		(0xF0000000, 0xF0000000),
+		(0x10123467, 0x10123467)]);
+	T_d_l(Opcode.I64_REINTERPRET_F64, [
+		(0, 0),
+		(0xFBAC_DE01_2345_6781, 0xFBAC_DE01_2345_6781)
+		]);
+	T_i_f(Opcode.F32_REINTERPRET_I32, [
+		(0, 0),
+		(0xF0000000, 0xF0000000),
+		(0x10123467, 0x10123467)]);
+	T_l_d(Opcode.F64_REINTERPRET_I64, [
+		(0, 0),
+		(0xFBAC_DE01_2345_6781, 0xFBAC_DE01_2345_6781)
+		]);
+	T_i_i(Opcode.I32_EXTEND8_S, [
+		(0, 0),
+		(127, 127),
+		(0x80, 0xFFFF_FF80),
+		(0xaaaa10BD, 0xFFFF_FFBD)]);
+	T_i_i(Opcode.I32_EXTEND16_S, [
+		(0, 0),
+		(127, 127),
+		(0x80, 0x80),
+		(0xaa10_BD01, 0xFFFF_BD01)]);
+	T_l_l(Opcode.I64_EXTEND8_S, [
+		(0, 0),
+		(127, 127),
+		(0x80, 0xFFFF_FFFF_FFFF_FF80L),
+		(0xaaaa10BD, 0xFFFF_FFFF_FFFF_FFBDL),
+		(0x1111_3333_aaaa_10BD, 0xFFFF_FFFF_FFFF_FFBDL)]);
+	T_l_l(Opcode.I64_EXTEND16_S, [
+		(0, 0),
+		(127, 127),
+		(0x80, 0x80),
+		(0xaa10_BD01, 0xFFFF_FFFF_FFFF_BD01L),
+		(0x2222_4444_aa10_BD02, 0xFFFF_FFFF_FFFF_BD02L)]);
+	T_l_l(Opcode.I64_EXTEND32_S, [
+		(1, 1),
+		(0xFACEDEAD, 0xFFFFFFFFFACEDEAD),
+		(0x7ACEDEAD, 0x7ACEDEAD),
+		(0xFFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
+		(0x12345678_87654321L, 0xFFFFFFFF_87654321),
+		(99889988, 99889988)]);
+	T_f_i(Opcode.I32_TRUNC_SAT_F32_S, [
+		(0, 0),
+		(Floats.f_1p31, i32.max),
+		(Floats.f_nan, 0),
+		(Floats.f_minus1p31, i32.min),
+		(0xcf32d05e, i32.min)]);
+	T_f_i(Opcode.I32_TRUNC_SAT_F32_U, [
+		(0, 0),
+		(Floats.f_1p31, 1 << 31),
+		(Floats.f_1p32, -1),
+		(Floats.f_nan, 0),
+		(Floats.f_minus1p31, 0),
+		(0xcf32d05e, 0)]);
+	T_d_i(Opcode.I32_TRUNC_SAT_F64_S, [
+		(0, 0),
+		(Floats.d_1p32, i32.max),
+		(0x41f8000000000000, i32.max),
+		(Floats.d_nan, 0),
+		(0xc1e65a0bc0000000, i32.min)]);
+	T_d_i(Opcode.I32_TRUNC_SAT_F64_U, [
+		(0, 0),
+		(Floats.d_1p31, 1 << 31),
+		(Floats.d_1p32, -1),
+		(0x41f8000000000000, -1),
+		(Floats.d_nan, 0),
+		(0xc1e65a0bc0000000, 0)]);
+	T_f_l(Opcode.I64_TRUNC_SAT_F32_S, [
+		(0, 0),
+		(Floats.f_1p31, 1L << 31),
+		(Floats.f_1p32, 1L << 32),
+		(Floats.f_1p63, long.max),
+		(Floats.f_1p64, long.max),
+		(Floats.f_nan, 0),
+		(Floats.f_minus1p63, long.min),
+		(0xdf123456, long.min)]);
+	T_f_l(Opcode.I64_TRUNC_SAT_F32_U, [
+		(0, 0),
+		(Floats.f_1p31, 1L << 31),
+		(Floats.f_1p32, 1L << 32),
+		(Floats.f_1p63, 1L << 63),
+		(Floats.f_1p64, -1L),
+		(Floats.f_nan, 0),
+		(Floats.f_minus1p63, 0),
+		(0xdf123456, 0)]);
+	T_d_l(Opcode.I64_TRUNC_SAT_F64_S, [
+		(0, 0),
+		(Floats.d_1p31, 1L << 31),
+		(Floats.d_1p32, 1L << 32),
+		(Floats.d_1p63, long.max),
+		(Floats.d_1p64, long.max),
+		(Floats.d_nan, 0),
+		(Floats.d_minus1p63, long.min),
+		(0xc3e0010020030000, long.min)]);
+	T_d_l(Opcode.I64_TRUNC_SAT_F64_U, [
+		(0, 0),
+		(Floats.d_1p31, 1L << 31),
+		(Floats.d_1p32, 1L << 32),
+		(Floats.d_1p63, 1L << 63),
+		(Floats.d_1p64, -1),
+		(Floats.d_nan, 0),
+		(Floats.d_minus1p63, 0),
+		(0xc3e0010020030000, 0)]);
+}
