@@ -1,0 +1,13 @@
+(module
+  (memory 1)
+  (func (export "main") (param i32) (result i32)
+    (i32.load offset=32 (local.get 0))
+  )
+)
+(assert_return (invoke "main" (i32.const 0)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 1)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 100)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 1024)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 65500)) (i32.const 0))
+(assert_trap (invoke "main" (i32.const 65530)) "")
+(assert_trap (invoke "main" (i32.const 65532)) "")

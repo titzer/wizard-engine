@@ -1,0 +1,10 @@
+(module
+  (func (export "main") (param i32 i32) (result i32)
+    (i32.div_s (local.get 0) (local.get 1))
+  )
+)
+(assert_return (invoke "main" (i32.const 5555) (i32.const 1111)) (i32.const 5))
+(assert_return (invoke "main" (i32.const -77777777) (i32.const 11111111)) (i32.const -7))
+(assert_return (invoke "main" (i32.const -77777777) (i32.const 11111)) (i32.const -7000))
+(assert_trap (invoke "main" (i32.const -2147483648) (i32.const -1)) "")
+(assert_trap (invoke "main" (i32.const 333) (i32.const 0)) "")

@@ -1,0 +1,17 @@
+(module
+  (func $id (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32) (local.get 3))
+  (func (export "main") (param i32) (result i32)
+    (call $id
+      (i32.const 122)
+      (i32.const 223)
+      (i32.const 3424)
+      (local.get 0)
+      (i32.const 5525)
+      (i32.const 6626)
+      (i32.const 777727)
+      (i32.const 99928)
+    )
+  )
+)
+(assert_return (invoke "main" (i32.const 7678)) (i32.const 7678))
+(assert_return (invoke "main" (i32.const -999333)) (i32.const -999333))

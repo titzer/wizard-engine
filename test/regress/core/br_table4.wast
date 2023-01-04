@@ -1,0 +1,43 @@
+(module
+  (func (export "main") (param i32) (result i32)
+    (block
+    (block
+    (block
+    (block
+    (block
+    (block
+      (br_table 0 1 2 3 4 5 5 4 3 2 1 0 0 0 1 1 2 2 (local.get 0)
+    ) (return (i32.const 44))
+    ) (return (i32.const 45))
+    ) (return (i32.const 46))
+    ) (return (i32.const 47))
+    ) (return (i32.const 48))
+    ) (return (i32.const 49))
+  )
+  (i32.const 56)
+  )
+)
+(assert_return (invoke "main" (i32.const 0)) (i32.const 45))
+(assert_return (invoke "main" (i32.const 1)) (i32.const 46))
+(assert_return (invoke "main" (i32.const 2)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 3)) (i32.const 48))
+(assert_return (invoke "main" (i32.const 4)) (i32.const 49))
+(assert_return (invoke "main" (i32.const 5)) (i32.const 56))
+(assert_return (invoke "main" (i32.const 6)) (i32.const 56))
+(assert_return (invoke "main" (i32.const 7)) (i32.const 49))
+(assert_return (invoke "main" (i32.const 8)) (i32.const 48))
+(assert_return (invoke "main" (i32.const 9)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 10)) (i32.const 46))
+(assert_return (invoke "main" (i32.const 11)) (i32.const 45))
+(assert_return (invoke "main" (i32.const 12)) (i32.const 45))
+(assert_return (invoke "main" (i32.const 13)) (i32.const 45))
+(assert_return (invoke "main" (i32.const 14)) (i32.const 46))
+(assert_return (invoke "main" (i32.const 15)) (i32.const 46))
+(assert_return (invoke "main" (i32.const 16)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 17)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 18)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 19)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 20)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 21)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 22)) (i32.const 47))
+(assert_return (invoke "main" (i32.const 23)) (i32.const 47))

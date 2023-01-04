@@ -1,0 +1,11 @@
+(module
+  (func (export "main") (param i32) (result i32)
+	(i32.const 46)
+	(br_if 0 (local.get 0))
+	(drop)
+	(i32.const 57)
+  )
+)
+(assert_return (invoke "main" (i32.const 0)) (i32.const 57))
+(assert_return (invoke "main" (i32.const 1)) (i32.const 46))
+(assert_return (invoke "main" (i32.const 87234)) (i32.const 46))
