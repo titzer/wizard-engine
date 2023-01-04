@@ -12,7 +12,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 make_binary unittest || exit $?
 
-CMD="$BINARY -expected=$WIZENG_LOC/test/unittest.failures -expected=$WIZENG_LOC/test/unittest.failures.${TEST_TARGET}"
+CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_LOC/test/unittest.failures -expected=$WIZENG_LOC/test/unittest.failures.${TEST_TARGET}"
 
 print_testing
 # run unittests and pipe through progress program
