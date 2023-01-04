@@ -60,6 +60,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	var success = true;
 	var unwind_label: MasmLabel;
 	var last_probe = 0;
+	var skip_to_end: bool;
 
 	new() {
 		masm.unimplemented = unsupported;
@@ -95,8 +96,24 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			it.dispatch(this);
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
+			if (skip_to_end) doSkipToEndOfBlock();
 		}
 		return success;
+	}
+	def doSkipToEndOfBlock() {
+		skip_to_end = false;
+		var height = 0;
+		while (it.more() && success) {
+			var opcode = it.current();
+			match (opcode) {
+				BLOCK, LOOP, TRY, IF => height++;
+				ELSE, CATCH, CATCH_ALL => if (height == 0) return;
+				END, DELEGATE => if (height-- == 0) return;
+				_ => ;
+			}
+			if (Trace.compiler) traceOpcodeUnreachable();
+			it.next();
+		}
 	}
 	def checkRegAlloc() {
 		if (Trace.compiler) {
@@ -190,7 +207,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def visit_UNREACHABLE() {
 		emitTrap(TrapReason.UNREACHABLE);
-		state.setUnreachable();
+		setUnreachable();
 	}
 	def visit_NOP() {
 		// emit nothing
@@ -256,7 +273,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var target = state.getControl(depth);
 		state.emitTransfer(target, emitSlotTransfer);
 		masm.emit_br(target.label);
-		state.setUnreachable();
+		setUnreachable();
 	}
 	def visit_BR_IF(depth: u31) {
 		var target = state.getControl(depth);
@@ -276,13 +293,13 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_BR_TABLE(depths: Range<u31>) {
 		var sv = state.pop();
 		emitBrTable(sv, depths);
-		state.setUnreachable();
+		setUnreachable();
 	}
 	def visit_RETURN() {
 		var target = state.ctl_stack.elems[0];
 		state.emitTransfer(target, emitSlotTransfer);
 		masm.emit_br(target.label);
-		state.setUnreachable();
+		setUnreachable();
 	}
 	def visit_CALL(index: u31) {
 		var func = module.functions[index];
@@ -371,7 +388,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var sv = state.pop();
 		if (sv.isConst() && sv.const == 0) {
 			emitTrap(TrapReason.NULL_DEREF);
-			state.setUnreachable();
+			setUnreachable();
 			return;
 		}
 		ensure_reg(sv, state.sp, regs.func_arg);
@@ -1006,8 +1023,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
 			if (sum > u32.max) {
 				masm.emit_br(masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS)); // statically OOB
-				state.setUnreachable();
-				state.push(SpcConsts.kindToFlags(kind), NO_REG, 0);
+				setUnreachable();
 				return;
 			}
 			offset = u32.view(sum);
@@ -1033,7 +1049,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
 			if (sum > u32.max) {
 				masm.emit_br(masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS)); // statically OOB
-				state.setUnreachable();
+				setUnreachable();
 				return;
 			}
 			offset = u32.view(sum);
@@ -1111,12 +1127,24 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_s_r(u32.!(slot), reg, sv.kind());
 		state.state[slot] = SpcAbstractVal(sv.kindFlagsAndTag(IS_STORED), NO_REG, sv.const);
 	}
+	def setUnreachable() {
+		skip_to_end = true;
+		state.setUnreachable();
+	}
 	def traceOpcodeAndStack() {
 		OUT.out(Trace.STDOUT);
 		OUT.put2("  %x(+%d): ", it.pc, it.pc - start_pos);
 		it.trace(OUT, module, instrTracer);
 		while (OUT.length < 32) OUT.puts(" ");
 		traceStack();
+	}
+	def traceOpcodeUnreachable() {
+		OUT.out(Trace.STDOUT);
+		OUT.put2("  %x(+%d): ", it.pc, it.pc - start_pos);
+		it.trace(OUT, module, instrTracer);
+		while (OUT.length < 32) OUT.puts(" ");
+		OUT.puts("...");
+		OUT.outln();
 	}
 	def traceStack() {
 		OUT.put1("sp=%d |", state.sp);
@@ -1353,6 +1381,13 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 		if (ctl.merge_count > 0) {
 			var max = ctl.val_stack_top + u32.view(ctl.results.length);
 			resetTo(max, ctl.merge_state);
+		} else {
+			// merge not reached; push "bottom" value for all results
+			sp = ctl.val_stack_top;
+			for (r in ctl.results) {
+				push(typeToKindFlags(r) | IS_STORED | TAG_STORED | IS_CONST, NO_REG, 0);
+			}
+			
 		}
 	}
 	def isTransferEmpty(target: SpcControl) -> bool {
