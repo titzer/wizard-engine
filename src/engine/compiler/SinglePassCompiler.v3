@@ -966,7 +966,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def ensure_reg(sv: SpcAbstractVal, slot: u32, reg: Reg) -> Reg {
 		if (!sv.inReg()) {
 			if (reg == NO_REG) reg = allocReg(sv.kind()).reg;
-			if (sv.isConst()) masm.emit_mov_r_i(reg, sv.const);
+			if (sv.isConst()) masm.emit_mov_r_k(reg, sv.kind(), sv.const);
 			else masm.emit_mov_r_s(reg, sv.kind(), slot);
 			return reg;
 		}
@@ -1489,12 +1489,17 @@ component Fold_ii_i {
 }
 
 // Collects the parallel moves and orders them properly.
+// Reused repeatedly by the compiler, so nodes are recycled internally.
 class SpcMoveResolver(masm: MacroAssembler) {
 	private var moves = Array<MoveNode>.new(16);
 	private var numMoves = 0;
 	private def constRegMoves = Vector<(ValueKind, int, Reg)>.new();
 	private def constSlotMoves = Vector<(ValueKind, int, u32)>.new();
 
+	// Add a move or moves to the collection of parallel moves to transfer the
+	// abstract value in one slot to another. The abstract value may be a constant,
+	// in a register, or in a slot.
+	// Generates a value tag store if necessary.
 	def addMove(to: (u32, SpcAbstractVal), from: (u32, SpcAbstractVal)) {
 		if (Trace.compiler) {
 			OUT.put1("    addMove slot=%d ", to.0);
@@ -1504,7 +1509,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 			OUT.outln();
 		}
 		var tv = to.1, fv = from.1;
-		if (masm.valuerep.tagged && tv.tagStored()) {
+		if (masm.valuerep.tagged && tv.tagStored()) { // XXX: move tag store operation into state?
 			if (from.0 != to.0 || !fv.tagStored()) {
 				// store the tag into to-slot
 				masm.emit_mov_m_i(masm.tagAddr(to.0), fv.kind().code);
@@ -1515,23 +1520,24 @@ class SpcMoveResolver(masm: MacroAssembler) {
 			if (tv.inReg()) constRegMoves.put(fv.kind(), fv.const, tv.reg);
 			return;
 		}
-		var kind = tv.kind();
+		var kind = fv.kind();
 		if (tv.isStored()) {
 			// store the value into slot
 			if (from.0 != to.0 || !fv.isStored()) {
-				if (fv.inReg()) mov(s(kind, to.0), r(kind, fv.reg));
-				else mov(s(kind, to.0), s(kind, from.0));
+				if (fv.inReg()) mov(kind, s(to.0), r(fv.reg));
+				else mov(kind, s(to.0), s(from.0));
 			}
 		}
 		if (tv.inReg()) {
 			// load or move the value into appropriate register
 			if (fv.inReg()) {
-				if (tv.reg != fv.reg) mov(r(kind, tv.reg), r(kind, fv.reg));
+				if (tv.reg != fv.reg) mov(kind, r(tv.reg), r(fv.reg));
 			} else {
-				mov(r(kind, tv.reg), s(kind, from.0));
+				mov(kind, r(tv.reg), s(from.0));
 			}
 		}
 	}
+	// Order and emit the moves to the macro assembler.
 	def emitMoves() {
 		for (i < numMoves) {
 			var m = moves[i];
@@ -1541,7 +1547,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 		
 		for (i < constRegMoves.length) {
 			var m = constRegMoves[i];
-			masm.emit_mov_r_i(m.2, m.1);
+			masm.emit_mov_r_k(m.2, m.0, m.1);
 		}
 		constRegMoves.resize(0);
 		for (i < constSlotMoves.length) {
@@ -1551,40 +1557,41 @@ class SpcMoveResolver(masm: MacroAssembler) {
 		constSlotMoves.resize(0);
 		constRegMoves.resize(0);
 	}
-	private def mov(dst: MoveNode, src: MoveNode) {
+	private def mov(kind: ValueKind, dst: MoveNode, src: MoveNode) {
+		dst.kind = kind;
 		dst.dstNext = src.dstList;
 		src.dstList = dst;
 		dst.src = src;
 	}
-	private def s(kind: ValueKind, slot: u32) -> MoveNode {
-		for (i < numMoves) {
+	private def s(slot: u32) -> MoveNode {
+		for (i < numMoves) { // XXX: avoid linear search for matching MoveNode
 			var m = moves[i];
-			if (m.slot == slot && m.reg == NO_REG) return m; // XXX: check kind
+			if (m.slot == slot && m.reg == NO_REG) return m;
 		}
-		var m = allocMove(kind);
+		var m = allocMove();
 		m.slot = slot;
 		m.reg = NO_REG;
 		return m;
 	}
-	private def r(kind: ValueKind, reg: Reg) -> MoveNode {
-		for (i < numMoves) {
+	private def r(reg: Reg) -> MoveNode {
+		for (i < numMoves) { // XXX: avoid linear search for matching MoveNode
 			var m = moves[i];
-			if (m.reg == reg) return m; // XXX: check kind
+			if (m.reg == reg) return m;
 		}
-		var m = allocMove(kind);
+		var m = allocMove();
 		m.slot = 0;
 		m.reg = reg;
 		return m;
 	}
-	private def allocMove(kind: ValueKind) -> MoveNode {
+	private def allocMove() -> MoveNode {
 		if (numMoves >= moves.length) moves = Arrays.grow(moves, moves.length * 2);
 		var m = moves[numMoves++];
 		if (m == null) {
 			m = moves[numMoves - 1] = MoveNode.new();
-			m.kind = kind;
+			m.kind = ValueKind.ABS;
 			return m;
 		}
-		m.kind = kind;
+		m.kind = ValueKind.ABS;
 		m.src = null;
 		m.dstList = null;
 		m.dstNext = null;
@@ -1617,22 +1624,37 @@ class SpcMoveResolver(masm: MacroAssembler) {
 	}
 	private def emitMove(dst: MoveNode, src: MoveNode) {
 		if (dst.reg == NO_REG) {
-			if (src.reg == NO_REG) masm.emit_mov_s_s(dst.slot, src.slot, dst.kind);
-			else masm.emit_mov_s_r(dst.slot, src.reg, dst.kind);
+			if (src.reg == NO_REG) {
+				if (Trace.compiler) OUT.put3("    emitMove[%s] slot=%d <- slot=%d", dst.kind.name, dst.slot, src.slot).outln();
+				masm.emit_mov_s_s(dst.slot, src.slot, dst.kind);
+			} else {
+				if (Trace.compiler) OUT.put3("    emitMove[%s] slot=%d <- %s", dst.kind.name, dst.slot, name(src.reg)).outln();
+				masm.emit_mov_s_r(dst.slot, src.reg, dst.kind);
+			}
 		} else {
-			if (src.reg == NO_REG) masm.emit_mov_r_s(dst.reg, dst.kind, src.slot);
-			else masm.emit_mov_r_r(dst.reg, src.reg);
+			if (src.reg == NO_REG) {
+				if (Trace.compiler) OUT.put3("    emitMove[%s] %s <- slot=%d", dst.kind.name, name(dst.reg), src.slot).outln();
+				masm.emit_mov_r_s(dst.reg, dst.kind, src.slot);
+			} else {
+				if (Trace.compiler) OUT.put3("    emitMove[%s] %s <- %s", dst.kind.name, name(dst.reg), name(src.reg)).outln();
+				masm.emit_mov_r_r(dst.reg, src.reg);
+			}
 		}
+	}
+	def name(r: Reg) -> string {
+		return masm.regAlloc.regConfig.regSet.getName(r);
 	}
 }
 
+// Nodes used in the internal move graph, which can be either a register or a value slot.
+// Due to the nature of parallel moves, each node can be the destination of at most one
+// move. Thus the {kind} of the node actually represents the kind of destination.
 def GRAY    = '\x01';
 def BLACK   = '\x02';
-// Used in ordering moves properly in DFS.
 class MoveNode {
 	var slot: u32;		// slot, if reg == REG_NONE
 	var reg: Reg;		// register, REG_NONE if slot
-	var kind: ValueKind;	// value kind
+	var kind: ValueKind;	// value kind of destination
 	var color: byte;	// used in traversing the graph
 	var src: MoveNode;	// source of the value for this node
 	var dstList: MoveNode;	// head of destination list
