@@ -1,0 +1,12 @@
+(module
+  (func (export "if1") (result i32)
+    (if (i32.const 1) (then (return (i32.const 44))))
+    (i32.const 55)
+  )
+  (func (export "if0") (result i32)
+    (if (i32.const 0) (then (return (i32.const 99))))
+    (i32.const 77)
+  )
+)
+(assert_return (invoke "if1") (i32.const 44))
+(assert_return (invoke "if0") (i32.const 77))
