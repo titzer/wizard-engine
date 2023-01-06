@@ -1258,6 +1258,7 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 			state[i] = to;
 			if (from != to) resolver.addMove((i, to), (i, from));
 		}
+		resolver.emitMoves();
 	}
 	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.IF.code, params, results, end_label);
@@ -1332,6 +1333,7 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 				resolver.addMove((t, to), (f, from));
 			}
 		}
+		resolver.emitMoves();
 	}
 	def emitKill(resolver: SpcMoveResolver) {
 		if (Trace.compiler) OUT.puts("    kill all").outln();
@@ -1346,6 +1348,7 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 			var slot = u32.view(i);
 			resolver.addMove((slot, nv), (slot, sv));
 		}
+		resolver.emitMoves();
 	}
 	private def toMergeVal(from: SpcAbstractVal) -> SpcAbstractVal {
 		// XXX: allow constants in merges
@@ -1487,6 +1490,13 @@ component Fold_ii_i {
 
 // Collects the parallel moves and orders them properly.
 class SpcMoveResolver(masm: MacroAssembler) {
+	def mapSize = 8;	// TUNABLE: size of move graph
+	def mapMask = 0b111;	// mask for looking up in map
+	def map = Array<MoveNode>.new(mapSize); // int -> node map
+	var size: int;
+
+	def constRegMoves = Vector<(ValueKind, int, Reg)>.new();
+	def constSlotMoves = Vector<(ValueKind, int, u32)>.new();
 
 	def addMove(to: (u32, SpcAbstractVal), from: (u32, SpcAbstractVal)) {
 		if (Trace.compiler) {
@@ -1503,30 +1513,66 @@ class SpcMoveResolver(masm: MacroAssembler) {
 				masm.emit_mov_m_i(masm.tagAddr(to.0), fv.kind().code);
 			}
 		}
+		if (fv.isConst()) {
+			if (tv.isStored()) constSlotMoves.put(fv.kind(), fv.const, to.0);
+			if (tv.inReg()) constRegMoves.put(fv.kind(), fv.const, tv.reg);
+			return;
+		}
 		if (tv.isStored()) {
 			// store the value into slot
 			if (from.0 != to.0 || !fv.isStored()) {
-				if (fv.isConst()) {
-					masm.emit_mov_s_k(to.0, fv.const, fv.kind());
-				} else if (fv.inReg()) {
-					masm.emit_mov_s_r(to.0, fv.reg, fv.kind());
+				if (fv.inReg()) {
+					mov_s_r(to.0, fv.reg, fv.kind());
 				} else {
-					masm.emit_mov_s_s(to.0, from.0, tv.kind());
+					mov_s_s(to.0, from.0, tv.kind());
 				}
 			}
-		} else if (tv.inReg()) {
+		}
+		if (tv.inReg()) {
 			// load or move the value into appropriate register
-			if (fv.isConst()) {
-				masm.emit_mov_r_i(tv.reg, fv.const);
-			} else if (fv.inReg()) {
-				if (tv.reg != fv.reg) {
-					// XXX: perform reg-reg move instead of storing to slot
-					masm.emit_mov_s_r(to.0, fv.reg, fv.kind());
-					masm.emit_mov_r_s(tv.reg, fv.kind(), to.0);
-				}
+			if (fv.inReg()) {
+				if (tv.reg != fv.reg) mov_r_r(tv.reg, tv.kind(), fv.reg);
 			} else {
-				masm.emit_mov_r_s(tv.reg, tv.kind(), from.0);
+				mov_r_s(tv.reg, tv.kind(), from.0);
 			}
 		}
 	}
+	private def mov_s_r(dst: u32, src: Reg, kind: ValueKind) {
+		masm.emit_mov_s_r(dst, src, kind);
+	}
+	private def mov_r_s(dst: Reg, kind: ValueKind, src: u32) {
+		masm.emit_mov_r_s(dst, kind, src);
+	}
+	private def mov_r_r(dst: Reg, kind: ValueKind, src: Reg) {
+		masm.emit_mov_r_r(dst, src);
+	}
+	private def mov_s_s(dst: u32, src: u32, kind: ValueKind) {
+		masm.emit_mov_s_s(dst, src, kind);
+	}
+	def emitMoves() {
+		for (i < constRegMoves.length) {
+			var m = constRegMoves[i];
+			masm.emit_mov_r_i(m.2, m.1);
+		}
+		constRegMoves.resize(0);
+		for (i < constSlotMoves.length) {
+			var m = constSlotMoves[i];
+			masm.emit_mov_s_k(m.2, m.1, m.0);
+		}
+		constSlotMoves.resize(0);
+	}
+}
+
+def GRAY    = '\x01';
+def BLACK   = '\x02';
+// Used in ordering moves properly in DFS.
+class MoveNode {
+	var slot: u32;			// slot, if reg == REG_NONE
+	var reg: Reg;			// register, REG_NONE if slot
+	var kind: ValueKind;		// value kind
+	var color: byte;		// used in traversing the graph
+	var src: MoveNode;		// source of the value for this node
+	var dstList: MoveNode;	// head of destination list
+	var dstNext: MoveNode;	// next in a list of successors
+	var hashNext: MoveNode;	// next in hash chain
 }
