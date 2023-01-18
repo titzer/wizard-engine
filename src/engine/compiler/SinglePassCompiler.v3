@@ -445,10 +445,46 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		freeVal(sv);
 	}
 	def visit_SELECT() {
+		emitSelect(1);
+	}
+	def visit_SELECT_T(val_types: Range<ValueTypeCode>) {
+		emitSelect(u32.!(val_types.length));
+	}
+	def emitSelect(count: u32) {
 		var sv = state.pop();
-		var fv = state.pop();
-		var tv = state.pop();
-		emitSelect1(sv, fv, tv);
+		var base: u32 = state.sp - count*2;
+		if (sv.isConst()) {
+			// XXX: select K* K* v => K* if all constants match
+			if (sv.const != 0) {
+				// select a* b* T => a*
+				for (i < count) freeVal(state.pop());
+			} else {
+				// select a* b* 0 => b*
+				for (i < count) {
+					var ti = base + i;
+					var fi = base + i + count;
+					var fv = state.state[fi];
+					if (fv.inReg()) reassignReg(fv.reg, int.!(ti));
+					var tv = state.state[ti];
+					state.state[ti] = SpcAbstractVal(tv.kindFlagsAndTag(fv.flags & (IN_REG | IS_CONST)), fv.reg, fv.const);
+					freeReg(tv.reg);
+				}
+			}
+			return freeVal(sv);
+		}
+		state.prepareRangeForMerge(base, base + count, resolver);
+		var label = masm.newLabel(it.pc);
+		var cond = MasmBrCond.I32_NONZERO;
+		if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
+		else masm.emit_br_m(masm.slotAddr(state.sp), cond, label);
+		for (i = base; i < base + count; i++) {
+			var fv = state.state[i + count];
+			resolver.addMove((i, state.state[i]), (i + count, fv));
+			freeVal(fv);
+		}
+		resolver.emitMoves();
+		masm.bindLabel(label);
+		state.sp = base + count;
 		freeVal(sv);
 	}
 	def visit_LOCAL_GET(index: u31) {
@@ -730,65 +766,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		for (i < args) state.pop();
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
-	}
-
-	def emitSelect1(sv: SpcAbstractVal, fv: SpcAbstractVal, tv: SpcAbstractVal) {
-		var tagStored = tv.flags & TAG_STORED;
-		var label = masm.newLabel(it.pc);
-		if (tv.isConst() && fv.isConst() && tv.const == fv.const) {
-			// select K K v => K
-			freeVal(tv);
-			freeVal(fv);
-			freeVal(sv);
-			state.push(tv.kindFlags(IS_CONST), NO_REG, tv.const);
-			return;
-		}
-		if (sv.isConst()) {
-			// select a b K => {a,b}
-			if (sv.const != 0) {
-				freeVal(fv);
-				state.pushV(tv);
-			} else {
-				freeVal(tv);
-				if (fv.isConst() || fv.inReg()) state.push(fv.flags & ~IS_STORED, fv.reg, fv.const);
-				else {
-					var kind = fv.kind();
-					var reg = allocRegTos(kind);
-					emit_read_slot_r(state.sp + 1, SpcReg(reg, kind));
-					state.push(fv.kindFlags(IN_REG | tagStored), reg, 0);
-				}
-			}
-			freeVal(sv);
-			return;
-		}
-		if (tv.inReg()) {
-			// reuse register for true value
-			var cond = MasmBrCond.I32_NONZERO;
-			if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
-			else masm.emit_br_m(masm.slotAddr(state.sp + 2), cond, label);
-
-			if (fv.isConst()) masm.emit_mov_r_k(tv.reg, tv.kind(), fv.const);
-			else if (fv.inReg()) masm.emit_mov_r_r(tv.reg, fv.reg);
-			else masm.emit_mov_r_s(tv.reg, tv.kind(), state.sp + 1);
-			masm.bindLabel(label);
-			state.push(tv.kindFlags(IN_REG | tagStored), tv.reg, 0);
-			freeVal(fv);
-		} else {
-			// load const true value into slot first
-			if (!tv.isStored()) masm.emit_mov_s_k(state.sp, tv.const, tv.kind());
-
-			// XXX: reuse the false register and flip branch if possible
-			var cond = MasmBrCond.I32_NONZERO;
-			if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
-			else masm.emit_br_m(masm.slotAddr(state.sp + 2), cond, label);
-
-			if (fv.isConst()) masm.emit_mov_s_k(state.sp, fv.const, tv.kind());
-			else if (fv.inReg()) masm.emit_mov_s_r(state.sp, fv.reg, tv.kind());
-			else masm.emit_mov_s_s(state.sp, state.sp + 1, tv.kind());
-			masm.bindLabel(label);
-			state.push(tv.kindFlags(IS_STORED | tagStored), NO_REG, 0);
-			freeVal(fv);
-		}
 	}
 	def emitBrIf(sv: SpcAbstractVal, cond: MasmBrCond, label: MasmLabel, target: SpcControl, emptyTransfer: bool) {
 		if (sv.isConst()) {
@@ -1103,19 +1080,20 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var sv = state.pop();
 		if (sv.inReg()) {
 			if (sv.reg == reg) return sv;
+			spillReg(reg);
 			reassignReg(reg, int.!(state.sp));
 			masm.emit_mov_r_r(reg, sv.reg);
 			freeReg(sv.reg);
 			return SpcAbstractVal(sv.flags, reg, sv.const);
 		}
 		var kind = sv.kind();
+		spillReg(reg);
 		reassignReg(reg, int.!(state.sp));
 		if (sv.isConst()) masm.emit_mov_r_k(reg, kind, sv.const);
 		else masm.emit_mov_r_s(reg, kind, state.sp);
 		return SpcAbstractVal(sv.flags | IN_REG, reg, sv.const);
 	}
 	def reassignReg(reg: Reg, slot: int) {
-		spillReg(reg);
 		freeReg(reg);
 		masm.regAlloc.unfree(reg, int.!(state.sp));
 	}
@@ -1297,10 +1275,12 @@ class SpcAbstractState(regAlloc: RegAlloc) {
 	def prepareLoop(resolver: SpcMoveResolver) {
 		var target = ctl_stack.peek();
 		target.merge_count = 1;
+		prepareRangeForMerge(0, sp, resolver);
 		target.merge_state = Arrays.range(state, 0, int.view(sp));
-		for (i < sp) {
+	}
+	def prepareRangeForMerge(start: u32, end: u32, resolver: SpcMoveResolver) {
+		for (i = start; i < end; i++) {
 			var from = state[i], to = toMergeVal(from);
-			target.merge_state[i] = to;
 			state[i] = to;
 			if (from != to) resolver.addMove((i, to), (i, from));
 		}
