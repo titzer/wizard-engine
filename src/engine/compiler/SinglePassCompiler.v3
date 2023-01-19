@@ -73,7 +73,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 	def gen(func: FuncDecl) -> bool {
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).outln();
-		// Metric collection: only call Sydstem.ticksUs() if time metric enabled.
+		// Metric collection: only call System.ticksUs() if time metric enabled.
 		var time_metric = Metrics.spc_time_us;
 		var before_us = if(time_metric.enabled, System.ticksUs());
 		var before_code_bytes = masm.curCodeBytes();
@@ -230,7 +230,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		// spill everything
 		state.emitKill(resolver);
 		// compute VSP for potential frame access
-		emit_compute_vsp(state.sp);
+		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_write_runtime_vsp(regs.vsp);
 		// reload WasmFunction
 		masm.emit_mov_r_m(ValueKind.REF, regs.runtime_arg_0, MasmAddr(regs.sp, c.wasm_func_offset));
@@ -337,36 +337,76 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		setUnreachable();
 	}
 	def visit_CALL(index: u31) {
+		visitDirectCall(index, false);
+	}
+	def visit_RETURN_CALL(index: u31) {
+		visitDirectCall(index, true);
+	}
+	def visitDirectCall(index: u31, tailCall: bool) {
 		var func = module.functions[index];
 		var offsets = masm.getOffsets();
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		state.emitKill(resolver);
-		emit_load_instance(regs.instance);
-		// XXX: skip loading the target function for direct intra-module calls?
-		masm.emit_mov_r_m(ValueKind.REF, regs.func_arg, MasmAddr(regs.instance, offsets.Instance_functions));
-		masm.emit_read_v3_array_r_i(ValueKind.REF, regs.func_arg, regs.func_arg, func.func_index);
-		emit_compute_vsp(state.sp);
-
+		// Load the instance (which must happen before frame is unwound).
+		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var tmp = allocTmp(ValueKind.REF);
+		emit_load_instance(tmp);
+
+		// Handle the current stack state.
+		if (tailCall) emitMoveTailCallArgs(func.sig); // transfer tail call args
+		else state.emitKill(resolver); // spill entire value stack
+
+		// Load the function, XXX: skip and compute function from instance + code on stack?
+		masm.emit_mov_r_m(ValueKind.REF, regs.func_arg, MasmAddr(tmp, offsets.Instance_functions));
+		masm.emit_read_v3_array_r_i(ValueKind.REF, regs.func_arg, regs.func_arg, func.func_index);
+
+		// Compute the value stack pointer.
+		emit_compute_vsp(vsp_reg, state.sp);
+
 		if (func.imp != null) {
-			// call to imported function must first check for WasmFunction
+			// A call to imported function must first check for WasmFunction.
 			masm.emit_mov_r_m(ValueKind.I32, tmp, MasmAddr(regs.func_arg, 0));
 			masm.emit_breq_r_i(tmp, offsets.WasmFunction_typeId, wasmcall_label);
 			masm.emit_write_runtime_vsp(regs.vsp);
 			masm.emit_mov_r_r(regs.runtime_arg_0, regs.func_arg);
-			masm.emit_call_runtime_callHost(regs.func_arg);
-			masm.emit_br(retpt);
+			if (tailCall) {
+				masm.emit_jump_runtime_callHost(regs.func_arg);
+			} else {
+				masm.emit_call_runtime_callHost(regs.func_arg);
+				masm.emit_br(retpt);
+			}
 		}
+		// Load the target code/entrypoint.
 		masm.bindLabel(wasmcall_label);
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(regs.func_arg, offsets.WasmFunction_decl));
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.FuncDecl_target_code));
-		masm.emit_call_r(tmp);
-		masm.bindLabel(retpt);
-		emit_unwind_check();
-		emit_reload_regs();
 
-		state.popArgsAndPushResults(func.sig);
+		// Call or jump to the entrypoint.
+		if (tailCall) {
+			masm.emit_jump_r(tmp);
+			setUnreachable();
+		} else {
+			masm.emit_call_r(tmp);
+			masm.bindLabel(retpt);
+			emit_unwind_check();
+			emit_reload_regs();
+			state.popArgsAndPushResults(func.sig);
+		}
+		freeReg(vsp_reg);
 		freeReg(tmp);
+	}
+	def emitMoveTailCallArgs(sig: SigDecl) {
+		var p = sig.params, count = u32.!(p.length);
+		var base = state.sp - count;
+		for (i < base) freeVal(state.state[i]); // free all unused slots of frame below args
+		for (i < count) { // transfer args
+			var tv = SpcVal(typeToKindFlags(p[i]) | IS_STORED | TAG_STORED, NO_REG, 0); // XXX: skip tag copy
+			var fv = state.state[base + i];
+			resolver.addMove((i, tv), (base + i, fv));
+		}
+		resolver.emitMoves();
+		state.sp = count;
+		// adjust frame
+		masm.emit_addw_r_i(regs.sp, masm.regAlloc.regConfig.spcFrameSize);
 	}
 	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
 		var sig = SigDecl.!(module.heaptypes[sig_index]);
@@ -393,7 +433,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(treg, offsets.Table_funcs));
 		masm.emit_read_v3_array_r_r(ValueKind.REF, regs.func_arg, tmp2, regs.func_arg);
 
-		emit_compute_vsp(state.sp);
+		emit_compute_vsp(regs.vsp, state.sp); // TODO: proper tmp
 
 		// check for WasmFunction
 		masm.emit_mov_r_m(ValueKind.I32, tmp2, MasmAddr(regs.func_arg, 0));
@@ -431,7 +471,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		state.emitKill(resolver);
 
-		emit_compute_vsp(state.sp);
+		emit_compute_vsp(regs.vsp, state.sp); // TODO: proper tmp
 		// check for null
 		masm.emit_breq_r_l(regs.func_arg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
 
@@ -762,7 +802,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def emit_call_runtime_op1n(op: Opcode, arg1: u31, args: int, results: Array<ValueType>, canTrap: bool) {
 		state.emitKill(resolver);
-		emit_compute_vsp(state.sp);
+		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_write_runtime_vsp(regs.vsp);
 		emit_load_instance(regs.runtime_arg_0);
 		masm.emit_mov_r_i(regs.runtime_arg_1, arg1);
@@ -774,7 +814,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def emit_call_runtime_op2n(op: Opcode, arg1: u31, arg2: u31, args: int, results: Array<ValueType>, canTrap: bool) {
 		state.emitKill(resolver);
-		emit_compute_vsp(state.sp);
+		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_write_runtime_vsp(regs.vsp);
 		emit_load_instance(regs.runtime_arg_0);
 		masm.emit_mov_r_i(regs.runtime_arg_1, arg1);
@@ -970,9 +1010,9 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		if (unwind_label == null) unwind_label = masm.newLabel(func.cur_bytecode.length);
 		masm.emit_brne_r_i(regs.ret_Abrupt, 0, unwind_label);
 	}
-	def emit_compute_vsp(slots: u32) {
-		masm.emit_mov_r_r(regs.vsp, regs.vfp); // XXX: use 3-addr adjustment of VSP (i.e. lea)
-		if (slots > 0) masm.emit_addw_r_i(regs.vsp, int.view(slots) * masm.valuerep.slot_size);
+	def emit_compute_vsp(dst: Reg, slots: u32) {
+		masm.emit_mov_r_r(dst, regs.vfp); // XXX: use 3-addr adjustment of VSP (i.e. lea)
+		if (slots > 0) masm.emit_addw_r_i(dst, int.view(slots) * masm.valuerep.slot_size);
 	}
 	def emit_reload_regs() {
 		// XXX: recompute VFP from VSP - #slots?
@@ -1063,6 +1103,15 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def allocTmp(kind: ValueKind) -> Reg {
 		var reg = masm.regAlloc.alloc(kind, TMP_SLOT);
 		if (reg == NO_REG) return findAndSpillReg(kind, TMP_SLOT);
+		return reg;
+	}
+	def allocTmpFixed(kind: ValueKind, reg: Reg) -> Reg {
+		if (masm.regAlloc.isFree(reg)) {
+			masm.regAlloc.unfree(reg, TMP_SLOT);
+		} else {
+			spillReg(reg);
+			reassignReg(reg, TMP_SLOT);
+		}
 		return reg;
 	}
 	def findAndSpillReg(kind: ValueKind, slot: int) -> Reg {
@@ -1522,25 +1571,6 @@ def typeToKindFlags(vt: ValueType) -> byte {
 		V128 => return KIND_V128;
 		_ => return KIND_REF;
 	}
-}
-// Specialized routines that work on i32, rather than values.
-component Fold_ii_i {
-	private def do_ii_z(f: (int, int) -> bool, a: int, b: int) -> int {
-		return if(f(a, a), 1);
-	}
-	private def do_uu_z(f: (u32, u32) -> bool, a: int, b: int) -> int {
-		return if(f(u32.view(a), u32.view(b)), 1);
-	}
-	def I32_EQ = do_ii_z(int.==, _, _);
-	def I32_NE = do_ii_z(int.!=, _, _);
-	def I32_LT_S = do_ii_z(int.<, _, _);
-	def I32_LT_U = do_uu_z(u32.<, _, _);
-	def I32_GT_S = do_ii_z(int.>, _, _);
-	def I32_GT_U = do_uu_z(u32.>, _, _);
-	def I32_LE_S = do_ii_z(int.<=, _, _);
-	def I32_LE_U = do_uu_z(u32.<=, _, _);
-	def I32_GE_S = do_ii_z(int.>=, _, _);
-	def I32_GE_U = do_uu_z(u32.>=, _, _);
 }
 
 // Collects the parallel moves and orders them properly.

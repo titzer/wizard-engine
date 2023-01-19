@@ -1,0 +1,22 @@
+(module
+  (func $f2 (param i32 i32) (result i32)
+    (local.get 0)
+  )
+  (func $f3 (param i32 i32) (result i32)
+    (local.get 1)
+  )
+  (func (export "m1") (param i32 i32) (result i32)
+    (return_call $f2 (local.get 0) (local.get 1))
+    (unreachable)
+  )
+  (func (export "m2") (param i32 i32) (result i32)
+    (return_call $f3 (local.get 0) (local.get 1))
+    (unreachable)
+  )
+)
+
+(assert_return (invoke "m1" (i32.const 22) (i32.const 33)) (i32.const 22))
+(assert_return (invoke "m1" (i32.const 44) (i32.const 55)) (i32.const 44))
+
+(assert_return (invoke "m2" (i32.const 77) (i32.const 88)) (i32.const 88))
+(assert_return (invoke "m2" (i32.const 88) (i32.const 99)) (i32.const 99))

@@ -8,15 +8,15 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-WIZENG_LOC=$(cd $HERE/../../../ && pwd)
-SPEC_LOC=$(cd $WIZENG_LOC/wasm-spec/repos/spec && pwd)
+WIZENG_LOC=$(cd $HERE/../../ && pwd)
+SPEC_LOC=${SPEC_LOC:=$(cd $WIZENG_LOC/wasm-spec/repos/spec && pwd)}
 
 if [ ! -d $SPEC_LOC ]; then
     echo "WebAssembly specification repo not found: $SPEC_LOC"
     exit 1
 fi
 
-SPEC_INT=$SPEC_LOC/interpreter/wasm
+SPEC_INT=${SPEC_INT:=$SPEC_LOC/interpreter/wasm}
 if [ ! -x $SPEC_INT ]; then
     echo "WebAssembly specification interpreter not found: $SPEC_INT"
     exit 1
