@@ -8,37 +8,15 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-if [ "$WIZENG_LOC" = "" ]; then
-    WIZENG_LOC=$(cd $DIR/../../ && pwd)
-fi
+. $DIR/../common.sh wizeng
 
-if [ "$TEST_TARGET" = "" ]; then
-    TEST_TARGET=int
-fi
+make_binary wizeng || exit $?
+
+WIZENG="../../$BINARY $WIZENG_OPTS"
 
 target=$TEST_TARGET
 
-function make_wizeng() {
-    cd $WIZENG_LOC
-    make bin/wizeng.${TEST_TARGET} 2>&1 > /tmp/wizeng.build.out
-    RET=$?
-    if [ "$RET" != 0 ]; then
-	cat /tmp/wizeng.build.out
-	exit $RET
-    fi
-}
-
-(make_wizeng)
-RET=$?
-if [ "$RET" != 0 ]; then
-    exit $RET
-fi
-
-printf "Testing ${CYAN}%-10s${NORM} %-13s | " wizeng $TEST_TARGET
-
-WIZENG=$WIZENG_LOC/bin/wizeng.$TEST_TARGET
-export T=/tmp/$USER/wizeng-test/wizeng/$target
-mkdir -p $T
+print_testing 
 
 cd $DIR
 if [ "$#" = 0 ]; then
