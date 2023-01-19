@@ -8,9 +8,23 @@ GREEN='[0;32m'
 YELLOW='[0;33m'
 NORM='[0;00m'
 
+### Utility for printing a testing line
+### XXX: duplicated with common.sh
+function print_testing() {
+    ARG=$1
+    printf "Testing ${CYAN}%-10s${NORM} " $harness
+    printf "%-13s " $ARG
+    if [ "$TEST_MODE" != "" ]; then
+	printf "%-13s " "-mode=$TEST_MODE"
+    fi
+    printf "%-13s | "  $TEST_TARGET
+}
+
 function skip() {
-    printf "Testing ${CYAN}%-10s${NORM} %-13s | " $1 $2
-    printf "${YELLOW}skipped (%s)${NORM}\n" "$3"
+    harness=$1
+    shift
+    print_testing
+    printf "${YELLOW}skipped (%s)${NORM}\n" "$1"
 }
 
 if [ "$TEST_TARGETS" = "" ]; then
@@ -23,33 +37,36 @@ fi
 
 # Unit tests
 for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
     if [ "$target" = jvm ]; then # TODO: out of memory
-	skip unit $target "initial heap too large on this target"
+	skip unit "initial heap too large on this target"
     else
-	TEST_TARGET=$target $SCRIPT_LOC/unit.sh
+        $SCRIPT_LOC/unit.sh
     fi
 done
 
 # Regression tests
 for target in $TEST_TARGETS; do
-    TEST_TARGET=$target $SCRIPT_LOC/regress.sh
+    export TEST_TARGET=$target
+    $SCRIPT_LOC/regress.sh
 done
 
 # Spec tests
 for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
     if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
-	skip spec $target "will run out of memory"
+	skip spec "will run out of memory"
     else
-	TEST_TARGET=$target $SCRIPT_LOC/spec.sh
+	$SCRIPT_LOC/spec.sh
     fi
 done
 
 # Wizeng tests
 for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
     if [ "$target" = "" ]; then # for symmetry
-	skip wizeng $target
+	skip wizeng
     else
-	TEST_TARGET=$target $SCRIPT_LOC/wizeng/test.sh
+	$SCRIPT_LOC/wizeng/test.sh
     fi
 done
-

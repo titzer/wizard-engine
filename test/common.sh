@@ -44,7 +44,7 @@ fi
 
 ### Set up the test target
 TEST_TARGET=${TEST_TARGET:=int}
-T=/tmp/$USER/wizeng-test/$harness/$TEST_TARGET/
+T=/tmp/$USER/wizeng-test/$harness/$TEST_TARGET/$TEST_MODE/
 mkdir -p $T
 
 ### Configure fatal and trace options
@@ -94,9 +94,10 @@ function make_binary() {
 ### Utility for printing a testing line
 function print_testing() {
     ARG=$1
-    if [ "$ARG" = "" ]; then
-	printf "Testing ${CYAN}%-10s${NORM} %-13s | " $harness $TEST_TARGET
-    else
-	printf "Testing ${CYAN}%-10s${NORM} %-13s %-13s | " $harness $ARG $TEST_TARGET
+    printf "Testing ${CYAN}%-10s${NORM} " $harness
+    printf "%-13s " $ARG
+    if [ "$TEST_MODE" != "" ]; then
+	printf "%-13s " "-mode=$TEST_MODE"
     fi
+    printf "%-13s | "  $TEST_TARGET
 }
