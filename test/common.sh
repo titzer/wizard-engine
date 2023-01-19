@@ -66,6 +66,10 @@ while [[ "$1" =~ ^\-.* ]]; do
     shift
 done
 
+if [ "$TEST_MODE" != "" ]; then
+    WIZENG_OPTS="$WIZENG_OPTS -mode=$TEST_MODE"
+fi
+
 if [[ "$1" =~ "-fatal-calls=" ]]; then
     export V3C_OPTS="$1 $V3C_OPTS"
     shift
@@ -95,9 +99,13 @@ function make_binary() {
 function print_testing() {
     ARG=$1
     printf "Testing ${CYAN}%-10s${NORM} " $harness
-    printf "%-13s " $ARG
+#TODO    printf "%-13s " $ARG
+    printf "%-13s "  $TEST_TARGET
     if [ "$TEST_MODE" != "" ]; then
-	printf "%-13s " "-mode=$TEST_MODE"
+	mode="-mode=$TEST_MODE"
+    else
+        mode=""
     fi
-    printf "%-13s | "  $TEST_TARGET
+    printf "%-13s " $mode
+    printf "| "
 }

@@ -8,16 +8,25 @@ GREEN='[0;32m'
 YELLOW='[0;33m'
 NORM='[0;00m'
 
+DEFAULT_MODES=1
+if [ "$TEST_MODE" != "" ]; then
+   DEFAULT_MODES=0
+fi
+
 ### Utility for printing a testing line
 ### XXX: duplicated with common.sh
 function print_testing() {
     ARG=$1
     printf "Testing ${CYAN}%-10s${NORM} " $harness
-    printf "%-13s " $ARG
+#TODO    printf "%-13s " $ARG
+    printf "%-13s "  $TEST_TARGET
     if [ "$TEST_MODE" != "" ]; then
-	printf "%-13s " "-mode=$TEST_MODE"
+	mode="-mode=$TEST_MODE"
+    else
+        mode=""
     fi
-    printf "%-13s | "  $TEST_TARGET
+    printf "%-13s " $mode
+    printf "| "
 }
 
 function skip() {
@@ -35,20 +44,28 @@ if [ "$TEST_TARGETS" = "" ]; then
     fi
 fi
 
+function do_script() {
+    script=$1
+    $SCRIPT_LOC/${script}.sh
+    if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
+        TEST_MODE=jit $SCRIPT_LOC/${script}.sh
+    fi
+}
+
 # Unit tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
     if [ "$target" = jvm ]; then # TODO: out of memory
 	skip unit "initial heap too large on this target"
-    else
-        $SCRIPT_LOC/unit.sh
+        continue;
     fi
+    $SCRIPT_LOC/unit.sh
 done
 
 # Regression tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    $SCRIPT_LOC/regress.sh
+    do_script regress
 done
 
 # Spec tests
@@ -56,9 +73,9 @@ for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
     if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
 	skip spec "will run out of memory"
-    else
-	$SCRIPT_LOC/spec.sh
+        continue
     fi
+    do_script spec
 done
 
 # Wizeng tests
@@ -66,7 +83,7 @@ for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
     if [ "$target" = "" ]; then # for symmetry
 	skip wizeng
-    else
-	$SCRIPT_LOC/wizeng/test.sh
+        continue
     fi
+    do_script wizeng/test
 done
