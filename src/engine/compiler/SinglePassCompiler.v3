@@ -52,6 +52,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def regs = masm.regAlloc.regConfig.regs;
 	def resolver = SpcMoveResolver.new(masm);
+	def temps = Array<Reg>.new(masm.regAlloc.regConfig.regSet.regs.length);
+	var num_temps = 0;
 
 	// Abstract state of the value stack
 	def state = SpcState.new(masm.regAlloc);
@@ -102,6 +104,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			if (Trace.compiler) traceOpcodeAndStack();
 			last_probe = 0;
 			it.dispatch(this);
+			freeTemps();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
 			if (skip_to_end) doSkipToEndOfBlock();
@@ -385,8 +388,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			emit_reload_regs();
 			state.popArgsAndPushResults(func.sig);
 		}
-		freeReg(vsp_reg);
-		freeReg(tmp);
 	}
 	def emitMoveTailCallArgs(sig: SigDecl) {
 		var p = sig.params, count = u32.!(p.length);
@@ -448,10 +449,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		emit_reload_regs();
 
 		state.popArgsAndPushResults(sig);
-		freeReg(vsp_reg);
 		freeVal(sv);
-		freeReg(treg);
-		freeReg(tmp2);
 	}
 	def visit_CALL_REF(index: u31) {
 		var sig = SigDecl.!(module.heaptypes[index]);
@@ -493,8 +491,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 
 		state.popArgsAndPushResults(sig);
 		freeVal(sv);
-		freeReg(tmp);
-		freeReg(vsp_reg);
 	}
 	def visit_DROP() {
 		var sv = state.pop();
@@ -656,7 +652,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_MEMORY_SIZE(memory_index: u31) {
 		var offsets = masm.getOffsets();
 		var reg = allocTmp(ValueKind.REF);
-		var r1 = allocTmp(ValueKind.I64);
+		var r1 = allocRegTos(ValueKind.I64);
 		var r2 = allocTmp(ValueKind.I64);
 		emit_load_instance(reg);
 		masm.emit_mov_r_m(ValueKind.REF, reg, MasmAddr(reg, offsets.Instance_memories));
@@ -665,8 +661,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_m(ValueKind.REF, r1, MasmAddr(reg, offsets.X86_64Memory_limit));
 		masm.emit_subw_r_r(r1, r2);
 		masm.emit_shrw_r_i(r1, 16);
-		freeReg(r2);
-		freeReg(reg);
 		state.push(KIND_I32 | IN_REG, r1, 0);
 	}
 	def visit_MEMORY_GROW(memory_index: u31) {
@@ -713,7 +707,7 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def visit_REF_FUNC(func_index: u31) {
 		var offsets = masm.getOffsets();
-		var reg = allocTmp(ValueKind.REF);
+		var reg = allocRegTos(ValueKind.REF);
 		emit_load_instance(reg);
 		// XXX: skip loading the target function for direct intra-module calls?
 		masm.emit_mov_r_m(ValueKind.REF, reg, MasmAddr(reg, offsets.Instance_functions));
@@ -750,7 +744,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Instance_dropped_data));
 		var addr = MasmAddr(tmp, offsets.Array_contents + dindex);
 		masm.emit_mov_m_i(addr, 1);
-		freeReg(tmp);
 	}
 	def visit_MEMORY_COPY(mindex1: u31, mindex2: u31) {
 		emit_call_runtime_op2(Opcode.MEMORY_COPY, mindex1, mindex2, true);
@@ -768,7 +761,6 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Instance_dropped_elems));
 		var addr = MasmAddr(tmp, offsets.Array_contents + dindex);
 		masm.emit_mov_m_i(addr, 1);
-		freeReg(tmp);
 	}
 	def visit_TABLE_COPY(tindex1: u31, tindex2: u31) {
 		emit_call_runtime_op2(Opcode.TABLE_COPY, tindex1, tindex2, true);
@@ -779,13 +771,12 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	def visit_TABLE_SIZE(table_index: u31) {
 		var offsets = masm.getOffsets();
 		var tmp = allocTmp(ValueKind.REF);
-		var r1 = allocTmp(ValueKind.I32);
+		var r1 = allocRegTos(ValueKind.I32);
 		emit_load_instance(tmp);
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Instance_tables));
 		masm.emit_read_v3_array_r_i(ValueKind.REF, tmp, tmp, int.!(table_index));
 		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Table_elems));
 		masm.emit_read_v3_array_length_r_r(r1, tmp);
-		freeReg(tmp);
 		state.push(KIND_I32 | IN_REG, r1, 0);
 	}
 	def visit_TABLE_FILL(index: u31) {
@@ -1099,7 +1090,8 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 	}
 	def allocTmp(kind: ValueKind) -> Reg {
 		var reg = masm.regAlloc.alloc(kind, TMP_SLOT);
-		if (reg == NO_REG) return findAndSpillReg(kind, TMP_SLOT);
+		if (reg == NO_REG) reg = findAndSpillReg(kind, TMP_SLOT);
+		temps[num_temps++] = reg;
 		return reg;
 	}
 	def allocTmpFixed(kind: ValueKind, reg: Reg) -> Reg {
@@ -1109,7 +1101,13 @@ class SinglePassCompiler(masm: MacroAssembler, extensions: Extension.set, limits
 			spillReg(reg);
 			reassignReg(reg, TMP_SLOT);
 		}
+		temps[num_temps++] = reg;
 		return reg;
+	}
+	def freeTemps() {
+		var c = num_temps;
+		for (i < c) masm.regAlloc.free(temps[i]);
+		num_temps = 0;
 	}
 	def findAndSpillReg(kind: ValueKind, slot: int) -> Reg {
 		var c = masm.regAlloc.regConfig;
