@@ -4,17 +4,12 @@
 // The {Execute} component provides an all-purpose facade to the rest of the engine and runtime
 // that deals with execution, modes, and stack traces. It separates the runtime from specifics
 // of the target, which may have one or more execution tiers.
-enum Mode(help: string) {
-	INTERPRETER("interpreter only"),
-	MIXED("mixed interpreted and compiled execution"),
-	JIT("JIT only")
-}
 component Execute {
 	def probes = ProbeList.new();		// probes on the global interpreter loop
 	var limits = Limits.new();		// limits on execution/memory
 	var exit_code: int;
 	var handleTrap = defaultTrap;		// how to handle traps
-	var mode = Mode.INTERPRETER;
+	var tiering: ExecutionStrategy;
 	def trapObjects = Array<Trap>.new(TrapReason.ERROR.tag + 1);
 	def NO_FRAMES = Array<(WasmFunction, int)>.new(0);
 
@@ -25,12 +20,12 @@ component Execute {
 	// Reset internal states.
 	def reset() {
 		probes.clear();
-		Target.reset();
+		tiering.reset();
 		if (Trace.interpreter) probes.add(TraceProbe.new());
 	}
 	// Call a given function with the given arguments.
 	def call(func: Function, args: Array<Value>) -> Result {
-		return Target.call(func, args);
+		return tiering.call(func, args);
 	}
 	private def doInvokeHostFunction(hf: HostFunction, args: Array<Value>) -> HostResult {
 		if (Trace.interpreter) traceCallHostFunction(hf);
@@ -66,9 +61,6 @@ component Execute {
 		var segment = if(hf != null, StackSegment.new(null, hf, NO_FRAMES));
 		return Result.Throw(Trap.new(reason, null, segment));
 	}
-	// General routines that are implemented by target-specific code.
-	def setMode = Target.setMode;
-	def finishModule = Target.finishModule;
 
 	// Traces calls to host functions.
 	def traceCallHostFunction(hf: HostFunction) {
@@ -273,4 +265,98 @@ def defaultBreak() -> Resumption {
 }
 def defaultTrap(reason: TrapReason) -> Resumption {
 	return Resumption.Trap(reason, false);
+}
+
+// The execution strategy controls how the engine executes Wasm bytecode, e.g. whether
+// an interpreter or compiler(s) are used, and at what points. It interposes at a number
+// of important events in the lifecycle of Wasm modules and instances and may or may not
+// perform synchronous or asynchronous work.
+class ExecutionStrategy {
+	// Called upon selection of this strategy (e.g. by command-line flag).
+	def onActivate() { }
+
+	// Called during execution startup and exit.
+	def onEngineStart() { }
+	def onEngineExit(code: int) { }
+
+	// Called if monitors are activated for the program.
+	def onMonitorsStart() { }
+	def onMonitorsFinish(module: Module, err: ErrorGen) { }
+
+	// Called during binary decoding of a module and relevant sections.
+	// Note that code validation has not yet been performed.
+	// Example usage: pre-allocate code space and start compiler threads.
+	def onModuleStart(module: Module, size: u32) { }			// note: size == 0 if estimate only
+	def onCodeSectionStart(module: Module, num_funcs: u32, size: u32) { }
+	def onFuncBody(module: Module, func_index: u32, body: Range<byte>, err: ErrorGen) { }
+	def onCodeSectionFinish(module: Module, num_funcs: u32, size: u32, err: ErrorGen) { }
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) { }		// note: size is exact
+
+	// Called when a function has its code validated.
+	// Example usage: do synchronous (AOT) one-off compile.
+	def onFuncValidationStart(module: Module, func_index: u32) { }
+	def onFuncValidationFinish(module: Module, func_index: u32, err: ErrorGen) { }
+
+	// Called when a module is instantiated.
+	// Example usage: generate code specialized to import bindings.
+	def onInstantiateStart(instantiator: Instantiator) { }
+	def onInstantiateFinish(instantiator: Instantiator, err: ErrorGen) { }
+
+	// Called before a test run of a function. (For testing only).
+	def onTestRun(wf: WasmFunction, err: ErrorGen) { }
+
+	// Call a function with arguments and return a result.
+	// Example implementation: call into the interpreter.
+	def call(func: Function, args: Array<Value>) -> Result;
+
+	// Reset all internal state of execution tiers.
+	def reset() { }
+}
+
+// Deals with command-line options for selecting the mode, printing help, etc.
+component ExecuteOptions {
+	private var modes: List<(string, ExecutionStrategy, string)>;
+	private var default: ExecutionStrategy;
+
+	// Used internally to register different execution strategies.
+	def registerMode(name: string, tiering: ExecutionStrategy, help: string) -> ExecutionStrategy {
+		modes = List.new((name, tiering, help), modes);
+		return tiering;
+	}
+	// Used internally to register different execution strategies.
+	def registerDefaultMode(name: string, tiering: ExecutionStrategy, help: string) -> ExecutionStrategy {
+		registerMode(name, tiering, help);
+		Execute.tiering = default = tiering;
+		return tiering;
+	}
+	// Set the mode from a command-line option.
+	def setMode(name: Range<byte>) -> bool {
+		for (l = modes; l != null; l = l.tail) {
+			var t = l.head;
+			if (ArrayUtil.equal(t.0, name)) {
+				t.1.onActivate();
+				Execute.tiering = t.1;
+				return true;
+			}
+		}
+		return false;
+	}
+	// Print help for the supported modes.
+	def printHelp() {
+		var out = Trace.OUT, H = out.putsln;
+		H("");
+		H("This build of the Wizard Engine responds to the execution mode flag in the following ways.");
+		H("");
+		for (l = modes; l != null; l = l.tail) {
+			var t = l.head;
+			out.puts("    -mode=");
+			out.puts(t.0);
+			out.pad(' ', 32);
+			if (t.1 == default) out.puts("(default) ");
+			out.puts(t.2);
+			out.outln();
+		}
+
+		H("");
+	}
 }

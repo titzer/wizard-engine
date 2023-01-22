@@ -10,115 +10,26 @@ component Target {
 	def limit_memory_pages = 65536u;
 	def newMemory = X86_64Memory.new;
 	def forceGC = RiGc.forceGC;
-	def reset = X86_64Interpreter.reset;
-	def call = RT.run;
-	var asmSpcEntry: (Pointer, WasmFunction, Pointer) -> AbruptReturn;
-	var globalCode: Mapping;
 	def tuning = X86_64InterpreterTuning.new();
 	def tagging = Tagging.new(tuning.taggedValues, tuning.simdSupport);
 
 	new() {
+		ExecuteOptions.registerMode("jit", X86_64SpcOnlyStrategy.new(), "ahead-of-time compile entire module with SPC");
+//TODO		ExecuteOptions.registerMode("aot", X86_64SpcOnlyStrategy.new(), "ahead-of-time compile entire module with SPC");
+//TODO		ExecuteOptions.registerMode("jit", X86_64SpcOnlyStrategy.new(), "lazy-compile functions on demand with SPC");
+//TODO		ExecuteOptions.registerMode("dyn", X86_64MixedStrategy.new(), "fast interpreter with dynamic tier-up to SPC");
+		ExecuteOptions.registerDefaultMode("int", X86_64InterpreterOnlyStrategy.new(), "fast interpreter only");
 		Execute.probes.onEnable = X86_64Interpreter.onProbeEnable;
 		Execute.probes.onDisable = X86_64Interpreter.onProbeDisable;
 	}
 
-	def setMode(m: EngineMode) -> bool {
-		match (m) {
-			JIT => {
-				Execute.mode = Mode.JIT;
-				return true;
-			}
-			FAST => {
-				Execute.mode = Mode.MIXED;
-				return true;
-			}
-			INT, DEBUG => {
-				Execute.mode = Mode.INTERPRETER;
-				return true;
-			}
-		}
-	}
-	def modeHelp(m: EngineMode) -> string {
-		match (m) {
-			JIT => return "ahead-of-time compile all modules with the single-pass compiler (spc)";
-			FAST => return "mixed mode with the fast interpreter (fast-int) and (spc)";
-			INT, DEBUG => return "fast interpreter only (fast-int)";
-		}
-	}
-	def finishModule(module: Module, err: ErrorGen) {
-		if (Execute.mode == Mode.INTERPRETER) return; // interpreter needs no post-processing for a module
-		spcCompileModule(module, err);
-	}
-	def spcCompileModule(module: Module, err: ErrorGen) {
-		ensureSpcEntry();
-
-		var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
-		var limits = Limits.new();
-		var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, module);
-		compiler.err = err;
-		var w = compiler.w;
-		w.put_b32(0xFFDDEECC); // ensure non-zero offset
-
-		// generate code for all functions
-		var starts = Array<int>.new(module.functions.length);
-		for (i < module.functions.length) {
-			var f = module.functions[i];
-			if (f.imported()) continue;
-			starts[i] = w.atEnd().pos;
-			var compiled = compiler.gen(f);
-			if (!compiled) starts[i] = -1;
-		}
-		// emit handlers for signal-generated traps
-		var masm = X86_64MacroAssembler.!(compiler.masm);
-		var oobMemoryHandlerLabel = masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS);
-		var divZeroHandlerLabel = masm.newTrapLabel(TrapReason.DIV_BY_ZERO);
-		var stackOverflowHandlerLabel = masm.newTrapLabel(TrapReason.STACK_OVERFLOW);
-
-		// emit shared sequences for all trap returns
-		// XXX: share trap return sequences across all modules
-		for (reason in TrapReason) {
-			var label = masm.getTrapLabel(reason);
-			if (label != null) compiler.emitTrapReturn(label, reason);
-		}
-
-		// copy and map code
-		var mapping = mapCode(masm.asm, masm.prepareToCopyInto);
-		for (i < starts.length) {
-			if (starts[i] > 0) {
-				var addr = mapping.range.start + starts[i];
-				if (Trace.compiler) Trace.OUT.put2("func[%d].spc_entry: break *0x%x", i, addr - Pointer.NULL).outln();
-				setTargetCode(module.functions[i], addr);
-			}
-		}
-		var code = X86_64SpcCode.new(mapping);
-		code.oobMemoryHandlerOffset = oobMemoryHandlerLabel.offset;
-		code.divZeroHandlerOffset = divZeroHandlerLabel.offset;
-		code.stackOverflowHandlerOffset = stackOverflowHandlerLabel.offset;
-
-		module.target_module = TargetModule(code);
-		RiRuntime.registerUserCode(code);
-		module.target_module.code.keepAlive();
-	}
+	// A handy chokepoint for setting breakpoints in debugging.
 	def setTargetCode(f: FuncDecl, addr: Pointer) {
 		f.target_code = TargetCode(addr);
 	}
-	def callSpcEntry(wf: WasmFunction) -> AbruptReturn {
-		var valueStack = RT.valueStack;
-		return asmSpcEntry(valueStack.sp, wf, wf.decl.target_code.spc_entry);
-	}
-	def ensureSpcEntry() {
-		if (asmSpcEntry == null) {
-			var w = DataWriter.new();
-			var asm = X86_64Assemblers.create64(w);
-			var c = X86_64Regs2.CONFIG;
-			def G = X86_64Regs2.toGpr;
-			asm.movq_r_r(G(c.regs.vsp), Target.V3_PARAM_GPRS[1]); // vsp
-			asm.movq_r_r(G(c.regs.func_arg), Target.V3_PARAM_GPRS[2]); // function
-			asm.ijmp_r(Target.V3_PARAM_GPRS[3]);
-			globalCode = mapCode(asm, null);
-			asmSpcEntry = CiRuntime.forgeClosure<void, (Pointer, WasmFunction, Pointer), AbruptReturn>(globalCode.range.start, ());
-			if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", globalCode.range.start - Pointer.NULL).outln();
-		}
+	// A handy chokepoint for entering JIT code from V3.
+	def callSpcEntry(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
+		return asmSpcEntry(sp, wf, wf.decl.target_code.spc_entry);
 	}
 	def genInterpreterIntoFile(filename: string) -> ErrorBuilder {
 		var data = System.fileLoad(filename);
@@ -156,4 +67,112 @@ def mapCode(asm: X86_64Assembler, prepare: (X86_64Assembler, u64) -> void) -> Ma
 	}
 	Mmap.protect(range.start, u64.!(range.end - range.start), Mmap.PROT_READ | Mmap.PROT_EXEC);
 	return mapping;
+}
+
+// The simplest execution strategy with an interpreter only.
+class X86_64InterpreterOnlyStrategy extends ExecutionStrategy {
+	// Call a function with arguments and return a result.
+	def call(func: Function, args: Array<Value>) -> Result {
+		if (X86_64Interpreter.interpreterCode == null) X86_64Interpreter.genInterpreterCode();
+		return X86_64Runtime.run(func, args); // XXX: specialize for interpreter-only
+	}
+}
+
+// An execution strategy where every function is compiled with {SinglPassCompiler}.
+class X86_64SpcOnlyStrategy extends ExecutionStrategy {
+	var hasMonitors = false;
+
+	// Called if monitors will be attached to the (forthcoming) module.
+	def onMonitorsStart() {
+		hasMonitors = true;
+	}
+	// Called after a module is parsed.
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		// TODO: skip for lazy compilation scenario
+		if (hasMonitors) return;		// defer compilation until {onMonitorsFinish()}
+		compileEntireModule(module, size, err);	// otherwise, do full AOT compile now
+	}
+	// Called after monitors have processed a module.
+	def onMonitorsFinish(module: Module, err: ErrorGen) {
+		compileEntireModule(module, 0, err);
+	}
+	// Called before a test function is run.
+	def onTestRun(wf: WasmFunction, err: ErrorGen) {
+		if (wf.decl.target_code.spc_entry == Pointer.NULL) {
+			compileEntireModule(wf.instance.module, 0, err); // XXX: compile individual functions in test
+		}
+	}
+	// Call a function with arguments and return a result.
+	def call(func: Function, args: Array<Value>) -> Result {
+		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
+	}
+	private def compileEntireModule(module: Module, size: u32, err: ErrorGen) {
+		ensureSpcEntry();
+
+		var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
+		var limits = Limits.new();
+		// TODO: ignore bailouts for non-AOT mode
+		var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, err);
+		var w = compiler.w;
+		w.put_b32(0xFFDDEECC); // ensure non-zero offset
+
+		// generate code for all functions
+		var starts = Array<int>.new(module.functions.length);
+		for (i = 0; err.ok() && i < module.functions.length; i++) { // TODO: graceful bailouts
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			starts[i] = w.atEnd().pos;
+			var compiled = compiler.gen(module, f);
+			if (!compiled) starts[i] = -1;
+		}
+		// emit handlers for signal-generated traps
+		var masm = X86_64MacroAssembler.!(compiler.masm);
+		var oobMemoryHandlerLabel = masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS);
+		var divZeroHandlerLabel = masm.newTrapLabel(TrapReason.DIV_BY_ZERO);
+		var stackOverflowHandlerLabel = masm.newTrapLabel(TrapReason.STACK_OVERFLOW);
+
+		// emit shared sequences for all trap returns
+		// XXX: share trap return sequences across all modules
+		for (reason in TrapReason) {
+			var label = masm.getTrapLabel(reason);
+			if (label != null) compiler.emitTrapReturn(label, reason);
+		}
+
+		// copy and map code
+		var mapping = mapCode(masm.asm, masm.prepareToCopyInto);
+		for (i < starts.length) {
+			if (starts[i] > 0) {
+				var addr = mapping.range.start + starts[i];
+				if (Trace.compiler) Trace.OUT.put2("func[%d].spc_entry: break *0x%x", i, addr - Pointer.NULL).outln();
+				Target.setTargetCode(module.functions[i], addr);
+			}
+		}
+		var code = X86_64SpcCode.new(mapping);
+		code.oobMemoryHandlerOffset = oobMemoryHandlerLabel.offset;
+		code.divZeroHandlerOffset = divZeroHandlerLabel.offset;
+		code.stackOverflowHandlerOffset = stackOverflowHandlerLabel.offset;
+
+		module.target_module = TargetModule(code);
+		RiRuntime.registerUserCode(code);
+		module.target_module.code.keepAlive();
+	}
+}
+
+// Support for V3 -> JIT calls.
+var asmSpcEntry: (Pointer, WasmFunction, Pointer) -> AbruptReturn;
+var globalCode: Mapping;
+
+def ensureSpcEntry() {
+	if (asmSpcEntry == null) {
+		var w = DataWriter.new();
+		var asm = X86_64Assemblers.create64(w);
+		var c = X86_64Regs2.CONFIG;
+		def G = X86_64Regs2.toGpr;
+		asm.movq_r_r(G(c.regs.vsp), Target.V3_PARAM_GPRS[1]); // vsp
+		asm.movq_r_r(G(c.regs.func_arg), Target.V3_PARAM_GPRS[2]); // function
+		asm.ijmp_r(Target.V3_PARAM_GPRS[3]);
+		globalCode = mapCode(asm, null);
+		asmSpcEntry = CiRuntime.forgeClosure<void, (Pointer, WasmFunction, Pointer), AbruptReturn>(globalCode.range.start, ());
+		if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", globalCode.range.start - Pointer.NULL).outln();
+	}
 }

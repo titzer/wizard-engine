@@ -9,19 +9,22 @@ def OUT = Trace.OUT;
 class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 	def err = ErrorGen.new(filename);
 	def module = Module.new(filename);
+	var tiering: ExecutionStrategy;
 	var validate_code = true;
-	var validator: CodeValidator;
-	var parser: WasmParser;
 
+	private var validator: CodeValidator;
+	private var parser: WasmParser;
 	private var fsm: BpFsm;
 	private var seen_sections = Array<bool>.new(BpSection.Data.tag + 3);
 	private var declared_func_count: u32;
 	private var func_body_cursor: int;
+	private var total_bytes: u32;
 
 	new() {
 		var callback = BinParserCallback.new(this);
 		fsm = BpFsm.new(extensions, limits, err, callback);
 		parser = WasmParser.new(extensions, limits, module, err, fsm.decoder);
+		if (tiering != null) tiering.onModuleStart(module, 0);
 	}
 
 	// Push new data into the parser from the specified range. The given
@@ -37,7 +40,9 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 
 		fsm.push(x, xpos, xlength);
 
-		Metrics.load_bytes.val += u32.!(xlength);
+		var l = u32.!(xlength);
+		total_bytes += l;
+		Metrics.load_bytes.val += l;
 		if (time_metric.enabled) time_metric.val += (u32.view(System.ticksUs() - before_us));
 	}
 	// Finish the decoding of the pushed bytes, returning a valid module
@@ -56,6 +61,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 		}
 		var r = fsm.finish();
 		if (time_metric.enabled) time_metric.val += (u32.view(System.ticksUs() - before_us));
+		if (tiering != null) tiering.onModuleFinish(module, total_bytes, err);
 		return r;
 	}
 
@@ -107,6 +113,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 				var set = StringSet.new(count);
 				readLoop("exports", count, WasmParser.readExportDecl(_, _, set));
 			}
+			// note: Code section handled specially by BpFsm.
 			Data => {
 				var pos = parser.decoder.pos;
 				var count = parser.readCountAndReserve("data segments", module.data, limits.max_num_data_segments);
@@ -144,6 +151,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 				err.abs(abspos).FuncCountMismatch(declared_func_count, count);
 			}
 		}
+		if (tiering != null) tiering.onCodeSectionStart(module, count, 0); // TODO: size
 	}
 	def readCustomSection(size: u32) {
 		var decoder = parser.decoder;
@@ -200,11 +208,14 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) {
 		}
 		func_body_cursor = i;
 		var body = decoder.readN(int.!(size));
+		if (tiering != null) tiering.onFuncBody(module, index, body, err);
 		decoder.at(start);
 		f.setOrigCode(body);
 		if (!validate_code) return;
 		if (validator == null) validator = CodeValidator.new(extensions, limits, module, err);
-		validator.validate(f, decoder);
+		if (tiering != null) tiering.onFuncValidationStart(module, index);
+		var r = validator.validate(f, decoder);
+		if (tiering != null) tiering.onFuncValidationFinish(module, index, err);
 	}
 }
 
