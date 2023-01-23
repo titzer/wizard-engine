@@ -24,6 +24,7 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_ABS = SpcConsts.KIND_ABS;
 
+// Implements the target-specific parts of the single-pass compiler for X86-64.
 class X86_64SinglePassCompiler extends SinglePassCompiler {
 	def w = DataWriter.new();
 	def mmasm = X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy());
@@ -268,13 +269,13 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 			masm.emit_mov_r_f32(a.reg, int.view(Floats.f_nan));
 		}
 		asm.jmp_rel_near(done);
-		
+
 		asm.bind(ret_b);
 		if (is64) asm.movsd_s_s(xmmA, xmmB); // fallthru
 		else asm.movss_s_s(xmmA, xmmB); // fallthru
 		asm.bind(ret_a); // nop
 		asm.bind(done);
-		
+
 		state.push(a.kindFlagsAndTag(IN_REG), a.reg, 0);
 		freeVal(b);
 	}
@@ -638,4 +639,67 @@ class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
 	def setLocal(i: int, v: Value); // TODO: translate to interpreter frame
 	// Set operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc. (dynamically typechecked).
 	def setOperand(i: int, v: Value); // TODO: translate to interpreter frame
+}
+
+// Support for V3 -> SPC calls.
+var entryStub: (WasmFunction, Pointer, Pointer) -> AbruptReturn;
+var lazyCompileStub: Pointer;
+var stubCode: Mapping;
+var lazyCompileObject: ExecutionStrategy;
+
+// Global functionality associated with the single-pass compiler for X86-64.
+component X86_64Spc {
+	// Generate and map code for global stubs.
+	def genStubs(lazyCompile: (WasmFunction, Pointer) -> (WasmFunction, Pointer, Pointer)) {
+		if (entryStub != null) return;
+		// SPC entry stub
+		var w = DataWriter.new();
+		var asm = X86_64Assemblers.create64(w);
+		var c = X86_64Regs2.CONFIG;
+		var func_arg = G(c.regs.func_arg);
+		if (func_arg == Target.V3_PARAM_GPRS[2]) {
+			// XXX: use macro assembler to order moves
+			var scratch = R.R15; 					// TODO: use scratch from macro asm
+			asm.movq_r_r(scratch, func_arg);
+			asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
+			asm.movq_r_r(G(c.regs.vsp), scratch);			// vsp
+		} else {
+			asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
+			asm.movq_r_r(G(c.regs.vsp), Target.V3_PARAM_GPRS[2]);	// vsp
+		}
+		asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
+		asm.invalid();
+
+		var lazy_offset = w.pos;
+		if (lazyCompile != null) {
+			// SPC lazy compile stub
+			asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(c.regs.func_arg));	// function
+			asm.movq_r_r(Target.V3_PARAM_GPRS[2], G(c.regs.vsp));		// vsp
+			// Load the receiver of the {lazyCompile} closure.
+			var t = CiRuntime.unpackClosure<ExecutionStrategy, (WasmFunction, Pointer), (WasmFunction, Pointer, Pointer)>(lazyCompile);
+			lazyCompileObject = t.1;
+			var obj_ptr = int.!((Pointer.atField(lazyCompileObject) - Pointer.NULL));
+			asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
+			// Call the {lazyCompile} closure.
+			var scratch = X86_64Regs.R15;
+			asm.movq_r_i(scratch, int.!(t.0 - Pointer.NULL));		// 32-bit absolute address
+			asm.icall_r(scratch);
+			// Tail-call the result of the compile.
+			asm.movq_r_r(G(c.regs.func_arg), Target.V3_RET_GPRS[0]);	// function
+			asm.movq_r_r(G(c.regs.vsp), Target.V3_RET_GPRS[1]);		// vsp
+			asm.ijmp_r(Target.V3_RET_GPRS[3]);				// tail-call entrypoint
+		}
+		asm.invalid();
+
+		stubCode = Target.mapCode(asm, null);
+		entryStub = CiRuntime.forgeClosure<void, (WasmFunction, Pointer, Pointer), AbruptReturn>(stubCode.range.start, ());
+		lazyCompileStub = stubCode.range.start + lazy_offset;
+
+		if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", stubCode.range.start - Pointer.NULL).outln();
+		if (Trace.compiler) Trace.OUT.put1("spc_lazy_compile: break *0x%x", lazyCompileStub - Pointer.NULL).outln();
+	}
+	// A handy chokepoint for entering JIT code from V3.
+	def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
+		return entryStub(wf, sp, wf.decl.target_code.spc_entry);
+	}
 }
