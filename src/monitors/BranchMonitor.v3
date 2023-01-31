@@ -1,91 +1,104 @@
-class BranchInfo {
-	var taken: Vector<u64>;
-	// for IF and BR_IF, [0] = not taken and [1] = taken
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
 
-	def init(length: int) {
-		taken = Vector.new();
-		taken.putn(0, length);
-	}
-	def render(out: TraceBuilder) {
-		out.putc('[');
-		for (i < taken.length) {
-			out.putd(taken[i]);
-			if (i < taken.length - 1) {
-				out.puts(", ");
-			}
-		}
-		out.putc(']');
-	}
+class BmEntry(func: FuncDecl, pc: int, op: Opcode, numTargets: int) {
+	// for IF and BR_IF, [0] = not taken and [1] = taken
+	def taken = Array<u64>.new(numTargets);
 }
 
-class BranchMonitorVisitor(info: BranchInfo) extends BytecodeVisitor {
+class BranchMonitorState(module: Module) extends BytecodeVisitor {
+	def entries = Vector<BmEntry>.new();
+	var bi: BytecodeIterator;
+
 	def visit_IF(btc: BlockTypeCode) {
-		info.init(2);
+		addBranchInfo(Opcode.IF, 2, false);
 	}
 	def visit_BR_IF(depth: u31) {
-		info.init(2);
+		addBranchInfo(Opcode.BR_IF, 2, false);
 	}
 	def visit_BR_TABLE(labels: Range<u31>) {
-		info.init(labels.length);
+		addBranchInfo(Opcode.BR_TABLE, labels.length, true);
 	}
-}
 
-class BranchMonitor extends Monitor {
-	def probes = Vector<Probe>.new();
-	def entries = Vector<(Module, FuncDecl, int, Opcode)>.new();
-	def branches = Vector<BranchInfo>.new();
+	private def addBranchInfo(opcode: Opcode, numTargets: int, isBrTable: bool) {
+		var f = bi.func;
+		var entry = BmEntry.new(f, bi.pc, opcode, numTargets);
+		entries.put(entry);
 
-	def onParse(module: Module) {
-		var it = BytecodeIterator.new();
-		
-		for (i < module.functions.length) {
-			var f = module.functions[i];
-			if (f.imp != null) continue;
-			
-			var bi = it.reset(f);
-			for (v = 0; bi.more(); bi.next()) {
-				var op = bi.current();
-				var branchInfo: BranchInfo;
-
-				match (op) {
-					IF, BR_IF, BR_TABLE => {
-						var branchInfo = BranchInfo.new();
-						branches.put(branchInfo);
-						entries.put(module, f, bi.pc, op);
-						bi.dispatch(BranchMonitorVisitor.new(branchInfo));
-						var probe = BranchMonitorProbe.new(this, branchInfo);
-						module.insertProbeAt(f.func_index, bi.pc, probe);
-					}
-					_ => ;
-				}
-			}
-		}
+		var probe = if(isBrTable, BranchMonitorBranchTableProbe.new(entry.taken), BranchMonitorProbe.new(entry.taken));
+		module.insertProbeAt(f.func_index, bi.pc, probe);
 	}
-	def onFinish(i: Instance) {
+	def report() {
 		var prev: FuncDecl;
-		for (i < branches.length) {
-			var branchInfo = branches[i];
+		for (i < entries.length) {
 			var e = entries[i];
-			if (e.1 != prev) {
-				prev = e.1;
-				Trace.OUT.put1("func %q:", prev.render(e.0.names, _)).outln();
+			if (e.func != prev) {
+				prev = e.func;
+				Trace.OUT.put1("func %q:", prev.render(module.names, _)).outln();
 			}
-			Trace.OUT.put1("  +%d ", e.2);
-			Opcodes.render(Trace.OUT, e.3.code);
+			Trace.OUT.put1("  +%d ", e.pc);
+			Opcodes.render(Trace.OUT, e.op.code);
 			Trace.OUT.puts(": ");
-			branches[i].render(Trace.OUT);
+			Trace.OUT.putc('[');
+			var taken = e.taken;
+			for (j < taken.length) {
+				if (j > 0) Trace.OUT.csp();
+				Trace.OUT.putd(taken[j]);
+			}
+			Trace.OUT.putc(']');
 			Trace.OUT.outln();
 		}
 	}
 }
 
-class BranchMonitorProbe(m: BranchMonitor, info: BranchInfo) extends Probe {
+class BranchMonitor extends Monitor {
+	def visitors = Vector<BranchMonitorState>.new();
+
+	def onParse(module: Module) {
+		def visitor = BranchMonitorState.new(module);
+		visitors.put(visitor);
+
+		var it = BytecodeIterator.new();
+		visitor.bi = it;
+
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			if (f.imp != null) continue;
+			
+			var bi = it.reset(f);
+			while (bi.more()) {
+				bi.dispatch(visitor);
+				bi.next();
+			}
+		}
+	}
+	def onFinish(i: Instance) {
+		for (j < visitors.length) {
+			visitors[j].report();
+		}
+	}
+}
+
+class BranchMonitorProbe(taken: Array<u64>) extends Probe {
 	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
 		var accessor = frame.getFrameAccessor();
 		var condition = accessor.getOperand(0);
 		var taken = Values.v_i(condition) == 0;
 		var index = if(taken, 1, 0);
-		info.taken[index] += 1;
+		this.taken[index] += 1;
+		return Resumption.Continue;
+	}
+}
+class BranchMonitorBranchTableProbe(taken: Array<u64>) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+		var accessor = frame.getFrameAccessor();
+		var numBranches = taken.length;
+		var condition = accessor.getOperand(0);
+		var takenBranch = Values.v_i(condition);
+		if (takenBranch >= numBranches) {
+			takenBranch = numBranches - 1;
+		}
+		this.taken[takenBranch] += 1;
 		return Resumption.Continue;
 	}
 }
