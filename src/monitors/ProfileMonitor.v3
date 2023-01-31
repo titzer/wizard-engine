@@ -1,0 +1,196 @@
+// Copyright 2022 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A tree-based profiler
+class ProfileTreeNode(parent: ProfileTreeNode, id: int) {
+    var children: HashMap<int, ProfileTreeNode> = HashMap<int, ProfileTreeNode>.new(int.!<int>, int.==);
+    var totalTime: int;
+    var curTime: int;
+    var count: int;
+    
+    def getOrCreateChild(childId: int) -> ProfileTreeNode {
+        if (children[childId] == null) {
+            children[childId] = ProfileTreeNode.new(this, childId);
+        }
+        return children[childId];
+    }
+    def enter() {
+        curTime = System.ticksUs();
+        count++;
+    }
+    def exit() {
+        totalTime += System.ticksUs() - curTime;
+    }
+
+    def render(T: TraceBuilder, m: Module, depth: int, total: int, maxDepth: int) {
+        var totalPercentTime = if(depth == 1, totalTime, total);
+        var childArray: Array<(int, ProfileTreeNode)>;
+        var selfTime: int;
+
+        if (maxDepth == -1 || depth < maxDepth) {
+            var childVec = Vector<(int, ProfileTreeNode)>.new();
+            children.apply(putChild(childVec, _));
+            childArray = childVec.extract();
+            childArray = Arrays.sort(childArray, 0, childArray.length, byTime);
+
+            var childTotalTime = 0;
+            for (i < childArray.length) {
+                childTotalTime += childArray[i].1.totalTime;
+            }
+            selfTime = totalTime - childTotalTime;
+        } else {
+            selfTime = totalTime;
+        }
+        
+        if (id == -1) {
+            // Root node in ProfileTree
+            renderHeader(T);
+        } else {
+            var l = T.length;
+            var f = m.functions[id];
+            for (i < depth) T.puts("  ");
+            T.puts(TermColors.CYAN);
+            T.puts("func ");
+            f.render(m.names, T);
+            T.puts(TermColors.DEFAULT);
+            T.pad(' ', l + 50);
+            renderRight(T, 10, renderTime(_, selfTime));
+            renderRight(T, 10, renderPct(_, selfTime, totalPercentTime));
+            T.pad(' ', l + 65);
+            renderRight(T, 10, put1(_, "%d", count));
+            T.outln();
+        }
+
+        if (maxDepth == -1 || depth < maxDepth) {
+            for (child in childArray) {
+                child.1.render(T, m, depth + 1, totalPercentTime, maxDepth);
+            }
+        }
+    }
+    private def putChild<T>(vector: Vector<T>, child: T) {
+        vector.put(child);
+    }
+    private def byTime(a: (int, ProfileTreeNode), b: (int, ProfileTreeNode)) -> bool {
+        return b.1.totalTime < a.1.totalTime;
+    }
+}
+
+class ProfileTree {
+    var rootNode: ProfileTreeNode;
+    var curNode: ProfileTreeNode;
+
+    new() {
+        rootNode = ProfileTreeNode.new(null, -1);
+        curNode = rootNode;
+    }
+    def enterFunc(id: int) {
+        curNode = curNode.getOrCreateChild(id);
+        curNode.enter();
+    }
+    def exitFunc() {
+        curNode.exit();
+        curNode = curNode.parent;
+    }
+}
+
+class ProfileMonitor extends Monitor {
+    var tree: ProfileTree;
+    var maxDepth: int = -1;
+
+    def configure(args: string) -> string {
+        if (args.length > 0) {
+            maxDepth = Ints.parseDecimal(args, 0).1;
+        }
+        return null;
+    }
+	def onParse(module: Module) {
+		var it = BytecodeIterator.new();
+		var enterProbe = ProfileMonitorEnterProbe.new(this);
+		var exitProbe = ProfileMonitorExitProbe.new(this);
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			if (f.imp != null) continue; // skip imported functions
+			var bi = it.reset(f);
+			if (bi.current() == Opcode.LOOP) ; // TODO: handle functions that start with a loop
+			module.insertProbeAt(f.func_index, bi.pc, enterProbe);
+
+			for (v = 0; bi.more(); bi.next()) {
+				var op = bi.current();
+				match (op) {
+					RETURN => ;
+					END => if ((bi.pc + 1) < f.cur_bytecode.length) continue;
+					_ => continue;
+				}
+				module.insertProbeAt(f.func_index, bi.pc, exitProbe);
+			}
+		}
+        tree = ProfileTree.new();
+	}
+	def onExit(code: int) {
+		onFinish(null);
+	}
+	def onFinish(i: Instance) {
+        tree.rootNode.render(Trace.OUT, i.module, 0, 0, maxDepth);
+	}
+
+    private def renderHeader(T: TraceBuilder) {
+        var l = T.length;
+        T.puts(TermColors.CYAN);
+        T.puts("*");
+        T.puts(TermColors.DEFAULT);
+        T.pad(' ', l + 50);
+        renderRight(T, 10, puts(_, "time"));
+        renderRight(T, 10, puts(_, "%"));
+        T.pad(' ', l + 65);
+        renderRight(T, 10, puts(_, "count"));
+        T.outln();
+    }
+    private def renderRight(T: TraceBuilder, len: int, f: TraceBuilder -> void) {
+        var str = TraceBuilder.new();
+        f(str);
+        for (i < len - str.length) {
+            T.putc(' ');
+        }
+        T.puts(str.extract());
+    }
+    private def renderUs(T: TraceBuilder, time: int) {
+        var divisor = 1000000;
+        T.putd(time / divisor);
+        T.putc('.');
+        for (divisor = 1000000; divisor > 1; divisor /= 10) {
+            T.putd((time / divisor) % 10);
+        }
+        T.putc('s');
+    }
+    private def renderPct(T: TraceBuilder, dividend: int, divisor: int) {
+        var value = dividend * 100 / divisor;
+        T.putd(value);
+        T.putc('.');
+        for (base = 10; base < 1000; base *= 10) {
+            T.putd((dividend * base * 100 / divisor) % 10);
+        }
+        T.putc('%');
+    }
+    private def puts(T: TraceBuilder, s: string) {
+        T.puts(s);
+    }
+    private def put1<T1>(T: TraceBuilder, fmt: string, p1: T1) {
+        T.put1(fmt, p1);
+    }
+    private def renderTime(T: TraceBuilder, time: int) {
+        renderUs(T, time);
+    }
+}
+class ProfileMonitorEnterProbe(m: ProfileMonitor) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+        var id = func.decl.func_index;
+        m.tree.enterFunc(id);
+		return Resumption.Continue;
+	}
+}
+class ProfileMonitorExitProbe(m: ProfileMonitor) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+        m.tree.exitFunc();
+        return Resumption.Continue;
+	}
+}
