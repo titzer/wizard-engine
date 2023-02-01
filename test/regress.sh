@@ -20,7 +20,7 @@ TESTS="$@"
 
 function run_tests() {
     if [ "$TESTS" =  "" ]; then
-        for dir in core gen; do
+        for dir in core gen simd; do
 	    TESTS=$(ls test/regress/$dir/*.bin.wast)
 	    $CMD $TESTS
         done
