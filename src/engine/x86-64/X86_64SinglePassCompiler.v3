@@ -536,6 +536,7 @@ def SIGFPE  = 8;
 def SIGBUS  = 10;
 def SIGSEGV = 11;
 
+// Represents the JITed code for an entire module.
 // Implements the RiUserCode interface to add generated machine code to the V3 runtime.
 // Handles stackwalking and signals in JITed code.
 class X86_64SpcCode extends RiUserCode {
@@ -544,7 +545,8 @@ class X86_64SpcCode extends RiUserCode {
 	var oobMemoryHandlerOffset: int;	// handler for signals caused by OOB memory access
 	var divZeroHandlerOffset: int;		// handler for signals caused by divide by zero
 	var stackOverflowHandlerOffset: int;	// handler for signals caused by (value- or call-) stack overflow
-	var buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
+	def buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
+	var codeEnd: int;			// for dynamically adding code to the end
 
 	new(mapping) super(mapping.range.start, mapping.range.end) { }
 
@@ -607,7 +609,7 @@ class X86_64SpcCode extends RiUserCode {
 	// Get a frame accessor for the probe API.
 	def getFrameAccessor(sp: Pointer) -> X86_64SpcFrameAccessor {
 		var retip = (sp + -Pointer.SIZE).load<Pointer>();
-		if (!mapping.range.contains(sp)) return null;
+		if (!mapping.range.contains(retip)) return null;
 		if (true) { // XXX: tuning for caching frame accessor object
 			var prev = (sp + IVarConfig.frame.ACCESSOR.disp).load<X86_64SpcFrameAccessor>();
 			if (prev != null) return prev;
@@ -616,6 +618,8 @@ class X86_64SpcCode extends RiUserCode {
 			return n;
 		}
 		return X86_64SpcFrameAccessor.new(sp);
+	}
+	def installCodeFor(m: Module, func_index: int, masm: X86_64MacroAssembler) {
 	}
 }
 
@@ -650,11 +654,12 @@ var lazyCompileObject: ExecutionStrategy;
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
 	// Generate and map code for global stubs.
-	def genStubs(lazyCompile: (WasmFunction, Pointer) -> (WasmFunction, Pointer, Pointer)) {
+	def genStubs(lazyCompile: WasmFunction -> (WasmFunction, Pointer)) {
 		if (entryStub != null) return;
 		// SPC entry stub
 		var w = DataWriter.new();
-		var asm = X86_64Assemblers.create64(w);
+		var masm = X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy());
+		var asm = X86_64Assembler.!(masm.asm);
 		var c = X86_64Regs2.CONFIG;
 		var func_arg = G(c.regs.func_arg);
 		if (func_arg == Target.V3_PARAM_GPRS[2]) {
@@ -673,10 +678,10 @@ component X86_64Spc {
 		var lazy_offset = w.pos;
 		if (lazyCompile != null) {
 			// SPC lazy compile stub
+			masm.emit_store_runtime_vsp(c.regs.vsp);
 			asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(c.regs.func_arg));	// function
-			asm.movq_r_r(Target.V3_PARAM_GPRS[2], G(c.regs.vsp));		// vsp
 			// Load the receiver of the {lazyCompile} closure.
-			var t = CiRuntime.unpackClosure<ExecutionStrategy, (WasmFunction, Pointer), (WasmFunction, Pointer, Pointer)>(lazyCompile);
+			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer)>(lazyCompile);
 			lazyCompileObject = t.1;
 			var obj_ptr = int.view(u32.!((Pointer.atField(lazyCompileObject) - Pointer.NULL)));
 			asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
@@ -685,9 +690,10 @@ component X86_64Spc {
 			asm.movq_r_i(scratch, int.view(u32.!(t.0 - Pointer.NULL)));	// 32-bit absolute address
 			asm.icall_r(scratch);
 			// Tail-call the result of the compile.
+			asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
 			asm.movq_r_r(G(c.regs.func_arg), Target.V3_RET_GPRS[0]);	// function
-			asm.movq_r_r(G(c.regs.vsp), Target.V3_RET_GPRS[1]);		// vsp
-			asm.ijmp_r(Target.V3_RET_GPRS[3]);				// tail-call entrypoint
+			masm.emit_load_runtime_vsp(c.regs.vsp);
+			asm.ijmp_r(scratch);						// jump to entrypoint
 		}
 		asm.invalid();
 
@@ -701,5 +707,12 @@ component X86_64Spc {
 	// A handy chokepoint for entering JIT code from V3.
 	def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
 		return entryStub(wf, sp, wf.decl.target_code.spc_entry);
+	}
+	def setLazyCompileFor(decl: FuncDecl) {
+		decl.target_code = TargetCode(lazyCompileStub);
+	}
+	def returnCompileFailed(wf: WasmFunction, err: ErrorGen) -> (WasmFunction, Pointer); // TODO
+	def estimateCodeSizeFor(decl: FuncDecl) -> int {
+		return 60 + decl.orig_bytecode.length * 5;
 	}
 }
