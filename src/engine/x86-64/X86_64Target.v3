@@ -2,6 +2,8 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def RT: X86_64Runtime;
+def PAGE_SIZE = 4096u;
+def PAGE_SIZE_i: int = 4096;
 // Contains target-specific factory functions.
 component Target {
 	def V3_PARAM_GPRS = [X86_64Regs.RDI, X86_64Regs.RSI, X86_64Regs.RDX, X86_64Regs.RCX, X86_64Regs.R8, X86_64Regs.R9]; 		// System-V
@@ -14,8 +16,7 @@ component Target {
 	def tagging = Tagging.new(tuning.taggedValues, tuning.simdSupport);
 
 	new() {
-		ExecuteOptions.registerMode("jit", X86_64SpcAotStrategy.new(),
-			"ahead-of-time compile entire module with SPC");
+		ExecuteOptions.registerMode("jit", X86_64SpcAotStrategy.new(), "ahead-of-time compile entire module with SPC");
 //TODO		ExecuteOptions.registerMode("lazy", X86_64SpcLazyStrategy.new(), "lazy-compile functions on demand with SPC");
 //TODO		ExecuteOptions.registerMode("dyn", X86_64DynamicStrategy.new(), "fast interpreter with dynamic tier-up to SPC");
 //TODO		ExecuteOptions.registerMode("mixed", X86_64MixedStrategy.new(), "lazy-compile functions on demand with SPC, fallback to fast-int");
@@ -28,6 +29,9 @@ component Target {
 	// A handy chokepoint for setting breakpoints in debugging.
 	def setTargetCode(f: FuncDecl, addr: Pointer) {
 		f.target_code = TargetCode(addr);
+	}
+	// A handy chokepoint for setting breakpoints in debugging.
+	def finishCompile(f: FuncDecl) {
 	}
 	def genInterpreterIntoFile(filename: string) -> ErrorBuilder {
 		var data = System.fileLoad(filename);
@@ -115,12 +119,11 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 	}
 	private def compileEntireModule(module: Module, size: u32, err: ErrorGen) {
 		// ensure entrypoint and lazy compile stubs are generated
-		X86_64Spc.genStubs(null);
+		X86_64Spc.genStubs();
+		X86_64Spc.setLazyCompile(null);
 
-		var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
-		var limits = Limits.new();
 		// TODO: ignore bailouts for non-AOT mode
-		var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, err);
+		var compiler = newCompiler(module.filename);
 		var w = compiler.w;
 
 		// generate code for all functions
@@ -171,6 +174,7 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 
 // One tier: SPC, functions are lazily compiled.
 class X86_64SpcLazyStrategy extends ExecutionStrategy {
+	def TRAP_HANDLER_RESERVATION = PAGE_SIZE;
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installLazyCompileStubForModule(module, err);
@@ -185,9 +189,10 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 	}
 	private def installLazyCompileStubForModule(module: Module, err: ErrorGen) {
 		// ensure entrypoint and lazy compile stubs are generated
-		X86_64Spc.genStubs(lazyCompile);
+		X86_64Spc.genStubs();
+		X86_64Spc.setLazyCompile(lazyCompile);
 		// Estimate code space for the entire module.
-		var codeSize = 4096 + 4096;
+		var codeSize = PAGE_SIZE_i * 2;
 		// Set all functions to refer to the lazy compile stub.
 		for (i = 0; err.ok() && i < module.functions.length; i++) {
 			var f = module.functions[i];
@@ -195,41 +200,54 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 			X86_64Spc.setLazyCompileFor(f);
 			codeSize += X86_64Spc.estimateCodeSizeFor(f);
 		}
+		// Round up to the next page size.
+		codeSize = PAGE_SIZE_i * ((codeSize + PAGE_SIZE_i - 1) / PAGE_SIZE_i);
 		// Allocate a read/write/execute mapping for code.
 		var mapping = Mmap.reserve(u64.!(codeSize), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
 		var code = X86_64SpcCode.new(mapping);
 		module.target_module = TargetModule(code);
 		RiRuntime.registerUserCode(code);
 		code.keepAlive();
-		// TODO: compile the trap reason labels onto the last page.
-//		var oobMemoryHandlerLabel = masm.newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS);
-//		var divZeroHandlerLabel = masm.newTrapLabel(TrapReason.DIV_BY_ZERO);
-//		var stackOverflowHandlerLabel = masm.newTrapLabel(TrapReason.STACK_OVERFLOW);
+		if (Trace.compiler) Trace.OUT.put3("%s: reserved 0x%x ... 0x%x for lazy-compiled code",
+			module.filename, (mapping.range.start - Pointer.NULL), (mapping.range.end - Pointer.NULL)).outln();
+
+		// Compile the trap reason labels onto the last page.
+		var compiler = newCompiler(module.filename);
+		var masm = X86_64MacroAssembler.!(compiler.masm);
+		var lastPageOffset = int.!(mapping.range.size() - TRAP_HANDLER_RESERVATION);
+		for (reason in TrapReason) {
+			var label = masm.newTrapLabel(reason);
+			compiler.emitTrapReturn(label, reason);
+			code.trapHandlerOffsets[reason.tag] = label.offset + lastPageOffset;
+		}
+		Target.copyInto(code.mapping.range, lastPageOffset, masm.w);
 	}
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer) {
 		var module = wf.instance.module;
 		var code = module.target_module.spc_code;
-		// XXX: cache the compiler across lazy compiles
-		var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
-		var limits = Limits.new();
-		var err = ErrorGen.new(module.filename);
-		var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, err);
+		var compiler = newCompiler(module.filename); // XXX: cache per-thread
+		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
+
+		// Bind all trap handler labels used in the newly-compiled code to the handlers at the end of the code.
+		for (reason in TrapReason) {
+			var label = masm.newTrapLabel(reason); // XXX: cache trap labels
+			masm.bindLabelTo(label, code.trapHandlerOffsets[reason.tag] - code.codeEnd);
+		}
 
 		// generate code for the function
+// XXX:		w.align(8);
 		compiler.gen(module, wf.decl);
 
 		// Check for remaining code space
-		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
-		w.align(8);
-		var regionSize = code.mapping.range.end - code.mapping.range.start;
-		var remaining = regionSize - code.codeEnd;
+		var regionSize = code.mapping.range.size();
+		var remaining =  regionSize - u64.!(code.codeEnd) - TRAP_HANDLER_RESERVATION;
 		var codeSize = w.atEnd().pos;
-		if (codeSize > remaining) err.abs(0).set(
+		if (codeSize > remaining) compiler.err.abs(0).set(
 			Strings.format3("exhausted code space for module (%d of %d bytes remaining, need %d)",
 				remaining, regionSize, codeSize));
 
 		// Check for any errors
-		if (err.error()) return X86_64Spc.returnCompileFailed(wf, err);
+		if (compiler.err.error()) return X86_64Spc.returnCompileFailed(wf, compiler.err);
 
 		// Copy code into end of region
 		var range = code.mapping.range;
@@ -239,6 +257,14 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 
 		Target.setTargetCode(wf.decl, spc_entry);
 		if (Trace.compiler) Trace.OUT.put2("func[%d].spc_entry: break *0x%x", wf.decl.func_index, spc_entry - Pointer.NULL).outln();
+		Target.finishCompile(wf.decl);
 		return (wf, spc_entry);
 	}
+}
+def newCompiler(filename: string) -> X86_64SinglePassCompiler {
+	var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
+	var limits = Limits.new();
+	var err = ErrorGen.new(filename);
+	var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, err);
+	return compiler;
 }
