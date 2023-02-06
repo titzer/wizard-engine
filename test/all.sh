@@ -49,6 +49,7 @@ function do_script() {
     $SCRIPT_LOC/${script}.sh
     if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
         TEST_MODE=jit $SCRIPT_LOC/${script}.sh
+        TEST_MODE=lazy $SCRIPT_LOC/${script}.sh
     fi
 }
 
