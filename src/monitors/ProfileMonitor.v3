@@ -1,18 +1,20 @@
-// Copyright 2022 Ben L. Titzer. All rights reserved.
+// Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
 // A tree-based profiler
-class ProfileTreeNode(parent: ProfileTreeNode, id: int) {
-    var children: HashMap<int, ProfileTreeNode> = HashMap<int, ProfileTreeNode>.new(int.!<int>, int.==);
+class ProfileTreeNode(parent: ProfileTreeNode, func: WasmFunction) {
+    var children: List<ProfileTreeNode>;
     var totalTime: int;
     var curTime: int;
     var count: int;
     
-    def getOrCreateChild(childId: int) -> ProfileTreeNode {
-        if (children[childId] == null) {
-            children[childId] = ProfileTreeNode.new(this, childId);
+    def getOrCreateChild(func: WasmFunction) -> ProfileTreeNode {
+        for (i = children; i != null; i = i.tail) {
+            if (i.head.func == func) return i.head;
         }
-        return children[childId];
+        var childNode = ProfileTreeNode.new(this, func);
+        children = List.new(childNode, children);
+        return childNode;
     }
     def enter() {
         curTime = System.ticksUs();
@@ -22,56 +24,72 @@ class ProfileTreeNode(parent: ProfileTreeNode, id: int) {
         totalTime += System.ticksUs() - curTime;
     }
 
-    def render(T: TraceBuilder, m: Module, depth: int, total: int, maxDepth: int) {
+    def render(out: TraceBuilder, m: Module, depth: int, total: int, maxDepth: int) {
         var totalPercentTime = if(depth == 1, totalTime, total);
-        var childArray: Array<(int, ProfileTreeNode)>;
-        var selfTime: int;
+        var nestedTime: int = totalTime;
+        var selfTime: int = totalTime;
+
+        var childArray = Lists.toArray(children);
+        childArray = Arrays.sort(childArray, 0, childArray.length, byTime);
 
         if (maxDepth == -1 || depth < maxDepth) {
-            var childVec = Vector<(int, ProfileTreeNode)>.new();
-            children.apply(putChild(childVec, _));
-            childArray = childVec.extract();
-            childArray = Arrays.sort(childArray, 0, childArray.length, byTime);
-
             var childTotalTime = 0;
             for (i < childArray.length) {
-                childTotalTime += childArray[i].1.totalTime;
+                childTotalTime += childArray[i].totalTime;
             }
-            selfTime = totalTime - childTotalTime;
+            selfTime = nestedTime - childTotalTime;
         } else {
-            selfTime = totalTime;
+            selfTime = -1;
         }
         
-        if (id == -1) {
+        if (func == null) {
             // Root node in ProfileTree
-            renderHeader(T);
+            renderHeader(out);
         } else {
-            var l = T.length;
-            var f = m.functions[id];
-            for (i < depth) T.puts("  ");
-            T.puts(TermColors.CYAN);
-            T.puts("func ");
-            f.render(m.names, T);
-            T.puts(TermColors.DEFAULT);
-            T.pad(' ', l + 50);
-            renderRight(T, 10, renderTime(_, selfTime));
-            renderRight(T, 10, renderPct(_, selfTime, totalPercentTime));
-            T.pad(' ', l + 65);
-            renderRight(T, 10, put1(_, "%d", count));
-            T.outln();
+            var l = out.length;
+            var f = func.decl;
+            for (i < depth) out.puts("  ");
+            out.puts(TermColors.CYAN);
+            out.puts("func ");
+            f.render(m.names, out);
+            out.puts(TermColors.DEFAULT);
+            out.pad(' ', l + 50);
+            TraceUtil.renderRight(out, 12, TraceUtil.renderUs(_, selfTime));
+            TraceUtil.renderRight(out, 12, TraceUtil.renderUs(_, nestedTime));
+            TraceUtil.renderRight(out, 10, TraceUtil.renderPct(_, selfTime, totalPercentTime, 3));
+            TraceUtil.renderRight(out, 10, put1(_, "%d", count));
+            out.outln();
         }
 
         if (maxDepth == -1 || depth < maxDepth) {
             for (child in childArray) {
-                child.1.render(T, m, depth + 1, totalPercentTime, maxDepth);
+                if (child != null) child.render(out, m, depth + 1, totalPercentTime, maxDepth);
             }
         }
     }
-    private def putChild<T>(vector: Vector<T>, child: T) {
-        vector.put(child);
+    private def byTime(a: ProfileTreeNode, b: ProfileTreeNode) -> bool {
+        return b.totalTime < a.totalTime;
     }
-    private def byTime(a: (int, ProfileTreeNode), b: (int, ProfileTreeNode)) -> bool {
-        return b.1.totalTime < a.1.totalTime;
+
+    private def renderHeader(out: TraceBuilder) {
+        var l = out.length;
+        out.puts(TermColors.CYAN);
+        out.puts("*");
+        out.puts(TermColors.DEFAULT);
+        out.pad(' ', l + 50);
+        TraceUtil.renderRight(out, 12, puts(_, "nested"));
+        TraceUtil.renderRight(out, 12, puts(_, "self"));
+        TraceUtil.renderRight(out, 10, puts(_, "%"));
+        TraceUtil.renderRight(out, 10, puts(_, "count"));
+        out.outln();
+    }
+    
+    
+    private def puts(out: TraceBuilder, s: string) {
+        out.puts(s);
+    }
+    private def put1<T1>(out: TraceBuilder, fmt: string, p1: T1) {
+        out.put1(fmt, p1);
     }
 }
 
@@ -80,11 +98,11 @@ class ProfileTree {
     var curNode: ProfileTreeNode;
 
     new() {
-        rootNode = ProfileTreeNode.new(null, -1);
+        rootNode = ProfileTreeNode.new(null, null);
         curNode = rootNode;
     }
-    def enterFunc(id: int) {
-        curNode = curNode.getOrCreateChild(id);
+    def enterFunc(func: WasmFunction) {
+        curNode = curNode.getOrCreateChild(func);
         curNode.enter();
     }
     def exitFunc() {
@@ -96,12 +114,29 @@ class ProfileTree {
 class ProfileMonitor extends Monitor {
     var tree: ProfileTree;
     var maxDepth: int = -1;
+    var filter: DeclFilter;
 
+    // format: --monitors=profile{depth=2,calls=*}
     def configure(args: string) -> string {
-        if (args.length > 0) {
-            maxDepth = Ints.parseDecimal(args, 0).1;
+        var argNameStart: int;
+        for (i = 0; i < args.length; i++) {
+            if (args[i] == '=') {
+                var argName = Arrays.range(args, argNameStart, i);
+                var argValueStart = i;
+                while (i < args.length && args[i] != ',') i++;
+                var argValue = Arrays.range(args, argValueStart + 1, i);
+                handleArg(argName, argValue);
+                argNameStart = i + 1;
+            }
         }
         return null;
+    }
+    private def handleArg(name: string, value: string) {
+        if (Strings.equal(name, "depth")) {
+            maxDepth = Ints.parseDecimal(value, 0).1;
+        } else if (Strings.equal(name, "calls")) {
+            filter = DeclFilter.new(value);
+        }
     }
 	def onParse(module: Module) {
 		var it = BytecodeIterator.new();
@@ -110,6 +145,8 @@ class ProfileMonitor extends Monitor {
 		for (i < module.functions.length) {
 			var f = module.functions[i];
 			if (f.imp != null) continue; // skip imported functions
+            if (filter != null && !filter.matches(module, f)) continue;
+
 			var bi = it.reset(f);
 			if (bi.current() == Opcode.LOOP) ; // TODO: handle functions that start with a loop
 			module.insertProbeAt(f.func_index, bi.pc, enterProbe);
@@ -132,59 +169,10 @@ class ProfileMonitor extends Monitor {
 	def onFinish(i: Instance) {
         tree.rootNode.render(Trace.OUT, i.module, 0, 0, maxDepth);
 	}
-
-    private def renderHeader(T: TraceBuilder) {
-        var l = T.length;
-        T.puts(TermColors.CYAN);
-        T.puts("*");
-        T.puts(TermColors.DEFAULT);
-        T.pad(' ', l + 50);
-        renderRight(T, 10, puts(_, "time"));
-        renderRight(T, 10, puts(_, "%"));
-        T.pad(' ', l + 65);
-        renderRight(T, 10, puts(_, "count"));
-        T.outln();
-    }
-    private def renderRight(T: TraceBuilder, len: int, f: TraceBuilder -> void) {
-        var str = TraceBuilder.new();
-        f(str);
-        for (i < len - str.length) {
-            T.putc(' ');
-        }
-        T.puts(str.extract());
-    }
-    private def renderUs(T: TraceBuilder, time: int) {
-        var divisor = 1000000;
-        T.putd(time / divisor);
-        T.putc('.');
-        for (divisor = 1000000; divisor > 1; divisor /= 10) {
-            T.putd((time / divisor) % 10);
-        }
-        T.putc('s');
-    }
-    private def renderPct(T: TraceBuilder, dividend: int, divisor: int) {
-        var value = dividend * 100 / divisor;
-        T.putd(value);
-        T.putc('.');
-        for (base = 10; base < 1000; base *= 10) {
-            T.putd((dividend * base * 100 / divisor) % 10);
-        }
-        T.putc('%');
-    }
-    private def puts(T: TraceBuilder, s: string) {
-        T.puts(s);
-    }
-    private def put1<T1>(T: TraceBuilder, fmt: string, p1: T1) {
-        T.put1(fmt, p1);
-    }
-    private def renderTime(T: TraceBuilder, time: int) {
-        renderUs(T, time);
-    }
 }
 class ProfileMonitorEnterProbe(m: ProfileMonitor) extends Probe {
 	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
-        var id = func.decl.func_index;
-        m.tree.enterFunc(id);
+        m.tree.enterFunc(func);
 		return Resumption.Continue;
 	}
 }
