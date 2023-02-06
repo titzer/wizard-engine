@@ -1,35 +1,76 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// TODO: make SPC tests capable of running in v3i
 def T = UnitTests.registerT("spc:", _, SpcTester.new, _);
 def X = [
 	T("pool0", test_pool0),
 	T("pool1", test_pool1),
 	T("pool2", test_pool2),
 	T("pool3", test_pool3),
+	T("pool_alloc0", test_pool_alloc0),
+	T("pool_alloc1", test_pool_alloc1),
+	T("pool_alloc2", test_pool_alloc2),
+	T("pool_free0", test_pool_free0),
+	T("pool_free1", test_pool_free1),
+	T("pool_freeAll", test_pool_freeAll),
+	T("pool_unfree0", test_pool_unfree0),
 	()
 ];
 
+def NO_REG = Reg(0);
 def RA = Reg(1);
 def RB = Reg(2);
 def RC = Reg(3);
-def RD = Reg(4);
-def RE = Reg(5);
+def XA = Reg(4);
+def XB = Reg(5);
+def POOL_0 = [RA, RB, RC];
+def POOL_1 = [XA, XB];
+def POOLS = [POOL_0, POOL_1];
 
-def set = setupRegSet();
+def regConfig = setupRegConfig();
+def set = regConfig.regSet;
 
-def setupRegSet() -> RegSet {
-	var r = RegSet.new([RA, RD, RC, RB, RE], ["<invalid>", "%ra", "%rd", "%rc", "%rb", "%re"]);
-	// TODO: map regs to pools?
-	return r;
+def setupRegConfig() -> RegConfig {
+	var regSet = RegSet.new([NO_REG, RA, RB, RC, XA, XB], ["<none>", "%ra", "%rb", "%rc", "%xa", "%xb"]);
+	var roles = Array<Reg>.new(1 + RegRole.TLS.tag);
+	var regConfig = RegConfig.new(regSet, RegRoles.new(roles));
+	regConfig.numRegPools = 2;
+
+	for (r in POOL_0) regConfig.regToPool[r.index] = 0;
+	for (r in POOL_1) regConfig.regToPool[r.index] = 1;
+
+	regConfig.kindToPool[ValueKind.REF.tag] = 0;
+	regConfig.kindToPool[ValueKind.I32.tag] = 0;
+	regConfig.kindToPool[ValueKind.I64.tag] = 0;
+	regConfig.kindToPool[ValueKind.F32.tag] = 1;
+	regConfig.kindToPool[ValueKind.F64.tag] = 1;
+	regConfig.kindToPool[ValueKind.V128.tag] = 1;
+
+	return regConfig;
 }
 
 class SpcTester(t: Tester) {
 	var pool = PriorityRegPool.new(set.regs, null);
-	
+
 	def assertFree(expected: bool, r: Reg) {
 		var got = pool.isFree(r);
-		if (got != expected) t.fail3("expected isFree(%s) == %z, got %z", set.names[r.index], expected, got);
+		if (got != expected) t.fail3("expected isFree(%s) == %z, got %z", set.getName(r), expected, got);
+	}
+	def assertInPool(pool: int, r: Reg) {
+		for (rj in POOLS[pool]) {
+			if (r == rj) return;
+		}
+		t.fail2("expected register in pool %d, got %s", pool, set.getName(r));
+	}
+	def assertDifferent(r: Array<Reg>) {
+		for (i < r.length) {
+			for (j < r.length) {
+				if (i == j) continue;
+				if (r[i] == r[j]) return t.fail3("expected, different registers, got %s @ %d and %d",
+					set.getName(r[i]), i, j);
+			}
+		}
 	}
 }
 
@@ -59,10 +100,10 @@ def test_pool1(t: SpcTester) {
 
 def test_pool2(t: SpcTester) {
 	var p = t.pool;
-	
+
 	var r1 = p.alloc();
 	var r2 = p.alloc();
-	
+
 	p.free(r2);
 	var r3 = p.alloc();
 	t.t.asserteq(r2, r3); // r2 has priority over r3
@@ -90,5 +131,160 @@ def test_pool3(t: SpcTester) {
 		t.assertFree(true, r);
 		var g = p.alloc();
 		if (r != g) t.t.fail2("expected alloc = %d, got %d", r.index, g.index);
+	}
+}
+
+def trace_alloc(p: SpcRaPool) -> Reg {
+	var r = p.alloc();
+	if (Trace.test) Trace.OUT.put1("alloc = %s", regConfig.regSet.getName(r)).outln();
+	return r;
+}
+
+def test_pool_alloc0(t: SpcTester) {
+	for (pool < POOLS.length) {
+		var p = SpcRaPool.new(regConfig, pool);
+		var alloced = Array<bool>.new(regConfig.regSet.regs.length);
+
+		// exhaustively allocate from the pool
+		for (i < POOLS[pool].length) {
+			var r = trace_alloc(p);
+			if (r == NO_REG) return t.t.fail("failed allocation");
+			if (alloced[r.index]) return t.t.fail("repeated allocation");
+			alloced[r.index] = true;
+			t.assertInPool(pool, r);
+		}
+
+		// No more allocations should succeed.
+		for (i < 5) {
+			var r = trace_alloc(p);
+			if (r != NO_REG) return t.t.fail("allocation succeeded, should fail");
+		}
+	}
+}
+
+def test_pool_alloc1(t: SpcTester) {
+	for (pool < POOLS.length) {
+		var p = SpcRaPool.new(regConfig, pool);
+		for (i < 5 * POOLS[pool].length) {
+			var r = trace_alloc(p);
+			t.assertInPool(pool, r);
+			p.free(r);
+		}
+	}
+}
+
+def test_pool_alloc2(t: SpcTester) {
+	for (pool < POOLS.length) {
+		var p = SpcRaPool.new(regConfig, pool);
+		for (i < 5 * POOLS[pool].length) {
+			var r1 = trace_alloc(p), r2 = trace_alloc(p);
+			t.assertInPool(pool, r1);
+			t.assertInPool(pool, r2);
+			t.assertDifferent([r1, r2]);
+			if ((i & 1) == 1) { // free in a different order each time
+				p.free(r1);
+				p.free(r2);
+			} else {
+				p.free(r2);
+				p.free(r1);
+			}
+		}
+	}
+}
+
+def test_pool_free0(t: SpcTester) {
+	var v = Vector<Reg>.new();
+	for (pi < POOLS.length) {
+		var pool = POOLS[pi];
+		var p = SpcRaPool.new(regConfig, pi);
+
+		// First, exhaust the pool.
+		for (i < pool.length) {
+			var r = p.alloc();
+			v.put(r);
+			t.assertInPool(pi, r);
+		}
+		t.assertDifferent(v.extract());
+
+		// Then free a specific register and realloc it.
+		for (i < 3) {
+			for (rj in pool) {
+				p.free(rj);
+				var rk = trace_alloc(p);
+				if (rk != rj) return t.t.fail("expected free() and then alloc() to return same");
+			}
+		}
+	}
+}
+
+def test_pool_free1(t: SpcTester) {
+	var v = Vector<Reg>.new();
+	for (pi < POOLS.length) {
+		var pool = POOLS[pi];
+		var p = SpcRaPool.new(regConfig, pi);
+
+		for (j < 3) {
+			// First, exhaust the pool.
+			for (i < pool.length) {
+				var r = p.alloc();
+				v.put(r);
+				t.assertInPool(pi, r);
+			}
+			t.assertDifferent(v.extract());
+
+			// Then free each one manually.
+			for (rj in pool) p.free(rj);
+		}
+	}
+}
+
+def test_pool_freeAll(t: SpcTester) {
+	var v = Vector<Reg>.new();
+	for (pi < POOLS.length) {
+		var pool = POOLS[pi];
+		var p = SpcRaPool.new(regConfig, pi);
+
+		for (j < 3) {
+			// First, exhaust the pool.
+			for (i < pool.length) {
+				var r = p.alloc();
+				v.put(r);
+				t.assertInPool(pi, r);
+			}
+			t.assertDifferent(v.extract());
+
+			// Then free everything,
+			var array = Array<int>.new(set.regs.length);
+			p.freeAll(array, -1);
+
+			// And check the array has been reset at those locations too.
+			for (rj in pool) {
+				if (array[rj.index] != -1) return t.t.fail1("expected array to be cleared for %s", set.getName(rj));
+			}
+		}
+	}
+}
+
+def test_pool_unfree0(t: SpcTester) {
+	var v = Vector<Reg>.new();
+	for (pi < POOLS.length) {
+		var pool = POOLS[pi];
+		// unfree a specific register and make sure it doesnt get allocated.
+		for (r in pool) {
+			var p = SpcRaPool.new(regConfig, pi);
+			p.unfree(r);
+
+			for (i < pool.length - 1) {
+				var g = trace_alloc(p);
+				if (g == r) return t.t.fail1("allocated unfreed register %s", set.getName(r));
+				v.put(g);
+				t.assertInPool(pi, g);
+			}
+			t.assertDifferent(v.extract());
+			for (i < 5) {
+				var g = trace_alloc(p);
+				if (g != NO_REG) return t.t.fail("should be no more registers");
+			}
+		}
 	}
 }

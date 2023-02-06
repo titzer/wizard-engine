@@ -1,0 +1,174 @@
+// Represents the abstract control and value stacks during single-pass compilation, as well as
+// the register allocation state. The register allocation state is intimately intertwined with the
+// value stack representation, and efficient implementation of the control stack requires a
+// snapshotting mechanism.
+class SpcState2(regConfig: RegConfig) {
+	def regState = Array<SpcRegState>.new(regConfig.regSet.regs.length);
+	def regPools = Array<SpcRaPool>.new(regConfig.numRegPools);
+	var valState: Array<SpcVal>;
+
+	new() {
+		for (i < regPools.length) regPools[i] = SpcRaPool.new(regConfig, i);
+	}
+
+	// Operations that modify the control stack.
+	def pushBlock(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl;
+	def pushLoop(params: Array<ValueType>, results: Array<ValueType>, start_label: MasmLabel) -> SpcControl;
+	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl;
+	def doElse();
+	def resetToMerge(ctl: SpcControl);
+	def isTransferEmpty(target: SpcControl);
+	def emitFallthru(resolver: SpcMoveResolver);
+	def emitTransfer(target: SpcControl, resolver: SpcMoveResolver);
+	def prepareLoop(resolver: SpcMoveResolver);
+	def prepareRangeForMerge(start: u32, end: u32, resolver: SpcMoveResolver);
+	def setUnreachable();
+
+	// Operations that modify the value stack by pushing, popping, or altering values.
+	def push(flags: byte, reg: Reg, const: int);
+	def pop() -> SpcVal;
+	def popReg() -> SpcVal;
+	def popFixedReg(reg: Reg) -> SpcVal;
+	def popRegToOverwrite() -> SpcVal;
+	def popFixedRegToOverwrite(reg: Reg) -> SpcVal;
+	def setSlot(flags: byte, reg: Reg, const: int);
+
+	// Operations that modify the value stack's register allocation or spill state.
+	def peek() -> SpcVal;
+	def spillSlot(slot: u32);
+	def spillAll();
+	def killSlot(slot: u32);
+	def killAll();
+
+	// Operations that only affect register state.
+	def allocReg(kind: ValueKind, slot: u32) -> Reg;
+	def refReg(reg: Reg, slot: u32);
+	def assertReffed(reg: Reg, slot: u32);
+	def unrefReg(reg: Reg, slot: u32);
+	def allocTmp(kind: ValueKind) -> Reg;
+	private def snapshotInto(s: SpcRaSnapshot);
+	private def restoreFrom(s: SpcRaSnapshot);
+	def freeTmps();
+}
+def NO_REG = Reg(0);
+def REG_FREE = SpcRegState(0);
+
+// Allocates registers from pool number {poolIndex} from {regConfig}.
+//
+// Internally, both allocated and free registers are maintained in one doubly-linked list.
+// The {freeCursor} points at the first free register, and the free list follows {.next} links.
+// Allocated registers are kept in the list pointed to by {freeCursor.prev} and can be iterated by
+// following {.prev} links.
+//
+// links [0, rax,       rbx,     rcx     .... ]
+//            v          v         v
+//           [rax] <-> [rbx] <-> [rcx]
+//                                 ^
+//   (allocated registers) <--  freeCursor  ---> (free registers)
+class SpcRaPool(regConfig: RegConfig, poolIndex: int) {
+	private def links = Array<SpcRaPoolLink>.new(regConfig.regSet.regs.length);
+	private var freeCursor: SpcRaPoolLink;
+	private var last: SpcRaPoolLink;
+
+	new() {
+		var prev: SpcRaPoolLink;
+		var regSet = regConfig.regSet;
+		for (reg in regSet.regs) {
+			if (reg == NO_REG) continue;
+			if (regConfig.regToPool[reg.index] != poolIndex) continue;
+			var link = SpcRaPoolLink.new(reg, prev, null);
+			if (prev != null) prev.next = link;
+			else freeCursor = link;
+			links[reg.index] = link;
+			prev = link;
+		}
+		last = SpcRaPoolLink.new(NO_REG, prev, null);
+		prev.next = last;
+	}
+
+	// Allocate the a register from this pool. Returns {NO_REG} if none available.
+	def alloc() -> Reg {
+		var result = freeCursor.reg;
+		if (result != NO_REG) freeCursor = freeCursor.next;
+		return result;
+	}
+	// Free the given register {reg}.
+	def free(reg: Reg) {
+		var link = links[reg.index];
+		if (link == freeCursor) return; // already free; ok
+		if (link == freeCursor.prev) {
+			freeCursor = freeCursor.prev; // cheap bump-back of freeCursor
+		} else {
+			link.remove();
+			link.insertBefore(freeCursor); // remove and reinsert before prev
+			freeCursor = link;
+		}
+	}
+	// Set the given register {reg} as allocated.
+	def unfree(reg: Reg) {
+		var link = links[reg.index];
+		if (link == freeCursor) {
+			freeCursor = freeCursor.next;
+		} else {
+			link.remove();
+			link.insertBefore(freeCursor); // remove and reinsert before prev
+		}
+	}
+	// Free all allocated registers and reset their state in {regState} to be {freeVal}.
+	def freeAll<T>(regState: Array<T>, freeVal: T) {
+		var l = freeCursor;
+		while (l.prev != null) {
+			var n = l.prev;
+			regState[n.reg.index] = freeVal;
+			l = n;
+		}
+		freeCursor = l;
+	}
+	// Call {allocated} and {free} with all appropriate registers.
+	def apply<T>(allocated: Reg -> T, free: Reg -> T) {
+		for (l = freeCursor.prev; l != null; l = l.prev) allocated(l.reg);
+		for (l = freeCursor; l.reg != NO_REG; l = l.next) free(l.reg);
+	}
+	// Search the allocated list for the register with the minimum associated {cost}.
+	// Does not alter the allocation status of the register.
+	def findMinAllocated(cost: Reg -> int) -> Reg {
+		var minimum = int.max;
+		var minReg = NO_REG;
+		for (l = freeCursor.prev; l != null; l = l.prev) {
+			var reg = l.reg, c = cost(reg);
+			if (c == 0) return reg; // can't do better than 0.
+			if (c < minimum) {
+				minimum = c;
+				minReg = reg;
+			}
+		}
+		return minReg;
+	}
+}
+
+type SpcRegState(bits: u32) #unboxed { }
+
+class SpcRaPoolLink(reg: Reg, var prev: SpcRaPoolLink, var next: SpcRaPoolLink) {
+	def remove() -> this {
+		var n = next, p = prev;
+		if (p != null) p.next = n;
+		if (n != null) n.prev = p;
+		next = prev = null;
+	}
+	def insertBefore(that: SpcRaPoolLink) -> this {
+		// TODO assert prev == null;
+		// TODO assert next == null;
+		next = that;
+		var p = that.prev;
+		prev = p;
+		if (p != null) p.next = this;
+		that.prev = this;
+	}
+}
+
+class SpcRaSnapshot {
+	var valState: Array<SpcVal>;
+	var sp: int;
+
+	def resize(s: int) -> this;
+}
