@@ -535,6 +535,7 @@ def ucontext_rsp_offset = 160;
 def SIGFPE  = 8;
 def SIGBUS  = 10;
 def SIGSEGV = 11;
+def globalBuf = StringBuilder.new().grow(256);  // avoid allocations when describing frames
 
 // Represents the JITed code for an entire module.
 // Implements the RiUserCode interface to add generated machine code to the V3 runtime.
@@ -543,7 +544,6 @@ class X86_64SpcCode extends RiUserCode {
 	def mapping: Mapping;
 	def frameSize = IVarConfig.frameSize;
 	def trapHandlerOffsets = Array<int>.new(TrapReason.ERROR.tag + 1);
-	def buf = StringBuilder.new().grow(128);  // avoid allocations when describing frames
 	var codeEnd: int;			// for dynamically adding code to the end
 
 	new(mapping) super(mapping.range.start, mapping.range.end) { }
@@ -555,6 +555,7 @@ class X86_64SpcCode extends RiUserCode {
 		var instance = (sp + IVarConfig.frame.INSTANCE.disp).load<Instance>();
 		var wf = (sp + IVarConfig.frame.WASM_FUNC.disp).load<WasmFunction>();
 		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
+		var buf = globalBuf;
 		wf.decl.render(instance.module.names, buf);
 		buf.ln().out(out);
 		buf.reset();
@@ -621,6 +622,37 @@ class X86_64SpcCode extends RiUserCode {
 	}
 }
 
+// The lazy-compile stub needs special handling in the Virgil runtime because it has
+// a frame that stores the function being compiled.
+class X86_64SpcLazyCompileStub extends RiUserCode {
+	def frameSize = Pointer.SIZE;
+	
+	new(start: Pointer, end: Pointer) super(start, end) { }
+	
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		var msg = "\tin [spc-lazy-compile-stub] ";
+		out(msg, 0, msg.length);
+		var wf = (sp + 0).load<WasmFunction>();
+		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
+		var buf = globalBuf;
+		wf.decl.render(wf.instance.module.names, buf);
+		buf.ln().out(out);
+		buf.reset();
+	}
+	// Called from V3 runtime for a frame where {ip} is in the stub code.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp += frameSize;	 // assume frame is allocated
+		ip = sp.load<Pointer>(); // return address on stack
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+	// Called from V3 runtime when the garbage collector needs to scan a JIT stack frame.
+	def scanFrame(ip: Pointer, sp: Pointer) {
+		// The WasmFunction is stored in the frame for debugging.
+		RiGc.scanRoot(sp + 0);
+	}
+}
+
 // Implements frame accessor for JIT compiled method frames. For SPC, the frame layout is almost
 // identical to interpreter frames, so it inherits from the base implementation.
 class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
@@ -678,20 +710,22 @@ component X86_64Spc {
 
 		// =========== SPC lazy compile stub ========================
 		var lazy_offset = w.pos;
+		asm.pushq_r(G(c.regs.func_arg));					// push function onto stack
 		masm.emit_store_runtime_vsp(c.regs.vsp);
 		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(c.regs.func_arg));	// function
 		// Load {lazyCompileObject}.
 		var obj_ptr = int.view(u32.!((Pointer.atField(lazyCompileObject) - Pointer.NULL)));
 		asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
 		// Call the {lazyCompileFunc}.
-		var scratch = X86_64Regs.R15;
 		var func_ptr = int.view(u32.!(Pointer.atField(lazyCompileFunc) - Pointer.NULL));
 		asm.icall_m(X86_64Addr.new(null, null, 1, func_ptr));
+		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
 		// Check for non-null abrupt return.
 		var unwind = X86_64Label.new();
 		asm.q.cmp_r_i(Target.V3_RET_GPRS[2], 0);
 		asm.jc_rel_near(C.NZ, unwind);
 		// Tail-call the result of the compile.
+		var scratch = X86_64Regs.R15;
 		asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
 		asm.movq_r_r(G(c.regs.func_arg), Target.V3_RET_GPRS[0]);	// function
 		masm.emit_load_runtime_vsp(c.regs.vsp);
@@ -701,10 +735,14 @@ component X86_64Spc {
 		asm.bind(unwind);
 		asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
 		asm.ret();
+		var lazy_end = w.pos;
 
 		stubCode = Target.mapCode(asm, null);
 		entryStub = CiRuntime.forgeClosure<void, (WasmFunction, Pointer, Pointer), AbruptReturn>(stubCode.range.start, ());
 		lazyCompileStub = stubCode.range.start + lazy_offset;
+		// Register user code to allow walking over a lazy compile frame.
+		RiRuntime.registerUserCode(X86_64SpcLazyCompileStub.new(
+			lazyCompileStub, stubCode.range.start + lazy_end));
 
 		if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", stubCode.range.start - Pointer.NULL).outln();
 		if (Trace.compiler) Trace.OUT.put1("spc_lazy_compile: break *0x%x", lazyCompileStub - Pointer.NULL).outln();
