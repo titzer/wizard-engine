@@ -18,7 +18,7 @@ print_testing
 # run unittests and pipe through progress program
 LOG=$T/unit.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then
-    $CMD "$@" | tee $LOG | progress tti
+    $CMD "$@" | tee $LOG | $PROGRESS
 else
     $CMD "$@" | tee $LOG
 fi

@@ -49,7 +49,7 @@ for b in $BRANCHES; do
     fi
     print_testing $b
     if [ $PROGRESS_PIPE = 1 ]; then
-	run $b | tee $T/spec.$b.out | progress tti
+	run $b | tee $T/spec.$b.out | $PROGRESS
     else
 	run $b | tee $T/spec.$b.out
     fi

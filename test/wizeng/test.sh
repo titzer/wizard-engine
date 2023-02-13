@@ -16,7 +16,7 @@ WIZENG="../../$BINARY $WIZENG_OPTS"
 
 target=$TEST_TARGET
 
-print_testing 
+print_testing
 
 cd $DIR
 if [ "$#" = 0 ]; then
@@ -75,4 +75,4 @@ function run_tests() {
     done
 }
 
-run_tests $TESTS | progress tti
+run_tests $TESTS | $PROGRESS

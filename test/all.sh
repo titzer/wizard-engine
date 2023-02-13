@@ -13,6 +13,13 @@ if [ "$TEST_MODE" != "" ]; then
    DEFAULT_MODES=0
 fi
 
+SCRIPT_EXIT_CODE=0
+
+# Progress arguments. By default the inline (i) mode is used, while the CI sets
+# it to line (c) mode
+PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
+PROGRESS="progress $PROGRESS_ARGS"
+
 ### Utility for printing a testing line
 ### XXX: duplicated with common.sh
 function print_testing() {
@@ -36,6 +43,14 @@ function skip() {
     printf "${YELLOW}skipped (%s)${NORM}\n" "$1"
 }
 
+function update_exit_code_if_non_zero() {
+    if [[ $1 != 0 ]]; then
+        if [[ $SCRIPT_EXIT_CODE == 0 ]]; then
+            SCRIPT_EXIT_CODE=$1
+        fi
+    fi
+}
+
 if [ "$TEST_TARGETS" = "" ]; then
     if [ "$TEST_TARGET" = "" ]; then
 	TEST_TARGETS="int x86-linux x86-64-linux jvm"
@@ -47,9 +62,15 @@ fi
 function do_script() {
     script=$1
     $SCRIPT_LOC/${script}.sh
+    X=$?
+    update_exit_code_if_non_zero $X
     if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
         TEST_MODE=jit $SCRIPT_LOC/${script}.sh
+        X=$?
+        update_exit_code_if_non_zero $X
         TEST_MODE=lazy $SCRIPT_LOC/${script}.sh
+        X=$?
+        update_exit_code_if_non_zero $X
     fi
 }
 
@@ -61,6 +82,8 @@ for target in $TEST_TARGETS; do
         continue;
     fi
     $SCRIPT_LOC/unit.sh
+    X=$?
+    update_exit_code_if_non_zero $X
 done
 
 # Regression tests
@@ -88,3 +111,5 @@ for target in $TEST_TARGETS; do
     fi
     do_script wizeng/test
 done
+
+exit $SCRIPT_EXIT_CODE

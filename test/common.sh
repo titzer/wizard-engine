@@ -26,6 +26,11 @@ if [ ! -x "$CUR_V3C" ]; then
     exit 1
 fi
 
+# Progress arguments. By default the inline (i) mode is used, while the CI sets
+# it to line (c) mode
+PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
+PROGRESS="progress $PROGRESS_ARGS"
+
 if [ "$VIRGIL_LIB_UTIL" = "" ]; then
     if [ "$VIRGIL_LOC" = "" ]; then
 	VIRGIL_LIB_UTIL=$(dirname $CUR_V3C)/../lib/util/
