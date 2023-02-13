@@ -16,7 +16,7 @@ fi
 SCRIPT_EXIT_CODE=0
 
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
-# it to line (c) mode
+# it to character (c) mode
 PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
 PROGRESS="progress $PROGRESS_ARGS"
 
