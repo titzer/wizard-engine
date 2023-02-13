@@ -9,8 +9,6 @@ cd virgil
 export PATH=$PATH:"$PWD/bin:$PWD/bin/dev:$PWD/test/config"
 ./test/configure
 make
-aeneas clean
-aeneas bootstrap
 
 # Set up wizard
 cd ../wizard-engine
