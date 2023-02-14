@@ -12,7 +12,7 @@ make
 
 # Set up wizard
 cd ../wizard-engine
-make -j
+make -j x86-64-linux
 
 # Install OCaml for specification tests
 sudo apt install -y ocaml ocamlbuild
