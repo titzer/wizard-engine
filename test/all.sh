@@ -13,8 +13,6 @@ if [ "$TEST_MODE" != "" ]; then
    DEFAULT_MODES=0
 fi
 
-SCRIPT_EXIT_CODE=0
-
 # Progress arguments. By default the inline (i) mode is used, while the CI sets
 # it to character (c) mode
 PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
@@ -43,11 +41,9 @@ function skip() {
     printf "${YELLOW}skipped (%s)${NORM}\n" "$1"
 }
 
-function update_exit_code_if_non_zero() {
+function exit_if_failure() {
     if [[ $1 != 0 ]]; then
-        if [[ $SCRIPT_EXIT_CODE == 0 ]]; then
-            SCRIPT_EXIT_CODE=$1
-        fi
+        exit $1
     fi
 }
 
@@ -61,16 +57,10 @@ fi
 
 function do_script() {
     script=$1
-    $SCRIPT_LOC/${script}.sh
-    X=$?
-    update_exit_code_if_non_zero $X
+    $SCRIPT_LOC/${script}.sh || exit_if_failure $?
     if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
-        TEST_MODE=jit $SCRIPT_LOC/${script}.sh
-        X=$?
-        update_exit_code_if_non_zero $X
-        TEST_MODE=lazy $SCRIPT_LOC/${script}.sh
-        X=$?
-        update_exit_code_if_non_zero $X
+        TEST_MODE=jit $SCRIPT_LOC/${script}.sh || exit_if_failure $?
+        TEST_MODE=lazy $SCRIPT_LOC/${script}.sh || exit_if_failure $?
     fi
 }
 
@@ -81,9 +71,7 @@ for target in $TEST_TARGETS; do
 	skip unit "initial heap too large on this target"
         continue;
     fi
-    $SCRIPT_LOC/unit.sh
-    X=$?
-    update_exit_code_if_non_zero $X
+    $SCRIPT_LOC/unit.sh || exit_if_failure $?
 done
 
 # Regression tests
@@ -112,4 +100,4 @@ for target in $TEST_TARGETS; do
     do_script wizeng/test
 done
 
-exit $SCRIPT_EXIT_CODE
+exit 0
