@@ -24,7 +24,7 @@ function run_tests() {
 	    TESTS=$(ls test/regress/$dir/*.bin.wast)
 	    $CMD $TESTS
         done
-    
+
     for ext in $(find test/regress -type d) ; do
 	if [[ $ext =~ test/regress/(ext:.*) ]]; then
 	    arg="-${BASH_REMATCH[1]}"
@@ -41,7 +41,7 @@ print_testing
 
 LOG=$T/regress.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then
-    run_tests | tee $LOG | progress tti
+    run_tests | tee $LOG | $PROGRESS
 else
     run_tests | tee $LOG
 fi

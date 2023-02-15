@@ -13,6 +13,11 @@ if [ "$TEST_MODE" != "" ]; then
    DEFAULT_MODES=0
 fi
 
+# Progress arguments. By default the inline (i) mode is used, while the CI sets
+# it to character (c) mode
+PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
+PROGRESS="progress $PROGRESS_ARGS"
+
 ### Utility for printing a testing line
 ### XXX: duplicated with common.sh
 function print_testing() {
@@ -36,6 +41,12 @@ function skip() {
     printf "${YELLOW}skipped (%s)${NORM}\n" "$1"
 }
 
+function exit_if_failure() {
+    if [[ $1 != 0 ]]; then
+        exit $1
+    fi
+}
+
 if [ "$TEST_TARGETS" = "" ]; then
     if [ "$TEST_TARGET" = "" ]; then
 	TEST_TARGETS="int x86-linux x86-64-linux jvm"
@@ -46,10 +57,10 @@ fi
 
 function do_script() {
     script=$1
-    $SCRIPT_LOC/${script}.sh
+    $SCRIPT_LOC/${script}.sh || exit_if_failure $?
     if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
-        TEST_MODE=jit $SCRIPT_LOC/${script}.sh
-        TEST_MODE=lazy $SCRIPT_LOC/${script}.sh
+        TEST_MODE=jit $SCRIPT_LOC/${script}.sh || exit_if_failure $?
+        TEST_MODE=lazy $SCRIPT_LOC/${script}.sh || exit_if_failure $?
     fi
 }
 
@@ -60,7 +71,7 @@ for target in $TEST_TARGETS; do
 	skip unit "initial heap too large on this target"
         continue;
     fi
-    $SCRIPT_LOC/unit.sh
+    $SCRIPT_LOC/unit.sh || exit_if_failure $?
 done
 
 # Regression tests
@@ -88,3 +99,5 @@ for target in $TEST_TARGETS; do
     fi
     do_script wizeng/test
 done
+
+exit 0
