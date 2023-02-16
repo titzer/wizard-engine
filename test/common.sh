@@ -114,3 +114,21 @@ function print_testing() {
     printf "%-13s " $mode
     printf "| "
 }
+
+function run_batched() {
+    local batching=$1
+    if [ "$batching" = "" ]; then
+        batching=1
+    fi
+    shift
+    local cmd=$1
+    shift
+
+
+    local i=1
+    while [ $i -le $# ]; do
+	local args=${@:$i:$batching}
+        $cmd $args
+	i=$(($i + $batching))
+    done
+}

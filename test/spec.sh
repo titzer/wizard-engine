@@ -25,13 +25,12 @@ function run {
         fi
     done
 
-    COUNT=$(echo $TESTS | awk '{print NF}')
+    local batching=${BATCHING:=1}
+    if [ "$TEST_TARGET" = jvm ]; then
+        batching=20
+    fi
 
-    # run unittests and pipe through progress program
-    echo "##>${COUNT}"
-    for t in $TESTS; do
-	$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS $t
-    done
+    run_batched $batching "$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS" $TESTS
 }
 
 BRANCHES="$*"
