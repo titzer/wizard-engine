@@ -13,7 +13,9 @@ class Monitor {
 	}
 	// Called by the engine after a module is successfully parsed. A monitor may insert
 	// instrumentation into the module that will be apply to all instances of the module.
-	def onParse(m: Module) {
+	def onParse(m: Module) -> ModuleMonitor {
+		var mm = ModuleMonitor.new(mm);
+		return mm;
 	}
 	// Called by the engine during instantiation when a binding is supplied for an import
 	// to a module. A monitor may interpose on the binding (e.g. by wrapping an imported
@@ -25,12 +27,6 @@ class Monitor {
 	// insert instrumentation specific to the instance, e.g. on the exports.
 	def onInstantiate(i: Instance) {
 	}
-	// Called by the engine before an instance is started.
-	def onStart(f: Function) {
-	}
-	// Called by the engine before the main method, if any, is called.
-	def onMain(f: Function, args: Array<Value>) {
-	}
 	// Called by the engine after the instance has finished executing, e.g. to print
 	// a report.
 	def onFinish(i: Instance) {
@@ -40,3 +36,121 @@ class Monitor {
 	}
 }
 
+type DynamicLoc(wf: WasmFunction: pc: int, frame: TargetFrame) #unboxed;
+type MemoryRange(mem: Memory, index: u64, size: u64) #unboxed;
+
+class ModuleMonitor(module: Module) {
+	def beforeStart(f: DynamicLoc -> Resumption) {
+	}
+	def beforeMain(f: DynamicLoc -> Resumption) {
+	}
+
+	def beforeMemRead(f: (DynamicLoc, MemoryRange) -> Resumption) {
+	}
+	def beforeMemWrite(f: (DynamicLoc, MemoryRange) -> Resumption) {
+	}
+	def beforeMemReadAndWrite(f: (DynamicLoc, MemoryRange, bool) -> Resumption) {
+
+	}
+	def beforeMemGrow(f: (DynamicLoc, Memory, u64) -> Resumption) {
+
+	}
+
+	// Attach a callback that is called when func (non-import) is called
+	def beforeFuncCall(func: FuncDecl, f: DynamicLoc -> Resumption) {
+		if (func.imp != null) return;
+		beforeFnCallAndReturn(func, f, null);
+	}
+	// Attach a callback that is called when func (non-import) returns
+	def beforeFuncReturn(func: FuncDecl, f: DynamicLoc -> Resumption) {
+		if (func.imp != null) return;
+		beforeFnCallAndReturn(func, null, f);
+	}
+	// Attach callbacks that are called when a func is called or returns
+	def beforeFuncCallAndReturn(func: FuncDecl, callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
+		var it = BytecodeIterator.new();
+		var bi = it.reset(func);
+
+		var startsWithLoop = false;
+		var frameAccessors: ListStack<FrameAccessor>;
+		if (bi.current() == Opcode.LOOP) {
+			startsWithLoop = true;
+			frameAccessors = ListStack<FrameAccessor>.new();
+			module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopEnterProbe.new(enterProbe, frameAccessors));
+		} else if (enterProbe != null) {
+			module.insertProbeAt(func.func_index, bi.pc, enterProbe);
+		}
+
+		for (bi = it.reset(func); bi.more(); bi.next()) {
+			var op = bi.current();
+			match (op) {
+				RETURN => ;
+				END => if (bi.pc + 1 < bi.func.cur_bytecode.length) continue;
+				_ => continue;
+			}
+
+			if (startsWithLoop) {
+				module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopExitProbe.new(exitProbe, frameAccessors));
+			} else if (exitProbe != null) {
+				module.insertProbeAt(func.func_index, bi.pc, exitProbe);
+			}
+		}
+	}
+
+	// Attach a callback to any non-import function call
+	def beforeCall(f: DynamicLoc -> Resumption) {
+		forEachFunc(isNotImport, beforeFuncCall(_, f));
+	}
+	// Attach a callback to any non-import function return
+	def beforeReturn(f: DynamicLoc -> Resumption) {
+		forEachFunc(isNotImport, beforeFuncReturn(_, f));
+	}
+	// Attach a callback to any non-import function call or return
+	def beforeCallAndReturn(callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
+		forEachFunc(isNotImport, beforeFuncCallAndReturn(_, callFn, retFn));
+	}
+
+	// Helpers
+
+	// call f(funcDecl) if filter(funcDecl) is true
+	def forEachFunc(filter: FuncDecl -> bool, f: FuncDecl -> void) {
+		for (i < module.functions.length) {
+			var func = module.functions[i];
+			if (!filter(func)) continue;
+			f(func);
+		}
+	}
+	def isImport(func: FuncDecl) -> bool {
+		return func.imp != null;
+	}
+	def isNotImport(func: FuncDecl) -> bool {
+		return func.imp == null;
+	}
+}
+
+private class FuncWithLoopEnterProbe(
+	frameAccessors: ListStack<FrameAccessor>,
+	f: DynamicLoc -> Resumption,
+) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+		var curAccessor = frame.getFrameAccessor();
+		if (!frameAccessors.empty() && curAccessor == frameAccessors.peek())
+			return Resumption.Continue;
+		frameAccessors.push(curAccessor);
+		if (probe != null)
+			return f(func, pc, frame);
+		return Resumption.Continue;
+	}
+}
+
+private class FuncWithLoopExitProbe(
+	frameAccessors: ListStack<FrameAccessor>,
+	f: DynamicLoc -> Resumption
+) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+		frameAccessors.pop();
+		if (probe != null)
+			return probe.fire(func, pc, frame);
+		return Resumption.Continue;
+	}
+}
