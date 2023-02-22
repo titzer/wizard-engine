@@ -89,6 +89,8 @@ fi
 # make build file with target
 BUILD_FILE=$(make_build_file)
 
+PREGEN=1
+
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
@@ -97,12 +99,16 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
-        cp $E $E.genint
-        $E.genint -gen-int=$E > /tmp/wizeng.genint.out 2>&1
-	if [ $? != 0 ]; then
-	    echo warning: could not serialize interpreter into $E, may be slower
+	if [ "$PREGEN" != 0 ]; then
+            cp $E $E.genint
+            $E.genint -gen-int=$E > /tmp/wizeng.genint.out 2>&1
+	    if [ $? != 0 ]; then
+		echo warning: could not serialize interpreter into $E, may be slower
+	    fi
+            rm $E.genint
+	else
+	    echo "warning: skipped pregen of stubs in $E, may be slower"
 	fi
-        rm $E.genint
     fi
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3

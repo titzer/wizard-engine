@@ -618,20 +618,22 @@ class X86_64SpcCode extends RiUserCode {
 		}
 		return X86_64SpcFrameAccessor.new(sp);
 	}
-	def installCodeFor(m: Module, func_index: int, masm: X86_64MacroAssembler) {
-	}
 }
 
 // The lazy-compile stub needs special handling in the Virgil runtime because it has
 // a frame that stores the function being compiled.
-class X86_64SpcLazyCompileStub extends RiUserCode {
+class X86_64SpcCompileStub extends RiUserCode {
+	def stubName: string;
 	def frameSize = Pointer.SIZE;
-	
-	new(start: Pointer, end: Pointer) super(start, end) { }
-	
+
+	new(stubName, start: Pointer, end: Pointer) super(start, end) { }
+
 	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
-		var msg = "\tin [spc-lazy-compile-stub] ";
+		var msg = "\tin [spc-";
+		out(msg, 0, msg.length);
+		out(stubName, 0, stubName.length);
+		msg = "-compile-stub] ";
 		out(msg, 0, msg.length);
 		var wf = (sp + 0).load<WasmFunction>();
 		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
@@ -675,29 +677,23 @@ class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
 	def setOperand(i: int, v: Value); // TODO: translate to interpreter frame
 }
 
-// Support for V3 -> SPC calls.
-var entryStub: (WasmFunction, Pointer, Pointer) -> AbruptReturn;
-var lazyCompileStub: Pointer;
-var stubCode: Mapping;
-// An unpacked closure for lazy compilation.
 var lazyCompileFunc: Pointer;
 var lazyCompileObject: ExecutionStrategy;
 
+var tierupCompileFunc: Pointer;
+var tierupCompileObject: ExecutionStrategy;
+
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
-	// Generate and map code for global stubs.
-	def genStubs() {
-		if (entryStub != null) return;
-
-		// =========== SPC entry stub ================================
-		var w = DataWriter.new();
+	// Generate the SPC entry stub.
+	def genEntryStub(w: DataWriter) {
 		var masm = X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy());
 		var asm = X86_64Assembler.!(masm.asm);
 		var c = X86_64Regs2.CONFIG;
 		var func_arg = G(c.regs.func_arg);
 		if (func_arg == Target.V3_PARAM_GPRS[2]) {
 			// XXX: use macro assembler to order moves
-			var scratch = R.R15; 					// TODO: use scratch from macro asm
+			var scratch = masm.scratch;
 			asm.movq_r_r(scratch, func_arg);
 			asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
 			asm.movq_r_r(G(c.regs.vsp), scratch);			// vsp
@@ -707,10 +703,24 @@ component X86_64Spc {
 		}
 		asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
 		asm.invalid();
-
-		// =========== SPC lazy compile stub ========================
-		var lazy_offset = w.pos;
-		asm.pushq_r(G(c.regs.func_arg));					// push function onto stack
+	}
+	def setLazyCompile(lazyCompile: WasmFunction -> (WasmFunction, Pointer, AbruptReturn)) {
+		if (lazyCompile == null) {
+			lazyCompileObject = null;
+			lazyCompileFunc = Pointer.NULL;
+			return;
+		} else {
+			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer, AbruptReturn)>(lazyCompile);
+			lazyCompileFunc = t.0;
+			lazyCompileObject = t.1;
+		}
+	}
+	def genLazyCompileStub(w: DataWriter) {
+		var masm = X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy());
+		var asm = X86_64Assembler.!(masm.asm);
+		var c = X86_64Regs2.CONFIG;
+		var func_arg = G(c.regs.func_arg);
+		asm.pushq_r(G(c.regs.func_arg));				// push function onto stack
 		masm.emit_store_runtime_vsp(c.regs.vsp);
 		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(c.regs.func_arg));	// function
 		// Load {lazyCompileObject}.
@@ -735,34 +745,57 @@ component X86_64Spc {
 		asm.bind(unwind);
 		asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
 		asm.ret();
-		var lazy_end = w.pos;
-
-		stubCode = Target.mapCode(asm, null);
-		entryStub = CiRuntime.forgeClosure<void, (WasmFunction, Pointer, Pointer), AbruptReturn>(stubCode.range.start, ());
-		lazyCompileStub = stubCode.range.start + lazy_offset;
-		// Register user code to allow walking over a lazy compile frame.
-		RiRuntime.registerUserCode(X86_64SpcLazyCompileStub.new(
-			lazyCompileStub, stubCode.range.start + lazy_end));
-
-		if (Trace.compiler) Trace.OUT.put1("spc_entry: break *0x%x", stubCode.range.start - Pointer.NULL).outln();
-		if (Trace.compiler) Trace.OUT.put1("spc_lazy_compile: break *0x%x", lazyCompileStub - Pointer.NULL).outln();
 	}
-	def setLazyCompile(lazyCompile: WasmFunction -> (WasmFunction, Pointer, AbruptReturn)) {
-		if (lazyCompile == null) {
-			lazyCompileObject = null;
-			lazyCompileFunc = Pointer.NULL;
+	def setTierupCompile(tierupCompile: WasmFunction -> (WasmFunction, Pointer, AbruptReturn)) {
+		if (tierupCompile == null) {
+			tierupCompileObject = null;
+			tierupCompileFunc = Pointer.NULL;
+			return;
 		} else {
-			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer, AbruptReturn)>(lazyCompile);
-			lazyCompileFunc = t.0;
-			lazyCompileObject = t.1;
+			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer, AbruptReturn)>(tierupCompile);
+			tierupCompileFunc = t.0;
+			tierupCompileObject = t.1;
 		}
 	}
+	def genTierupCompileStub(w: DataWriter) {
+		var masm = X86_64MacroAssembler.new(w, X86_64Regs2.SPC_ALLOC.copy());
+		var asm = X86_64Assembler.!(masm.asm);
+		var c = X86_64Regs2.CONFIG;
+		var func_arg = G(c.regs.func_arg);
+		// Decrement execution counter by 1 and compile if <= 0
+		var scratch = masm.scratch;
+		var offsets = V3Offsets.new();
+		asm.movq_r_m(scratch, G(c.regs.func_arg).plus(offsets.WasmFunction_decl));
+		asm.q.sub_m_i(scratch.plus(offsets.FuncDecl_tierup_trigger), 1);
+//TODO		asm.jc_rel_near(C.NA, interpreter_entry);
+
+		asm.pushq_r(G(c.regs.func_arg));				// push function onto stack
+		masm.emit_store_runtime_vsp(c.regs.vsp);
+		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(c.regs.func_arg));	// function
+		// Load {lazyCompileObject}.
+		var obj_ptr = int.view(u32.!((Pointer.atField(lazyCompileObject) - Pointer.NULL)));
+		asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
+		// Call the {tierupCompileFunc}.
+		var func_ptr = int.view(u32.!(Pointer.atField(tierupCompileFunc) - Pointer.NULL));
+		asm.icall_m(X86_64Addr.new(null, null, 1, func_ptr));
+		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
+		// Tail-call the result of the compile (which could be interpreter entry).
+		asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
+		asm.movq_r_r(G(c.regs.func_arg), Target.V3_RET_GPRS[0]);	// function
+		masm.emit_load_runtime_vsp(c.regs.vsp);
+		asm.ijmp_r(scratch);						// jump to entrypoint
+		asm.invalid();
+	}
+
 	// A handy chokepoint for entering JIT code from V3.
 	def invoke(wf: WasmFunction, sp: Pointer) -> AbruptReturn {
-		return entryStub(wf, sp, wf.decl.target_code.spc_entry);
+		return X86_64PreGenStubs.getSpcV3Entry()(wf, sp, wf.decl.target_code.spc_entry);
 	}
 	def setLazyCompileFor(decl: FuncDecl) {
-		decl.target_code = TargetCode(lazyCompileStub);
+		decl.target_code = TargetCode(X86_64PreGenStubs.getSpcLazyCompileStub().start);
+	}
+	def setTierUpFor(decl: FuncDecl) {
+		decl.target_code = TargetCode(X86_64PreGenStubs.getSpcTierupCompileStub().start);
 	}
 	def returnCompileFailed(wf: WasmFunction, err: ErrorGen) -> (WasmFunction, Pointer, AbruptReturn) {
 		var buf = StringBuilder.new();

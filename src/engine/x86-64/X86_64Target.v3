@@ -18,7 +18,7 @@ component Target {
 	new() {
 		ExecuteOptions.registerMode("jit", X86_64SpcAotStrategy.new(), "ahead-of-time compile entire module with SPC");
 		ExecuteOptions.registerMode("lazy", X86_64SpcLazyStrategy.new(), "lazy-compile functions on demand with SPC");
-//TODO		ExecuteOptions.registerMode("dyn", X86_64DynamicStrategy.new(), "fast interpreter with dynamic tier-up to SPC");
+		ExecuteOptions.registerMode("dyn", X86_64DynamicStrategy.new(), "fast interpreter with dynamic tier-up to SPC");
 //TODO		ExecuteOptions.registerMode("mixed", X86_64MixedStrategy.new(), "lazy-compile functions on demand with SPC, fallback to fast-int");
 		ExecuteOptions.registerDefaultMode("int", X86_64InterpreterOnlyStrategy.new(),
 			"fast interpreter only");
@@ -30,7 +30,7 @@ component Target {
 		var data = System.fileLoad(filename);
 		var err = ErrorBuilder.new().puts("interpreter generator: ");
 		if (data == null) return err.put1("could not load executable %s\n", filename);
-		var ok = X86_64Interpreter.serializeInterpreterCodeIntoExecutable(data);
+		var ok = X86_64PreGenStubs.genAndWriteIntoExecutable(data);
 		if (ok == false) return err.put1("could not patch executable %s\n", filename);
 		var fd = System.fileOpen(filename, false);
 		if (fd < 0) return err.put1("could not write executable: %s\n", filename);
@@ -78,7 +78,6 @@ type TargetFrame(sp: Pointer) #unboxed {
 class X86_64InterpreterOnlyStrategy extends ExecutionStrategy {
 	// Call a function with arguments and return a result.
 	def call(func: Function, args: Array<Value>) -> Result {
-		if (X86_64Interpreter.interpreterCode == null) X86_64Interpreter.genInterpreterCode();
 		return X86_64Runtime.run(func, args); // XXX: specialize for interpreter-only
 	}
 }
@@ -112,8 +111,9 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 	}
 	private def compileEntireModule(module: Module, size: u32, err: ErrorGen) {
 		// ensure entrypoint and lazy compile stubs are generated
-		X86_64Spc.genStubs();
+		X86_64PreGenStubs.gen();
 		X86_64Spc.setLazyCompile(null);
+		X86_64Spc.setTierupCompile(null);
 
 		// TODO: ignore bailouts for non-AOT mode
 		var compiler = newCompiler(module.filename);
@@ -169,7 +169,6 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 
 // One tier: SPC, functions are lazily compiled.
 class X86_64SpcLazyStrategy extends ExecutionStrategy {
-	def TRAP_HANDLER_RESERVATION = PAGE_SIZE;
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installLazyCompileStubForModule(module, err);
@@ -184,38 +183,18 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 	}
 	private def installLazyCompileStubForModule(module: Module, err: ErrorGen) {
 		// ensure entrypoint and lazy compile stubs are generated
-		X86_64Spc.genStubs();
+		X86_64PreGenStubs.gen();
 		X86_64Spc.setLazyCompile(lazyCompile);
-		// Estimate code space for the entire module.
-		var codeSize = PAGE_SIZE_i * 2;
+		X86_64Spc.setTierupCompile(null);
 		// Set all functions to refer to the lazy compile stub.
+		var codeSize = MINIMUM_CODE_SIZE;
 		for (i = 0; err.ok() && i < module.functions.length; i++) {
 			var f = module.functions[i];
 			if (f.imported()) continue;
 			X86_64Spc.setLazyCompileFor(f);
 			codeSize += X86_64Spc.estimateCodeSizeFor(f);
 		}
-		// Round up to the next page size.
-		codeSize = PAGE_SIZE_i * ((codeSize + PAGE_SIZE_i - 1) / PAGE_SIZE_i);
-		// Allocate a read/write/execute mapping for code.
-		var mapping = Mmap.reserve(u64.!(codeSize), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
-		var code = X86_64SpcCode.new(mapping);
-		module.target_module = TargetModule(code);
-		RiRuntime.registerUserCode(code);
-		code.keepAlive();
-		if (Trace.compiler) Trace.OUT.put3("%s: reserved 0x%x ... 0x%x for lazy-compiled code",
-			module.filename, (mapping.range.start - Pointer.NULL), (mapping.range.end - Pointer.NULL)).outln();
-
-		// Compile the trap reason labels onto the last page.
-		var compiler = newCompiler(module.filename);
-		var masm = X86_64MacroAssembler.!(compiler.masm);
-		var lastPageOffset = int.!(mapping.range.size() - TRAP_HANDLER_RESERVATION);
-		for (reason in TrapReason) {
-			var label = masm.newTrapLabel(reason);
-			compiler.emitTrapReturn(label, reason);
-			code.trapHandlerOffsets[reason.tag] = label.offset + lastPageOffset;
-		}
-		Target.copyInto(code.mapping.range, lastPageOffset, masm.w);
+		allocateCodeForModule(module, codeSize);
 	}
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, AbruptReturn) {
 		var module = wf.instance.module;
@@ -255,10 +234,320 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 		return (wf, spc_entry, null);
 	}
 }
+// Two tiers: fast-int, frequently-executed functions are compiled with SPC.
+class X86_64DynamicStrategy extends ExecutionStrategy {
+	def TRAP_HANDLER_RESERVATION = PAGE_SIZE;
+	// Called after a module is parsed.
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		installTierUpStubForModule(module, err);
+	}
+	// Called before a test function is run.
+	def onTestRun(wf: WasmFunction, err: ErrorGen) {
+		installTierUpStubForModule(wf.instance.module, err);
+	}
+	// Call a function with arguments and return a result.
+	def call(func: Function, args: Array<Value>) -> Result {
+		return X86_64Runtime.run(func, args);
+	}
+	private def installTierUpStubForModule(module: Module, err: ErrorGen) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
+		X86_64Spc.setLazyCompile(null);
+		X86_64Spc.setTierupCompile(tierupCompile);
+		// Set all functions to refer to the tier-up compile stub.
+		var codeSize = MINIMUM_CODE_SIZE;
+		for (i = 0; err.ok() && i < module.functions.length; i++) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			X86_64Spc.setTierUpFor(f);
+			codeSize += X86_64Spc.estimateCodeSizeFor(f);
+		}
+		allocateCodeForModule(module, codeSize);
+	}
+	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, AbruptReturn) {
+		var module = wf.instance.module;
+		var code = module.target_module.spc_code;
+		var compiler = newCompiler(module.filename); // XXX: cache per-thread
+		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
+
+		// Bind all trap handler labels used in the newly-compiled code to the handlers at the end of the code.
+		for (reason in TrapReason) {
+			var label = masm.newTrapLabel(reason); // XXX: cache trap labels
+			masm.bindLabelTo(label, code.trapHandlerOffsets[reason.tag] - code.codeEnd);
+		}
+
+		// generate code for the function
+// XXX:		w.align(8);
+		compiler.gen(module, wf.decl);
+
+		// Check for remaining code space
+		var regionSize = code.mapping.range.size();
+		var remaining =  regionSize - u64.!(code.codeEnd) - TRAP_HANDLER_RESERVATION;
+		var codeSize = w.atEnd().pos;
+		if (codeSize > remaining) compiler.err.abs(0).set(
+			Strings.format3("exhausted code space for module (%d of %d bytes remaining, need %d)",
+				remaining, regionSize, codeSize));
+
+		// Check for any errors
+		if (compiler.err.error()) return X86_64Spc.returnCompileFailed(wf, compiler.err);
+
+		// Copy code into end of region
+		var range = code.mapping.range;
+		var spc_entry = range.start + code.codeEnd;
+		masm.setTargetAddress(u64.view(spc_entry - Pointer.NULL));
+		code.codeEnd = Target.copyInto(range, code.codeEnd, w);
+
+		wf.decl.target_code = TargetCode(spc_entry);
+		Debug.finishCompile(wf.decl, u64.view(spc_entry - Pointer.NULL));
+		return (wf, spc_entry, null);
+	}
+}
+
 def newCompiler(filename: string) -> X86_64SinglePassCompiler {
 	var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
 	var limits = Limits.new();
 	var err = ErrorGen.new(filename);
 	var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64Regs2.CONFIG, err);
 	return compiler;
+}
+def TRAP_HANDLER_RESERVATION = PAGE_SIZE;
+def MINIMUM_CODE_SIZE = PAGE_SIZE_i;
+def allocateCodeForModule(module: Module, codeSize: int) {
+	// Round up to the next page size.
+	var codeSize = PAGE_SIZE_i * ((codeSize + PAGE_SIZE_i - 1) / PAGE_SIZE_i);
+	// Allocate a read/write/execute mapping for code.
+	var mapping = Mmap.reserve(u64.!(codeSize), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
+	var code = X86_64SpcCode.new(mapping);
+	module.target_module = TargetModule(code);
+	RiRuntime.registerUserCode(code);
+	code.keepAlive();
+	if (Trace.compiler) Trace.OUT.put3("%s: reserved 0x%x ... 0x%x for spc-jit code",
+		module.filename, (mapping.range.start - Pointer.NULL), (mapping.range.end - Pointer.NULL)).outln();
+
+	// Compile the trap reason labels onto the last page.
+	var compiler = newCompiler(module.filename);
+	var masm = X86_64MacroAssembler.!(compiler.masm);
+	var lastPageOffset = int.!(mapping.range.size() - TRAP_HANDLER_RESERVATION);
+	for (reason in TrapReason) {
+		var label = masm.newTrapLabel(reason);
+		compiler.emitTrapReturn(label, reason);
+		code.trapHandlerOffsets[reason.tag] = label.offset + lastPageOffset;
+	}
+	Target.copyInto(code.mapping.range, lastPageOffset, masm.w);
+}
+
+// Statically-allocated buffer for pre-generated code (in compiled binary).
+def GLOBAL_BUFFER_MARKER = 0x7ACEBEEF778899AA;
+def PREGEN_CODE_MARKER = 0x7FAACCEE;
+def GLOBAL_BUFFER_HEADER_SIZE = 64;
+def INL_SIZE = 32 * 1024;
+def OOL_SIZE = 4 * 1024;
+def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
+def global_buffer = allocGlobalBufferWithMarker(TOTAL_SIZE + PAGE_SIZE_i);
+def allocGlobalBufferWithMarker(size: int) -> Array<byte> {
+	var result = Array<byte>.new(size);
+	var w = DataWriter.new().reset(result, 0, result.length);
+	w.put_b64(GLOBAL_BUFFER_MARKER);
+	return result;
+}
+
+// Interface to pre-generated code stubs.
+def I: X86_64Interpreter;
+component X86_64PreGenStubs {
+	private var spcV3Entry: (WasmFunction, Pointer, Pointer) -> AbruptReturn;
+	// XXX: the RiUserCode objects must be pre-allocated.
+	private def ic = X86_64InterpreterCode.new(Pointer.NULL, Pointer.NULL);
+	private def spcLazyCompileStub = X86_64SpcCompileStub.new("lazy", Pointer.NULL, Pointer.NULL);
+	private def spcTierupCompileStub = X86_64SpcCompileStub.new("tierup", Pointer.NULL, Pointer.NULL);
+
+	def getInterpreterCode() -> X86_64InterpreterCode {
+		if (I.interpreterCode == null) gen();
+		return I.interpreterCode;
+	}
+	def getIntV3Entry() -> (WasmFunction, Pointer) -> AbruptReturn {
+		if (I.interpreterCode == null) gen();
+		return I.interpreterCode.intV3Entry;
+	}
+	def getSpcV3Entry() -> (WasmFunction, Pointer, Pointer) -> AbruptReturn {
+		if (I.interpreterCode == null) gen();
+		return spcV3Entry;
+	}
+	def getSpcLazyCompileStub() -> X86_64SpcCompileStub {
+		if (I.interpreterCode == null) gen();
+		return spcLazyCompileStub;
+	}
+	def getSpcTierupCompileStub() -> X86_64SpcCompileStub {
+		if (I.interpreterCode == null) gen();
+		return spcTierupCompileStub;
+	}
+
+	def gen() {
+		if (I.interpreterCode != null) return;
+		// Deseralize or generate the pregen stubs
+		var start = System.ticksUs();
+		I.interpreterCode = deserializeOrGenerateCode();
+		var time = System.ticksUs() - start;
+		Metrics.pregen_time_us.val += u64.view(time);
+		Metrics.pregen_bytes.val += u64.!(I.interpreterCode.end - I.interpreterCode.start);
+
+		if (Debug.pregen) Trace.OUT.put1("Created pregen stubs in %d \xCE\xBCs.\n", time).outln();
+	}
+	def genAndWriteIntoExecutable(executable: string) -> bool {
+		// generate the code and write it into
+		gen();
+		// try to find {global_buffer} in {data}
+		var d = DataReader.new(executable);
+		// the global buffer contents will be at the same page alignment in the executable
+		var page_offset = int.!((Pointer.atContents(global_buffer) - Pointer.NULL) & (PAGE_SIZE - 1));
+		var found = -1;
+		for (pos = page_offset; pos < d.limit; pos += PAGE_SIZE_i) {
+			var val = d.at(pos).read_u64();
+			if (val == GLOBAL_BUFFER_MARKER) { found = pos; break; }
+		}
+		if (found < 0) return false;
+		if (Debug.pregen) {
+			Trace.OUT.put2("Pregen buffer in executable @+%d (0x%x)", found, found).outln();
+		}
+		// Write the executable code and the offsets of {InterpreterCode} into the executable.
+		var w = DataWriter.new().reset(executable, found, found);
+		w.puta(global_buffer);		// write machine code
+		w.at(found);			// back up to write offsets
+		// Write the pregen code offsets to serialized memory (e.g. a file with global buffer).
+		var out = w.put_b32;
+		out(PREGEN_CODE_MARKER);
+		out(ic.fastDispatchTableOffset);
+		out(ic.probedDispatchTableOffset);
+		out(ic.codeStart);
+		out(ic.intV3EntryOffset);
+		out(ic.intSpcEntryOffset);
+		out(ic.intIntEntryOffset);
+		out(ic.oobMemoryHandlerOffset);
+		out(ic.divZeroHandlerOffset);
+		out(ic.stackOverflowHandlerOffset);
+		out(ic.spcV3EntryOffset);
+		out(ic.spcLazyCompileOffset);
+		out(ic.spcTierupCompileOffset);
+		out(ic.codeEnd);
+		return true;
+	}
+	def deserializeOrGenerateCode() -> X86_64InterpreterCode {
+		def d = DataReader.new(global_buffer);
+
+		var start = Pointer.atContents(global_buffer);
+		var range = MemoryRange.new(start, start + global_buffer.length);
+
+		Debug.beforePregen();
+		ic.start = range.start;
+
+		// Try deserializing the pregen code offsets directly from the global buffer.
+		var marker = d.read_u32();
+		if (Debug.pregen) {
+			Trace.OUT.put2("Pregen buffer marker = 0x%x (0x%x indicates generated)",
+				marker, PREGEN_CODE_MARKER).outln();
+		}
+		if (marker == PREGEN_CODE_MARKER) {
+			if (Debug.pregen) {
+				Trace.OUT.put2("Pregen stubs exist in [0x%x ... 0x%x]",
+					(range.start - Pointer.NULL),
+					(range.end - Pointer.NULL));
+				Trace.OUT.outln();
+			}
+			ic.fastDispatchTableOffset	= int.view(d.read_u32());
+			ic.probedDispatchTableOffset	= int.view(d.read_u32());
+			ic.codeStart			= int.view(d.read_u32());
+			ic.intV3EntryOffset		= int.view(d.read_u32());
+			ic.intSpcEntryOffset		= int.view(d.read_u32());
+			ic.intIntEntryOffset		= int.view(d.read_u32());
+			ic.oobMemoryHandlerOffset	= int.view(d.read_u32());
+			ic.divZeroHandlerOffset		= int.view(d.read_u32());
+			ic.stackOverflowHandlerOffset	= int.view(d.read_u32());
+			ic.spcV3EntryOffset		= int.view(d.read_u32());
+			ic.spcLazyCompileOffset		= int.view(d.read_u32());
+			ic.spcTierupCompileOffset	= int.view(d.read_u32());
+			ic.codeEnd			= int.view(d.read_u32());
+		} else {
+			//         global buffer v   [0 ...                                         TOTAL_SIZE  ]
+			//      |xxxxxxxxxxxxxxxx|h|l|marker|global_header|...|dispatch|...|inline_code|ool_code|___
+			//      ^----elem0_offset----^
+			// page ^                                       1KiB  ^       page ^      page ^
+			var mask = 4095L;
+			var elem0_offset = (start - Pointer.NULL) & mask;
+			var alloc_offset = elem0_offset + 8 + GLOBAL_BUFFER_HEADER_SIZE;
+			var aligned_offset = (alloc_offset + mask) & ~mask;
+			var skip = int.!(aligned_offset - elem0_offset);
+
+			if (Debug.pregen) {
+				Trace.OUT.put3("Generating pregen stubs into [0x%x ... 0x%x], skipping %d bytes",
+					(range.start - Pointer.NULL),
+					(range.end - Pointer.NULL),
+					skip);
+				Trace.OUT.outln();
+			}
+
+			var w = DataWriter.new().reset(global_buffer, skip, skip);
+			// Gen interpreter
+			X86_64InterpreterGen.new(ic, w).gen(range);
+			// Gen SPC entry
+			ic.spcV3EntryOffset = w.atEnd().pos;
+			X86_64Spc.genEntryStub(w);
+			// Gen SPC lazy compile
+			ic.spcLazyCompileOffset = w.atEnd().pos;
+			X86_64Spc.genLazyCompileStub(w);
+			// Gen SPC tierup compile
+			ic.spcTierupCompileOffset = w.atEnd().pos;
+			X86_64Spc.genTierupCompileStub(w);
+		}
+		// Finish the interpreter code.
+		ic.end = range.start + ic.codeEnd;
+		ic.setV3Entry();
+		I.interpreterCode = ic;
+		I.dispatchTable = ic.start +
+			if(Execute.probes.elem != null,
+				ic.probedDispatchTableOffset,
+				ic.fastDispatchTableOffset);
+
+		// Write-protect the executable code for security and debugging
+		Mmap.protect(range.start + ic.codeStart, u64.!(ic.codeEnd - ic.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
+
+		// Register user code objects with the Virgil runtime.
+		RiRuntime.registerUserCode(ic);
+
+		// SPC entry point
+		spcV3Entry = CiRuntime.forgeClosure<void,
+			(WasmFunction, Pointer, Pointer), AbruptReturn>(
+				range.start + ic.spcV3EntryOffset, ());
+
+		// SPC lazy compile
+		spcLazyCompileStub.start = range.start + ic.spcLazyCompileOffset;
+		spcLazyCompileStub.end = range.start + ic.spcTierupCompileOffset;
+		RiRuntime.registerUserCode(spcLazyCompileStub);
+
+		// SPC tierup compile
+		spcTierupCompileStub.start = range.start + ic.spcTierupCompileOffset;
+		spcTierupCompileStub.end = range.start + ic.spcTierupCompileOffset + 100; // TODO: size
+		RiRuntime.registerUserCode(spcTierupCompileStub);
+
+		// Trace results to help in debugging
+		if (Debug.pregen || Debug.interpreter || Trace.compiler || Debug.compiler) {
+			var s = range.start - Pointer.NULL;
+			Trace.OUT
+				.puts("Pregen interpreter and compiler stub addresses:\n")
+				.put1("\tcode start:                0x%x\n", s + ic.codeStart)
+				.put1("\tint v3 entry:       break *0x%x\n", s + ic.intV3EntryOffset)
+				.put1("\tint spc entry:      break *0x%x\n", s + ic.intSpcEntryOffset)
+				.put1("\tint int entry:      break *0x%x\n", s + ic.intIntEntryOffset)
+				.put1("\tfast dispatch:             0x%x\n", s + ic.fastDispatchTableOffset)
+				.put1("\tprobed dispatch:           0x%x\n", s + ic.probedDispatchTableOffset)
+				.put1("\toob memory:         break *0x%x\n", s + ic.oobMemoryHandlerOffset)
+				.put1("\tdivide by zero:     break *0x%x\n", s + ic.divZeroHandlerOffset)
+				.put1("\tstack overflow:     break *0x%x\n", s + ic.stackOverflowHandlerOffset)
+				.put1("\tspc v3 entry:       break *0x%x\n", s + ic.spcV3EntryOffset)
+				.put1("\tspc lazy compile:   break *0x%x\n", s + ic.spcLazyCompileOffset)
+				.put1("\tspc tierup compile: break *0x%x\n", s + ic.spcTierupCompileOffset)
+				.put1("\tcode end:                  0x%x\n", s + ic.codeEnd)
+				.outln();
+		}
+		Debug.afterPregen();
+		return ic;
+	}
 }
