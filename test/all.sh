@@ -111,5 +111,15 @@ for target in $TEST_TARGETS; do
     do_script selfhost
 done
 
+# Virgil tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = int ]; then # TODO: runs really, really slow on v3i
+	skip virgil "runs too slowly"
+        continue
+    fi
+    do_script virgil/test
+done
+
 
 exit 0
