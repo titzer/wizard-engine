@@ -26,6 +26,11 @@ component Target {
 		Execute.probes.onDisable = X86_64Interpreter.onProbeDisable;
 	}
 
+	def setTargetCode(f: FuncDecl, addr: Pointer) {
+		if (Trace.compiler) Trace.OUT.put2("func[%d].target_code: break *0x%x", f.func_index, addr - Pointer.NULL).outln();
+		f.target_code = TargetCode(addr);
+		Debug.finishCompile(f, u64.view(addr - Pointer.NULL));
+	}
 	def genInterpreterIntoFile(filename: string) -> ErrorBuilder {
 		var data = System.fileLoad(filename);
 		var err = ErrorBuilder.new().puts("interpreter generator: ");
@@ -64,6 +69,25 @@ component Target {
 		}
 		return offset + length;
 	}
+	def setTieredEntrypoint(module: Module) { // TODO: remove, move all tests/entrypoints to validation
+		// With multi-tier support, the interpreter calls through target code, so every
+		// function needs a proper entrypoint.
+		if (!Target.tuning.multiTierSupport) return;
+		var ic = X86_64PreGenStubs.getInterpreterCode();
+		var entry = ic.start + ic.intSpcEntryOffset;
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			f.target_code = TargetCode(entry);
+		}
+	}
+	def setUnconditionalInterpreterEntryIfMultiTier(f: FuncDecl) {
+		// With multi-tier support, the interpreter calls through target code, so every
+		// function needs a proper entrypoint.
+		if (!Target.tuning.multiTierSupport) return;
+		var ic = X86_64PreGenStubs.getInterpreterCode();
+		var entry = ic.start + ic.intSpcEntryOffset;
+		f.target_code = TargetCode(entry);
+	}
 }
 
 type TargetCode(spc_entry: Pointer) #unboxed { }
@@ -79,6 +103,10 @@ class X86_64InterpreterOnlyStrategy extends ExecutionStrategy {
 	// Call a function with arguments and return a result.
 	def call(func: Function, args: Array<Value>) -> Result {
 		return X86_64Runtime.run(func, args); // XXX: specialize for interpreter-only
+	}
+	def onFuncValidationFinish(module: Module, func: FuncDecl, err: ErrorGen) {
+		if (err != null && !err.ok()) return;
+		Target.setUnconditionalInterpreterEntryIfMultiTier(func);
 	}
 }
 
@@ -151,8 +179,7 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 			if (starts[i] >= 0) {
 				var addr = mapping.range.start + starts[i];
 				var f = module.functions[i];
-				f.target_code = TargetCode(addr);
-				Debug.finishCompile(f, u64.view(addr - Pointer.NULL));
+				Target.setTargetCode(f, addr);
 			}
 		}
 		var code = X86_64SpcCode.new(mapping);
@@ -163,7 +190,7 @@ class X86_64SpcAotStrategy extends ExecutionStrategy {
 		module.target_module = TargetModule(code);
 		RiRuntime.registerUserCode(code);
 		module.target_module.spc_code.keepAlive();
-		Debug.finishCompilingModule(module);
+		Debug.finishCompileModule(module);
 	}
 }
 
@@ -174,7 +201,7 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 		installLazyCompileStubForModule(module, err);
 	}
 	// Called before a test function is run.
-	def onTestRun(wf: WasmFunction, err: ErrorGen) {
+	def onTestRun(wf: WasmFunction, err: ErrorGen) { // TODO: move this to onFuncValidationFinish
 		installLazyCompileStubForModule(wf.instance.module, err);
 	}
 	// Call a function with arguments and return a result.
@@ -182,6 +209,7 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
 	}
 	private def installLazyCompileStubForModule(module: Module, err: ErrorGen) {
+		// TODO: lazy-allocate module code too
 		// ensure entrypoint and lazy compile stubs are generated
 		X86_64PreGenStubs.gen();
 		X86_64Spc.setLazyCompile(lazyCompile);
@@ -203,6 +231,7 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
 		// Bind all trap handler labels used in the newly-compiled code to the handlers at the end of the code.
+		// XXX: cache the label objects too?
 		for (reason in TrapReason) {
 			var label = masm.newTrapLabel(reason); // XXX: cache trap labels
 			masm.bindLabelTo(label, code.trapHandlerOffsets[reason.tag] - code.codeEnd);
@@ -229,8 +258,7 @@ class X86_64SpcLazyStrategy extends ExecutionStrategy {
 		masm.setTargetAddress(u64.view(spc_entry - Pointer.NULL));
 		code.codeEnd = Target.copyInto(range, code.codeEnd, w);
 
-		wf.decl.target_code = TargetCode(spc_entry);
-		Debug.finishCompile(wf.decl, u64.view(spc_entry - Pointer.NULL));
+		Target.setTargetCode(wf.decl, spc_entry);
 		return (wf, spc_entry, null);
 	}
 }
@@ -297,8 +325,7 @@ class X86_64DynamicStrategy extends ExecutionStrategy {
 		masm.setTargetAddress(u64.view(spc_entry - Pointer.NULL));
 		code.codeEnd = Target.copyInto(range, code.codeEnd, w);
 
-		wf.decl.target_code = TargetCode(spc_entry);
-		Debug.finishCompile(wf.decl, u64.view(spc_entry - Pointer.NULL));
+		Target.setTargetCode(wf.decl, spc_entry);
 		return (wf, spc_entry, null);
 	}
 }
@@ -495,7 +522,7 @@ component X86_64PreGenStubs {
 			X86_64Spc.genLazyCompileStub(w);
 			// Gen SPC tierup compile
 			ic.spcTierupCompileOffset = w.atEnd().pos;
-			X86_64Spc.genTierupCompileStub(w);
+			X86_64Spc.genTierupCompileStub(w, ic);
 		}
 		// Finish the interpreter code.
 		ic.end = range.start + ic.codeEnd;
@@ -533,15 +560,15 @@ component X86_64PreGenStubs {
 			Trace.OUT
 				.puts("Pregen interpreter and compiler stub addresses:\n")
 				.put1("\tcode start:                0x%x\n", s + ic.codeStart)
-				.put1("\tint v3 entry:       break *0x%x\n", s + ic.intV3EntryOffset)
-				.put1("\tint spc entry:      break *0x%x\n", s + ic.intSpcEntryOffset)
-				.put1("\tint int entry:      break *0x%x\n", s + ic.intIntEntryOffset)
+				.put1("\tv3->int entry:      break *0x%x\n", s + ic.intV3EntryOffset)
+				.put1("\tspc->int entry:     break *0x%x\n", s + ic.intSpcEntryOffset)
+				.put1("\tint->int entry:     break *0x%x\n", s + ic.intIntEntryOffset)
 				.put1("\tfast dispatch:             0x%x\n", s + ic.fastDispatchTableOffset)
 				.put1("\tprobed dispatch:           0x%x\n", s + ic.probedDispatchTableOffset)
 				.put1("\toob memory:         break *0x%x\n", s + ic.oobMemoryHandlerOffset)
 				.put1("\tdivide by zero:     break *0x%x\n", s + ic.divZeroHandlerOffset)
 				.put1("\tstack overflow:     break *0x%x\n", s + ic.stackOverflowHandlerOffset)
-				.put1("\tspc v3 entry:       break *0x%x\n", s + ic.spcV3EntryOffset)
+				.put1("\tv3->entry:          break *0x%x\n", s + ic.spcV3EntryOffset)
 				.put1("\tspc lazy compile:   break *0x%x\n", s + ic.spcLazyCompileOffset)
 				.put1("\tspc tierup compile: break *0x%x\n", s + ic.spcTierupCompileOffset)
 				.put1("\tcode end:                  0x%x\n", s + ic.codeEnd)
