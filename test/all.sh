@@ -101,4 +101,15 @@ for target in $TEST_TARGETS; do
     do_script wizeng/test
 done
 
+# Self-hosted (unit) tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
+	skip selfhost "will run out of memory"
+        continue
+    fi
+    do_script selfhost
+done
+
+
 exit 0

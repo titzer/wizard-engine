@@ -90,8 +90,12 @@ fi
 function make_binary() {
     cd $WIZENG_LOC
     local binary=$1
+    local target=$2
+    if [ "$target" = "" ]; then
+	target=$TEST_TARGET
+    fi
     local out=$T/$binary.build.out
-    export BINARY=bin/$binary.${TEST_TARGET}
+    export BINARY=bin/$binary.$target
     make $BINARY 2>&1 > $out
     local ret=$?
     if [ $ret != 0 ]; then
