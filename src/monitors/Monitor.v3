@@ -151,8 +151,21 @@ class ModuleMonitor(module: Module) {
 	def beforeInstr(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) {
 		module.insertProbeAt(func.func_index, pc, CallbackProbe.new(f));
 	}
+	// Attach a callback that is called right after an instruction has executed.
+	// This is equivalent to a beforeInstr callback before the next instruction,
+	// but the next instruction may be dynamic depending on control flow.
 	def afterInstr(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) {
-		// TODO
+		var bi = BytecodeIterator.new();
+		var it = bi.reset(func);
+		var visitor = AfterInstrVisitor.new(module, func, pc, f);
+		visitor.bi = it;
+
+		it.current();
+		while (it.pc < pc) {
+			it.dispatch(visitor);
+			it.next();
+		}
+		it.dispatch(visitor);
 	}
 
 	// Attach a callback to any non-import function call
@@ -270,5 +283,129 @@ private class MemoryGrowProbe(f: (DynamicLoc, u32) -> Resumption) extends Probe 
 		var accessor = frame.getFrameAccessor();
 		var pages = u32.!(Values.v_i(accessor.getOperand(0)));
 		return f(DynamicLoc(func, pc, frame), pages);
+	}
+}
+
+// This probe dynamically inserts probes at destinations, based on the current
+// state of the program (e.g. for branches, it attaches an `AfterInstrDestProbe`
+// that removes itself).
+private class AfterInstrProbe(module: Module, opcode: Opcode, dests: Range<int>, f: DynamicLoc -> Resumption) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+		var nextPc = getNextPc(func, pc, frame);
+		if (nextPc != -1) {
+			module.insertProbeAt(func.decl.func_index, nextPc, AfterInstrDestProbe.new(func.instance.module, f));
+		} else {
+			// Special case: probe parent frame
+			var accessor = frame.getFrameAccessor();
+			var caller = accessor.caller();
+			if (caller.func == null) {
+				Trace.OUT.puts("  ignored").outln();
+			} else {
+				var bi = BytecodeIterator.new();
+				var it = bi.reset(caller.func.decl);
+				it.skipTo(caller.pc);
+				it.next();
+				module.insertProbeAt(caller.func.decl.func_index, it.pc, AfterInstrDestProbe.new(func.instance.module, f));
+			}
+		}
+		return Resumption.Continue;
+	}
+
+	// Get the next pc based on the state of the current frame
+	// Return -1 if this is the end of the function and we need to go to the
+	// calling function.
+	private def getNextPc(func: WasmFunction, pc: int, frame: TargetFrame) -> int {
+		if (dests[0] == -1) {
+			return -1;
+		}
+
+		match (opcode) {
+			BR_IF => ;
+			BR_TABLE => ;
+			IF => ;
+			RETURN => return -1;
+			END => return dests[0];
+			_ => return dests[0];
+		}
+
+		var accessor = frame.getFrameAccessor();
+		var condition = Values.v_i(accessor.getOperand(0));
+
+		match (opcode) {
+			BR_IF => return dests[if(condition != 0, 1, 0)];
+			BR_TABLE => {
+				if (condition >= dests.length) condition = dests.length - 1;
+				return dests[condition];
+			}
+			IF => return dests[if(condition != 0, 0, 1)];
+			_ => ;
+		}
+		return pc;
+	}
+}
+private class AfterInstrDestProbe(module: Module, f: DynamicLoc -> Resumption) extends Probe {
+	def fire(func: WasmFunction, pc: int, frame: TargetFrame) -> Resumption {
+		module.removeProbeAt(func.decl.func_index, pc, this);
+		f(DynamicLoc(func, pc, frame));
+		return Resumption.Continue;
+	}
+}
+private class AfterInstrVisitor(module: Module, func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) extends BytecodeVisitor {
+	var bi: BytecodeIterator;
+	var stp: int;
+	var sidetable = func.sidetable;
+
+	def visitOp(op: Opcode) {
+		var nextPc = bi.codeptr.pos;
+		maybeInsertProbe([nextPc], f);
+	}
+
+	def visit_BR(depth: u31) {
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		maybeInsertProbe([takenPc], f);
+	}
+
+	def visit_BR_IF(depth: u31) {
+		var notTakenPc = bi.codeptr.pos;
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		maybeInsertProbe([notTakenPc, takenPc], f);
+	}
+
+	def visit_BR_TABLE(labels: Range<u31>) {
+		stp += 4;
+		var dests = Array<int>.new(labels.length);
+		for (i < labels.length) {
+			dests[i] = sidetable[stp] + bi.pc;
+			stp += 4;
+		}
+		maybeInsertProbe(dests, f);
+	}
+
+	def visit_IF(btc: BlockTypeCode) {
+		var takenPc = bi.codeptr.pos;
+		var elsePc = sidetable[stp] + bi.pc;
+		stp += 4;
+		maybeInsertProbe([elsePc, takenPc], f);
+	}
+
+	def visit_ELSE() {
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		maybeInsertProbe([takenPc], f);
+	}
+
+	def visit_END() {
+		if ((bi.pc + 1) < bi.func.cur_bytecode.length) {
+			maybeInsertProbe([bi.codeptr.pos], f);
+		} else {
+			maybeInsertProbe([-1], f);
+		}
+	}
+
+	private def maybeInsertProbe(dests: Range<int>, f: DynamicLoc -> Resumption) {
+		if (bi.pc != pc) return;
+		module.insertProbeAt(bi.func.func_index, bi.pc, AfterInstrProbe.new(module, bi.current(), dests, f));
 	}
 }
