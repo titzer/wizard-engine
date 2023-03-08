@@ -1,0 +1,273 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class ModuleMonitor(module: Module) {
+	// Attach a callback that is called when func (non-import) is called
+	def beforeFuncCall(func: FuncDecl, f: DynamicLoc -> Resumption) {
+		if (func.imp != null) return;
+		beforeFuncCallAndReturn(func, f, null);
+	}
+	// Attach a callback that is called when func (non-import) returns
+	def beforeFuncReturn(func: FuncDecl, f: DynamicLoc -> Resumption) {
+		if (func.imp != null) return;
+		beforeFuncCallAndReturn(func, null, f);
+	}
+	// Attach callbacks that are called when a func is called or returns
+	def beforeFuncCallAndReturn(func: FuncDecl, callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
+		var it = BytecodeIterator.new();
+		var bi = it.reset(func);
+
+		var startsWithLoop = false;
+		var frameAccessors: ListStack<FrameAccessor>;
+		if (bi.current() == Opcode.LOOP) {
+			startsWithLoop = true;
+			frameAccessors = ListStack<FrameAccessor>.new();
+			module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopEnterProbe.new(frameAccessors, callFn));
+		} else if (callFn != null) {
+			module.insertProbeAt(func.func_index, bi.pc, CallbackProbe.new(callFn));
+		}
+
+		for (bi = it.reset(func); bi.more(); bi.next()) {
+			var op = bi.current();
+			match (op) {
+				RETURN => ;
+				END => if (bi.pc + 1 < bi.func.cur_bytecode.length) continue;
+				_ => continue;
+			}
+
+			if (startsWithLoop) {
+				module.insertProbeAt(func.func_index, bi.pc, FuncWithLoopExitProbe.new(frameAccessors, retFn));
+			} else if (retFn != null) {
+				module.insertProbeAt(func.func_index, bi.pc, CallbackProbe.new(retFn));
+			}
+		}
+	}
+	// Attach a callback to any non-import function call
+	def beforeCall(f: DynamicLoc -> Resumption) {
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncCall(_, f));
+	}
+	// Attach a callback to any non-import function return
+	def beforeReturn(f: DynamicLoc -> Resumption) {
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncReturn(_, f));
+	}
+	// Attach a callback to any non-import function call or return
+	def beforeCallAndReturn(callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncCallAndReturn(_, callFn, retFn));
+	}
+
+	// Attach a callback to an instruction
+	def beforeInstr(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) {
+		module.insertProbeAt(func.func_index, pc, CallbackProbe.new(f));
+	}
+	// Attach a callback that fires after an instruction has executed
+	// The resultant DynamicLoc will be the next wasm bytecode that is executed,
+	// skipping the entry/exit of any host functions in between.
+	def afterInstr(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) {
+		var bi = BytecodeIterator.new();
+		var it = bi.reset(func);
+		var visitor = AfterInstrVisitor.new(module, func, pc, f);
+		visitor.bi = it;
+
+		it.current();
+		while (it.pc < pc) {
+			it.dispatch(visitor);
+			it.next();
+		}
+		it.dispatch(visitor);
+	}
+
+	// Helpers
+	// call f(funcDecl) if filter(module, funcDecl) is true
+	def forEachFunc(filter: (Module, FuncDecl) -> bool, f: FuncDecl -> void) {
+		for (i < module.functions.length) {
+			var func = module.functions[i];
+			if (!filter(module, func)) continue;
+			f(func);
+		}
+	}
+}
+
+component MonitorUtil {
+	def isImport(module: Module, func: FuncDecl) -> bool {
+		return func.imp != null;
+	}
+	def isNotImport(module: Module, func: FuncDecl) -> bool {
+		return func.imp == null;
+	}
+}
+
+private class FuncWithLoopEnterProbe(
+	frameAccessors: ListStack<FrameAccessor>,
+	f: DynamicLoc -> Resumption
+) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var curAccessor = dynamicLoc.frame.getFrameAccessor();
+		if (!frameAccessors.empty() && curAccessor == frameAccessors.peek())
+			return Resumption.Continue;
+		frameAccessors.push(curAccessor);
+		if (f != null)
+			return f(dynamicLoc);
+		return Resumption.Continue;
+	}
+}
+private class FuncWithLoopExitProbe(
+	frameAccessors: ListStack<FrameAccessor>,
+	f: DynamicLoc -> Resumption
+) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		frameAccessors.pop();
+		if (f != null)
+			return f(dynamicLoc);
+		return Resumption.Continue;
+	}
+}
+
+private class AfterInstrGlobalProbe(f: DynamicLoc -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		Execute.probes.remove(this);
+		return f(dynamicLoc);
+	}
+}
+// This probe dynamically activates probes at destinations, based on the current
+// state of the program. This is attached for after instruction callbacks that
+// have multiple destinations possible at runtime, with the exception of
+// CALL_INDIRECT and RETURN/END of function, where it activates the global
+// interpreter probe instead.
+private class AfterInstrProbe(module: Module, opcode: Opcode, destProbes: Range<AfterInstrDestProbe>, f: DynamicLoc -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var nextProbe = getNextProbe(dynamicLoc);
+		if (nextProbe != null) {
+			nextProbe.active = true;
+		}
+		return Resumption.Continue;
+	}
+
+	// Get the next destination probe based on the state of the current frame
+	private def getNextProbe(dynamicLoc: DynamicLoc) -> AfterInstrDestProbe {
+		if (destProbes.length == 1) {
+			return destProbes[0];
+		}
+
+		match (opcode) {
+			BR_IF => ;
+			BR_TABLE => ;
+			IF => ;
+			_ => return null;
+		}
+
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var condition = Values.v_i(accessor.getOperand(0));
+
+		match (opcode) {
+			BR_IF => return destProbes[if(condition != 0, 1, 0)];
+			BR_TABLE => {
+				if (condition >= destProbes.length)
+					condition = destProbes.length - 1;
+				return destProbes[condition];
+			}
+			IF => return destProbes[if(condition != 0, 0, 1)];
+			_ => ;
+		}
+		return null;
+	}
+}
+private class AfterInstrAddGlobalProbe(f: DynamicLoc -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		Execute.probes.add(AfterInstrGlobalProbe.new(f));
+		return Resumption.Continue;
+	}
+}
+private class AfterInstrDestProbe(module: Module, f: DynamicLoc -> Resumption) extends Probe {
+	var active = false;
+	
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		if (active) {
+			active = false;
+			return f(dynamicLoc);
+		}
+		return Resumption.Continue;
+	}
+}
+private class AfterInstrVisitor(module: Module, func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) extends BytecodeVisitor {
+	var bi: BytecodeIterator;
+	var stp: int;
+	var sidetable = func.sidetable;
+
+	def visitOp(op: Opcode) {
+		insertProbes([bi.codeptr.pos], f);
+	}
+	def visit_BR(depth: u31) {
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		insertProbes([takenPc], f);
+	}
+	def visit_BR_IF(depth: u31) {
+		var notTakenPc = bi.codeptr.pos;
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		insertProbes([notTakenPc, takenPc], f);
+	}
+	def visit_BR_TABLE(labels: Range<u31>) {
+		stp += 4;
+		var dests = Array<int>.new(labels.length);
+		for (i < labels.length) {
+			dests[i] = sidetable[stp] + bi.pc;
+			stp += 4;
+		}
+		insertProbes(dests, f);
+	}
+	def visit_IF(btc: BlockTypeCode) {
+		var takenPc = bi.codeptr.pos;
+		var elsePc = sidetable[stp] + bi.pc;
+		stp += 4;
+		insertProbes([elsePc, takenPc], f);
+	}
+	def visit_ELSE() {
+		var takenPc = sidetable[stp] + bi.pc;
+		stp += 4;
+		insertProbes([takenPc], f);
+	}
+	def visit_END() {
+		if ((bi.pc + 1) < bi.func.cur_bytecode.length) {
+			insertProbes([bi.codeptr.pos], f);
+		} else {
+			insertGlobalProbe(f);
+		}
+	}
+	def visit_CALL(func_index: u31) {
+		insertCallProbe(func_index, f);
+	}
+
+	def visit_RETURN() {
+		insertGlobalProbe(f);
+	}
+	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
+		insertGlobalProbe(f);
+	}
+
+	private def insertProbes(dests: Range<int>, f: DynamicLoc -> Resumption) {
+		if (bi.pc != pc) return;
+		var destProbes = Array<AfterInstrDestProbe>.new(dests.length);
+		for (i < dests.length) {
+			if (dests[i] == -1) {
+				destProbes[i] = null;
+			} else {
+				destProbes[i] = AfterInstrDestProbe.new(module, f);
+				module.insertProbeAt(bi.func.func_index, dests[i], destProbes[i]);
+			}
+		}
+		module.insertProbeAt(bi.func.func_index, bi.pc, AfterInstrProbe.new(module, bi.current(), destProbes, f));
+	}
+	private def insertCallProbe(func_index: u31, f: DynamicLoc -> Resumption) {
+		if (bi.pc != pc) return;
+		var destProbe = AfterInstrDestProbe.new(module, f);
+		var func_it = BytecodeIterator.new();
+		var func_bi = func_it.reset(module.functions[func_index]);
+		func_bi.current();
+		module.insertProbeAt(func_index, func_bi.pc, destProbe);
+		module.insertProbeAt(bi.func.func_index, bi.pc, AfterInstrProbe.new(module, bi.current(), [destProbe], f));
+	}
+	private def insertGlobalProbe(f: DynamicLoc -> Resumption) {
+		module.insertProbeAt(bi.func.func_index, bi.pc, AfterInstrAddGlobalProbe.new(f));
+	}
+}
