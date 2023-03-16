@@ -44,3 +44,52 @@
 (assert_return (invoke "andnot" (v128.const i32x4 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678)
                                 (v128.const i32x4 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef))
                                 (v128.const i32x4 0x02141210 0x02141210 0x02141210 0x02141210))
+
+
+(module (memory 1)
+  (func (export "nested-v128.andnot")
+    (drop
+      (v128.andnot
+        (v128.andnot
+          (v128.andnot
+            (v128.load (i32.const 0))
+            (v128.load (i32.const 1))
+          )
+          (v128.andnot
+            (v128.load (i32.const 0))
+            (v128.load (i32.const 1))
+          )
+        )
+        (v128.andnot
+          (v128.andnot
+            (v128.load (i32.const 0))
+            (v128.load (i32.const 1))
+          )
+          (v128.andnot
+            (v128.load (i32.const 0))
+            (v128.load (i32.const 1))
+          )
+        )
+      )
+    )
+  )
+)
+
+(assert_return (invoke "nested-v128.andnot"))
+
+(assert_invalid
+  (module
+    (func $v128.andnot-1st-arg-empty (result v128)
+      (v128.andnot (v128.const i32x4 0 0 0 0))
+    )
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module
+    (func $v128.andnot-arg-empty (result v128)
+      (v128.andnot)
+    )
+  )
+  "type mismatch"
+)
