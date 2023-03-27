@@ -102,7 +102,49 @@ class ModuleMonitor(module: Module) {
 			it.dispatch(visitor);
 		}
 	}
-	private def isNotImport(module: Module, func: FuncDecl) -> bool {
+
+	def beforeMemRead(f: (DynamicLoc, Memory, u64, u64) -> Resumption) {
+		beforeMemOp(f, null, null);
+	}
+	def beforeMemWrite(f: (DynamicLoc, Memory, u64, u64) -> Resumption) {
+		beforeMemOp(null, f, null);
+	}
+	def beforeMemGrow(f: (DynamicLoc, Memory, u32) -> Resumption) {
+		beforeMemOp(null, null, f);
+	}
+	private def beforeMemOp(
+		readFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+		writeFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+		growFn: (DynamicLoc, Memory, u32) -> Resumption
+	) {
+		var it = BytecodeIterator.new();
+		var visitor = MemoryVisitor.new(module, readFn, writeFn, growFn);
+		visitor.bi = it;
+
+		forEachFunc(MonitorUtil.isNotImport, monitorFuncForMemoryAccess(_, visitor));
+	}
+	private def monitorFuncForMemoryAccess(func: FuncDecl, visitor: MemoryVisitor) {
+		for (bi = visitor.bi.reset(func); bi.more(); bi.next()) {
+			bi.dispatch(visitor);
+		}
+	}
+
+	// Helpers
+	// call f(funcDecl) if filter(module, funcDecl) is true
+	def forEachFunc(filter: (Module, FuncDecl) -> bool, f: FuncDecl -> void) {
+		for (i < module.functions.length) {
+			var func = module.functions[i];
+			if (!filter(module, func)) continue;
+			f(func);
+		}
+	}
+}
+
+component MonitorUtil {
+	def isImport(module: Module, func: FuncDecl) -> bool {
+		return func.imp != null;
+	}
+	def isNotImport(module: Module, func: FuncDecl) -> bool {
 		return func.imp == null;
 	}
 }
@@ -283,5 +325,66 @@ private class GlobalVisitor(module: Module, f: DynamicLoc -> Resumption, isWrite
 		if (global_index == targetIndex && isWrite) {
 			module.insertProbeAt(bi.func.func_index, bi.pc, CallbackProbe.new(f));
 		}
+	}
+}
+
+private class MemoryVisitor(
+	module: Module,
+	loadFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+	storeFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+	growFn: (DynamicLoc, Memory, u32) -> Resumption
+) extends BytecodeVisitor {
+	var bi: BytecodeIterator;
+
+	def visitLoad(op: Opcode, imm: MemArg) {
+		if (loadFn == null) return;
+		var size: u64;
+		match (op) {
+			// TODO: V128, ATOMIC ops
+			I32_LOAD8_S, I32_LOAD8_U, I64_LOAD8_S, I64_LOAD8_U => size = 1;
+			I32_LOAD16_S, I32_LOAD16_U, I64_LOAD16_S, I64_LOAD16_U => size = 2;
+			I32_LOAD, I64_LOAD32_S, I64_LOAD32_U => size = 4;
+			I64_LOAD, F64_LOAD => size = 8;
+			_ => size = 0;
+		}
+		module.insertProbeAt(bi.func.func_index, bi.pc, MemoryAccessProbe.new(imm, size, loadFn));
+	}
+
+	def visitStore(op: Opcode, imm: MemArg) {
+		if (storeFn == null) return;
+		var size: u64;
+		match (op) {
+			// TODO: V128, ATOMIC ops
+			I32_STORE8, I64_STORE8 => size = 1;
+			I32_STORE16, I64_STORE16 => size = 2;
+			I32_STORE, I64_STORE32, F32_STORE => size = 4;
+			I64_STORE, F64_STORE => size = 8;
+			_ => size = 0;
+		}
+		module.insertProbeAt(bi.func.func_index, bi.pc, MemoryAccessProbe.new(imm, size, storeFn));
+	}
+
+	def visit_MEMORY_GROW(memory_index: u31) {
+		if (growFn != null)
+			module.insertProbeAt(bi.func.func_index, bi.pc, MemoryGrowProbe.new(memory_index, growFn));
+	}
+}
+private class MemoryAccessProbe(imm: MemArg, size: u64, f: (DynamicLoc, Memory, u64, u64) -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var address: u64 = u64.!(Values.v_i(accessor.getOperand(0)));
+		address += imm.offset;
+
+		var memory = dynamicLoc.func.instance.memories[imm.memory_index];
+
+		return f(dynamicLoc, memory, address, size);
+	}
+}
+private class MemoryGrowProbe(memory_index: u31, f: (DynamicLoc, Memory, u32) -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var pages = u23.!(Values.v_i(accessor.getOperand(0)));
+		var memory = dynamicLoc.func.instance.memories[memory_index];
+		return f(dynamicLoc, memory, pages);
 	}
 }
