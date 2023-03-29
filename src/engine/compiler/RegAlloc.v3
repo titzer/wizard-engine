@@ -61,50 +61,62 @@ class PriorityRegPool {
 // pools; they must be set with {setPool(i)}.
 class RegAlloc {
 	def regConfig: RegConfig;
-	private var pools: Array<PriorityRegPool>;
+	private def regToPool = regConfig.regToPool;
+	private var pools: Array<RegPool32>;
+	private var freebits: Array<int>;
 	private var assign: Array<int>;
 
 	new(regConfig, prev: RegAlloc) {
 		if (prev == null) {
-			pools = Array<PriorityRegPool>.new(regConfig.numRegPools);
+			pools = Array<RegPool32>.new(regConfig.numRegPools);
+			freebits = Array<int>.new(regConfig.numRegPools);
+			for (i < freebits.length) freebits[i] = 0xFFFF_FFFF;
 			assign = Array<int>.new(regConfig.regSet.regs.length);
 			for (i < assign.length) assign[i] = -1;
 		} else {
-			pools = Arrays.dup(prev.pools);
-			for (i < pools.length) pools[i] = pools[i].copy();
+			pools = prev.pools;
+			freebits = Arrays.dup(prev.freebits);
 			assign = Arrays.dup(prev.assign);
 		}
 	}
-	def setPool(i: int, p: PriorityRegPool) {
-		pools[i] = p;
+	def setPool(i: int, pool: RegPool32) {
+		pools[i] = pool;
 	}
 	def alloc(kind: ValueKind, assignment: int) -> Reg {
-		var pool_index = regConfig.kindToPool[kind.tag];
-		if (pool_index < 0) return Reg(0);
-		var r = pools[pool_index].alloc();
-		if (r.index > 0) assign[r.index] = assignment;
-		return r;
-	}
-	def get(reg: Reg) -> int {
-		if (reg.index >= assign.length) return -1;
-		return assign[reg.index];
+		var p = regConfig.kindToPool[kind.tag];
+		if (p < 0) return NO_REG;
+		var f = freebits[p], i = 0;
+		// XXX: use CTZ (count trailing zeroes) instruction
+		if ((f & 0xFFFF) == 0) { i += 16; f >>= 16; }
+		if ((f & 0xFF) == 0) { i += 8; f >>= 8; }
+		if ((f & 0xF) == 0) { i += 4; f >>= 4; }
+		if ((f & 0x3) == 0) { i += 2; f >>= 2; }
+		if ((f & 0x1) == 0) { i += 1; f >>= 1; }
+		var pool = pools[p];
+		if (i >= pool.regs.length) return NO_REG;
+		freebits[p] &= ~(1 << u5.view(i));
+		var reg = pool.regs[i];
+		assign[reg.index] = assignment;
+		return reg;
 	}
 	def free(reg: Reg) {
-		var pool_index = regConfig.regToPool[reg.index];
-		assign[reg.index] = -1;
-		return pools[pool_index].free(reg);
+		assign[reg.index] = -1; // TODO: multiple assignments
+		var p = regToPool[reg.index];
+		var i = pools[p].map[reg.index];
+		freebits[p] |= (1 << i);
 	}
 	def isFree(reg: Reg) -> bool {
 		return assign[reg.index] < 0;
 	}
 	def unfree(reg: Reg, assignment: int) {
-		var pool_index = regConfig.regToPool[reg.index];
-		assign[reg.index] = assignment;
-		return pools[pool_index].unfree(reg);
+		assign[reg.index] = assignment; // TODO: multiple assignments
+		var p = regToPool[reg.index];
+		var i = pools[p].map[reg.index];
+		freebits[p] &= ~(1 << i);
 	}
 	def clear() -> this {
-		for (p in pools) p.clear();
-		for (i < assign.length) assign[i] = -1;
+		for (i < freebits.length) freebits[i] = 0xFFFF_FFFF;
+		for (i < assign.length) assign[i] = -1; // TODO: multiple assignments
 	}
 	def copy() -> RegAlloc {
 		return RegAlloc.new(regConfig, this);
@@ -112,12 +124,13 @@ class RegAlloc {
 	// Finds the allocated register with the lowest assignment.
 	def findSpillCandidate(kind: ValueKind) -> Reg {
 		var lowest = int.max, reg: Reg;
-		var p = pools[regConfig.kindToPool[kind.tag]];
-		var alloc = ~p.freebits;
+		var p = regConfig.kindToPool[kind.tag];
+		var regs = pools[p].regs;
+		var alloc = ~freebits[p];
 		var i = 0;
 		while (alloc != 0) {
 			if (1 == (alloc & 1)) {
-				var candidate = p.regs[i];
+				var candidate = regs[i];
 				var assignment = assign[candidate.index];
 				if (assignment < lowest) {
 					lowest = assignment;
@@ -129,11 +142,29 @@ class RegAlloc {
 		}
 		return reg;
 	}
+	// Call {func} for each allocated register.
+	def forEachAllocatedReg<T>(reg: Reg, func: Reg -> T) {
+		for (p < freebits.length) {
+			var alloc = ~freebits[p];
+			var regs = pools[p].regs;
+			var i = 0;
+			while (alloc != 0) {
+				if (1 == (alloc & 1)) func(regs[i]);
+			}
+			alloc = alloc >> 1;
+			i++;
+		}
+	}
+	// Call {func} for every assignment of {reg}.
+	def forEachAssignment<T>(reg: Reg, func: (Reg, int) -> T) {
+		var assignment = assign[reg.index];
+		if (assignment >= 0) func(reg, assignment); // TODO: multiple assignments
+	}
 }
 def NO_REG = Reg(0);
 
 //                 alloc  free   unfree   clear   copy     iter free   iter alloc
-// PriorityRegPool     5     1        1       1      1            32           32
+// PriorityRegPool     5     1        1       1      1            32            a
 // SpcRaPool           1     1        1       a      ?             f            a
 
 // Allocates registers from pool number {poolIndex} from {regConfig}.
