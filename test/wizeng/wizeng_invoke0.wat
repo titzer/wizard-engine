@@ -1,0 +1,15 @@
+(module
+  (import "wizeng" "invoke0" (func $invoke0 (param funcref)))
+  (table 2 funcref)
+  (elem (i32.const 0) $foo $bar)
+  (func $bar)
+  (func $foo
+    (call $bar)
+  )
+  (func $main (export "main")
+    (ref.func $foo)
+    (call $invoke0)
+    (ref.func $bar)
+    (call $invoke0)
+  )
+)
