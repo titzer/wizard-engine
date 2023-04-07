@@ -2,32 +2,40 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def NO_REG = Reg(0);
-// A register allocator that has different pools for different register classes.
-// When initially allocated, a register configuration has empty priority register
-// pools; they must be set with {setPool(i)}.
+// A register allocator that manages the allocated state of each register in a set of register
+// pools, where the register state is either *free* or *allocated* one or more non-negative integer
+// *assignments*.
+// When initially created, a {RegAlloc} has no register pools; they must be set with {setPool(i)}
+// prior to use.
+// This implementation allocates registers in priority order according to each pool.
 class RegAlloc {
-	def regConfig: RegConfig;
-	private def regToPool = regConfig.regToPool;
-	private var pools: Array<RegPool32>;
-	private var freebits: Array<int>;
-	private var assign: Array<int>;
+	def regConfig: RegConfig;			// all registers, and reg -> pool mapping
+	private def regToPool = regConfig.regToPool;	// for quicker access
+	private var pools: Array<RegPool32>;		// the register pools
+	private var freebits: Array<int>;		// free status for each register, by pool
+	private var first: Array<int>;			// first assignment of each register
+	private var aliases: Array<List<int>>;		// overflow list of each register
 
 	new(regConfig, prev: RegAlloc) {
 		if (prev == null) {
-			pools = Array<RegPool32>.new(regConfig.numRegPools);
-			freebits = Array<int>.new(regConfig.numRegPools);
+			pools = Array.new(regConfig.numRegPools);
+			freebits = Array.new(regConfig.numRegPools);
 			for (i < freebits.length) freebits[i] = 0xFFFF_FFFF;
-			assign = Array<int>.new(regConfig.regSet.regs.length);
-			for (i < assign.length) assign[i] = -1;
+			first = Array.new(regConfig.regSet.regs.length);
+			aliases = Array.new(first.length);
+			for (i < first.length) first[i] = -1;
 		} else {
 			pools = prev.pools;
 			freebits = Arrays.dup(prev.freebits);
-			assign = Arrays.dup(prev.assign);
+			first = Arrays.dup(prev.first);
+			aliases = Arrays.dup(prev.aliases);
 		}
 	}
+	// Set the {i}th pool to {pool}.
 	def setPool(i: int, pool: RegPool32) -> this {
 		pools[i] = pool;
 	}
+	// Allocate a register of the given {ValueKind} and set its first {assignment}.
 	def alloc(kind: ValueKind, assignment: int) -> Reg {
 		var p = regConfig.kindToPool[kind.tag];
 		if (p < 0) return NO_REG;
@@ -42,69 +50,179 @@ class RegAlloc {
 		if (i >= pool.regs.length) return NO_REG;
 		freebits[p] &= ~(1 << u5.view(i));
 		var reg = pool.regs[i];
-		assign[reg.index] = assignment;
+		first[reg.index] = assignment;
 		return reg;
 	}
+	// Free the register {reg}, removing all of its assignments.
 	def free(reg: Reg) {
-		assign[reg.index] = -1; // TODO: multiple assignments
+		first[reg.index] = -1;
+		aliases[reg.index] = null;
 		var p = regToPool[reg.index];
 		var i = pools[p].map[reg.index];
 		freebits[p] |= (1 << i);
 	}
+	// Returns {true} if {reg} has no assignments.
 	def isFree(reg: Reg) -> bool {
-		return assign[reg.index] < 0;
+		return first[reg.index] < 0;
 	}
-	def unfree(reg: Reg, assignment: int) {
-		assign[reg.index] = assignment; // TODO: multiple assignments
+	// Add an {assignment} to the register {reg}.
+	def assign(reg: Reg, assignment: int) {
+		if (first[reg.index] >= 0) {
+			// already assigned; add an alias
+			aliases[reg.index] = List.new(assignment, aliases[reg.index]);
+			return;
+		}
+		// not assigned yet; add the assignment and set as not free
+		first[reg.index] = assignment;
 		var p = regToPool[reg.index];
 		var i = pools[p].map[reg.index];
 		freebits[p] &= ~(1 << i);
 	}
+	// Change one assignment of {reg} from {before} to {after}.
+	// Returns {true} if the register did have the assignment {before}.
+	def reassign(reg: Reg, before: int, after: int) -> bool {
+		var assignment = first[reg.index];
+		if (assignment == before) {
+			// Common, fast case; just adjust the assignment.
+			first[reg.index] = after;
+			return true;
+		}
+		// General case, just unassign and assign.
+		return (unassign(reg, before), assign(reg, after)).0; // XXX: additional inline cases?
+	}
+	// Remove the {assignment} from {reg} if it has that assignment.
+	// Frees the register if the last assignment is removed.
+	// Returns {true} if the register did have the assignment.
+	def unassign(reg: Reg, assignment: int) -> bool {
+		var l = aliases[reg.index];
+		if (l == null) { // no aliases
+			if (first[reg.index] == assignment) { // free if the assignment matches
+				first[reg.index] = -1;
+				var p = regToPool[reg.index];
+				var i = pools[p].map[reg.index];
+				freebits[p] |= (1 << i);
+				return true;
+			}
+			return false; // no such alias
+		}
+		if (first[reg.index] == assignment) { // first assignment matches
+			first[reg.index] = l.head;
+			aliases[reg.index] = l.tail;
+			return true;
+		}
+		// XXX: recursively remove {assignment} from aliases, which could copy the entire list.
+		var n = recursivelyRemoveItem(assignment, l);
+		aliases[reg.index] = n;
+		return n != l;
+	}
+	private def recursivelyRemoveItem(i: int, l: List<int>) -> List<int> {
+		if (l == null) return null;
+		if (l.head == i) return l.tail;
+		var t = l.tail;
+		var n = recursivelyRemoveItem(i, t);
+		return if(t == n, l, List.new(l.head, n));
+	}
+	// Returns the "frequency" of {reg}, which is an approximate count such that {0}=free,
+	// {1}=exactly one assignment, {2}=more than one assignment.
+	def frequency(reg: Reg) -> u2 {
+		if (first[reg.index] < 0) return 0;
+		return if(aliases[reg.index] == null, 1, 2);
+	}
+	// Remove all assignments for all registers.
 	def clear() -> this {
 		for (i < freebits.length) freebits[i] = 0xFFFF_FFFF;
-		for (i < assign.length) assign[i] = -1; // TODO: multiple assignments
+		for (i < first.length) first[i] = -1;
+		for (i < aliases.length) aliases[i] = null;
 	}
+	// Make a copy of this register allocator, including all of its current assignments.
 	def copy() -> RegAlloc {
 		return RegAlloc.new(regConfig, this);
 	}
-	// Finds the allocated register with the lowest assignment.
-	def findSpillCandidate(kind: ValueKind) -> Reg {
+	// Finds the allocated register of {kind} with the lowest score. The {addSpillCost}
+	// function takes {(score, reg, assign)} and should add the additional spill cost
+	// of the register {reg} with assignment {assign}.
+	def findSpillCandidate(kind: ValueKind, addSpillCost: (int, Reg, int) -> int) -> Reg {
 		var lowest = int.max, reg: Reg;
 		var p = regConfig.kindToPool[kind.tag];
 		var regs = pools[p].regs;
 		var alloc = ~freebits[p];
 		var i = 0;
-		while (alloc != 0) {
-			if (1 == (alloc & 1)) {
-				var candidate = regs[i];
-				var assignment = assign[candidate.index];
-				if (assignment < lowest) {
-					lowest = assignment;
+		for (i = 0; alloc != 0; (alloc = alloc >> 1, i++)) {
+			if (1 != (alloc & 1)) continue; // register is free
+			var candidate = regs[i];
+			var score = addSpillCost(0, candidate, first[candidate.index]);
+			if (score >= lowest) continue;  // cannot be lowest
+			var l = aliases[candidate.index];
+			while (true) {
+				if (l == null) { // no more aliases, score is lowest
+					lowest = score;
 					reg = candidate;
+					break;
 				}
+				score = addSpillCost(score, candidate, l.head);
+				if (score >= lowest) break;
+				l = l.tail;
 			}
-			alloc = alloc >> 1;
-			i++;
 		}
 		return reg;
 	}
-	// Call {func} for each allocated register.
+	// Calls {func} for each allocated register.
 	def forEachAllocatedReg<T>(reg: Reg, func: Reg -> T) {
-		for (p < freebits.length) {
+		for (p < pools.length) {
 			var alloc = ~freebits[p];
 			var regs = pools[p].regs;
 			var i = 0;
 			while (alloc != 0) {
 				if (1 == (alloc & 1)) func(regs[i]);
+				alloc = alloc >> 1;
+				i++;
 			}
-			alloc = alloc >> 1;
-			i++;
 		}
 	}
-	// Call {func} for every assignment of {reg}.
-	def forEachAssignment<T>(reg: Reg, func: (Reg, int) -> T) {
-		var assignment = assign[reg.index];
-		if (assignment >= 0) func(reg, assignment); // TODO: multiple assignments
+	// Calls {func} for every assignment of {reg}.
+	def forEachAssignment<T>(reg: Reg, func: int -> T) {
+		var assignment = first[reg.index];
+		if (assignment >= 0) {
+			func(assignment);
+			for (l = aliases[reg.index]; l != null; l = l.tail) func(l.head);
+		}
+	}
+	def forEachAssignmentInRange<T>(reg: Reg, min: int, max: int, func: int -> T) {
+		var assignment = first[reg.index];
+		if (assignment >= 0) {
+			if (assignment >= min && assignment < max) func(assignment);
+			for (l = aliases[reg.index]; l != null; l = l.tail) {
+				var next = l.head;
+				if (next >= min && next < max) func(next);
+			}
+		}
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		for (p < pools.length) {
+			if (p > 0) buf.csp();
+			buf.put1("pool[%d]={", p);
+
+			var alloc = ~freebits[p];
+			var regs = pools[p].regs;
+			var j = 0;
+			for (i = 0; alloc != 0; (alloc = alloc >> 1, i++)) {
+				if (1 != (alloc & 1)) continue;
+				if (j++ > 0) buf.csp();
+				var reg = regs[i];
+				buf.puts(regConfig.regSet.getName(reg));
+				buf.puts("={");
+				var assignment = first[reg.index];
+				buf.putd(assignment);
+				for (l = aliases[reg.index]; l != null; l = l.tail) buf.put1(",%d", l.head);
+				buf.puts("}");
+			}
+
+			buf.puts("}");
+		}
+		return buf;
+	}
+	def debugTODO() {
+		if (Debug.compiler) { render(Trace.OUT); Trace.OUT.outln(); }
 	}
 }
 

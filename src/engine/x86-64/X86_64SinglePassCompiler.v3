@@ -35,12 +35,10 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	}
 
 	private def visitCompareI(asm: X86_64Assembler, cond: X86_64Cond) -> bool {
-		var b = state.pop(), a = popReg();
+		var b = pop(), a = popReg();
 		if (b.isConst()) asm.cmp_r_i(G(a.reg), b.const);
 		else if (b.inReg()) asm.cmp_r_r(G(a.reg), G(b.reg));
 		else asm.cmp_r_m(G(a.reg), A(masm.slotAddr(state.sp + 1)));
-		freeVal(b);
-		freeVal(a);
 		var d = allocRegTos(ValueKind.I32), r1 = G(d);
 		asm.set_r(cond, r1);
 		asm.movbzx_r_r(r1, r1);
@@ -90,8 +88,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm.bind(ret_zero);
 		asm.movd_r_i(G(d), 0);
 		asm.bind(done);
-		freeVal(a);
-		freeVal(b);
 		state.push(KIND_I32 | IN_REG, d, 0);
 	}
 	def visit_F32_EQ() { visitFloatCmp(asm.ucomiss_s_s, false, C.NZ); }
@@ -141,11 +137,10 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	private def visitIDivRem(dst: Reg, emit: X86_64Gpr -> void) {
 		var b = popFixedReg(X86_64Regs2.RCX); // XXX: use any reg except RAX or RDX
 		var a = popFixedReg(X86_64Regs2.RAX);
+		spillReg(X86_64Regs2.RAX);
 		spillReg(X86_64Regs2.RDX);
 		emit(G(b.reg));
-		freeVal(b);
-		freeVal(a);
-		masm.regAlloc.unfree(dst, int.!(state.sp));
+		masm.regAlloc.assign(dst, int.!(state.sp));
 		state.push(a.kindFlagsAndTag(IN_REG), dst, 0);
 	}
 	def visit_I32_DIV_S() { visitIDivRem(X86_64Regs2.RAX, mmasm.emit_i32_div_s); } // XXX: fold potentially-trapping div/rem
@@ -156,7 +151,7 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	private def visitShift(kind: ValueKind, emit_r_i: (X86_64Gpr, u6) -> X86_64Assembler, emit_r_cl: X86_64Gpr -> X86_64Assembler) -> bool {
 		var b = state.peek(), a: SpcVal;
 		if (b.isConst()) {
-			state.pop();
+			pop();
 			a = popRegToOverwrite();
 			emit_r_i(G(a.reg), u6.view(b.const));
 		} else {
@@ -164,7 +159,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 			a = popRegToOverwrite();
 			emit_r_cl(G(a.reg));
 		}
-		freeVal(b);
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, a.reg, 0); // XXX: tag preservation
 		return true;
 	}
@@ -222,7 +216,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm.d.and_r_i(scratch, 0x7FFFFFFF);
 		asm.movd_s_r(X(d), scratch);
 		state.push(sv.kindFlagsAndTag(IN_REG), d, 0);
-		freeVal(sv);
 	}
 	def visit_F32_NEG() {
 		var sv = popReg(), r = X(sv.reg), scratch = mmasm.scratch;
@@ -231,7 +224,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm.d.xor_r_i(scratch, 0x80000000);
 		asm.movd_s_r(X(d), scratch);
 		state.push(sv.kindFlagsAndTag(IN_REG), d, 0);
-		freeVal(sv);
 	}
 	def visit_F32_CEIL() { do_op1_x_x(ValueKind.F32, asm.roundss_s_s(_, _, X86_64Rounding.TO_POS_INF)); }
 	def visit_F32_FLOOR() { do_op1_x_x(ValueKind.F32, asm.roundss_s_s(_, _, X86_64Rounding.TO_NEG_INF)); }
@@ -277,7 +269,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm.bind(done);
 
 		state.push(a.kindFlagsAndTag(IN_REG), a.reg, 0);
-		freeVal(b);
 	}
 	def visit_F32_MIN() { visitFloatMinOrMax(false, true); }
 	def visit_F32_MAX() { visitFloatMinOrMax(false, false); }
@@ -285,7 +276,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var sv = popReg(), d = popRegToOverwrite(); // XXX: constant-fold and strength reduce
 		var t1 = allocTmp(ValueKind.I32), t2 = allocTmp(ValueKind.I32);
 		mmasm.emit_f32_copysign(X(d.reg), X(sv.reg), G(t1), G(t2));
-		freeVal(sv);
 		state.push(d.kindFlagsAndTag(IN_REG), d.reg, 0);
 	}
 
@@ -325,17 +315,17 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var sv = popReg(), d = popRegToOverwrite(); // XXX: constant-fold and strength reduce
 		var t1 = allocTmp(ValueKind.I64), t2 = allocTmp(ValueKind.I64);
 		mmasm.emit_f64_copysign(X(d.reg), X(sv.reg), G(t1), G(t2));
-		freeVal(sv);
 		state.push(d.kindFlagsAndTag(IN_REG), d.reg, 0);
 	}
 
 	private def visitITruncF(opcode: Opcode) {
 		var x1 = popReg();
+		spillReg(x1.reg); // XXX: macro assembler routine overwrites x1
+		var xkind = if(opcode.sig.params[0] == ValueType.F32, ValueKind.F32, ValueKind.F64);
 		var dkind = if(opcode.sig.results[0] == ValueType.I32, ValueKind.I32, ValueKind.I64);
-		var xscratch = allocTmp(if(opcode.sig.params[0] == ValueType.F32, ValueKind.F32, ValueKind.F64));
+		var xscratch = allocTmp(xkind);
 		var d = allocRegTos(dkind);
 		mmasm.emit_i_trunc_f(opcode, G(d), X(x1.reg), X(xscratch));
-		freeVal(x1);
 		state.push(SpcConsts.kindToFlags(dkind) | IN_REG, d, 0);
 	}
 
@@ -360,7 +350,7 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 			|| do_op1_r(ValueKind.I64, mmasm.emit_i64_extend_i32_u));
 	}
 	def visitReinterpret(kind: ValueKind) {
-		var sv = state.pop(), flags = SpcConsts.kindToFlags(kind);
+		var sv = pop(), flags = SpcConsts.kindToFlags(kind);
 		if (sv.isConst()) {
 			state.push(flags | IS_CONST, NO_REG, sv.const);
 		} else if (sv.inReg()) {
@@ -373,7 +363,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 				_ => bailout("unexpected value kind");
 			}
 			state.push(flags | IN_REG, d, 0);
-			freeVal(sv);
 		} else {
 			state.push(flags | IS_STORED, NO_REG, 0);
 		}
@@ -415,12 +404,11 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	def visit_I64_TRUNC_SAT_F64_U() { visitITruncF(Opcode.I64_TRUNC_SAT_F64_U); }
 
 	private def visitFConvertI32S(kind: ValueKind, emit_cvt: (X86_64Xmmr, X86_64Gpr) -> X86_64Assembler) {
-		var sv = popReg(), r1 = G(sv.reg);
+		var sv = popReg(), r1 = G(sv.reg); // TODO: register killed
 		var d = allocRegTos(kind);
 		asm.q.shl_r_i(r1, 32);
 		asm.q.sar_r_i(r1, 32); // sign-extend
 		emit_cvt(X(d), r1);
-		freeVal(sv);
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, d, 0);
 	}
 	def visit_F32_CONVERT_I32_S() { visitFConvertI32S(ValueKind.F32, asm.cvtsi2ss_s_r); }
@@ -430,7 +418,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var d = allocRegTos(kind);
 		asm.movd_r_r(r1, r1); // zero-extend
 		emit_cvt(X(d), r1);
-		freeVal(sv);
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, d, 0);
 	}
 	def visit_F32_CONVERT_I32_U() { visitFConvertI32U(ValueKind.F32, asm.cvtsi2ss_s_r); }
@@ -439,7 +426,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var sv = popReg(), r1 = G(sv.reg);
 		var d = allocRegTos(kind);
 		emit_cvt(X(d), r1);
-		freeVal(sv);
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, d, 0);
 	}
 	private def visitFConvertI64U(kind: ValueKind, emit_cvt: (X86_64Xmmr, X86_64Gpr, X86_64Xmmr, X86_64Gpr) -> void) {
@@ -447,7 +433,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var d = allocRegTos(kind);
 		var xscratch = allocTmp(kind);
 		emit_cvt(X(d), r1, X(xscratch), mmasm.scratch);
-		freeVal(sv);
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, d, 0);
 	}
 	def visit_F32_CONVERT_I64_S() { visitFConvertI64S(ValueKind.F32, asm.cvtsi2ss_s_r); }
@@ -471,7 +456,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var d = allocRegTos(kind);
 		emit(G(d), r);
 		state.push(sv.kindFlagsMatching(kind, IN_REG), d, 0);
-		freeVal(sv);
 		return true;
 	}
 	// r1 = op(r1, r2)
@@ -480,7 +464,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var a = popRegToOverwrite();
 		emit(G(a.reg), G(b.reg));
 		state.push(a.kindFlagsMatching(kind, IN_REG), a.reg, 0);
-		freeVal(b);
 		return true;
 	}
 	// r1 = op(r1, m2)
@@ -498,7 +481,7 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	private def do_op2_r_i<T>(kind: ValueKind, emit: (X86_64Gpr, int) -> T) -> bool {
 		var b = state.peek();
 		if (!b.isConst()) return false;
-		state.pop();
+		pop();
 		var a = popRegToOverwrite();
 		emit(G(a.reg), b.const);
 		state.push(a.kindFlagsMatching(kind, IN_REG), a.reg, 0);
@@ -516,7 +499,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var d = allocRegTos(kind);
 		emit(X(d), r);
 		state.push(sv.kindFlagsMatching(kind, IN_REG), d, 0);
-		freeVal(sv);
 		return true;
 	}
 	// x1 = op(x1, x2)
@@ -525,7 +507,6 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var a = popRegToOverwrite();
 		emit(X(a.reg), X(b.reg));
 		state.push(a.kindFlagsMatching(kind, IN_REG), a.reg, 0);
-		freeVal(b);
 		return true;
 	}
 }
