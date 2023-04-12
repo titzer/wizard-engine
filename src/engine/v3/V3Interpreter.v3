@@ -16,31 +16,20 @@ component V3Interpreter {
 	def run(f: Function, args: Array<Value>) -> Result {
 		// Reset interpreter state
 		reset();
+		// Begin execution
+		return call(f, args);
+	}
+	def call(f: Function, args: Array<Value>) -> Result {
 		// Push arguments onto the stack
 		if (args != null) for (a in args) val_stack.push(a);
-		// Begin execution
-		var prev_top = prev_call_stack_top = call_stack.top;
-		doCallFunction(f); // call a host function or push a frame
-		// Keep executing bytecodes while there is a top frame
-		while (call_stack.top > prev_top) {
-			if (E.probes != null) {
-				var ret = E.fireProbes(DynamicLoc(frame.func, frame.pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-			}
-			var pc = codeptr.pos;
-			var b = codeptr.peek1();
-			var opcode: Opcode;
-			if (b == InternalOpcode.PROBE.code) {
-				var ret = Execute.fireProbesAt(DynamicLoc(frame.func, pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-				opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
-			} else {
-				opcode = codeptr.read_opcode();
-			}
-			execOp(pc, opcode);
+		var result = runWithTailCalls(f);
+
+		if (result == null) {
+			return Result.Value(popN(f.sig.results.length));
+		} else {
+			thrown = null;
+			return Result.Throw(result);
 		}
-		if (thrown != null) return Result.Throw(thrown);
-		return Result.Value(popN(f.sig.results.length));
 	}
 	def finish(ret: Throwable) -> Result {
 		return Result.Throw(Trap.!(ret));
@@ -142,20 +131,20 @@ component V3Interpreter {
 			CALL => {
 				var func_index = codeptr.read_uleb32();
 				var f = frame.func.instance.functions[func_index];
-				doCallFunction(f);
+				runWithTailCalls(f);
 			}
 			CALL_INDIRECT => {
 				var sig_index = codeptr.read_uleb32();
 				var table_index = codeptr.read_uleb32();
 				var func_index = popu();
 				var f = lookupIndirect(sig_index, table_index, func_index);
-				if (f != null) doCallFunction(f);
+				if (f != null) runWithTailCalls(f);
 			}
 			RETURN_CALL => {
 				var func_index = codeptr.read_uleb32();
 				var f = frame.func.instance.functions[func_index];
 				prepareReturnCall(f.sig);
-				doCallFunction(f);
+				runWithTailCalls(f);
 			}
 			RETURN_CALL_INDIRECT => {
 				var sig_index = codeptr.read_uleb32();
@@ -164,7 +153,7 @@ component V3Interpreter {
 				var f = lookupIndirect(sig_index, table_index, func_index);
 				if (f != null) {
 					prepareReturnCall(f.sig);
-					doCallFunction(f);
+					runWithTailCalls(f);
 				}
 			}
 			CALL_REF => {
@@ -172,7 +161,7 @@ component V3Interpreter {
 				var v = pop();
 				var func = Function.!(Value.Ref.!(v).val);
 				if (func == null) trap(TrapReason.NULL_DEREF);
-				else doCallFunction(func);
+				else runWithTailCalls(func);
 			}
 			RETURN_CALL_REF => {
 				var sig_index = codeptr.read_uleb32();
@@ -182,7 +171,7 @@ component V3Interpreter {
 					trap(TrapReason.NULL_DEREF);
 				} else {
 					prepareReturnCall(func.sig);
-					doCallFunction(func);
+					runWithTailCalls(func);
 				}
 			}
 			DELEGATE => {
@@ -994,42 +983,40 @@ component V3Interpreter {
 		}
 		return table.funcs[func_index];
 	}
-	def invokeFunction(f: Function, args: Array<Value>) -> Result {
-		for (a in args) val_stack.push(a);
+	def runWithTailCalls(func: Function) -> Throwable {
+		// Interpreter Loop
 		var prev_top = call_stack.top;
-		doCallFunction(f);
-		while (call_stack.top > prev_top) {
-			if (E.probes != null) {
-				var ret = E.fireProbes(DynamicLoc(frame.func, frame.pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-			}
-			var pc = codeptr.pos;
-			var b = codeptr.peek1();
-			var opcode: Opcode;
-			if (b == InternalOpcode.PROBE.code) {
-				var ret = Execute.fireProbesAt(DynamicLoc(frame.func, pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-				opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
-			} else {
-				opcode = codeptr.read_opcode();
-			}
-			execOp(pc, opcode);
-		}
-		if (thrown != null) return Result.Throw(thrown);
-		return Result.Value(popN(f.sig.results.length));
-	}
-	def doCallFunction(func: Function) {
-		while (true) {  // host function may tail-call another function
+		while (true) {
 			match (func) {
-				wf: WasmFunction => return pushFrame(wf);
+				wf: WasmFunction => {
+					pushFrame(wf);
+					while (call_stack.top > prev_top) {
+						if (E.probes != null) {
+							var ret = E.fireProbes(DynamicLoc(frame.func, frame.pc, TargetFrame(frame)));
+							if (ret != null) return ret;
+						}
+						var pc = codeptr.pos;
+						var b = codeptr.peek1();
+						var opcode: Opcode;
+						if (b == InternalOpcode.PROBE.code) {
+							var ret = Execute.fireProbesAt(DynamicLoc(frame.func, pc, TargetFrame(frame)));
+							if (ret != null) return ret;
+							opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
+						} else {
+							opcode = codeptr.read_opcode();
+						}
+						execOp(pc, opcode);
+					}
+					return thrown;
+				}
 				hf: HostFunction => {
 					var prev_top = prev_call_stack_top;
 					var result = doInvokeHostFunction(hf);
 					match (result) {
 						Throw(thrown) => {
 							thrown.prepend(popFrames(prev_top), hf);
-							this.thrown = thrown;
-							return;
+							this.thrown = null;
+							return thrown;
 						}
 						Value0 => ;
 						Value1(val) => {
@@ -1047,11 +1034,11 @@ component V3Interpreter {
 					if (frame == null) {  // popped top frame, finished execution
 						codeptr.reset(null, 0, 0);
 					}
-					return;
+					return null;
 				}
-				_ => return trap(TrapReason.FUNC_INVALID);
 			}
 		}
+		return Trap.new(TrapReason.FUNC_INVALID, null, null);
 	}
 	def popFrames(prev_top: int) -> Array<(WasmFunction, int)> {
 		var frames = Array<(WasmFunction, int)>.new(call_stack.top - prev_top);
@@ -1120,6 +1107,7 @@ component V3Interpreter {
 	def trap(reason: TrapReason) {
 		thrown = Trap.new(reason, null, null);
 		thrown.prepend(popFrames(prev_call_stack_top), null);
+		Trace.OUT.puts("trapping").outln();
 	}
 	def fail(msg: string) {
 		thrown = InternalError.new(msg, null);
