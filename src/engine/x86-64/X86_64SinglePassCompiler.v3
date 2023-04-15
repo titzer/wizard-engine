@@ -523,6 +523,7 @@ def globalBuf = StringBuilder.new().grow(256);  // avoid allocations when descri
 class X86_64SpcCode extends RiUserCode {
 	def mapping: Mapping;
 	def trapHandlerOffsets = Array<int>.new(TrapReason.ERROR.tag + 1);
+	var sourcePcs: Vector<(int, int)>;
 	var codeEnd: int;			// for dynamically adding code to the end
 
 	new(mapping) super(mapping.range.start, mapping.range.end) { }
@@ -584,6 +585,21 @@ class X86_64SpcCode extends RiUserCode {
 		if (mapping == null) System.error(null, null);
 		if (mapping.range == null) System.error(null, null);
 	}
+	// Look up the source {pc} of a location {i} in this code. Returns {-1} if no exact entry is found.
+	// Return addresses are treated differently than other addresses in the code.
+	def lookupPc(ip: Pointer, isRetAddr: bool) -> int {
+		if (Trace.compiler) Trace.OUT.put2("SpcCode.lookupPc(0x%x, ret=%z)", (ip - Pointer.NULL), isRetAddr).outln();
+		if (sourcePcs == null) return -1;
+		if (!mapping.range.contains(ip)) return -1;
+		var offset = ip - mapping.range.start - if(isRetAddr, 1);
+		// XXX: use binary search for looking up source PCs in SPC code
+		for (i < sourcePcs.length) {
+			var entry = sourcePcs[i];
+			if (Trace.compiler) Trace.OUT.put2("  (offset=%d, pc=%d)", entry.0, entry.1).outln();
+			if (offset == entry.0) return entry.1;
+		}
+		return -1;
+	}
 	// Get a frame accessor for the probe API.
 	def getFrameAccessor(sp: Pointer) -> X86_64SpcFrameAccessor {
 		var retip = (sp + -Pointer.SIZE).load<Pointer>();
@@ -591,11 +607,26 @@ class X86_64SpcCode extends RiUserCode {
 		if (true) { // XXX: tuning for caching frame accessor object
 			var prev = (sp + IVAR_FRAME.ACCESSOR.disp).load<X86_64SpcFrameAccessor>();
 			if (prev != null) return prev;
-			var n = X86_64SpcFrameAccessor.new(sp);
+			var n = X86_64SpcFrameAccessor.new(sp, this);
 			(sp + IVAR_FRAME.ACCESSOR.disp).store<X86_64SpcFrameAccessor>(n);
 			return n;
 		}
-		return X86_64SpcFrameAccessor.new(sp);
+		return X86_64SpcFrameAccessor.new(sp, this);
+	}
+	def appendCode(masm: X86_64MacroAssembler) -> Pointer {
+		var range = mapping.range;
+		var startOffset = codeEnd;
+		var entrypoint = range.start + startOffset;
+		masm.setTargetAddress(u64.view(entrypoint - Pointer.NULL));
+		codeEnd = Target.copyInto(range, startOffset, masm.w);
+		if (masm.source_locs != null) {
+			if (sourcePcs == null) sourcePcs = Vector.new();
+			for (i < masm.source_locs.length) {
+				var entry = masm.source_locs[i];
+				sourcePcs.put(entry.0 + startOffset, entry.1);
+			}
+		}
+		return entrypoint;
 	}
 }
 
@@ -637,7 +668,8 @@ class X86_64SpcCompileStub extends RiUserCode {
 // Implements frame accessor for JIT compiled method frames. For SPC, the frame layout is almost
 // identical to interpreter frames, so it inherits from the base implementation.
 class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
-	new(sp: Pointer) super(sp) {
+	def code: X86_64SpcCode;
+	new(sp: Pointer, code) super(sp) {
 		var wf = (sp + IVAR_FRAME.WASM_FUNC.disp).load<WasmFunction>();
 		decl = wf.decl;
 	}
@@ -648,7 +680,8 @@ class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
 	}
 	// Returns the current program counter.
 	def pc() -> int {
-		return 0; // TODO: compute PC from return IP of callee
+		// TODO: handle case where this is the top frame with a trap
+		return if(code != null, code.lookupPc(readIp(), true));
 	}
 	// Set the value of a local variable. (dynamically typechecked).
 	def setLocal(i: int, v: Value); // TODO: translate to interpreter frame
