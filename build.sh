@@ -59,7 +59,9 @@ function make_build_file() {
 		local build_data="$target $build_time by ${USER}@${HOST}"
 	fi
 
-	echo "var unused__ = Version.buildData = \"$build_data\";" > $build_file
+        # TODO: handle case where build is not in a git repo
+        REVS="$(git rev-list --count HEAD)"
+	echo "var unused__ = (Version.buildData = \"$build_data\", Version.minorVersion = $REVS);" > $build_file
 
 	echo $build_file
 }
