@@ -85,6 +85,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Abstract state of the value stack
 	def state = SpcState.new(regAlloc);
 	// Other state
+	def trap_labels = Vector<(TrapReason, MasmLabel)>.new();
 	var start_pos = 0;
 	var module: Module;
 	var func: FuncDecl;
@@ -97,6 +98,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 	new() {
 		masm.unimplemented = unsupported;
+		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
 	}
 
 	def gen(module: Module, func: FuncDecl) -> bool {
@@ -115,6 +117,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		sig = func.sig;
 		unwind_label = null;
 		regAlloc.clear();
+		trap_labels.resize(0);
 		success = true;
 
 		// Initialize parameters, locals, and first control stack entry.
@@ -145,6 +148,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(unwind_label);
 			unwind_label = null;
 			emitUnwind();
+		}
+		for (i < trap_labels.length) {
+			var e = trap_labels[i];
+			masm.bindLabel(e.1);
+			masm.emit_mov_m_i(xenv.pc_slot, e.1.create_pos);
+			masm.emit_jump_to_trap_at(e.0);
 		}
 		if (success) {
 			// Metric collection
@@ -456,11 +465,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_read_v3_array_r_i(ValueKind.REF, treg, treg, int.!(table_index));
 		// bounds check
 		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(treg, offsets.Table_ids));
-		masm.emit_bounds_check_v3_array(tmp2, func_reg, masm.newTrapLabel(TrapReason.FUNC_INVALID));
+		masm.emit_bounds_check_v3_array(tmp2, func_reg, newTrapLabel(TrapReason.FUNC_INVALID));
 		// signature check
 		masm.emit_read_v3_array_r_r(ValueKind.I32, tmp2, tmp2, func_reg); // XXX: using ref reg as int
-		masm.emit_breq_r_i(tmp2, -1, masm.newTrapLabel(TrapReason.FUNC_INVALID));
-		masm.emit_brne_r_i(tmp2, sig.canon_id, masm.newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
+		masm.emit_breq_r_i(tmp2, -1, newTrapLabel(TrapReason.FUNC_INVALID));
+		masm.emit_brne_r_i(tmp2, sig.canon_id, newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
 		// load from table
 		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(treg, offsets.Table_funcs));
 		masm.emit_read_v3_array_r_r(ValueKind.REF, func_reg, tmp2, func_reg);
@@ -517,7 +526,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		emit_compute_vsp(vsp_reg, state.sp);
 		// check for null
-		masm.emit_breq_r_l(func_reg, 0, masm.newTrapLabel(TrapReason.NULL_DEREF));
+		masm.emit_breq_r_l(func_reg, 0, newTrapLabel(TrapReason.NULL_DEREF));
 
 		var tmp = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.I32, tmp, MasmAddr(func_reg, 0));
@@ -788,13 +797,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (sv.isConst()) {
 			if (sv.const == 0) return emitTrap(TrapReason.NULL_DEREF); // statically null
 		} else if (sv.inReg()) {
-			masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
+			masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 		} else {
 			// XXX: use masm.br_m if necessary?
 			var tos = state.sp - 1;
 			var reg = allocReg(ValueKind.REF, tos);
 			masm.emit_mov_r_s(ValueKind.REF, reg, tos);
-			masm.emit_br_r(reg, MasmBrCond.REF_NULL, masm.newTrapLabel(TrapReason.NULL_DEREF));
+			masm.emit_br_r(reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 			state.overwrite(sv.kindFlagsAndTag(IN_REG | (sv.flags & IS_STORED)), reg, 0);
 		}
 	}
@@ -971,6 +980,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_r_trap(regs.ret_throw, reason);
 		masm.emit_addw_r_i(regs.sp, frame.frameSize);
 		masm.emit_ret();
+	}
+	def newTrapLabel(reason: TrapReason) -> MasmLabel {
+		var label = masm.newLabel(it.pc);
+		trap_labels.put(reason, label);
+		return label;
 	}
 	def unsupported() {
 		success = false; // XXX: add opcode
