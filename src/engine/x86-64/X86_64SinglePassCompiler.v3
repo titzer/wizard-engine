@@ -517,20 +517,23 @@ def SIGBUS  = 10;
 def SIGSEGV = 11;
 def globalBuf = StringBuilder.new().grow(256);  // avoid allocations when describing frames
 
-// Represents the JITed code for an entire module.
+// Represents SPC code that uses complete frames (both trapping code and module code).
 // Implements the RiUserCode interface to add generated machine code to the V3 runtime.
 // Handles stackwalking and signals in JITed code.
 class X86_64SpcCode extends RiUserCode {
+	def name: string;
 	def mapping: Mapping;
-	def trapHandlerOffsets = Array<int>.new(TrapReason.ERROR.tag + 1);
-	var sourcePcs: Vector<(int, int)>;
-	var codeEnd: int;			// for dynamically adding code to the end
 
-	new(mapping) super(mapping.range.start, mapping.range.end) { }
+	new(name, mapping) super(mapping.range.start, mapping.range.end) { }
 
-	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	// V3-runtime callback: upon fatal errors to describe a frame for a stacktrace.
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
-		var msg = "\tin [spc-jit] ";
+		var msg: string;
+		msg = "\tin [";
+		out(msg, 0, msg.length);
+		msg = name;
+		out(msg, 0, msg.length);
+		msg = "] ";
 		out(msg, 0, msg.length);
 		var instance = (sp + IVAR_FRAME.INSTANCE.disp).load<Instance>();
 		var wf = (sp + IVAR_FRAME.WASM_FUNC.disp).load<WasmFunction>();
@@ -540,23 +543,48 @@ class X86_64SpcCode extends RiUserCode {
 		buf.ln().out(out);
 		buf.reset();
 	}
-
-	// Called from V3 runtime for a frame where {ip} is in JIT code.
+	// V3-runtime callback: to advance over this frame.
 	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
 		sp += IVAR_FRAME.size;	 // assume frame is allocated
 		ip = sp.load<Pointer>(); // return address on stack
 		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
 	}
-
-	// Called from V3 runtime when the garbage collector needs to scan a JIT stack frame.
+	// V3-runtime callback: when the garbage collector needs to scan a JIT stack frame.
 	def scanFrame(ip: Pointer, sp: Pointer) {
 		// Handle other roots in the frame
 		RiGc.scanRoot(sp + IVAR_FRAME.WASM_FUNC.disp);
 		RiGc.scanRoot(sp + IVAR_FRAME.INSTANCE.disp);
 		RiGc.scanRoot(sp + IVAR_FRAME.ACCESSOR.disp);
 	}
+	// XXX: Keeps the whole-program optimizer from deleting fields needed for rooting the range.
+	def keepAlive() {
+		if (mapping == null) System.error(null, null);
+		if (mapping.range == null) System.error(null, null);
+	}
+	// Get a frame accessor for the probe API.
+	def getFrameAccessor(sp: Pointer) -> X86_64SpcFrameAccessor {
+		var retip = (sp + -Pointer.SIZE).load<Pointer>();
+		if (!mapping.range.contains(retip)) return null;
+		if (true) { // XXX: tuning for caching frame accessor object
+			var prev = (sp + IVAR_FRAME.ACCESSOR.disp).load<X86_64SpcFrameAccessor>();
+			if (prev != null) return prev;
+			var n = X86_64SpcFrameAccessor.new(sp);
+			(sp + IVAR_FRAME.ACCESSOR.disp).store<X86_64SpcFrameAccessor>(n);
+			return n;
+		}
+		return X86_64SpcFrameAccessor.new(sp);
+	}
+}
 
-	// Called from V3 runtime to handle an OS-level signal that occurred while {ip} was in JIT code.
+// Represents the JITed code for an entire module.
+class X86_64SpcModuleCode extends X86_64SpcCode {
+	def trapHandlerOffsets = Array<int>.new(TrapReason.ERROR.tag + 1);
+	var codeEnd: int;			// for dynamically adding code to the end
+	var sourcePcs: Vector<(int, int)>;
+
+	new(mapping: Mapping) super("spc-module", mapping) { }
+
+	// V3-runtime callback: handle an OS-level signal that occurred while {ip} was in JIT code.
 	def handleSignal(signum: int, siginfo: Pointer, ucontext: Pointer, ip: Pointer, sp: Pointer) -> bool {
 		var pip = ucontext + ucontext_rip_offset;
 		var ip = pip.load<Pointer>();
@@ -579,11 +607,7 @@ class X86_64SpcCode extends RiUserCode {
 				return true;
 			}
 		}
-		return true;
-	}
-	def keepAlive() { // XXX: need to trick V3 whole-program optimizer to not delete these fields
-		if (mapping == null) System.error(null, null);
-		if (mapping.range == null) System.error(null, null);
+		return false;
 	}
 	// Look up the source {pc} of a location {i} in this code. Returns {-1} if no exact entry is found.
 	// Return addresses are treated differently than other addresses in the code.
@@ -600,19 +624,7 @@ class X86_64SpcCode extends RiUserCode {
 		}
 		return -1;
 	}
-	// Get a frame accessor for the probe API.
-	def getFrameAccessor(sp: Pointer) -> X86_64SpcFrameAccessor {
-		var retip = (sp + -Pointer.SIZE).load<Pointer>();
-		if (!mapping.range.contains(retip)) return null;
-		if (true) { // XXX: tuning for caching frame accessor object
-			var prev = (sp + IVAR_FRAME.ACCESSOR.disp).load<X86_64SpcFrameAccessor>();
-			if (prev != null) return prev;
-			var n = X86_64SpcFrameAccessor.new(sp, this);
-			(sp + IVAR_FRAME.ACCESSOR.disp).store<X86_64SpcFrameAccessor>(n);
-			return n;
-		}
-		return X86_64SpcFrameAccessor.new(sp, this);
-	}
+	// Appends code to the end of this module.
 	def appendCode(masm: X86_64MacroAssembler) -> Pointer {
 		var range = mapping.range;
 		var startOffset = codeEnd;
@@ -668,8 +680,7 @@ class X86_64SpcCompileStub extends RiUserCode {
 // Implements frame accessor for JIT compiled method frames. For SPC, the frame layout is almost
 // identical to interpreter frames, so it inherits from the base implementation.
 class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
-	def code: X86_64SpcCode;
-	new(sp: Pointer, code) super(sp) {
+	new(sp: Pointer) super(sp) {
 		var wf = (sp + IVAR_FRAME.WASM_FUNC.disp).load<WasmFunction>();
 		decl = wf.decl;
 	}
@@ -677,11 +688,6 @@ class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
 	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
 	def isUnwound() -> bool {
 		return this != (sp + IVAR_FRAME.ACCESSOR.disp).load<FrameAccessor>();
-	}
-	// Returns the current program counter.
-	def pc() -> int {
-		// TODO: handle case where this is the top frame with a trap
-		return if(code != null, code.lookupPc(readIp(), true));
 	}
 	// Set the value of a local variable. (dynamically typechecked).
 	def setLocal(i: int, v: Value); // TODO: translate to interpreter frame
