@@ -4,7 +4,7 @@
   )
   (func $start (export "_start")
     (local $cnt i32)
-    (local.set $cnt (i32.const 5000))
+    (local.set $cnt (i32.const 50))
     (loop $l
         (call $foo)
         (call $bar)
