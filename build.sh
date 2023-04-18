@@ -38,10 +38,10 @@ TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
-WIZENG="src/wizeng.main.v3"
-WAVE="src/wave/*.v3"
-WASI="src/wasi/*.v3"
-WASI_X86_64_LINUX="src/wasi/x86-64-linux/*.v3"
+WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
+WAVE="src/modules/wave/*.v3"
+WASI="src/modules/wasi/*.v3"
+WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
 JAWA="src/jawa/*.v3"
 
 PROGRAM=$1

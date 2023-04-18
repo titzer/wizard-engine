@@ -82,7 +82,7 @@ def main(args: Array<string>) -> int {
 	for (j < module.imports.length) {
 		var name = module.imports[j].imp.module_name;
 		if (map[name] == null) {
-			var p = HostModuleRegistry.map[name];
+			var p = ModuleRegistry.map[name];
 			if (p == null) return ErrorBuilder.new()
 				.puts(path)
 				.put2(": import[%d] from unknown module \"%s\"\n", j, name)
@@ -216,42 +216,6 @@ def putWizeng(out: StringBuilder) -> StringBuilder {
 	return out.puts("Wizard Engine ").puts(Version.version).putc('.').putd(Version.minorVersion);
 }
 
-// Host modules must be registered by their name so the Wizard engine can find them.
-component HostModuleRegistry {
-	def map = Strings.newMap<HostModule>();
-	def add(m: HostModule) {
-		map[m.name] = m;
-	}
-}
-// A host module (with state) that can provide imports to a module as well as the entrypoint and exit value.
-class HostModule extends ImportProcessor {
-	new(name: string) super(name) { }
-
-	// Initializes the host module with the command-line arguments.
-	def init(args: Array<string>, trace: bool) { }
-	// Get the main export and arguments, if exported from the instance.
-	def getEntry(instance: Instance) -> (Function, Array<Value>) { return (null, null); }
-	// De-initialize after running.
-	def deinit(result: Result) { }
-
-	// Helper functions.
-	def findExportedMemory(instance: Instance) -> Memory {
-		// Find memory and save internally
-		for (iex in instance.exports) match (iex) {
-			x: Memory => return x;
-		}
-		return null;
-	}
-	def getRegion(memory: Memory, v: Value, size: u32) -> i64 {
-		if (memory == null) return -1;
-		if (Value.I32.?(v)) return memory.boundsCheck(0, Value.I32.!(v).val, size);
-		return -1;
-	}
-	def getRegion2(memory: Memory, v: u32, size: u32) -> i64 {
-		if (memory == null) return -1;
-		return memory.boundsCheck(0, v, size);
-	}
-}
 // Wraps imported functions with tracing. Can apply a filter to be selective on which imports to trace.
 class ImportTracer(var filter: DeclFilter) {
 	def wrap(decl: Decl, ex: Exportable) -> Exportable {
@@ -345,7 +309,7 @@ component WizengOptions {
 			return true;
 		}
 		if (Strings.equal(arg, "--expose-wizeng")) {
-			HostModuleRegistry.add(WizengModule.new());
+			ModuleRegistry.add(WizengModule.new());
 			return true;
 		}
 		return false;
@@ -366,122 +330,3 @@ def findDefaultMain(instance: Instance) -> (Function, Array<Value>) {
 	return (null, null);
 }
 
-enum WizengExports(sig: SigDecl, invoke: (WizengModule, Array<Value>) -> HostResult) {
-	invoke0(SigCache.g_v, WizengModule.invoke0),
-	error(SigCache.ii_v, WizengModule.error),
-	crash(SigCache.v_v, WizengModule.crash),
-	// XXX: wizeng module
-	// .force_gc()
-	// .crash()
-	// .new_module()
-}
-class WizengModule extends HostModule("wizeng") {
-	var instance: Instance;
-	var memory: Memory;
-
-	def preprocess(module: Module, result: Array<Exportable>) {
-		var imports = module.imports;
-		for (j < imports.length) {
-			var i = imports[j];
-			if (!Strings.equal(this.name, i.imp.module_name)) continue;
-			if (!FuncDecl.?(i)) continue;
-			var impf = FuncDecl.!(i);
-			var found = false;
-			for (ex in WizengExports) {
-				if (Strings.equal(ex.name, i.imp.field_name)) {
-					var func = ex.invoke(this, _);
-					result[j] = HostFunctionN.new(ex.name, ex.sig, func);
-					found = true;
-					break;
-				}
-			}
-			if (!found && Strings.equal("new_funcref", i.imp.field_name)) {
-				var results = impf.sig.results;
-				if (results.length != 1) continue;
-				var sig: SigDecl;
-				var rtype = results[0];
-				match (rtype) {
-					Ref(nullable, heap) => match (heap) {
-						Func(s) => sig = s;
-						_ => continue;
-					}
-					_ => continue;
-				}
-
-				var sig_index = 0; // TODO: get correct sig index?
-				var func = new_funcref(sig, sig_index, _);
-				var imported_sig = SigDecl.new([], SigCache.arr_ii, [rtype]);
-				result[j] = HostFunctionN.new("new_funcref", imported_sig, func);
-			}
-		}
-	}
-	def postprocess(instance: Instance) {
-		this.instance = instance;
-		this.memory = findExportedMemory(instance);
-	}
-	// exported: Invokes a {funcref} value with no arguments.
-	def invoke0(args: Array<Value>) -> HostResult {
-		match (args[0]) {
-			Ref(object) => {
-				match (object) {
-					null => return HostResult.Throw(Trap.new(TrapReason.NULL_DEREF, null, null));
-					x: Function => return invokeFunction0(x);
-				}
-			}
-			_ => ;
-		}
-
-		return HostResult.Throw(Trap.new(TrapReason.FAILED_CAST, null, null));
-	}
-	// exported: Throws an error whose message is in the Wasm memory.
-	def error(args: Array<Value>) -> HostResult {
-		var base = Values.v_u(args[0]), size = Values.v_u(args[1]);
-		var offset = getRegion2(memory, base, size);
-		if (offset < 0) return HostResult.Throw(Trap.new(TrapReason.MEM_OUT_OF_BOUNDS, "when calling wizeng.error()", null));
-		var msg = memory.extract(u32.!(offset), size);
-		return HostResult.Throw(Trap.new(TrapReason.ERROR, msg, null));
-	}
-	// exported: Crashes the engine intentionally.
-	def crash(args: Array<Value>) -> HostResult {
-		System.error("Fatal", "wizeng.crash() called by program");
-		return HostResult.Throw(null);
-	}
-	// exported: Creates a new function with bytecode in memory.
-	def new_funcref(sig: SigDecl, sig_index: int, args: Array<Value>) -> HostResult {
-		var base = Values.v_u(args[0]), size = Values.v_u(args[1]);
-		var offset = getRegion2(memory, base, size);
-		if (offset < 0) return HostResult.Throw(Trap.new(TrapReason.MEM_OUT_OF_BOUNDS,
-			"when calling wizeng.new_funcref()", null));
-		var module = instance.module;
-		var code = memory.extract(u32.!(offset), size);
-		var func = FuncDecl.new(sig_index);
-		func.setOrigCode(code);
-		func.sig = sig;
-		func.func_index = module.functions.length + module.new_funcs++;
-		var err = ErrorGen.new(module.filename);
-		Execute.tiering.onFuncBody(module, u32.!(func.func_index), code, err);
-		var validator = CodeValidator.new(Extension.FUNCTION_REFERENCES, Limits.new(), module, err);
-		match (validator.validateFunc(func)) {
-			Ok => ;
-			Error(error_code, error_pos, error_msg) => {
-// TODO				Trace.OUT.put3("error[%s]: %s @ +%d", error_code.name, error_msg, error_pos).outln();
-				return HostResult.Value1(Values.REF_NULL); // TODO: return error code
-			}
-		}
-		var wf = WasmFunction.new(instance, func);
-		Execute.tiering.onNewFunction(wf, err);
-		return HostResult.Value1(Value.Ref(wf));
-	}
-
-	private def invokeFunction0(func: Function) -> HostResult {
-		if (func.sig.params.length != 0 || func.sig.results.length != 0) {
-			return HostResult.Throw(Trap.new(TrapReason.FUNC_SIG_MISMATCH, null, null));
-		}
-
-		var result = Execute.invoke(func, []);
-		match (result) {
-			Throw(thrown) => return HostResult.Throw(thrown);
-			_ => return HostResult.Value0;
-		}
-	}
-}
