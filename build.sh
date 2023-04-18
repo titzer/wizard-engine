@@ -88,7 +88,7 @@ fi
 # make build file with target
 BUILD_FILE=$(make_build_file)
 
-PREGEN=1
+PREGEN=${PREGEN:=1}
 
 # build
 exe=${PROGRAM}.${TARGET}
