@@ -47,15 +47,15 @@ class ModuleMonitor(module: Module) {
 	}
 	// Attach callback {f} to any non-import function execution.
 	def beforeAllFuncExec(f: DynamicLoc -> Resumption) {
-		forEachFunc(isNotImport, beforeFuncExec(_, f));
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncExec(_, f));
 	}
 	// Attach callback {f} to any non-import function return.
 	def beforeAllFuncReturn(f: DynamicLoc -> Resumption) {
-		forEachFunc(isNotImport, beforeFuncReturn(_, f));
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncReturn(_, f));
 	}
 	// Attach callback {f} to any non-import function call or return.
 	def beforeAllFuncExecAndReturn(callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
-		forEachFunc(isNotImport, beforeFuncExecAndReturn(_, callFn, retFn));
+		forEachFunc(MonitorUtil.isNotImport, beforeFuncExecAndReturn(_, callFn, retFn));
 	}
 	// Attach callback {f} to before an instruction execution.
 	def beforeInstrExec(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) {
@@ -79,13 +79,27 @@ class ModuleMonitor(module: Module) {
 	}
 	// Attach callback {f} to before a read of the global at index {global_index}.
 	def beforeGlobalRead(f: DynamicLoc -> Resumption, global_index: u31) {
-		forEachFunc(isNotImport, monitorFuncForGlobalAccess(_, global_index, false, f));
+		forEachFunc(MonitorUtil.isNotImport, monitorFuncForGlobalAccess(_, global_index, false, f));
 	}
 	// Attach callback {f} to before a write of the global at index {global_index}.
 	def beforeGlobalWrite(f: DynamicLoc -> Resumption, global_index: u31) {
-		forEachFunc(isNotImport, monitorFuncForGlobalAccess(_, global_index, true, f));
+		forEachFunc(MonitorUtil.isNotImport, monitorFuncForGlobalAccess(_, global_index, true, f));
 	}
-	// Helper function to call {f(funcDecl)} if {filter(module, funcDecl)} on all functions in this module.
+	// Attach callback {f} to before every memory read.
+	def beforeMemRead(f: (DynamicLoc, Memory, u64, u64) -> Resumption) {
+		beforeMemOp(f, null, null);
+	}
+	// Attach callback {f} to before every memory write.
+	def beforeMemWrite(f: (DynamicLoc, Memory, u64, u64) -> Resumption) {
+		beforeMemOp(null, f, null);
+	}
+	// Attach callback {f} to before every memory grow.
+	def beforeMemGrow(f: (DynamicLoc, Memory, u32) -> Resumption) {
+		beforeMemOp(null, null, f);
+	}
+
+	// Helpers
+	// call f(funcDecl) if filter(module, funcDecl) is true
 	def forEachFunc(filter: (Module, FuncDecl) -> bool, f: FuncDecl -> void) {
 		for (i < module.functions.length) {
 			var func = module.functions[i];
@@ -93,6 +107,7 @@ class ModuleMonitor(module: Module) {
 			f(func);
 		}
 	}
+
 	private def monitorFuncForGlobalAccess(func: FuncDecl, global_index: u31, isWrite: bool, f: DynamicLoc -> Resumption) {
 		var bi = BytecodeIterator.new();
 		var visitor = GlobalVisitor.new(module, f, isWrite, global_index);
@@ -102,7 +117,29 @@ class ModuleMonitor(module: Module) {
 			it.dispatch(visitor);
 		}
 	}
-	private def isNotImport(module: Module, func: FuncDecl) -> bool {
+	private def beforeMemOp(
+		readFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+		writeFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+		growFn: (DynamicLoc, Memory, u32) -> Resumption
+	) {
+		var it = BytecodeIterator.new();
+		var visitor = MemoryVisitor.new(module, readFn, writeFn, growFn);
+		visitor.bi = it;
+
+		forEachFunc(MonitorUtil.isNotImport, monitorFuncForMemoryAccess(_, visitor));
+	}
+	private def monitorFuncForMemoryAccess(func: FuncDecl, visitor: MemoryVisitor) {
+		for (bi = visitor.bi.reset(func); bi.more(); bi.next()) {
+			bi.dispatch(visitor);
+		}
+	}
+}
+
+component MonitorUtil {
+	def isImport(module: Module, func: FuncDecl) -> bool {
+		return func.imp != null;
+	}
+	def isNotImport(module: Module, func: FuncDecl) -> bool {
 		return func.imp == null;
 	}
 }
@@ -283,5 +320,48 @@ private class GlobalVisitor(module: Module, f: DynamicLoc -> Resumption, isWrite
 		if (global_index == targetIndex && isWrite) {
 			module.insertProbeAt(bi.func.func_index, bi.pc, CallbackProbe.new(f));
 		}
+	}
+}
+
+private class MemoryVisitor(
+	module: Module,
+	loadFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+	storeFn: (DynamicLoc, Memory, u64, u64) -> Resumption,
+	growFn: (DynamicLoc, Memory, u32) -> Resumption
+) extends BytecodeVisitor {
+	var bi: BytecodeIterator;
+
+	def visitLoad(op: Opcode, imm: MemArg, size: u8) {
+		// TODO: Take into account lane_index for V128 operations
+		if (loadFn == null) return;
+		module.insertProbeAt(bi.func.func_index, bi.pc, MemoryAccessProbe.new(imm, size, loadFn));
+	}
+	def visitStore(op: Opcode, imm: MemArg, size: u8) {
+		if (storeFn == null) return;
+		module.insertProbeAt(bi.func.func_index, bi.pc, MemoryAccessProbe.new(imm, size, storeFn));
+	}
+
+	def visit_MEMORY_GROW(memory_index: u31) {
+		if (growFn != null)
+			module.insertProbeAt(bi.func.func_index, bi.pc, MemoryGrowProbe.new(memory_index, growFn));
+	}
+}
+private class MemoryAccessProbe(imm: MemArg, size: u64, f: (DynamicLoc, Memory, u64, u64) -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var address: u64 = u64.!(Values.v_i(accessor.getOperand(0)));
+		address += imm.offset;
+
+		var memory = dynamicLoc.func.instance.memories[imm.memory_index];
+
+		return f(dynamicLoc, memory, address, size);
+	}
+}
+private class MemoryGrowProbe(memory_index: u31, f: (DynamicLoc, Memory, u32) -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var pages = u23.!(Values.v_i(accessor.getOperand(0)));
+		var memory = dynamicLoc.func.instance.memories[memory_index];
+		return f(dynamicLoc, memory, pages);
 	}
 }
