@@ -1,0 +1,21 @@
+(module
+  (import "wizeng" "tail_invoke0" (func $tail_invoke0 (param funcref)))
+  (table 3 funcref)
+  (elem (i32.const 0) $foo $bar $baz)
+  (func $bar)
+  (func $foo
+    (call $bar)
+  )
+  (func $baz
+    (ref.func $foo)
+    (call $tail_invoke0)
+  )
+  (func $main (export "main")
+    (ref.func $foo)
+    (call $tail_invoke0)
+    (ref.func $bar)
+    (call $tail_invoke0)
+    (ref.func $baz)
+    (call $tail_invoke0)
+  )
+)
