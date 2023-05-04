@@ -25,6 +25,8 @@ else
     TESTS="$@"
 fi
 
+RAW=${RAW:=0}
+
 function run_test() {
     local test=$1
     local flags=""
@@ -75,4 +77,8 @@ function run_tests() {
     done
 }
 
-run_tests $TESTS | $PROGRESS
+if [ "$RAW" = 0 ]; then
+    run_tests $TESTS | $PROGRESS
+else
+    run_tests $TESTS
+fi

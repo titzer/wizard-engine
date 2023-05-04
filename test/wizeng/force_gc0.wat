@@ -1,0 +1,12 @@
+(module
+  (import "wizeng" "force_gc" (func $force_gc))
+  (func $main (export "main")
+    (block (br_if 0 (i32.const 0)))
+    (block (br_if 0 (i32.const 0)))
+    (call $force_gc)
+    (block (br_if 0 (i32.const 0)))
+    (call $force_gc)
+    (block (br_if 0 (i32.const 0)))
+    (call $force_gc)
+  )
+)
