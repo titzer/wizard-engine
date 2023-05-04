@@ -6,23 +6,27 @@ def OUT = Trace.OUT;
 def E: Execute;
 component V3Interpreter {
 	private var instrTracer: InstrTracer;
-	def val_stack = ArrayStack<Value>.new();   // XXX: inline value stack array and top
+	def val_stack = ArrayStack<Value>.new();	// XXX: inline value stack array and top
 	private def codeptr = CodePtr.new(null);	// pointer into code
-	private var frame: V3Frame;		// cached of top-of-stack frame
-	def call_stack = ArrayStack<V3Frame>.new();
-	private var prev_call_stack_top: int;
-	private var thrown: Throwable;				// trap reason, if any
+	private var thrown: Throwable;			// trap reason, if any
 
-	def run(f: Function, args: Array<Value>) -> Result {
-		// Reset interpreter state
-		reset();
+	var num_frames: int;			// number of frames on the call stack (including host frames)
+	var call_stack_size: int;		// number of non-host frames
+	var frame: V3Frame = null;		// points to the top frame
+	var host_frame: V3Frame = null;		// points to the top host frame
+
+	def call(f: Function, args: Array<Value>) -> Result {
+		var val_stack_top = val_stack.top;
+
 		// Push arguments onto the stack
 		if (args != null) for (a in args) val_stack.push(a);
 		// Begin execution
-		var prev_top = prev_call_stack_top = call_stack.top;
-		doCallFunction(f); // call a host function or push a frame
-		// Keep executing bytecodes while there is a top frame
-		while (call_stack.top > prev_top) {
+		var old_frame = frame;
+		var old_frame_index = if(frame == null, 0, frame.index);
+		var old_host_frame = host_frame;
+
+		doCallFunction(f);
+		while (frame != null && frame.index > old_frame_index) {
 			if (E.probes != null) {
 				var ret = E.fireProbes(DynamicLoc(frame.func, frame.pc, TargetFrame(frame)));
 				if (ret != null) return finish(ret);
@@ -39,43 +43,86 @@ component V3Interpreter {
 			}
 			execOp(pc, opcode);
 		}
-		if (thrown != null) return Result.Throw(thrown);
+
+		for (f = frame; f != old_frame; f = f.prev) f.accessor = null;
+		frame = old_frame;
+		host_frame = old_host_frame;
+		if (thrown != null) {
+			var thrown = this.thrown;
+			this.thrown = null;
+			val_stack.top = val_stack_top;
+			return Result.Throw(thrown);
+		}
 		return Result.Value(popN(f.sig.results.length));
 	}
 	def finish(ret: Throwable) -> Result {
 		return Result.Throw(Trap.!(ret));
 	}
 	def reset() {
-		for (f in call_stack.elems) if (f != null) f.accessor = null;
+		for (f = frame; f != null; f = f.prev) f.accessor = null;
 		thrown = null;
-		frame = null;
 		val_stack.top = 0;
-		call_stack.top = 0;
-		prev_call_stack_top = 0;
+		num_frames = 0;
+		call_stack_size = 0;
+		frame = null;
+		host_frame = null;
+	}
+	def doCallFunction(func: Function) {
+		while (true) {
+			match (func) {
+				wf: WasmFunction => return pushFrame(wf);
+				hf: HostFunction => {
+					var old_top = host_frame;
+					var result = doInvokeHostFunction(hf);
+					match (result) {
+						Throw(thrown) => {
+							thrown.prepend(popFrames(old_top), hf);
+							this.thrown = thrown;
+							return;
+						}
+						Value0 => ;
+						Value1(val) => {
+							val_stack.push(val);
+						}
+						ValueN(vals) => {
+							for (a in vals) val_stack.push(a);
+						}
+						TailCall(f, args) => {
+							func = f;
+							for (e in args) val_stack.push(e);
+							continue; // execute a tail call to a new function
+						}
+					}
+					if (frame == null) {  // popped top frame, finished execution
+						codeptr.reset(null, 0, 0);
+					} else if (frame.func != null) {
+						advanceCaller();
+					}
+					return;
+				}
+			}
+		}
 	}
 	def pushFrame(f: WasmFunction) {
-		if (call_stack.top >= E.limits.max_call_depth) {
+		if (call_stack_size >= E.limits.max_call_depth) {
 			return trap(TrapReason.STACK_OVERFLOW);
 		}
+
+		call_stack_size++;
 		// Allocate a frame
-		var nf = call_stack.next();
-		if (nf != null) {  // reuse cached Frame object if possible
-			call_stack.top++;
-		} else {
-			nf = V3Frame.new();
-			call_stack.push(nf);
-		}
+		var nf = getNextFrame();
 		var sp = val_stack.top;
 		nf.fp = sp - f.decl.sig.params.length;
+
 		// Setup function and code pointer
 		nf.func = f;
 		nf.pc = 0;
 		nf.stp = 0;
 		nf.accessor = null;
+
 		var code = f.decl.cur_bytecode;
 		codeptr.reset(code, 0, code.length);
 		// Initialize locals
-		frame = nf;
 		codeptr.iterate_local_codes(push_locals);
 		nf.pc = codeptr.pos; // move code pointer after locals
 	}
@@ -941,29 +988,32 @@ component V3Interpreter {
 		}
 		return pc + e.dpc;
 	}
+	def advanceCaller() {
+		var code = frame.func.decl.cur_bytecode;
+		codeptr.reset(code, frame.pc, code.length);
+		var opcode = codeptr.read_opcode_but_skip_probe(frame.func.decl);
+		match (opcode) {
+			CALL, CALL_REF => {
+				codeptr.read_uleb32();
+			}
+			CALL_INDIRECT => {
+				codeptr.read_uleb32();
+				codeptr.read_uleb32();
+			}
+			_ => fail(Strings.format1("expected call instruction in return, got %s", opcode.name));
+		}
+		frame.pc = codeptr.pos;
+	}
 	def doReturn() {
 		var count = frame.func.decl.sig.results.length;
 		copyVals(count, frame.fp);
 		frame.accessor = null;
-		call_stack.pop();
-		frame = call_stack.peek();
+		popFrame();
+
 		if (frame == null) {  // popped top frame, finished execution
 			codeptr.reset(null, 0, 0);
-		} else { // advance past caller's call instruction
-			var code = frame.func.decl.cur_bytecode;
-			codeptr.reset(code, frame.pc, code.length);
-			var opcode = codeptr.read_opcode_but_skip_probe(frame.func.decl);
-			match (opcode) {
-				CALL, CALL_REF => {
-					codeptr.read_uleb32();
-				}
-				CALL_INDIRECT => {
-					codeptr.read_uleb32();
-					codeptr.read_uleb32();
-				}
-				_ => fail(Strings.format1("expected call instruction in return, got %s", opcode.name));
-			}
-			frame.pc = codeptr.pos;
+		} else if (frame.func != null) { // advance past caller's call instruction
+			advanceCaller();
 		}
 	}
 	def doCast(val: Value, nullable: bool) -> bool {
@@ -973,8 +1023,7 @@ component V3Interpreter {
 	def prepareReturnCall(sig: SigDecl) {
 		var fp = frame.fp, count = sig.params.length, sp = val_stack.top - count;
 		copyVals(count, frame.fp);
-		call_stack.pop();
-		frame = call_stack.peek();
+		popFrame();
 	}
 	def lookupIndirect(sig_index: u32, table_index: u32, func_index: u32) -> Function {
 		var instance = frame.func.instance;
@@ -991,80 +1040,15 @@ component V3Interpreter {
 		}
 		return table.funcs[func_index];
 	}
-	def invokeFunction(f: Function, args: Array<Value>) -> Result {
-		for (a in args) val_stack.push(a);
-		var prev_top = call_stack.top;
-		doCallFunction(f);
-		while (call_stack.top > prev_top) {
-			if (E.probes != null) {
-				var ret = E.fireProbes(DynamicLoc(frame.func, frame.pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-			}
-			var pc = codeptr.pos;
-			var b = codeptr.peek1();
-			var opcode: Opcode;
-			if (b == InternalOpcode.PROBE.code) {
-				var ret = Execute.fireProbesAt(DynamicLoc(frame.func, pc, TargetFrame(frame)));
-				if (ret != null) return finish(ret);
-				opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
-			} else {
-				opcode = codeptr.read_opcode();
-			}
-			execOp(pc, opcode);
-		}
-		if (thrown != null) return Result.Throw(thrown);
-		return Result.Value(popN(f.sig.results.length));
-	}
-	def doCallFunction(func: Function) {
-		while (true) {  // host function may tail-call another function
-			match (func) {
-				wf: WasmFunction => return pushFrame(wf);
-				hf: HostFunction => {
-					var prev_top = prev_call_stack_top;
-					var result = doInvokeHostFunction(hf);
-					match (result) {
-						Throw(thrown) => {
-							thrown.prepend(popFrames(prev_top), hf);
-							this.thrown = thrown;
-							return;
-						}
-						Value0 => ;
-						Value1(val) => {
-							val_stack.push(val);
-						}
-						ValueN(vals) => {
-							for (a in vals) val_stack.push(a);
-						}
-						TailCall(f, args) => {
-							func = f;
-							for (e in args) val_stack.push(e);
-							continue; // execute a tail call to a new function
-						}
-					}
-					if (frame == null) {  // popped top frame, finished execution
-						codeptr.reset(null, 0, 0);
-					}
-					return;
-				}
-				_ => return trap(TrapReason.FUNC_INVALID);
-			}
-		}
-	}
-	def popFrames(prev_top: int) -> Array<(WasmFunction, int)> {
-		var frames = Array<(WasmFunction, int)>.new(call_stack.top - prev_top);
-		for (i = prev_top; i < call_stack.top; i++) {
-			var f = call_stack.elems[i];
-			frames[i - prev_top] = (f.func, f.pc);
-			f.accessor = null;
-		}
-		call_stack.top = prev_top;
-		return frames;
-	}
 	def doInvokeHostFunction(hf: HostFunction) -> HostResult {
 		if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 		var result: HostResult;
 		var count: int, sp: int;
 		var elems = val_stack.elems;
+
+		var host_frame = getNextHostFrame();
+		host_frame.hf = hf;
+
 		match (hf) {
 			hf0: HostFunction0 => {
 				count = 0;
@@ -1098,6 +1082,7 @@ component V3Interpreter {
 				result = hfN.invokeN(args);
 			}
 		}
+		popFrame();
 		return result;
 	}
 	def doTruncF32<T>(min: float, max: float, trunc: float -> T, push: T -> ()) {
@@ -1116,11 +1101,11 @@ component V3Interpreter {
 	}
 	def trap(reason: TrapReason) {
 		thrown = Trap.new(reason, null, null);
-		thrown.prepend(popFrames(prev_call_stack_top), null);
+		thrown.prepend(popFrames(host_frame), null);
 	}
 	def fail(msg: string) {
 		thrown = InternalError.new(msg, null);
-		thrown.prepend(popFrames(prev_call_stack_top), null);
+		thrown.prepend(popFrames(host_frame), null);
 	}
 	def copyVals(count: int, dest: int) {
 		var sp = val_stack.top - count;
@@ -1166,7 +1151,7 @@ component V3Interpreter {
 		return result;
 	}
 	def traceStep() {
-		for (i < call_stack.top) OUT.sp();
+		for (i < call_stack_size) OUT.sp();
 		OUT.put1("+%d: ", codeptr.pos);  // XXX: fixed width decimal offset
 		var module = if(frame.func.instance != null, frame.func.instance.module);
 		var opcode = codeptr.data[codeptr.pos];
@@ -1327,14 +1312,91 @@ component V3Interpreter {
 		var r = f(double.view(x));
 		val_stack.elems[val_stack.top-1] = Value.F64(u64.view(r));
 	}
+
+	// Get the next frame, or make a new one if necessary
+	private def getNextFrame() -> V3Frame {
+		if (frame == null) {
+			frame = V3Frame.new();
+		} else if (frame.next != null) { // reuse frame object
+			frame = frame.next;
+		} else {
+			var new_frame = V3Frame.new();
+			new_frame.prev = frame;
+			frame.next = new_frame;
+			frame = new_frame;
+		}
+		num_frames++;
+		frame.index = num_frames;
+		return frame;
+	}
+	// Get the next host frame, or make a new one if necessary
+	private def getNextHostFrame() -> V3Frame {
+		frame = getNextFrame();
+		if (host_frame == null) {
+			frame.prev_host = null;
+			frame.next_host = null;
+		} else {
+			frame.prev_host = host_frame;
+			host_frame.next_host = frame;
+		}
+		host_frame = frame;
+		return host_frame;
+	}
+	private def popFrame() -> V3Frame {
+		num_frames--;
+		if (frame == host_frame) {
+			host_frame = host_frame.prev_host;
+		} else if (frame.func != null) {
+			call_stack_size--;
+		}
+		frame.hf = frame.func = frame.accessor = null;
+		frame = frame.prev;
+		return frame;
+	}
+	private def popFrames(prev_top: V3Frame) -> Array<(WasmFunction, int)> {
+		var top_index = if(frame == null, 0, frame.index);
+		var prev_top_index = if(prev_top == null, 0, prev_top.index);
+		var frames = Array<(WasmFunction, int)>.new(top_index - prev_top_index);
+		while (frame != prev_top) {
+			frames[frame.index - prev_top_index - 1] = (frame.func, frame.pc);
+			popFrame();
+		}
+		return frames;
+	}
 }
 
 class V3Frame {
-	var func: WasmFunction;
+	var hf: HostFunction;	// null if wasm function
+	var func: WasmFunction;	// null if host function
+	// both hf and wf null if frame is inactive
+
+	var prev: V3Frame;
+	var next: V3Frame;
+	var prev_host: V3Frame;	// null if wasm function
+	var next_host: V3Frame;	// null if wasm function
+
 	var fp: int;
 	var pc: int;
 	var stp: int;
 	var accessor: V3FrameAccessor;
+
+	var index: int;
+
+	def caller() -> WasmOrHostLoc {
+		if (prev == null) {
+			return WasmOrHostLoc.None;
+		} else if (prev.func != null) {
+			return WasmOrHostLoc.WasmLoc(prev.func, prev.pc, TargetFrame(prev));
+		} else {
+			return WasmOrHostLoc.HostLoc(prev.hf, V3HostFrame.new(prev));
+		}
+	}
+}
+
+class V3HostFrame(frame: V3Frame) extends HostFrame {
+	def caller() -> WasmOrHostLoc {
+		return frame.caller();
+	}
 }
 
 class V3FrameAccessor(frame: V3Frame) extends FrameAccessor {
@@ -1357,7 +1419,7 @@ class V3FrameAccessor(frame: V3Frame) extends FrameAccessor {
 	// Returns {true} if this frame is currently the top executing frame, {false} if the
 	// frame has called another function or been unwound.
 	def isTop() -> bool {
-		return if(!isUnwound(), V3Interpreter.call_stack.peek() == frame);
+		return if(!isUnwound(), V3Interpreter.frame == frame);
 	}
 	// Returns the call depth of this frame within its segment, with the bottom frame being #0.
 	def depth() -> int {
@@ -1370,27 +1432,22 @@ class V3FrameAccessor(frame: V3Frame) extends FrameAccessor {
 			var a = cached_caller.accessor;
 			if (a != null && a.cached_depth >= 0) return a.cached_depth + 1;
 		}
-		for (i = V3Interpreter.call_stack.top - 1; i >= 0; i--) {
-			var f = V3Interpreter.call_stack.elems[i];
+		var i = V3Interpreter.call_stack_size - 1;
+		for (f = V3Interpreter.frame; f != null; f = f.prev) {
 			if (f == frame) return i;
 			// do a drive-by calculation of non-matching frame depth
-			var a = f.accessor;
-			if (a != null && a.cached_depth < 0) a.cached_depth = i;
+			if (f.hf == null) {
+				var a = f.accessor;
+				if (a != null && a.cached_depth < 0) a.cached_depth = i;
+				i--;
+			}
 		}
 		return 0; // TODO: not found. error?
 	}
-	// Get the caller frame. If none, then {Frame.func} will be {null}.
-	def caller() -> DynamicLoc {
+	// Get the caller frame, either a wasm or host function. If none, then {Frame.func} will be {null}.
+	def caller() -> WasmOrHostLoc {
 		checkNotUnwound();
-		if (cached_caller == null) {
-			var depth = depth();
-			if (depth == 0) {
-				return DynamicLoc(null, 0, TargetFrame(null));
-			} else {
-				cached_caller = V3Interpreter.call_stack.elems[depth - 1];
-			}
-		}
-		return DynamicLoc(cached_caller.func, cached_caller.pc, TargetFrame(cached_caller));
+		return frame.caller();
 	}
 	// Get the number of local variables in this frame.
 	def numLocals() -> int {
