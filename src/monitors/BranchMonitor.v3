@@ -7,7 +7,7 @@ class BmEntry(func: FuncDecl, pc: int, op: Opcode, numTargets: int) {
 	def taken = Array<u64>.new(numTargets);
 }
 
-class BranchMonitorState(module: Module) extends BytecodeVisitor {
+class BranchMonitorState(mm: ModuleMonitor) extends BytecodeVisitor {
 	def entries = Vector<BmEntry>.new();
 	var bi: BytecodeIterator;
 
@@ -26,16 +26,15 @@ class BranchMonitorState(module: Module) extends BytecodeVisitor {
 		var entry = BmEntry.new(f, bi.pc, opcode, numTargets);
 		entries.put(entry);
 
-		var probe = if(isBrTable, BranchMonitorBranchTableProbe.new(entry.taken), BranchMonitorProbe.new(entry.taken));
-		module.insertProbeAt(f.func_index, bi.pc, probe);
+		mm.beforeInstrExec(f, bi.pc, if(isBrTable, branchTableCallback, branchCallback)(_, entry.taken));
 	}
-	def report() {
+	def onFinish(i: Instance) {
 		var prev: FuncDecl;
 		for (i < entries.length) {
 			var e = entries[i];
 			if (e.func != prev) {
 				prev = e.func;
-				Trace.OUT.put1("func %q:", prev.render(module.names, _)).outln();
+				Trace.OUT.put1("func %q:", prev.render(mm.module.names, _)).outln();
 			}
 			Trace.OUT.put1("  +%d ", e.pc);
 			Opcodes.render(Trace.OUT, e.op.code);
@@ -50,56 +49,43 @@ class BranchMonitorState(module: Module) extends BytecodeVisitor {
 			Trace.OUT.outln();
 		}
 	}
+
+	private def branchCallback(dynamicLoc: DynamicLoc, taken: Array<u64>) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var condition = accessor.getOperand(0);
+		var branchTaken = Values.v_i(condition) != 0;
+		taken[if(branchTaken, 1, 0)] += 1;
+		return Resumption.Continue;
+	}
+	private def branchTableCallback(dynamicLoc: DynamicLoc, taken: Array<u64>) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var condition = accessor.getOperand(0);
+		var branchTaken = Values.v_i(condition);
+		if (branchTaken >= taken.length) branchTaken = taken.length - 1;
+		taken[branchTaken] += 1;
+		return Resumption.Continue;
+	}
 }
 
 class BranchMonitor extends Monitor {
 	def visitors = Vector<BranchMonitorState>.new();
+	def it = BytecodeIterator.new();
 
 	def onParse(module: Module) {
-		def visitor = BranchMonitorState.new(module);
+		var mm = ModuleMonitor.new(module);
+		def visitor = BranchMonitorState.new(mm);
 		visitors.put(visitor);
-
-		var it = BytecodeIterator.new();
 		visitor.bi = it;
 
-		for (i < module.functions.length) {
-			var f = module.functions[i];
-			if (f.imp != null) continue;
-			
-			var bi = it.reset(f);
-			while (bi.more()) {
-				bi.dispatch(visitor);
-				bi.next();
-			}
-		}
+		mm.forEachFunc(MonitorUtil.isNotImport, monitorFunc(_, visitor));
+		mm.afterFinish(visitor.onFinish);
 	}
-	def onFinish(i: Instance) {
-		for (j < visitors.length) {
-			visitors[j].report();
-		}
-	}
-}
 
-class BranchMonitorProbe(taken: Array<u64>) extends Probe {
-	def fire(dynamicLoc: DynamicLoc) -> Resumption {
-		var accessor = dynamicLoc.frame.getFrameAccessor();
-		var condition = accessor.getOperand(0);
-		var taken = Values.v_i(condition) != 0;
-		var index = if(taken, 1, 0);
-		this.taken[index] += 1;
-		return Resumption.Continue;
-	}
-}
-class BranchMonitorBranchTableProbe(taken: Array<u64>) extends Probe {
-	def fire(dynamicLoc: DynamicLoc) -> Resumption {
-		var accessor = dynamicLoc.frame.getFrameAccessor();
-		var numBranches = taken.length;
-		var condition = accessor.getOperand(0);
-		var takenBranch = Values.v_i(condition);
-		if (takenBranch >= numBranches) {
-			takenBranch = numBranches - 1;
+	private def monitorFunc(func: FuncDecl, visitor: BranchMonitorState) {
+		var bi = it.reset(func);
+		while (bi.more()) {
+			bi.dispatch(visitor);
+			bi.next();
 		}
-		this.taken[takenBranch] += 1;
-		return Resumption.Continue;
 	}
 }
