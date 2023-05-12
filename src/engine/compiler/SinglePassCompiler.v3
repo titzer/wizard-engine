@@ -123,13 +123,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
 		state.reset(sig, end_label);
-		state.num_locals = func.num_locals;
-
-		// Visit all local declarations.
-		it.dispatchLocalDecls(this);
+		state.num_locals = resolver.num_locals = func.num_locals;
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
+		
+		// Visit all local declarations.
+		it.dispatchLocalDecls(this);
 
 		// Emit instructions.
 		while (it.more() && success) {
@@ -1454,10 +1454,11 @@ class SpcState(regAlloc: RegAlloc, resolver: SpcMoveResolver) {
 	def addLocals(count: u32, ltype: ValueType) {
 		var nlength = sp + count;
 		if (nlength > state.length) grow(int.view(nlength + sp * 2));
-		var flags = typeToKindFlags(ltype) | TAG_STORED | IS_CONST; // TODO: store tag of locals
+		var flags = typeToKindFlags(ltype) | TAG_STORED | IS_CONST;
 		for (j < count) {
 			var k = j + sp;
 			state[k] = SpcVal(flags, NO_REG, 0);
+			aggressivelyStoreTag(k);
 		}
 		sp = nlength;
 	}
@@ -1616,8 +1617,20 @@ class SpcState(regAlloc: RegAlloc, resolver: SpcMoveResolver) {
 	def push(flags: byte, reg: Reg, const: int) {
 		var sp = this.sp;
 		if (sp >= state.length) grow(8 + state.length * 2);
-		maybeAlwaysStoreTagForPerfTesting(sp, SpcVal(flags, reg, const));
+		state[sp] = SpcVal(flags, reg, const);
+		aggressivelyStoreTag(sp);
 		this.sp++;
+	}
+	def aggressivelyStoreTag(slot: u32) {
+		match (tuning.spcTagging) {
+			AGG => ;
+			AGG_LOCALS => if (slot >= num_locals) return;
+			AGG_OPS => if (slot < num_locals) return;
+			_ => return;
+		}
+		var sv = state[slot];
+		resolver.storeTag(sv.kind(), slot);
+		state[slot] = SpcVal(sv.flags | TAG_STORED, sv.reg, sv.const);
 	}
 	def get(slot: u32) -> SpcVal {
 		return state[slot];
@@ -1646,11 +1659,12 @@ class SpcState(regAlloc: RegAlloc, resolver: SpcMoveResolver) {
 	def overwrite(flags: byte, reg: Reg, const: int) {
 		var old = state[sp - 1];
 		var tag_stored = if((old.flags & KIND_MASK) == (flags & KIND_MASK), old.flags & TAG_STORED);
-		maybeAlwaysStoreTagForPerfTesting(sp - 1, SpcVal(tag_stored | flags, reg, const));
+		state[sp - 1] = SpcVal(tag_stored | flags, reg, const);
+		aggressivelyStoreTag(sp - 1);
 	}
 	def set(slot: u32, flags: byte, reg: Reg, const: int) {
-		var sv = SpcVal(flags, reg, const);
-		maybeAlwaysStoreTagForPerfTesting(slot, sv);
+		state[slot] = SpcVal(flags, reg, const);
+		aggressivelyStoreTag(slot);
 	}
 	def setStored(slot: u32) {
 		var b = state[slot];
@@ -1674,14 +1688,6 @@ class SpcState(regAlloc: RegAlloc, resolver: SpcMoveResolver) {
 		OUT.put1("sp=%d |", sp);
 		for (i < sp) vals[i].render(OUT, regAlloc.poolMap.regSet);
 		OUT.outln();
-	}
-	def maybeAlwaysStoreTagForPerfTesting(slot: u32, sv: SpcVal) {
-		if (tuning.alwaysStoreTag) {
-			resolver.storeTag(sv.kind(), slot);
-			state[slot] = SpcVal(sv.flags | IS_STORED, sv.reg, sv.const);
-		} else {
-			state[slot] = sv;
-		}
 	}
 }
 def toTag(vt: ValueType) -> ValueKind {
@@ -1771,6 +1777,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 	private var numMoves = 0;
 	private def constRegMoves = Vector<(ValueKind, int, Reg)>.new();
 	private def constSlotMoves = Vector<(ValueKind, int, u32)>.new();
+	var num_locals: u16;
 
 	// Add a move or moves to the collection of parallel moves to transfer the
 	// abstract value in one slot to another. The abstract value may be a constant,
@@ -1786,7 +1793,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 		}
 		var tv = to.1, fv = from.1;
 		if (masm.valuerep.tagged && tv.tagStored()) { // XXX: move tag store operation into state?
-			if (tuning.alwaysStoreTag || from.0 != to.0 || !fv.tagStored()) {
+			if (from.0 != to.0 || !fv.tagStored()) {
 				// store the tag into to-slot
 				storeTag(fv.kind(), to.0);
 			}
@@ -1814,6 +1821,8 @@ class SpcMoveResolver(masm: MacroAssembler) {
 		}
 	}
 	def storeTag(kind: ValueKind, slot: u32) {
+		if (tuning.spcTagging.lazy_locals && slot < num_locals) return;
+		if (tuning.spcTagging.lazy_ops && slot >= num_locals) return;
 		masm.emit_mov_m_i(masm.tagAddr(slot), kind.code);
 	}
 	// Order and emit the moves to the macro assembler.
