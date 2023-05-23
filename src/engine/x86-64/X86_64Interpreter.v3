@@ -1,9 +1,9 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def tuning = X86_64InterpreterTuning.new(); // XXX: reduce duplication with target
 def RT: X86_64Runtime;
 def IVAR_FRAME = X86_64MasmRegs.IVAR_FRAME;
+var recordCurIpForTraps = !FeatureDisable.stacktraces;
 
 // Implements a Wasm interpreter by running handwritten x86-64 interpreter loop.
 component X86_64Interpreter {
@@ -24,7 +24,7 @@ component X86_64Interpreter {
 	}
 	def computePCFromFrame(sp: Pointer) -> int {
 		if (Debug.interpreter) dumpFrame(sp);
-		if (tuning.recordCurIpForTraps) return (sp + IVAR_FRAME.CURPC.disp).load<int>();
+		if (!FeatureDisable.stacktraces) return (sp + IVAR_FRAME.CURPC.disp).load<int>();
 		var ip   = (sp + IVAR_FRAME.IP.disp).load<Pointer>();
 		var code = Pointer.atContents((sp + IVAR_FRAME.CODE.disp).load<Array<byte>>());
 		return int.!(ip - code - 1);
@@ -55,7 +55,7 @@ class X86_64InterpreterFrameAccessor extends X86_64BaseFrameAccessor {
 
 	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
 	def isUnwound() -> bool {
-		if (!tuning.cacheFrameAccessor) return false; // TODO: proper unwound check
+		if (FeatureDisable.frameAccess) return false; // TODO: proper is-frame-unwound check
 		def frame = X86_64MasmRegs.IVAR_FRAME;
 		return this != (sp + IVAR_FRAME.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
 	}
@@ -183,7 +183,7 @@ class X86_64InterpreterCode extends RiUserCode {
 	def getFrameAccessor(sp: Pointer) -> X86_64InterpreterFrameAccessor {
 		var retip = (sp + -Pointer.SIZE).load<Pointer>();
 		if (!X86_64Interpreter.inCode(retip)) return null;
-		if (tuning.cacheFrameAccessor) {
+		if (!FeatureDisable.frameAccess) {
 			var prev = (sp + IVAR_FRAME.ACCESSOR.disp).load<X86_64InterpreterFrameAccessor>();
 			if (prev != null) return prev;
 			var n = X86_64InterpreterFrameAccessor.new(sp);
@@ -389,7 +389,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 
 	def gen(range: MemoryRange) {
-		if (tuning.dispatchEntrySize == 4 && (range.start - Pointer.NULL) > int.max) {
+		if (FastIntTuning.dispatchEntrySize == 4 && (range.start - Pointer.NULL) > int.max) {
 			fatal(Strings.format1("global buffer start address of 0x%x out of 31-bit range", (range.start - Pointer.NULL)));
 		}
 		// Record code start
@@ -424,7 +424,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (w.pos > initialSize) fatal(Strings.format2("need %d bytes for interpreter code, only allocated %d", w.pos, initialSize));
 	}
 	def genTypeTagTable() {
-		if (!tuning.useTypeTagTable) return;
+		if (FeatureDisable.complexBlockTypes) return;
 		// Reserve space for the type tag table and fill it out
 		typeTagTableOffset = w.pos;
 		w.skipN(256);
@@ -446,30 +446,30 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def reserveDispatchTables() {
 		{ // table #0
-			w.align(tuning.dispatchEntrySize);
+			w.align(FastIntTuning.dispatchEntrySize);
 			var ref = IcCodeRef.new(-1);
 			ref.offset = ic.fastDispatchTableOffset = w.pos;
-			w.skipN(256 * tuning.dispatchEntrySize);
+			w.skipN(256 * FastIntTuning.dispatchEntrySize);
 			dispatchTables[0] = (0, ref, null);
 		}
-		if (tuning.dispatchTableReg) {
-			w.align(tuning.dispatchEntrySize);
+		if (!FeatureDisable.globalProbes) {
+			w.align(FastIntTuning.dispatchEntrySize);
 			probedDispatchTableRef = IcCodeRef.new(-1);
 			probedDispatchTableRef.offset = ic.probedDispatchTableOffset = w.pos;
-			w.skipN(256 * tuning.dispatchEntrySize);
+			w.skipN(256 * FastIntTuning.dispatchEntrySize);
 		}
 		for (i < Opcodes.code_pages.length) {
 			var page = Opcodes.code_pages[i];
 			var ref = IcCodeRef.new(-1);
-			w.align(tuning.dispatchEntrySize);
+			w.align(FastIntTuning.dispatchEntrySize);
 			ref.offset = w.pos;
-			w.skipN(256 * tuning.dispatchEntrySize);
+			w.skipN(256 * FastIntTuning.dispatchEntrySize);
 			var ref2: IcCodeRef;
 
 			if (!page.oneByte) {
 				ref2 = IcCodeRef.new(-1);
 				ref2.offset = w.pos;
-				w.skipN(256 * tuning.dispatchEntrySize);
+				w.skipN(256 * FastIntTuning.dispatchEntrySize);
 			}
 
 			dispatchTables[i + 1] = (page.prefix, ref, ref2);
@@ -488,7 +488,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// Spill VSP (value stack pointer)
 			asm.movq_m_r(m_vsp, r_v3_vsp);
 			// load dispatch table into register
-			if (tuning.dispatchTableReg) masm.emit_load_dispatch_table_reg(xenv.dispatch);
+			if (!FeatureDisable.globalProbes) masm.emit_load_dispatch_table_reg(xenv.dispatch);
 			// move WasmFunction into tmp
 			asm.movq_r_r(tmp, r_v3_wasm_func);
 			restoreReg(r_vsp);
@@ -503,7 +503,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// Spill VSP (value stack pointer)
 			asm.movq_m_r(m_vsp, r_vsp);
 			// load dispatch table into register
-			if (tuning.dispatchTableReg) masm.emit_load_dispatch_table_reg(xenv.dispatch);
+			if (!FeatureDisable.globalProbes) masm.emit_load_dispatch_table_reg(xenv.dispatch);
 			// move WasmFunction into tmp
 			asm.movq_r_r(tmp, r_func_arg);
 			if (r_vsp != r_vsp) restoreReg(r_vsp);
@@ -690,7 +690,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genMisc();
 	}
 	def writeDispatchEntry(ref: IcCodeRef, opcode: int, offset: int) {
-		match (tuning.dispatchEntrySize) {
+		match (FastIntTuning.dispatchEntrySize) {
 			2 => w.at(ref.offset + 2 * opcode).put_b16(offset - ref.offset);
 			4 => w.at(ref.offset + 4 * opcode).put_b32(int.!((ic.start + offset) - Pointer.NULL));
 			8 => w.at(ref.offset + 8 * opcode).put_b64((ic.start + offset) - Pointer.NULL);
@@ -946,7 +946,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.jc_rel_near(C.NZ, call_host);
 
 			// WasmFunction: call into interpreter reentry or target code
-			if (tuning.multiTierSupport) {
+			if (!FeatureDisable.multiTier) {
 				var tmp = r_tmp2;
 				asm.movq_r_m(tmp, func_arg.plus(offsets.WasmFunction_decl));
 				asm.icall_m(tmp.plus(offsets.FuncDecl_target_code));
@@ -955,7 +955,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			}
 			genAbruptRetCheck();
 			restoreCallerIVars();
-			if (tuning.multiTierSupport) restoreDispatchTableReg();
+			if (!FeatureDisable.multiTier) restoreDispatchTableReg();
 			genDispatchOrJumpToDispatch();
 
 			// HostFunction: call into interpreter runtimeCall to enter into V3 code
@@ -1803,7 +1803,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.sub_r_i(origIp, 1);
 			genDispatch(origIp.indirect(), dispatchTables[0].1, false);
 		}
-		if (tuning.dispatchTableReg) {
+		if (!FeatureDisable.globalProbes) {
 			var offset = w.atEnd().pos;
 			for (i < 256) {
 				writeDispatchEntry(probedDispatchTableRef, i, offset);
@@ -2508,7 +2508,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 	}
 	def bindHandler(opcode: Opcode) {
-		if (tuning.handlerAlignment > 1) w.align(tuning.handlerAlignment);
+		if (FastIntTuning.handlerAlignment > 1) w.align(FastIntTuning.handlerAlignment);
 		var pos = w.atEnd().pos;
 		patchDispatchTable(opcode, pos);
 		if (Debug.interpreter) {
@@ -2537,7 +2537,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def saveCallerIVars() {
 		saveIVar(r_ip);
 		saveIVar(r_stp);
-		if (tuning.recordCurIpForTraps) saveIVar(r_curpc);
+		if (!FeatureDisable.stacktraces) saveIVar(r_curpc);
 	}
 	def restoreCallerIVars() {
 		restoreReg(r_ip);
@@ -2549,7 +2549,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		restoreReg(r_vfp);
 	}
 	def restoreDispatchTableReg() {
-		if (tuning.dispatchTableReg) {
+		if (!FeatureDisable.globalProbes) {
 			// restore dispatch table from Interpreter.dispatchTable
 			asm.movq_r_m(r_dispatch, absPointer(offsets.Interpreter_dispatchTable));
 		}
@@ -2644,7 +2644,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		bindHandler(opcode);
 		computeCurIpForTrap(-1);
 		var finish = asm.newLabel(), has_index: X86_64Label;
-		if (tuning.multiMemorySupport) { // dynamically check for memory index
+		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
 			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
@@ -2677,7 +2677,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genStore(gen: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
 		computeCurIpForTrap(-1);
 		var finish = asm.newLabel(), has_index: X86_64Label;
-		if (tuning.multiMemorySupport) { // dynamically check for memory index
+		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
 			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
@@ -2714,13 +2714,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.ret();
 	}
 	def genInvalidateFrameAccessor() {
-		if (tuning.cacheFrameAccessor) asm.movq_m_i(m_accessor, 0);
+		if (!FeatureDisable.frameAccess) asm.movq_m_i(m_accessor, 0);
 	}
 
 	// Generate a read of a 32-bit unsigned LEB.
 	def genReadUleb32(dest: X86_64Gpr) {
 		var ool_leb: OutOfLineLEB;
-		if (!tuning.inlineAllLEBs) {
+		if (!FastIntTuning.inlineAllLEBs) {
 			ool_leb = OutOfLineLEB.new(dest);
 			oolULeb32Sites.put(ool_leb);
 		}
@@ -2728,7 +2728,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movbzx_r_m(dest, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
 		asm.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
-		if (tuning.inlineAllLEBs) {
+		if (FastIntTuning.inlineAllLEBs) {
 			var leb_done = X86_64Label.new();
 			asm.jc_rel_near(C.Z, leb_done);
 			genReadLEBext(dest);
@@ -2793,7 +2793,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(done);
 	}
 	def genSkipBlockType() {
-		if (!tuning.complexBlockTypes) return genSkipLeb();
+		if (FeatureDisable.complexBlockTypes) return genSkipLeb();
 		var tmp = r_tmp0;
 		var done = X86_64Label.new();
 		asm.d.movbzx_r_m(tmp, ip_ptr);		// load first byte
@@ -2835,13 +2835,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// Generate an inline dispatch or a jump to the dispatch loop, depending on config.
 	def genDispatchOrJumpToDispatch() {
-		var gen = tuning.threadedDispatch;
+		var gen = FastIntTuning.threadedDispatch;
 		if (firstDispatchOffset == 0) {
 			firstDispatchOffset = w.pos;
 			gen = true;
 		}
 		if (gen) {
-			genDispatch(ip_ptr, if (!tuning.dispatchTableReg, dispatchTables[0].1), true);
+			genDispatch(ip_ptr, if (FeatureDisable.globalProbes, dispatchTables[0].1), true);
 		} else {
 			asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
 		}
@@ -2852,7 +2852,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var base = r_tmp1;
 		if (ptr != null) asm.movbzx_r_m(opcode, ptr);
 		if (increment) asm.inc_r(r_ip);
-		match (tuning.dispatchEntrySize) {
+		match (FastIntTuning.dispatchEntrySize) {
 			2 => {
 				if (table == null) asm.movq_r_r(base, r_dispatch);
 				else asm.lea(base, table); // RIP-relative LEA
@@ -2940,7 +2940,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// Runtime calls and traps need CURPC register to be valid.
 	def computeCurIpForTrap(delta: int) {
-		if (tuning.recordCurIpForTraps) computeCurIpFromIp(delta);
+		if (!FeatureDisable.stacktraces) computeCurIpFromIp(delta);
 	}
 	def computeCurIpFromIp(delta: int) {
 		asm.q.lea(r_curpc, X86_64Addr.new(r_ip, null, 1, delta - offsets.Array_contents));
@@ -2949,7 +2949,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.q.lea(r_ip, r_curpc.plus(0 - (delta - offsets.Array_contents)));
 	}
 	def computePcFromCurIp() {
-		if (tuning.recordCurIpForTraps) asm.q.sub_r_m(r_curpc, m_code);
+		if (!FeatureDisable.stacktraces) asm.q.sub_r_m(r_curpc, m_code);
 	}
 	// All traps are generated out-of-line and call into the runtime.
 	def genTraps() {
@@ -2979,7 +2979,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(divzero_label);
 		computePcFromCurIp();
 		saveIVar(r_stp);
-		if (tuning.recordCurIpForTraps) saveIVar(r_curpc);
+		if (!FeatureDisable.stacktraces) saveIVar(r_curpc);
 		// XXX: load runtime arg registers directly
 		asm.movq_r_m(r_tmp1, m_wasm_func);
 		asm.movd_r_i(r_tmp4, TrapReason.DIV_BY_ZERO.tag);
