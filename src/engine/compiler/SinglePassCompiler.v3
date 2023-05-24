@@ -90,6 +90,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var func: FuncDecl;
 	var sig: SigDecl;
 	var success = true;
+	var osr_pc: int;
+	var osr_offset: int;
+	var osr_state: Array<SpcVal>;
+	var osr_loop_label: MasmLabel;
+	var osr_entry_label: MasmLabel;
 	var ret_label: MasmLabel;
 	var unwind_label: MasmLabel;
 	var last_probe = 0;
@@ -101,8 +106,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 
 	def gen(module: Module, func: FuncDecl) -> bool {
-		// Metric collection: only call System.ticksUs() if time metrica enabled.
+		this.osr_pc = -1;
 		return Metrics.spc_time_us.run(gen0, (module, func));
+	}
+	def genOsr(module: Module, func: FuncDecl, pc: int) -> MasmLabel {
+		this.osr_pc = pc;
+		var ok = Metrics.spc_time_us.run(gen0, (module, func));
+		return if(ok, osr_entry_label);
 	}
 	private def gen0(module: Module, func: FuncDecl) -> bool {
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).outln();
@@ -118,6 +128,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		regAlloc.clear();
 		trap_labels.resize(0);
 		success = true;
+		osr_offset = -1;
+		osr_state = null;
 
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
@@ -153,6 +165,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(e.1);
 			masm.emit_mov_m_i(xenv.pc_slot, e.1.create_pos);
 			masm.emit_jump_to_trap_at(e.0);
+		}
+		if (osr_state != null) {
+			osr_entry_label = masm.newLabel(osr_pc);
+			emitOsrEntry(osr_entry_label, osr_state);
 		}
 		if (success) {
 			// Metric collection
@@ -303,6 +319,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.prepareLoop(resolver);
 		masm.bindLabel(ctl_top.label);
 		emitProbe();
+		if (it.pc == osr_pc) {
+			osr_state = state.ctl_stack.peek().copyMerge();
+			osr_loop_label = masm.newLabel(it.pc);
+			masm.bindLabel(osr_loop_label);
+		}
 	}
 	def visit_IF(btc: BlockTypeCode) {
 		var pr = btc.toAbstractBlockType(module);
@@ -970,6 +991,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_addw_r_i(regs.sp, frame.frameSize);
 		masm.emit_ret();
 	}
+	def emitOsrEntry(osr_entry_label: MasmLabel, state: Array<SpcVal>) {
+		if (Trace.compiler) Trace.OUT.put1("  OSR (+%d)", osr_entry_label.create_pos).outln();
+		masm.bindLabel(osr_entry_label);
+		emit_reload_regs();
+		for (i < u32.!(state.length)) {
+			var sv = state[i];
+			var iv = SpcVal(sv.kindFlags(IS_STORED | TAG_STORED), NO_REG, 0);
+			resolver.addMove((i, sv), (i, iv));
+		}
+		resolver.emitMoves();
+		masm.emit_br(osr_loop_label);
+	}
 	def emitTrap(reason: TrapReason) {
 		var label = masm.newTrapLabel(reason);
 		masm.emit_br(label);
@@ -1403,6 +1436,9 @@ class SpcControl {
 	}
 	def clearReset() {
 		reset_state = null;
+	}
+	def copyMerge() -> Array<SpcVal> {
+		return Arrays.dup(merge_state);
 	}
 }
 
