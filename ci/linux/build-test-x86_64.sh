@@ -23,4 +23,4 @@ cd test/wasm-spec
 cd ../..
 
 # Run all tests
-PROGRESS_ARGS=c TEST_TARGETS="int x86-64-linux" ./test/all.sh
+PROGRESS_ARGS=c TEST_TARGETS="v3i x86-64-linux" ./test/all.sh
