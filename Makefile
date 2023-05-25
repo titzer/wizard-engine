@@ -83,14 +83,14 @@ bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
 	./build.sh objdump x86-64-linux
 
 # interpreter targets
-bin/unittest.int: $(SPECTEST) build.sh
-	./build.sh unittest int
+bin/unittest.v3i: $(SPECTEST) build.sh
+	./build.sh unittest v3i
 
-bin/spectest.int: $(SPECTEST) build.sh
-	./build.sh spectest int
+bin/spectest.v3i: $(SPECTEST) build.sh
+	./build.sh spectest v3i
 
-bin/wizeng.int: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng int
+bin/wizeng.v3i: $(WIZENG) $(MONITORS) build.sh
+	./build.sh wizeng v3i
 
-bin/objdump.int: $(OBJDUMP) build.sh
-	./build.sh objdump int
+bin/objdump.v3i: $(OBJDUMP) build.sh
+	./build.sh objdump v3i

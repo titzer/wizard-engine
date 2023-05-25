@@ -48,7 +48,7 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
 fi
 
 ### Set up the test target
-TEST_TARGET=${TEST_TARGET:=int}
+TEST_TARGET=${TEST_TARGET:=v3i}
 T=/tmp/$USER/wizeng-test/$harness/$TEST_TARGET/$TEST_MODE/
 mkdir -p $T
 

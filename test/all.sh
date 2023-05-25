@@ -49,7 +49,7 @@ function exit_if_failure() {
 
 if [ "$TEST_TARGETS" = "" ]; then
     if [ "$TEST_TARGET" = "" ]; then
-	TEST_TARGETS="int x86-linux x86-64-linux jvm"
+	TEST_TARGETS="v3i x86-linux x86-64-linux jvm"
     else
 	TEST_TARGETS="$TEST_TARGET"
     fi
@@ -84,7 +84,7 @@ done
 # Spec tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
+    if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
 	skip spec "will run out of memory"
         continue
     fi
@@ -104,7 +104,7 @@ done
 # Self-hosted (unit) tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" = int ]; then # TODO: out of memory depending on host v3c
+    if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
 	skip selfhost "will run out of memory"
         continue
     fi
@@ -114,7 +114,7 @@ done
 # Virgil tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" = int ]; then # TODO: runs really, really slow on v3i
+    if [ "$target" = v3i ]; then # TODO: runs really, really slow on v3i
 	skip virgil "runs too slowly"
         continue
     fi

@@ -27,7 +27,7 @@ print_testing
 
 BATCHING=1000
 
-if [ "$TEST_TARGET" = int ]; then
+if [ "$TEST_TARGET" = v3i ]; then
     BATCHING=200
 fi
 

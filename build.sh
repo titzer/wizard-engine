@@ -116,7 +116,7 @@ elif [ "$TARGET" = "wave" ]; then
     V3C_PATH=$(which v3c)
     V3C_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wave}
     $V3C_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
-elif [ "$TARGET" = "int" ]; then
+elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
     RET=$?
@@ -131,9 +131,9 @@ elif [ "$TARGET" = "int" ]; then
 	fi
 	LIST="$LIST $(ls $f)"
     done
-    echo '#!/bin/bash' > bin/$PROGRAM.int
-    echo "v3i \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.int
-    chmod 755 bin/$PROGRAM.int
+    echo '#!/bin/bash' > bin/$PROGRAM.v3i
+    echo "v3i \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
+    chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors
     $V3C $LIST
 else
