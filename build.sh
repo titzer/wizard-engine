@@ -99,12 +99,13 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
 	if [ "$PREGEN" != 0 ]; then
-            cp $E $E.genint
-            $E.genint -gen-int=$E > /tmp/wizeng.genint.out 2>&1
+            cp $E $E.pregen
+            $E.pregen -pregen=$E > /tmp/wizeng.pregen.out 2>&1
 	    if [ $? != 0 ]; then
-		echo warning: could not serialize interpreter into $E, may be slower
+		echo "warning: could not pregen code into $E, may be slower (see $E.pregen)"
+	    else
+		rm $E.pregen
 	    fi
-            rm $E.genint
 	else
 	    echo "warning: skipped pregen of stubs in $E, may be slower"
 	fi
