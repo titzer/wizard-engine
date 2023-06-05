@@ -2673,6 +2673,10 @@
   (invoke "as-local.set/get-value_0_1" (v128.const i32x4 0x1 0x1 0x1 0x1))
   (v128.const i32x4 0x1 0x1 0x1 0x1)
 )
+(assert_return
+  (invoke "as-local.set/get-value_3_0" (v128.const i32x4 0x2 0x2 0x2 0x2))
+  (v128.const i32x4 0x2 0x2 0x2 0x2)
+)
 (assert_return (invoke "as-local.tee-value") (v128.const i32x4 0x0 0x1 0x2 0x3))
 (module binary
   "\00\61\73\6d\01\00\00\00\01\95\80\80\80\00\04\60"
