@@ -121,5 +121,14 @@ for target in $TEST_TARGETS; do
     do_script virgil/test
 done
 
+# Wasi tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = v3i ] || [ "$target" = jvm ] || [ "$target" = x86-linux ]; then
+	    skip wasi "doesn't run on v3i, jvm v86-linux" # TODO: wasi api is not implemented in v3i, jvm, x86-linux
+        continue
+    fi
+    do_script wasi/test
+done
 
 exit 0
