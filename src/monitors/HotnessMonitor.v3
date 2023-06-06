@@ -1,11 +1,26 @@
 // Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def OUT = Trace.OUT;
+
 // Implements a monitor that computes various measures of hotness of the program.
 class HotnessMonitor extends Monitor {
 	var hotness: HotnessData;
+	var inCodeMode = false;
+
+	def configure(args: string) -> string {
+		def argMap = MonitorOptions.parseMonitorArgs(args);
+		if (argMap.has("code") || argMap.has("c")) {
+			inCodeMode = true;
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
+	}
+
 	def onParse(m: Module) {
-		hotness = HotnessData.new(m);
+		hotness = HotnessData.new(m, inCodeMode);
 		var it = BytecodeIterator.new();
 
 		for (i < m.functions.length) {
@@ -27,41 +42,133 @@ class HotnessMonitor extends Monitor {
 	}
 }
 
-private class HotnessData(m: Module) {
+private class HotnessData(m: Module, inCodeMode: bool) {
 	def counters = Vector<LocCounter>.new();
 	
 	def newProbe(f: FuncDecl, pc: int) -> LocCounter {
-		var p = LocCounter.new(f, pc, 0);
+		var p = LocCounter.new(f, pc, 0, 0);
 		counters.put(p);
 		return p;
 	}
 	def report() {
 		// report the hottest paths in the program
-		var result = counters.extract();
+		var result = counters.copy();
+
 		result = Arrays.sort(result, 0, result.length, LocCounter.compare);
 		var total = 0uL;
 		for (r in result) total += r.count;
 		var sum = 0uL;
-		
-		var thresholds = [0.5d, 0.75d, 0.9d, 0.95d, 0.99d], t = 0;
+
+		var thresholds = [0.5d, 0.75d, 0.9d, 0.95d, 0.99d, 1d], t = 0;
 		var threshold = u64.truncd(thresholds[t] * double.roundi(total));
-		
+		var spectrum = [
+			Palette.VERY_HIGH, 
+			Palette.HIGH, 
+			Palette.MEDIUM, 
+			Palette.ACTIVE, 
+			Palette.LOW, 
+			Palette.VERY_LOW, 
+			Palette.UNREACHABLE
+		];
+
 		for (i < result.length) {
 			var r = result[i];
-			r.func.render(m.names, Trace.OUT);
-			Trace.OUT.put2(" +%d: %d", r.pc, r.count);
-			Trace.OUT.outln();
+			var funcColor = if(r.count > 0, Palette.FUNC, Palette.UNREACHABLE);
+			var lineColor = if(r.count > 0, Palette.LNO, Palette.UNREACHABLE);
+			if (inCodeMode) {
+				r.group = t;
+			} else {
+				OUT.puts(funcColor)
+					.puts("func ");
+				r.func.render(m.names, OUT);
+				OUT.puts(lineColor)
+					.put1(" +%d", r.pc)
+					.puts(Palette.DEFAULT)
+					.puts(":\t")
+					.puts(spectrum[t])
+					.putd(r.count)
+					.puts(Palette.DEFAULT)
+					.outln();
+			}
 			sum += r.count;
 			if (sum >= threshold) {
-				Trace.OUT.put2("--- (%d instrs) reach %d%", i, u64.truncd(100*thresholds[t])).outln();
+				if (inCodeMode) {
+					OUT.puts(spectrum[t])
+						.put2("--- (%d instrs)\treach %d%", i, u64.truncd(100*thresholds[t]))
+						.puts(Palette.DEFAULT)
+						.outln();
+				} else {
+					OUT.puts(spectrum[t])
+						.put2("--- (%d instrs)\treach %d%", i, u64.truncd(100*thresholds[t]))
+						.puts(Palette.DEFAULT)
+						.outln();
+				}
 				t++;
 				if (t >= thresholds.length) threshold = u64.max;
 				else threshold = u64.truncd(thresholds[t] * double.roundi(total));
 			}
 		}
+
+		if (!inCodeMode) return;
+
+		result = counters.extract();
+		def tracer = InstrTracer.new();
+		var bi = BytecodeIterator.new();
+		var i = 0;
+		while (i < result.length) {
+			var r = result[i];
+			bi = bi.reset(r.func);
+			var indent = 0;
+			OUT.puts(Palette.FUNC)
+				.put1("func %q:", r.func.render(m.names, _))
+				.puts(Palette.DEFAULT)
+				.outln();
+			var controlStack = ArrayStack<Opcode>.new();
+			while (bi.more()) {
+				r = result[i++];
+				var color = spectrum[r.group];
+				var op = bi.current();
+				match (op) {
+					BLOCK, LOOP, IF => {
+						controlStack.push(op);
+						OUT.puts(if(r.count > 0, Palette.LNO, Palette.UNREACHABLE))
+							.put1("+%d\t", bi.pc)
+							.puts(color)
+							.putd(r.count)
+							.putc('\t');
+						for (k < indent) {
+							OUT.putc('\t');
+						}
+						indent++;
+						OUT.puts(color);
+						bi.traceOrig(OUT, m, tracer);
+						OUT.puts(Palette.DEFAULT).outln();
+						bi.next();
+						continue;
+					}
+					END => {
+						var topControl = controlStack.pop();
+						indent--;
+					}
+					_ => ;
+				}
+				OUT.puts(if(r.count > 0, Palette.LNO, Palette.UNREACHABLE))
+					.put1("+%d\t", bi.pc)
+					.puts(spectrum[r.group])
+					.putd(r.count)
+					.putc('\t');
+				if (op == Opcode.ELSE) for (k < indent-1) OUT.putc('\t');
+				else for (k < indent) OUT.putc('\t');
+				OUT.puts(color);
+				bi.traceOrig(OUT, m, tracer);
+				OUT.puts(Palette.DEFAULT).outln();
+				bi.next();
+			}
+		}
 	}
 }
-private class LocCounter(func: FuncDecl, pc: int, var count: u64) extends Probe {
+
+private class LocCounter(func: FuncDecl, pc: int, var count: u64, var group: int) extends Probe {
 	def compare(that: LocCounter) -> bool {
 		if (this.count > that.count) return true;
 		if (this.count < that.count) return false;
