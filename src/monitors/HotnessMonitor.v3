@@ -20,7 +20,7 @@ class HotnessMonitor extends Monitor {
 	}
 
 	def onParse(m: Module) {
-		hotness = HotnessData.new(m, inCodeMode);
+		hotness = HotnessData.new(m);
 		var it = BytecodeIterator.new();
 
 		for (i < m.functions.length) {
@@ -28,8 +28,7 @@ class HotnessMonitor extends Monitor {
 			if (f.imp != null) continue; // skip imported functions
 
 			for (bi = it.reset(f); bi.more(); bi.next()) {
-				bi.current();
-				def p = hotness.newProbe(f, bi.pc);
+				def p = hotness.newProbe(f, bi.current(), bi.pc);
 				m.insertProbeAt(f.func_index, bi.pc, p);
 			}
 		}
@@ -38,130 +37,126 @@ class HotnessMonitor extends Monitor {
 		onFinish(null);
 	}
 	def onFinish(i: Instance) {
-		hotness.report();
+		if (inCodeMode) hotness.reportCode();
+		else hotness.report();
 	}
 }
 
-private class HotnessData(m: Module, inCodeMode: bool) {
+private class HotnessData(m: Module) {
 	def counters = Vector<LocCounter>.new();
-	
-	def newProbe(f: FuncDecl, pc: int) -> LocCounter {
-		var p = LocCounter.new(f, pc, 0, 0);
+	var thresholds = [0.5d, 0.75d, 0.9d, 0.95d, 0.99d, 1d];
+	var spectrum = [
+		Palette.VERY_HIGH, 
+		Palette.HIGH, 
+		Palette.MEDIUM, 
+		Palette.ACTIVE, 
+		Palette.LOW, 
+		Palette.VERY_LOW, 
+		Palette.UNREACHABLE
+	];
+
+	def newProbe(f: FuncDecl, op: Opcode, pc: int) -> LocCounter {
+		var p = LocCounter.new(f, pc, op, 0, 0);
 		counters.put(p);
 		return p;
 	}
-	def report() {
-		// report the hottest paths in the program
-		var result = counters.copy();
 
+	// initialize report
+	def initialize(sort: bool) -> Array<LocCounter> {
+		var result = if(sort, counters.extract(), counters.copy());
 		result = Arrays.sort(result, 0, result.length, LocCounter.compare);
 		var total = 0uL;
 		for (r in result) total += r.count;
 		var sum = 0uL;
-
-		var thresholds = [0.5d, 0.75d, 0.9d, 0.95d, 0.99d, 1d], t = 0;
+		var t = 0;
 		var threshold = u64.truncd(thresholds[t] * double.roundi(total));
-		var spectrum = [
-			Palette.VERY_HIGH, 
-			Palette.HIGH, 
-			Palette.MEDIUM, 
-			Palette.ACTIVE, 
-			Palette.LOW, 
-			Palette.VERY_LOW, 
-			Palette.UNREACHABLE
-		];
 
 		for (i < result.length) {
 			var r = result[i];
-			var funcColor = if(r.count > 0, Palette.FUNC, Palette.UNREACHABLE);
-			var lineColor = if(r.count > 0, Palette.LNO, Palette.UNREACHABLE);
-			if (inCodeMode) {
-				r.group = t;
-			} else {
-				OUT.puts(funcColor)
-					.puts("func ");
-				r.func.render(m.names, OUT);
-				OUT.puts(lineColor)
-					.put1(" +%d", r.pc)
-					.puts(Palette.DEFAULT)
-					.puts(":\t")
-					.puts(spectrum[t])
-					.putd(r.count)
-					.puts(Palette.DEFAULT)
-					.outln();
-			}
+			r.group = t;
 			sum += r.count;
 			if (sum >= threshold) {
-				OUT.puts(spectrum[t])
-					.put2("--- (%d instrs)\treach %d%", i, u64.truncd(100*thresholds[t]))
-					.puts(Palette.DEFAULT)
-					.outln();
 				t++;
 				if (t >= thresholds.length) threshold = u64.max;
 				else threshold = u64.truncd(thresholds[t] * double.roundi(total));
 			}
 		}
 
-		if (!inCodeMode) return;
+		return result;
+	}
 
-		result = counters.extract();
-		def tracer = InstrTracer.new();
-		var bi = BytecodeIterator.new();
-		var i = 0;
-		while (i < result.length) {
+	def report() {
+		var result = initialize(true);
+
+		for (i < result.length) {
 			var r = result[i];
-			bi = bi.reset(r.func);
-			var indent = 0;
-			OUT.puts(Palette.FUNC)
-				.put1("func %q:", r.func.render(m.names, _))
+
+			if (i > 0 && r.group > result[i-1].group) {
+				var t = result[i-1].group;
+				OUT.puts(spectrum[t])
+					.put2("--- (%d instrs)\treach %d%", i, u64.truncd(100*thresholds[t]))
+					.puts(Palette.DEFAULT)
+					.outln();
+			}
+			
+			var funcColor = if(r.count > 0, Palette.FUNC, Palette.UNREACHABLE);
+			var lineColor = if(r.count > 0, Palette.LNO, Palette.UNREACHABLE);
+
+			OUT.puts(funcColor)
+				.puts("func ");
+			r.func.render(m.names, OUT);
+			OUT.puts(lineColor)
+				.put1(" +%d", r.pc)
+				.puts(Palette.DEFAULT)
+				.puts(":\t")
+				.puts(spectrum[r.group])
+				.putd(r.count)
 				.puts(Palette.DEFAULT)
 				.outln();
-			var controlStack = ArrayStack<Opcode>.new();
-			while (bi.more()) {
-				r = result[i++];
-				var color = spectrum[r.group];
-				var op = bi.current();
-				match (op) {
-					BLOCK, LOOP, IF => {
-						controlStack.push(op);
-						OUT.puts(if(r.count > 0, Palette.LNO, Palette.UNREACHABLE))
-							.put1("+%d\t", bi.pc)
-							.puts(color)
-							.putd(r.count)
-							.putc('\t');
-						for (k < indent) {
-							OUT.putc('\t');
-						}
-						indent++;
-						OUT.puts(color);
-						bi.traceOrig(OUT, m, tracer);
-						OUT.puts(Palette.DEFAULT).outln();
-						bi.next();
-						continue;
-					}
-					END => {
-						var topControl = controlStack.pop();
-						indent--;
-					}
-					_ => ;
-				}
-				OUT.puts(if(r.count > 0, Palette.LNO, Palette.UNREACHABLE))
-					.put1("+%d\t", bi.pc)
-					.puts(spectrum[r.group])
-					.putd(r.count)
-					.putc('\t');
-				if (op == Opcode.ELSE) for (k < indent-1) OUT.putc('\t');
-				else for (k < indent) OUT.putc('\t');
-				OUT.puts(color);
-				bi.traceOrig(OUT, m, tracer);
-				OUT.puts(Palette.DEFAULT).outln();
-				bi.next();
+		}
+
+	}
+
+	def reportCode() {
+		initialize(false);
+		
+		var prev: FuncDecl;
+		var bi = BytecodeIterator.new();
+		var it = InstrTracer.new();
+		var controlStack = ArrayStack<Opcode>.new();
+		for (i < counters.length) {
+			var e = counters[i];
+			if (e.func != prev) {
+				bi.reset(e.func);
+				prev = e.func;
+				OUT.puts(Palette.FUNC)
+					.put1("func %q:", prev.render(m.names, _))
+					.outln();
 			}
+			bi.skipToPc(e.pc);
+			OUT.puts(Palette.LNO).put1("+%d ", e.pc)
+			    .puts(spectrum[e.group])
+			    .put1("\t%d\t", e.count);
+			match(e.op) {
+				BLOCK, LOOP, IF =>  {
+					for(i < controlStack.top) OUT.putc('\t');
+					bi.traceOrig(OUT, m, it);
+					OUT.outln();
+					controlStack.push(e.op);
+					continue;
+				}
+				END => controlStack.pop();
+				_ => ;
+			}
+			if (e.op == Opcode.ELSE) for(i < controlStack.top - 1) OUT.putc('\t');
+			else for(i < controlStack.top) OUT.putc('\t');
+			bi.traceOrig(OUT, m, it);
+			OUT.outln();
 		}
 	}
 }
 
-private class LocCounter(func: FuncDecl, pc: int, var count: u64, var group: int) extends Probe {
+private class LocCounter(func: FuncDecl, pc: int, op: Opcode, var count: u64, var group: int) extends Probe {
 	def compare(that: LocCounter) -> bool {
 		if (this.count > that.count) return true;
 		if (this.count < that.count) return false;
