@@ -78,7 +78,7 @@ function run_tests() {
 }
 
 if [ "$RAW" = 0 ]; then
-    run_tests $TESTS | $PROGRESS
+    run_tests $TESTS
 else
     run_tests $TESTS
 fi
