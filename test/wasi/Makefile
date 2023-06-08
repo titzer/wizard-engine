@@ -2,7 +2,7 @@ RT=$(VIRGIL_LOC)/rt
 N=$(RT)/native
 W=$(RT)/wasi_snapshot_preview1
 # RT_FILES=$(shell echo $W/*.v3 $N/NativeFileStream.v3)
-RT_FILES=$(shell echo $W/wasi_snapshot_preview1.v3 $N/NativeFileStream.v3)
+RT_FILES=$(shell echo $W/wasi_snapshot_preview1.v3 $W/System.v3 $N/NativeFileStream.v3)
 WATS=$(shell find . -name "*.wat")
 VS=$(shell find . -name "*.v3")
 WASM_WATS=$(WATS:.wat=.wasm)
