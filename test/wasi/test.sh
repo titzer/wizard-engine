@@ -8,8 +8,6 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-# We will make sure that all the wasi fuctionalities work in the x86-64-linux environment first
-TEST_TARGET=x86-64-linux
 . $DIR/../common.sh wasi
 
 make_binary wizeng || exit $?
@@ -25,6 +23,7 @@ else
     TESTS="$@"
 fi
 
+target=$TEST_TARGET
 RAW=${RAW:=0}
 
 function run_test() {
@@ -71,6 +70,10 @@ function run_test() {
 }
 
 function run_tests() {
+    if [ "$target" = v3i ] || [ "$target" = jvm ] || [ "$target" = x86-linux ]; then
+        # TODO: wasi apis are not implemented in those yet
+        return
+    fi
     printf "##>%d\n" $#
     for t in $@; do
 	    run_test $t
