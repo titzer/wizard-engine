@@ -2110,23 +2110,31 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movb_r_m(r, ip_ptr);
 		asm.q.add_r_i(r_ip, 1);
 	}
-	def decode_memarg(scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
+	def decode_memarg(src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
 		asm.q.inc_r(r_ip);			// skip flags byte
 		genReadUleb32(scratch1);			// decode offset
-		asm.movd_r_m(scratch2, vsph[-1].value);	// read index
+		asm.movd_r_m(scratch2, src);	// read index
 		asm.q.add_r_r(scratch1, scratch2);		// add index + offset
 		return r_mem0_base.plusR(scratch1, 1, 0);
 	}
-	def load_memarg32(dst: X86_64Gpr, scratch: X86_64Gpr) {
-		def addr = decode_memarg(dst, scratch);
+	def load_memarg8(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
+		asm.q.movb_r_m(dst, addr);
+	}
+	def load_memarg16(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
+		asm.q.movw_r_m(dst, addr);
+	}
+	def load_memarg32(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
 		asm.q.movd_r_m(dst, addr);
 	}
-	def load_memarg64(dst: X86_64Gpr, scratch: X86_64Gpr) {
-		def addr = decode_memarg(dst, scratch);
+	def load_memarg64(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
 		asm.q.movq_r_m(dst, addr);
 	}
-	def load_memarg128(dst: X86_64Xmmr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) {
-		def addr = decode_memarg(scratch1, scratch2);
+	def load_memarg128(dst: X86_64Xmmr, src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) {
+		def addr = decode_memarg(src, scratch1, scratch2);
 		asm.movdqu_s_m(dst, addr);
 	}
 	def genExtractLane(opcode: Opcode, tag: byte, size: byte, 
@@ -2168,11 +2176,26 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		decrementVsp();
 		endHandler();
 	}
+	def genLoadLane(opcode: Opcode, size: byte,
+		load_memarg: (X86_64Gpr, X86_64Addr, X86_64Gpr) -> void,
+		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+		bindHandler(opcode);
+		def dst : X86_64Addr = vsph[-1].value;
+		def idx : X86_64Gpr = r_tmp0;
+		def val : X86_64Gpr = r_tmp1;
+		def addr : X86_64Gpr = r_tmp2;
+		load_memarg(val, vsph[-2].value, addr); // should load memarg first per the bytecode order
+		load_imm8(idx); // then load imm
+		asm.q.lea(addr, dst); // load address
+		asm_mov_m_r(X86_64Addr.new(addr, idx, size, 0), val); // store (replace) value
+		if (valuerep.tagged) genTagUpdate(BpTypeCode.V128.code);
+		endHandler();
+	}
 	def genV128LoadZero(opcode: Opcode,
-		load_memarg: (X86_64Gpr, X86_64Gpr) -> void,
+		load_memarg: (X86_64Gpr, X86_64Addr, X86_64Gpr) -> void,
 		asm_insert_s_r_i: (X86_64Xmmr, X86_64Gpr, u8) -> X86_64Assembler) {
 		bindHandler(opcode);
-		load_memarg(r_tmp0, r_tmp1); // load memarg to tmp0
+		load_memarg(r_tmp0, vsph[-1].value, r_tmp1); // load memarg to tmp0
 		masm.emit_v128_zero(r_xmm0); // zero out xmm0
 		asm_insert_s_r_i(r_xmm0, r_tmp0, 0); // insert value to lowest bits
 		asm.movdqu_m_s(vsph[-1].value, r_xmm0);
@@ -2181,10 +2204,17 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genSimdInstrs() {
 		bindHandler(Opcode.V128_LOAD); {
-			load_memarg128(r_xmm0, r_tmp0, r_tmp1);
+			load_memarg128(r_xmm0, vsph[-1].value, r_tmp0, r_tmp1);
 			if (valuerep.tagged) genTagUpdate(BpTypeCode.V128.code); // update tag if necessary
 			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 			endHandler();
+		}
+		{
+			// V128 load_lane
+			genLoadLane(Opcode.V128_LOAD_8_LANE, 1, load_memarg8, asm.q.movb_m_r);
+			genLoadLane(Opcode.V128_LOAD_16_LANE, 2, load_memarg16, asm.q.movw_m_r);
+			genLoadLane(Opcode.V128_LOAD_32_LANE, 4, load_memarg32, asm.q.movd_m_r);
+			genLoadLane(Opcode.V128_LOAD_64_LANE, 8, load_memarg64, asm.q.movq_m_r);
 		}
 		{	// V128 load_lane with zero-extension
 			genV128LoadZero(Opcode.V128_LOAD_32_ZERO, load_memarg32, asm.pinsrd_s_r_i);
