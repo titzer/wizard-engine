@@ -1,7 +1,7 @@
 RT=$(VIRGIL_LOC)/rt
+UTIL=$(shell echo ${VIRGIL_LOC}/lib/util/*.v3)
 N=$(RT)/native
 W=$(RT)/wasi_snapshot_preview1
-# RT_FILES=$(shell echo $W/*.v3 $N/NativeFileStream.v3)
 RT_FILES=$(shell echo $W/wasi_snapshot_preview1.v3 $W/System.v3 $N/NativeFileStream.v3)
 WATS=$(shell find . -name "*.wat")
 VS=$(shell find . -name "*.v3")
@@ -15,7 +15,7 @@ all: $(WASM_WATS) $(WASM_VS)
 	wat2wasm $< -o $@
 
 %.wasm: %.v3
-	v3c -target=wasm -entry-export=_start -main-export=_start -rt.files="$(RT_FILES)" -heap-size=64k $<
+	v3c -target=wasm -entry-export=_start -main-export=_start -rt.files="$(RT_FILES)" -heap-size=64k $(UTIL) $<
 
 .PHONY: clean
 clean:
