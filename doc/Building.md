@@ -121,7 +121,7 @@ Now you're ready to run the specification tests.
 ...
 ```
 
-## Monitor Tests
+### Monitor Tests
 In `test/wizeng/` folder, to test all monitors with all the tests in this folder run:
 ```bash
 ./monitors.sh 
