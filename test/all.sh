@@ -101,6 +101,16 @@ for target in $TEST_TARGETS; do
     do_script wizeng/test
 done
 
+# Wizeng monitors tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = "" ]; then # for symmetry
+	skip monitors
+        continue
+    fi
+    do_script wizeng/monitors
+done
+
 # Self-hosted (unit) tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target

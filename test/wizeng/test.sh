@@ -12,7 +12,7 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 make_binary wizeng || exit $?
 
-WIZENG="../../$BINARY $WIZENG_OPTS"
+WIZENG="../../$BINARY $WIZENG_OPTS -nocolor"
 
 target=$TEST_TARGET
 

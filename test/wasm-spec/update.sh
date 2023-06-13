@@ -78,6 +78,7 @@ function build {
 	        echo "##+[$b] translating $sub/$t"
 		cp $t $SRC_SUB
 	        $WASM $t -o $BIN_SUB/${t/%.wast/}.bin.wast
+	        $WASM $t -o $BIN_SUB/${t/%.wast/}.wasm
                 check $?
             done
             popd
