@@ -121,6 +121,22 @@ Now you're ready to run the specification tests.
 ...
 ```
 
+## Monitor Tests
+In `test/wizeng/` folder, to test all monitors with all the tests in this folder run:
+```bash
+./monitors.sh 
+```
+Pass monitor names as arguments to only test specific monitor arguments:
+```bash
+./monitors.sh loops branches{c}
+```
+Use the `monitors-update.sh` script to update/create test outputs, for when a monitor is updated or a new monitor is added:
+```bash
+./monitors-update.sh <new-monitor1> <new-monitor2>
+```
+This will generate test outputs for valid test files found in `test/wizeng` for the supplied monitors.
+
+
 ## Proposal Tests
 
 The scripts for building and running specification tests can also handle proposals, such as (`gc` or `function-references`).
