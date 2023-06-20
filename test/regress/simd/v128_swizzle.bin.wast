@@ -1,0 +1,204 @@
+(module binary
+  "\00\61\73\6d\01\00\00\00\01\87\80\80\80\00\01\60"
+  "\02\7b\7b\01\7b\03\82\80\80\80\00\01\00\07\91\80"
+  "\80\80\00\01\0d\76\38\78\31\36\5f\73\77\69\7a\7a"
+  "\6c\65\00\00\0a\8e\80\80\80\00\01\88\80\80\80\00"
+  "\00\20\00\20\01\fd\0e\0b"
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x1312_1110 0x1716_1514 0x1b1a_1918 0x1f1e_1d1c)
+    (v128.const i32x4 0x302_0100 0x706_0504 0xb0a_0908 0xf0e_0d0c)
+  )
+  (v128.const i8x16
+    0x10
+    0x11
+    0x12
+    0x13
+    0x14
+    0x15
+    0x16
+    0x17
+    0x18
+    0x19
+    0x1a
+    0x1b
+    0x1c
+    0x1d
+    0x1e
+    0x1f
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0xf3f2_f1f0 0xf7f6_f5f4 0xfbfa_f9f8 0xfffe_fdfc)
+    (v128.const i32x4 0xfbfa_f9f8 0xfffe_fdfc 0x1312_1110 0x1716_1514)
+  )
+  (v128.const i8x16
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+    0x0
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6766_6564 0x6b6a_6968 0x6f6e_6d6c 0x7372_7170)
+    (v128.const i32x4 0xc0d_0e0f 0x809_0a0b 0x405_0607 0x1_0203)
+  )
+  (v128.const i8x16
+    0x73
+    0x72
+    0x71
+    0x70
+    0x6f
+    0x6e
+    0x6d
+    0x6c
+    0x6b
+    0x6a
+    0x69
+    0x68
+    0x67
+    0x66
+    0x65
+    0x64
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6766_6564 0x6b6a_6968 0x6f6e_6d6c 0x7372_7170)
+    (v128.const i32x4 0x2fe_01ff 0x4fc_03fd 0x6fa_05fb 0x8f8_07f9)
+  )
+  (v128.const i8x16
+    0x0
+    0x65
+    0x0
+    0x66
+    0x0
+    0x67
+    0x0
+    0x68
+    0x0
+    0x69
+    0x0
+    0x6a
+    0x0
+    0x6b
+    0x0
+    0x6c
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6766_6564 0x6b6a_6968 0x6f6e_6d6c 0x7372_7170)
+    (v128.const i32x4 0x110a_1009 0x130c_120b 0x150e_140d 0x1710_160f)
+  )
+  (v128.const i8x16
+    0x6d
+    0x0
+    0x6e
+    0x0
+    0x6f
+    0x0
+    0x70
+    0x0
+    0x71
+    0x0
+    0x72
+    0x0
+    0x73
+    0x0
+    0x0
+    0x0
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6766_6564 0x6b6a_6968 0x6f6e_6d6c 0x7372_7170)
+    (v128.const i32x4 0x110a_1009 0x130c_120b 0x150e_140d 0x1710_160f)
+  )
+  (v128.const i8x16
+    0x6d
+    0x0
+    0x6e
+    0x0
+    0x6f
+    0x0
+    0x70
+    0x0
+    0x71
+    0x0
+    0x72
+    0x0
+    0x73
+    0x0
+    0x0
+    0x0
+  )
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6667_6465 0x6a6b_6869 0x6e6f_6c6d 0x7273_7071)
+    (v128.const i32x4 0x302_0100 0x706_0504 0xb0a_0908 0xf0e_0d0c)
+  )
+  (v128.const i16x8 0x6465 0x6667 0x6869 0x6a6b 0x6c6d 0x6e6f 0x7071 0x7273)
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6465_6667 0x6869_6a6b 0x6c6d_6e6f 0x7071_7273)
+    (v128.const i32x4 0xc0d_0e0f 0x809_0a0b 0x405_0607 0x1_0203)
+  )
+  (v128.const i32x4 0x7372_7170 0x6f6e_6d6c 0x6b6a_6968 0x6766_6564)
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x7fc0_0000 0xffc0_0000 0x7f80_0000 0xff80_0000)
+    (v128.const i32x4 0x302_0100 0x706_0504 0xb0a_0908 0xf0e_0d0c)
+  )
+  (v128.const i32x4 0x7fc0_0000 0xffc0_0000 0x7f80_0000 0xff80_0000)
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x6766_6564 0x6b6a_6968 0x6f6e_6d5c 0x7372_7170)
+    (v128.const i32x4 0x0 0x8000_0000 0x7f80_0000 0xff80_0000)
+  )
+  (v128.const i32x4 0x6464_6464 0x64_6464 0x6464 0x6464)
+)
+(assert_return
+  (invoke "v8x16_swizzle"
+    (v128.const i32x4 0x4996_02d2 0x1234_5678 0x4996_02d2 0x1234_5678)
+    (v128.const i32x4 0x302_0100 0x706_0504 0xb0a_0908 0xf0e_0d0c)
+  )
+  (v128.const i32x4 0x4996_02d2 0x1234_5678 0x4996_02d2 0x1234_5678)
+)
+(assert_invalid
+  (module binary
+    "\00\61\73\6d\01\00\00\00\01\85\80\80\80\00\01\60"
+    "\00\01\7b\03\82\80\80\80\00\01\00\0a\9e\80\80\80"
+    "\00\01\98\80\80\80\00\00\41\01\fd\0c\0f\0e\0d\0c"
+    "\0b\0a\09\08\07\06\05\04\03\02\01\00\fd\0e\0b"
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module binary
+    "\00\61\73\6d\01\00\00\00\01\85\80\80\80\00\01\60"
+    "\00\01\7b\03\82\80\80\80\00\01\00\0a\9e\80\80\80"
+    "\00\01\98\80\80\80\00\00\fd\0c\0f\0e\0d\0c\0b\0a"
+    "\09\08\07\06\05\04\03\02\01\00\41\02\fd\0e\0b"
+  )
+  "type mismatch"
+)
