@@ -1,6 +1,6 @@
 # Wizard Engine Instrumentation
 
-The Wizard engine offers a variety of instrumentation and dynamic analysis monitors that provide information alongside the Wasm bytecode. These monitors dynamically insert probes into various parts of the bytecode, utilizing Wizard's efficient probing mechanism.
+The Wizard engine offers a variety of instrumentation and dynamic analysis monitors that are capable of providing information alongside Wasm bytecode as a program executes. These monitors dynamically insert probes into various parts of the bytecode, utilizing Wizard's efficient probing mechanism.
 
 ## Usage
 
