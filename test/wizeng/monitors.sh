@@ -8,7 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh wizeng-monitors
+. $DIR/../common.sh monitors
 
 make_binary wizeng || exit $?
 
