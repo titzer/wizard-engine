@@ -23,7 +23,7 @@ wizeng --monitors=loops,coverage{code=instr} test.wasm
 
 ## Options
 
-The available monitors and their options are as follows:
+When no optional arguments are provided, most monitors display only summaries. The `code` argument will print out instrumentation infromation alongside bytecode, where possible. The available monitors and their options are as follows:
 
 | Monitor    | Options                                    | Description                                                                                         |
 |------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------|
@@ -36,8 +36,6 @@ The available monitors and their options are as follows:
 | `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
 | `globals`  |                                            | Provides information on the usage of global variables.                                              |
 | `debug`    |                                            | Provides ability to step through bytecode and pause execution using breakpoints.                    |
-
-When no optional arguments are provided, most monitors display only summaries.
 
 ## Debugger
 
