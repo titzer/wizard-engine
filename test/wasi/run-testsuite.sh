@@ -8,7 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
-# TODO: Update to WebAssembly one once it gets merged
+# TODO: Update to WebAssembly owned repository once it gets merged
 REPO=https://github.com/pco2699/wasi-testsuite
 BRANCH=prod/testsuite-base
 REPOS=${WIZENG_LOC}/wasi/repos/
