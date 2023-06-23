@@ -2110,24 +2110,36 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movb_r_m(r, ip_ptr);
 		asm.q.add_r_i(r_ip, 1);
 	}
-	def decode_memarg(scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
+	def decode_memarg(src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
 		asm.q.inc_r(r_ip);			// skip flags byte
 		genReadUleb32(scratch1);			// decode offset
-		asm.movd_r_m(scratch2, vsph[-1].value);	// read index
+		asm.movd_r_m(scratch2, src);	// read index
 		asm.q.add_r_r(scratch1, scratch2);		// add index + offset
 		return r_mem0_base.plusR(scratch1, 1, 0);
 	}
-	def load_memarg32(dst: X86_64Gpr, scratch: X86_64Gpr) {
-		def addr = decode_memarg(dst, scratch);
+	def load_memarg8(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
+		asm.q.movb_r_m(dst, addr);
+	}
+	def load_memarg16(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
+		asm.q.movw_r_m(dst, addr);
+	}
+	def load_memarg32(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
 		asm.q.movd_r_m(dst, addr);
 	}
-	def load_memarg64(dst: X86_64Gpr, scratch: X86_64Gpr) {
-		def addr = decode_memarg(dst, scratch);
+	def load_memarg64(dst: X86_64Gpr, src: X86_64Addr, scratch: X86_64Gpr) {
+		def addr = decode_memarg(src, dst, scratch);
 		asm.q.movq_r_m(dst, addr);
 	}
-	def load_memarg128(dst: X86_64Xmmr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) {
-		def addr = decode_memarg(scratch1, scratch2);
+	def load_memarg128(dst: X86_64Xmmr, src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) {
+		def addr = decode_memarg(src, scratch1, scratch2);
 		asm.movdqu_s_m(dst, addr);
+	}
+	def store_memarg128(src: X86_64Addr, data: X86_64Xmmr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) {
+		def addr = decode_memarg(src, scratch1, scratch2);
+		asm.movdqu_m_s(addr, data);
 	}
 	def genExtractLane(opcode: Opcode, tag: byte, size: byte, 
 		asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> X86_64Assembler,
@@ -2168,27 +2180,97 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		decrementVsp();
 		endHandler();
 	}
+	def genLoadLane(opcode: Opcode, size: byte,
+		load_memarg: (X86_64Gpr, X86_64Addr, X86_64Gpr) -> void,
+		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+		bindHandler(opcode);
+		def dst : X86_64Addr = vsph[-1].value;
+		def idx : X86_64Gpr = r_tmp0;
+		def val : X86_64Gpr = r_tmp1;
+		def addr : X86_64Gpr = r_tmp2;
+		load_memarg(val, vsph[-2].value, addr); // should load memarg first per the bytecode order
+		load_imm8(idx); // then load imm
+		asm.q.lea(addr, dst); // load address
+		asm_mov_m_r(X86_64Addr.new(addr, idx, size, 0), val); // store (replace) value
+		if (valuerep.tagged) genTagUpdate(BpTypeCode.V128.code);
+		endHandler();
+	}
 	def genV128LoadZero(opcode: Opcode,
-		load_memarg: (X86_64Gpr, X86_64Gpr) -> void,
+		load_memarg: (X86_64Gpr, X86_64Addr, X86_64Gpr) -> void,
 		asm_insert_s_r_i: (X86_64Xmmr, X86_64Gpr, u8) -> X86_64Assembler) {
 		bindHandler(opcode);
-		load_memarg(r_tmp0, r_tmp1); // load memarg to tmp0
+		load_memarg(r_tmp0, vsph[-1].value, r_tmp1); // load memarg to tmp0
 		masm.emit_v128_zero(r_xmm0); // zero out xmm0
 		asm_insert_s_r_i(r_xmm0, r_tmp0, 0); // insert value to lowest bits
 		asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 		if (valuerep.tagged) genTagUpdate(BpTypeCode.V128.code);
 		endHandler();
 	}
+	def genStoreLane(opcode: Opcode, size: byte,
+		asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> X86_64Assembler,
+		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> X86_64Assembler) {
+		bindHandler(opcode);
+		def data : X86_64Addr = vsph[-1].value;
+		def idx : X86_64Gpr = r_tmp0;
+		def val : X86_64Gpr = r_tmp1;
+		def mem_addr = decode_memarg(vsph[-2].value, idx, val);
+		load_imm8(idx);
+		asm.q.lea(val, data); // load address of the vector, val as a temp variable
+		asm_mov_r_m(val, X86_64Addr.new(val, idx, size, 0)); // extract the lane from the value stack
+		asm_mov_m_r(mem_addr, val);
+		endHandler();
+	}
+	def genSplat(opcode: Opcode,
+		asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> X86_64Assembler,
+		masm_emit: (X86_64Xmmr, X86_64Gpr) -> void) {
+		bindHandler(opcode);
+		asm_mov_r_m(r_tmp0, vsph[-1].value);
+		masm_emit(r_xmm0, r_tmp0);
+		asm.movdqu_m_s(vsph[-1].value, r_xmm0);
+		genTagUpdate(BpTypeCode.V128.code);
+		endHandler();
+	}
+	def genSplatLoad(opcode: Opcode,
+		load_memarg: (X86_64Gpr, X86_64Addr, X86_64Gpr) -> void,
+		masm_emit: (X86_64Xmmr, X86_64Gpr) -> void) {
+		bindHandler(opcode);
+		load_memarg(r_tmp0, vsph[-1].value, r_tmp1);
+		masm_emit(r_xmm0, r_tmp0);
+		asm.movdqu_m_s(vsph[-1].value, r_xmm0);
+		genTagUpdate(BpTypeCode.V128.code);
+		endHandler();
+	}
 	def genSimdInstrs() {
 		bindHandler(Opcode.V128_LOAD); {
-			load_memarg128(r_xmm0, r_tmp0, r_tmp1);
+			computeCurIpForTrap(-1);
+			load_memarg128(r_xmm0, vsph[-1].value, r_tmp0, r_tmp1);
 			if (valuerep.tagged) genTagUpdate(BpTypeCode.V128.code); // update tag if necessary
 			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 			endHandler();
 		}
+		{
+			// V128 load_lane
+			genLoadLane(Opcode.V128_LOAD_8_LANE, 1, load_memarg8, asm.q.movb_m_r);
+			genLoadLane(Opcode.V128_LOAD_16_LANE, 2, load_memarg16, asm.q.movw_m_r);
+			genLoadLane(Opcode.V128_LOAD_32_LANE, 4, load_memarg32, asm.q.movd_m_r);
+			genLoadLane(Opcode.V128_LOAD_64_LANE, 8, load_memarg64, asm.q.movq_m_r);
+		}
 		{	// V128 load_lane with zero-extension
 			genV128LoadZero(Opcode.V128_LOAD_32_ZERO, load_memarg32, asm.pinsrd_s_r_i);
 			genV128LoadZero(Opcode.V128_LOAD_64_ZERO, load_memarg64, asm.pinsrq_s_r_i);
+		}
+		bindHandler(Opcode.V128_STORE); {
+			computeCurIpForTrap(-1);
+			asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+			store_memarg128(vsph[-2].value, r_xmm0, r_tmp0, r_tmp1);
+			adjustVsp(-2);
+			endHandler();
+		}
+		{
+			genStoreLane(Opcode.V128_STORE_8_LANE, 1, asm.q.movb_r_m, asm.q.movb_m_r);
+			genStoreLane(Opcode.V128_STORE_16_LANE, 2, asm.q.movw_r_m, asm.q.movw_m_r);
+			genStoreLane(Opcode.V128_STORE_32_LANE, 4, asm.q.movd_r_m, asm.q.movd_m_r);
+			genStoreLane(Opcode.V128_STORE_64_LANE, 8, asm.q.movq_r_m, asm.q.movq_m_r);
 		}
 		for (t in [
 			(Opcode.V128_AND, asm.andps_s_s),
@@ -2345,11 +2427,22 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.I16X8_EQ, asm.pcmpeqw_s_s)
 		]) {
 			bindHandler(t.0);
-			asm.movdqu_s_m(r_xmm0, vsph[-2].value);
-			asm.movdqu_s_m(r_xmm1, vsph[-1].value);
+			load_v128_xmm0_xmm1();
 			t.1(r_xmm0, r_xmm1);
 			asm.movdqu_m_s(vsph[-2].value, r_xmm0);
 			decrementVsp();
+			endHandler();
+		}
+		bindHandler(Opcode.I16X8_EXTADDPAIRWISE_I8X16_S); {
+			asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+			masm.emit_i16x8_extadd_pairwise_i8x16_s(r_xmm0, r_tmp0, r_xmm1);
+			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
+			endHandler();
+		}
+		bindHandler(Opcode.I16X8_EXTADDPAIRWISE_I8X16_U); {
+			asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+			masm.emit_i16x8_extadd_pairwise_i8x16_u(r_xmm0, r_tmp0, r_xmm1);
+			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 			endHandler();
 		}
 		for (t in [
@@ -2400,8 +2493,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.I64X2_NE, asm.pcmpeqq_s_s)
 		]) {
 			bindHandler(t.0);
-			asm.movdqu_s_m(r_xmm0, vsph[-2].value);
-			asm.movdqu_s_m(r_xmm1, vsph[-1].value);
+			load_v128_xmm0_xmm1();
 			t.1(r_xmm0, r_xmm1);
 			t.1(r_xmm1, r_xmm1);
 			asm.xorps_s_s(r_xmm0, r_xmm1);
@@ -2418,7 +2510,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.I8X16_LT_S, asm.pcmpgtb_s_s, load_v128_xmm1_xmm0),
 			(Opcode.I16X8_LT_S, asm.pcmpgtw_s_s, load_v128_xmm1_xmm0),
 			(Opcode.I32X4_LT_S, asm.pcmpgtd_s_s, load_v128_xmm1_xmm0),
-			(Opcode.I64X2_LT_S, asm.pcmpgtq_s_s, load_v128_xmm1_xmm0)
+			(Opcode.I64X2_LT_S, asm.pcmpgtq_s_s, load_v128_xmm1_xmm0),
+
+			(Opcode.F32X4_PMIN, asm.minps_s_s, load_v128_xmm1_xmm0),
+			(Opcode.F64X2_PMIN, asm.minpd_s_s, load_v128_xmm1_xmm0),
+			(Opcode.F32X4_PMAX, asm.maxps_s_s, load_v128_xmm1_xmm0),
+			(Opcode.F64X2_PMAX, asm.maxpd_s_s, load_v128_xmm1_xmm0)
 		]) {
 			bindHandler(t.0);
 			t.2();
@@ -2555,7 +2652,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		]) {
 			bindHandler(t.0);
 			asm.movdqu_s_m(r_xmm0, vsph[-1].value);
-			t.1(r_xmm0, r_tmp0, r_xmm1, r_xmm2);
+			t.1(r_xmm0, r_tmp0, r_xmm1);
 			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 			endHandler();
 		}
@@ -2599,6 +2696,47 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movdqu_m_s(vsph[-1].value, r_xmm0);
 			endHandler();
 		}
+		bindHandler(Opcode.I8X16_SHUFFLE); {
+			var RHS = X86_64Label.new(), LOOP_PRO = X86_64Label.new(), LOOP_EPI = X86_64Label.new();
+			incrementVsp(); // make room for a local variable dst (the result)
+			def dst = vsph[-1].value;
+			def dst_addr = r_tmp3;
+			asm.q.lea(dst_addr, dst);
+			def idx = r_tmp0; // idx's bound is [0, 31]
+			def val_addr = r_tmp1; // address of lhs/rhs
+			def i = r_tmp2; // loop counter
+			def SIMD_128_SIZE: byte = 16;
+			// vectors from the value stack
+			def lhs = vsph[-3].value;
+			def rhs = vsph[-2].value;
+			// for (i: byte < 16)
+			asm.movq_r_i(i, 0);
+			// LOOP_PROLOGUE:
+			asm.bind(LOOP_PRO);
+			load_imm8(idx);
+			asm.q.cmp_r_i(idx, SIMD_128_SIZE); // idx >= SIMD_128_SIZE?
+			asm.jc_rel_near(C.GE, RHS); // if so, jump to RHS
+			// Load from lhs
+			asm.q.lea(val_addr, lhs);
+			// LOOP_EPILOGUE:
+			asm.bind(LOOP_EPI);
+			asm.movb_r_m(idx, X86_64Addr.new(val_addr, idx, 1, 0)); // load value to idx, since the index is no longer needed
+			asm.movb_m_r(X86_64Addr.new(dst_addr, i, 1, 0), idx); // store value to dst
+			asm.inc_r(i);
+			asm.q.cmp_r_i(i, SIMD_128_SIZE); // loop when 0 <= i < 16
+			asm.jc_rel_near(C.L, LOOP_PRO);
+			// Return
+			asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+			asm.movdqu_m_s(vsph[-3].value, r_xmm0);
+			adjustVsp(-2);
+			endHandler();
+			// RHS:
+			asm.bind(RHS);
+			// Load from rhs
+			asm.q.sub_r_i(idx, SIMD_128_SIZE); // idx -= 16
+			asm.q.lea(val_addr, rhs);
+			asm.jmp_rel_near(LOOP_EPI);
+		}
 		{	// V128 lane extraction
 			genExtractLane(Opcode.I8X16_EXTRACTLANE_U, BpTypeCode.I32.code, 1, asm.movb_r_m, asm.movb_m_r, false);
 			genExtractLane(Opcode.I16X8_EXTRACTLANE_U, BpTypeCode.I32.code, 2, asm.movw_r_m, asm.movw_m_r, false);
@@ -2624,6 +2762,20 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genTagPush(BpTypeCode.V128.code);
 			incrementVsp();
 			endHandler();
+		}
+		{
+			// V128 splat
+			genSplat(Opcode.I8X16_SPLAT, asm.q.movb_r_m, masm.emit_i8x16_splat(_, _, r_xmm1));
+			genSplat(Opcode.I16X8_SPLAT, asm.q.movw_r_m, masm.emit_i16x8_splat);
+			genSplat(Opcode.I32X4_SPLAT, asm.q.movd_r_m, masm.emit_i32x4_splat);
+			genSplat(Opcode.I64X2_SPLAT, asm.q.movq_r_m, masm.emit_i64x2_splat);
+			genSplat(Opcode.F32X4_SPLAT, asm.q.movd_r_m, masm.emit_f32x4_splat(_, _, r_xmm1));
+			genSplat(Opcode.F64X2_SPLAT, asm.q.movq_r_m, masm.emit_f64x2_splat(_, _, r_xmm1));
+			// V128 load_splat
+			genSplatLoad(Opcode.V128_LOAD_8_SPLAT, load_memarg8, masm.emit_i8x16_splat(_, _, r_xmm1));
+			genSplatLoad(Opcode.V128_LOAD_16_SPLAT, load_memarg16, masm.emit_i16x8_splat);
+			genSplatLoad(Opcode.V128_LOAD_32_SPLAT, load_memarg32, masm.emit_i32x4_splat);
+			genSplatLoad(Opcode.V128_LOAD_64_SPLAT, load_memarg64, masm.emit_i64x2_splat);
 		}
 	}
 	def bindHandler(opcode: Opcode) {

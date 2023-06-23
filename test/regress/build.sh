@@ -28,7 +28,6 @@ else
     TESTS=$(ls "$@" | grep -v .bin.wast)
 fi
 
-
 for t in $TESTS; do
     echo "##+run +$t"
     $SPEC_INT $t
