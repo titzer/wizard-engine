@@ -36,10 +36,18 @@ TESTS=$(ls *.wasm)
 RAW=${RAW:=0}
 
 function run_test {
+    local flags=""
+    local args=""
     echo "##>${#MONITORS[@]}"
     for monitor in ${MONITORS[@]}; do
         local test=$1
-        local flag="--monitors=$monitor"
+        local mflag="--monitors=$monitor"
+        if [ -f $test.flags ]; then
+            flags=$(cat $test.flags)
+        fi
+        if [ -f $test.args ]; then
+            args=$(cat $test.args)
+        fi
 
         echo "##+$test | $monitor"
 
@@ -47,9 +55,9 @@ function run_test {
         local P=$T/$test.$suffix
 
         if [ -f $test.in  ]; then
-            $WIZENG $flag "$test" < $test.in > $P.out
+            $WIZENG $flags $mflag "$test" $args < $test.in > $P.out
         else
-            $WIZENG $flag "$test" > $P.out
+            $WIZENG $flags $mflag "$test" $args > $P.out
         fi  
 
         if [ -f monitors/$test.$suffix.out  ]; then

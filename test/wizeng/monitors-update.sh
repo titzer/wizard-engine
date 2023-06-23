@@ -29,22 +29,30 @@ fi
 
 # generate output files from all .wasm in a folder
 function update_tests_from {
+    local flags=""
+    local args=""
     FOLDER=$1
     PATHS=$(ls $FOLDER/*.wasm)
     echo "##>${#MONITORS[@]}"
     for monitor in ${MONITORS[@]}; do
-        local flag="--monitors=$monitor"
+        local mflag="--monitors=$monitor"
         echo "##>"${#PATHS[@]}
         for wasm_path in $PATHS; do
             local wasm_file=$(basename $wasm_path)
+            if [ -f $wasm_file.flags ]; then
+                flags=$(cat $wasm_file.flags)
+            fi
+            if [ -f $wasm_file.args ]; then
+                args=$(cat $wasm_file.args)
+            fi
             echo "##+$monitor | $wasm_file"
-            $WIZENG $flag "$wasm_path" > $T/$wasm_file.tmp
+            $WIZENG $flags $mflag "$wasm_path" $args > $T/$wasm_file.tmp
             if [ $? = 0 ]; then
                 local suffix=$(echo "$monitor" | tr '{}=,' '-')
                 mv $T/$wasm_file.tmp monitors/$wasm_file.$suffix.out
                 echo "##-ok: Updated $monitor output for $wasm_file"
             else
-                echo "##-fail: bad output"
+                echo "##-skipped: non-zero exit code"
             fi
         done
     done
