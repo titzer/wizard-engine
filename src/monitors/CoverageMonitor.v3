@@ -1,16 +1,39 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+def OUT = Trace.OUT;
+
+class CoverageMonitorProbe(module: Module, func: FuncDecl, monitor: CoverageMonitor, start: int) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		monitor.executed[dynamicLoc.pc + start] = true;
+		module.removeProbeAt(dynamicLoc.func.decl.func_index, dynamicLoc.pc, this);
+		return Resumption.Continue;
+	}
+}
+
 // Implements a simple monitor that tracks code coverage.
 class CoverageMonitor extends Monitor {
 	def entries = Vector<CoverageMonitorProbe>.new();
 	def isStartOfBlock = Vector<bool>.new();
 	def executed = Vector<bool>.new();
-	var inBasicBlockMode = true;
+	var inBasicBlockMode = false;
+	var inCodeMode = false;
 
 	def configure(args: string) -> string {
-		if (Strings.equal(args, "instr")) inBasicBlockMode = false;
-		return null;
+		def argMap = MonitorUtil.argMapFrom(args);
+		if (argMap.has("code") || argMap.has("c")) {
+			inCodeMode = true;
+			inBasicBlockMode = true;
+			var codeArg = if (argMap.has("code"), argMap["code"], argMap["c"]);
+			if (codeArg == null) return null;
+			if (Strings.equal(codeArg, "instr") || Strings.equal(codeArg, "i")) {
+				inBasicBlockMode = false;
+			}
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
 	}
 
 	def onParse(m: Module) {
@@ -22,69 +45,139 @@ class CoverageMonitor extends Monitor {
 			entries.put(p);
 			executed.putn(false, f.cur_bytecode.length);
 
-			if (inBasicBlockMode)
-				isStartOfBlock.putn(false, f.cur_bytecode.length);
+			isStartOfBlock.putn(false, f.cur_bytecode.length);
 
 			var addToNext = true;
 			for (bi = BytecodeIterator.new().reset(f); bi.more(); bi.next()) {
 				var op = bi.current();
-				if (inBasicBlockMode) {
-					if (addToNext) {
-						addToNext = false;
+				if (addToNext) {
+					addToNext = false;
+					isStartOfBlock[offset + bi.pc] = true;
+					if (inBasicBlockMode) m.insertProbeAt(f.func_index, bi.pc, p);
+				}
+				if (!inBasicBlockMode) {
+					m.insertProbeAt(f.func_index, bi.pc, p);
+				}
+				match (op) {
+					BLOCK, LOOP, TRY, CATCH, CATCH_ALL => {
 						isStartOfBlock[offset + bi.pc] = true;
 						m.insertProbeAt(f.func_index, bi.pc, p);
 					}
-					match (op) {
-						BLOCK, LOOP, ELSE, TRY, CATCH, CATCH_ALL => {
-							isStartOfBlock[offset + bi.pc] = true;
-							m.insertProbeAt(f.func_index, bi.pc, p);
-						}
-						BR, BR_IF, BR_TABLE, IF, THROW, RETHROW, END => addToNext = true;
-						_ => ;
-					}
-				} else {
-					m.insertProbeAt(f.func_index, bi.pc, p);
+					BR, BR_IF, BR_TABLE, IF, ELSE, THROW, RETHROW, END => addToNext = true;
+					_ => ;
 				}
 			}
 		}
 	}
+
 	def onExit(code: int) {
 		onFinish(null);
 	}
-	def onFinish(i: Instance) {
-		var prev: FuncDecl;
-		var tracer = InstrTracer.new(), d = DataReader.new([]);
-		var blockCovered = false;
-		var it = BytecodeIterator.new();
 
+	def onFinish(i: Instance) {
+		report(entries, isStartOfBlock, executed, inBasicBlockMode, inCodeMode);
+	}
+}
+
+// Output monitor results to STDOUT
+def report(entries: Vector<CoverageMonitorProbe>,
+		isStartOfBlock: Vector<bool>,
+		executed: Vector<bool>,
+		inBasicBlockMode: bool, 
+		inCodeMode: bool) {
+	var lowCoverageThreshold = 75; // in %, for highlighting low coverages
+	var prev: FuncDecl;
+	var tracer = InstrTracer.new(), d = DataReader.new([]);
+	var blockCovered = false;
+	var it = BytecodeIterator.new();
+	if (inCodeMode) {
 		for (j < entries.length) {
 			var e = entries[j];
-			Trace.OUT.put1("func %q:", e.func.render(e.module.names, _)).outln();
+			OUT.puts(Palette.FUNC).put1("func %q:", e.func.render(e.module.names, _)).puts(Palette.DEFAULT).outln();
 			for (bi = it.reset(e.func); bi.more(); bi.next()) {
 				bi.current();
 				d.reset(e.func.orig_bytecode, bi.pc, e.func.orig_bytecode.length);
-
 				if (inBasicBlockMode) {
-					if (isStartOfBlock[e.start + bi.pc]) {
+					var isStart = isStartOfBlock[e.start + bi.pc];
+					if (isStart) {
 						blockCovered = executed[e.start + bi.pc];
-						Trace.OUT.puts("->");
+						if (blockCovered) {
+							OUT.puts(Palette.LNO)
+								.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5)
+								.puts(Palette.COVERED)
+								.puts(" -->")
+								.puts(Palette.DEFAULT);
+						} else {
+							OUT.puts(Palette.UNREACHABLE)
+								.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5);
+						}
 					} else {
-						Trace.OUT.puts("  ");
+						if (!blockCovered) OUT.puts(Palette.UNREACHABLE);
+						else OUT.puts(Palette.DEFAULT);
+						OUT.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.putc(_, '-')), 5);
 					}
-					Trace.OUT.puts(if(blockCovered, " * ", "   "));
+					if (blockCovered) {
+						OUT.puts(Palette.COVERED).puts(if(isStart, "", "    "));
+					} else {
+						OUT.puts("    ");
+					}
+					OUT.puts(Palette.DEFAULT).puts("  ");
+					if (!blockCovered) OUT.puts(Palette.UNREACHABLE);
+					else if (isStart) OUT.puts(Palette.COVERED_FG).puts(Palette.COVERED_BG);
+					tracer.putInstr(OUT, e.module, d);
+					OUT.puts(Palette.DEFAULT).outln();
 				} else {
-					Trace.OUT.puts(if(executed[e.start + bi.pc], " * ", "   "));
+					var byteCovered = executed[e.start + bi.pc];
+					if (byteCovered)  OUT.puts(Palette.LNO);
+					else  OUT.puts(Palette.UNREACHABLE); 
+					OUT.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5);
+					OUT.puts("  ");
+					if (!byteCovered)  OUT.puts("  ").puts(Palette.UNREACHABLE);
+					else OUT.puts(Palette.COVERED).puts("* ").puts(Palette.COVERED_FG).puts(Palette.COVERED_BG);
+					tracer.putInstr(OUT, e.module, d);
+					OUT.puts(Palette.DEFAULT).outln();
 				}
-				tracer.putInstr(Trace.OUT, e.module, d);
-				Trace.OUT.outln();
 			}
 		}
-	}
-}
-class CoverageMonitorProbe(module: Module, func: FuncDecl, monitor: CoverageMonitor, start: int) extends Probe {
-	def fire(dynamicLoc: DynamicLoc) -> Resumption {
-		monitor.executed[dynamicLoc.pc + start] = true;
-		module.removeProbeAt(dynamicLoc.func.decl.func_index, dynamicLoc.pc, this);
-		return Resumption.Continue;
+	} else { // for summary when no args given
+		var instrsCovered = 0;
+		var totalInstrs = 0;
+		var blocksCovered = 0;
+		var totalBlocks = 0;
+		for (j < entries.length) {
+			var e = entries[j];
+			for (bi = it.reset(e.func); bi.more(); bi.next()) {
+				bi.current();
+				d.reset(e.func.orig_bytecode, bi.pc, e.func.orig_bytecode.length);
+				if (isStartOfBlock[e.start + bi.pc]) {
+					totalBlocks++;
+					if (executed[e.start + bi.pc]) blocksCovered++;
+				}
+				totalInstrs++;
+				if (executed[e.start + bi.pc]) instrsCovered++;
+			}
+		}
+		var instrCovPercentage = 100 * instrsCovered / totalInstrs;
+		var blockCovPercentage = 100 * blocksCovered / totalBlocks;
+		OUT.puts("Instr coverage:\t")
+			.puts(Palette.ACTIVE)
+			.putd(instrsCovered)
+			.puts(Palette.DEFAULT)
+			.put1(" / %d ", totalInstrs);
+		OUT.puts("(").puts(Palette.SUCCESS);
+		if (instrCovPercentage < 100) OUT.puts(Palette.WARN);
+		if (instrCovPercentage < lowCoverageThreshold) OUT.puts(Palette.DANGER);
+		TraceUtil.renderPercent(OUT, instrsCovered, totalInstrs, 1);
+		OUT.puts(Palette.DEFAULT).puts(")").outln()
+			.puts("Block coverage:\t")
+			.puts(Palette.ACTIVE)
+			.putd(blocksCovered)
+			.puts(Palette.DEFAULT)
+			.put1(" / %d ", totalBlocks);
+		OUT.puts("(").puts(Palette.SUCCESS);
+		if (blockCovPercentage < 100) OUT.puts(Palette.WARN);
+		if (blockCovPercentage < lowCoverageThreshold) OUT.puts(Palette.DANGER);
+		TraceUtil.renderPercent(OUT, blocksCovered, totalBlocks, 1);
+		OUT.puts(Palette.DEFAULT).puts(")").outln();
 	}
 }

@@ -1,31 +1,37 @@
 // Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Implements a simple monitor that counts the number of iterations of each loop.
+def OUT = Trace.OUT;
+
 class LmEntry(module: Module, func: FuncDecl, depth: int, pc: int) {
 	var endPc: int;
+	var count = 0;
 }
 
+// Implements a simple monitor that counts the number of iterations of each loop.
 class LoopMonitor extends Monitor {
 	def entries = Vector<LmEntry>.new();
-	def counts = Vector<u64>.new();
 	def it = BytecodeIterator.new();
+	var inCodeMode = false;
+
+	def configure(args: string) -> string {
+		def argMap = MonitorUtil.argMapFrom(args);
+		if (argMap.has("code") || argMap.has("c")) {
+			inCodeMode = true;
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
+	}
 
 	def onParse(m: Module) {
 		var mm = ModuleMonitor.new(m);
 		mm.forEachFunc(MonitorUtil.isNotImport, monitorFunc(mm, _));
 	}
+
 	def onFinish(i: Instance) {
-		var prev: FuncDecl;
-		for (j < entries.length) {
-			var e = entries[j];
-			if (e.func != prev) {
-				prev = e.func;
-				Trace.OUT.put1("func %q:", prev.render(e.module.names, _)).outln();
-			}
-			for (k < e.depth) Trace.OUT.puts("  ");
-			Trace.OUT.put3("  +%d ... +%d loop: %d", e.pc, e.endPc, counts[j]).outln();
-		}
+		report(entries, inCodeMode);
 	}
 
 	private def monitorFunc(mm: ModuleMonitor, func: FuncDecl) {
@@ -42,7 +48,6 @@ class LoopMonitor extends Monitor {
 					var lmEntry = LmEntry.new(mm.module, func, loopDepth, bi.pc);
 					entries.put(lmEntry);
 					controlStack.push((op, lmEntry));
-					counts.put(0);
 					loopDepth++;
 				}
 				// TODO: try and exception bytecodes 
@@ -59,8 +64,105 @@ class LoopMonitor extends Monitor {
 			}
 		}
 	}
+
 	private def loopHit(dynamicLoc: DynamicLoc, entry: int) -> Resumption {
-		counts[entry] = 1u + counts[entry];
+		entries[entry].count++;
 		return Resumption.Continue;
+	}
+}
+
+// Output monitor results to STDOUT
+def report(entries: Vector<LmEntry>, inCodeMode: bool) {
+	// FIXME: In code mode, the loop should be depicted
+	// to break from a BR, BR_IF, or BR_TABLE instead of END
+	if (inCodeMode) {
+		if (entries.length == 0) return;
+		var e = entries[0];
+		def tracer = InstrTracer.new();
+		var bi = BytecodeIterator.new();
+		var j = 0;
+		while (j < entries.length) {
+			e = entries[j];
+			bi = bi.reset(e.func);
+			var indent = 0;
+			OUT.puts(Palette.FUNC)
+				.put1("func %q:", e.func.render(e.module.names, _))
+				.puts(Palette.DEFAULT)
+				.outln();
+			var controlStack = ArrayStack<Opcode>.new();
+			var midPoints = Vector<int>.new();
+			while (bi.more()) {
+				var op = bi.current();
+				match (op) {
+					BLOCK, IF => controlStack.push(op);
+					LOOP => {
+						controlStack.push(op);
+						e = entries[j++];
+						midPoints.put((e.pc + e.endPc) / 2);
+						indent = e.depth + 1;
+						OUT.puts(Palette.SOURCE)
+							.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5);
+
+						for (k < indent - 1) OUT.puts("\t|");
+						OUT.puts(Palette.SOURCE).puts("\t-->\t");
+						bi.traceOrig(OUT, e.module, tracer);
+						OUT.puts(Palette.DEFAULT).outln();
+						bi.next();
+						continue;
+					}
+					END => {
+						var topControl = controlStack.pop();
+						if (topControl == Opcode.LOOP) {
+							OUT.puts(Palette.SOURCE)
+								.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5);
+							for (k < indent - 1) OUT.puts("\t|");
+							OUT.puts(Palette.SOURCE).puts("\t<--\t");
+							bi.traceOrig(OUT, e.module, tracer);
+							OUT.puts(Palette.DEFAULT).outln();
+							indent = if(e.depth > 0, indent - 1, 0);
+							midPoints.resize(midPoints.length - 1);
+							bi.next();
+							continue;
+						}
+					}
+					_ => ;
+				}
+				OUT.puts(Palette.LNO)
+					.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put1(_, "+%d", bi.pc)), 5);
+				for (k < indent) {
+					if (midPoints.length > 0 && bi.pc == midPoints[k]) {
+						var count = e.count;
+						if (count == 0) OUT.puts(Palette.UNREACHABLE);
+						else OUT.puts(Palette.COUNT);
+						OUT.put1("\t(%d)", count).puts(Palette.DEFAULT);
+					} else {
+						OUT.puts(Palette.SOURCE).puts("\t|").puts(Palette.DEFAULT);
+					}
+				}
+				OUT.puts(Palette.DEFAULT).putc('\t');
+				bi.traceOrig(OUT, e.module, tracer);
+				OUT.outln();
+				bi.next();
+			}
+		}
+	} else {
+		var prev: FuncDecl;
+		for (j < entries.length) {
+			var e = entries[j];
+			if (e.func != prev) {
+				prev = e.func;
+				OUT.puts(Palette.FUNC)
+					.put1("func %q:", prev.render(e.module.names, _))
+					.puts(Palette.DEFAULT).outln();
+			}
+			OUT.puts(Palette.LNO).rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.put2(_, " +%d ... +%d ", e.pc, e.endPc)), 14)
+				.puts(Palette.DEFAULT);
+
+			OUT.puts("loop: ")
+				.puts(Palette.COUNT)
+				.rjustify(' ', TraceUtil.renderedLength(OUT, TraceBuilder.putd(_, e.count)), 5)
+				.puts(Palette.DEFAULT)
+				.outln();
+		}
 	}
 }

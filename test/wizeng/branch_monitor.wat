@@ -8,6 +8,7 @@
     (loop $l
         (local.set $cnt (i32.sub (local.get $cnt) (i32.const 1)))
 	  (br_if $l (local.get $cnt))
+	  (br_if $l (local.get $cnt))
     )
     (call $foo)
   )

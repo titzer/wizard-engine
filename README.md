@@ -78,6 +78,8 @@ Read how to [Build and Test](doc/Building.md) Wizard.
 
 Read how to use [tracing options](doc/Tracing.md) in Wizard.
 
+Read how to use [monitor options](doc/Instrumentation.md) for instrumentation in Wizard.
+
 ### Research Projects
 
 Currently, Wizard supports three closely related research projects:
