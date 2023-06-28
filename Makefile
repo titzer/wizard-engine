@@ -13,6 +13,8 @@ jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
 
 wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
+v3i: bin/spectest.v3i bin/wizeng.v3i bin/unittest.v3i bin/objdump.v3i
+
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
 MONITORS=src/monitors/*.v3
 JIT=src/engine/compiler/*.v3
