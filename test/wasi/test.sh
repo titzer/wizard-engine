@@ -70,10 +70,6 @@ function run_test() {
 }
 
 function run_tests() {
-    if [ "$target" = v3i ] || [ "$target" = jvm ] || [ "$target" = x86-linux ]; then
-        # TODO: wasi apis are not implemented in those yet
-        return
-    fi
     printf "##>%d\n" $#
     for t in $@; do
 	    run_test $t
