@@ -750,11 +750,7 @@ class X86_64SpcFrameAccessor extends X86_64BaseFrameAccessor {
 	def setOperand(i: int, v: Value); // TODO: translate to interpreter frame
 }
 
-var lazyCompileFunc: Pointer;
-var lazyCompileObject: ExecutionStrategy;
-
-var tierupCompileFunc: Pointer;
-var tierupCompileObject: ExecutionStrategy;
+type SpcResultForStub(wf: WasmFunction, entrypoint: Pointer, thrown: Throwable) #unboxed { }
 
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
@@ -777,17 +773,6 @@ component X86_64Spc {
 		asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
 		asm.invalid();
 	}
-	def setLazyCompile(lazyCompile: WasmFunction -> (WasmFunction, Pointer, Throwable)) {
-		if (lazyCompile == null) {
-			lazyCompileObject = null;
-			lazyCompileFunc = Pointer.NULL;
-			return;
-		} else {
-			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer, Throwable)>(lazyCompile);
-			lazyCompileFunc = t.0;
-			lazyCompileObject = t.1;
-		}
-	}
 	def genLazyCompileStub(w: DataWriter) {
 		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 		var asm = X86_64Assembler.!(masm.asm);
@@ -796,12 +781,10 @@ component X86_64Spc {
 		asm.pushq_r(G(regs.func_arg));				// push function onto stack
 		masm.emit_store_runtime_vsp(regs.vsp);
 		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
-		// Load {lazyCompileObject}.
-		var obj_ptr = int.view(u32.!((Pointer.atField(lazyCompileObject) - Pointer.NULL)));
-		asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
-		// Call the {lazyCompileFunc}.
-		var func_ptr = int.view(u32.!(Pointer.atField(lazyCompileFunc) - Pointer.NULL));
-		asm.icall_m(X86_64Addr.new(null, null, 1, func_ptr));
+		// Load {null} for the receiver.
+		asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+		// Call {X86_64Spc.lazyCompile} directly.
+		masm.emit_call_abs(codePointer(X86_64Spc.lazyCompile));
 		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
 		// Check for non-null abrupt return.
 		var unwind = X86_64Label.new();
@@ -819,17 +802,6 @@ component X86_64Spc {
 		asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
 		asm.ret();
 	}
-	def setTierUpCompile(tierupCompile: WasmFunction -> (WasmFunction, Pointer, Throwable)) {
-		if (tierupCompile == null) {
-			tierupCompileObject = null;
-			tierupCompileFunc = Pointer.NULL;
-			return;
-		} else {
-			var t = CiRuntime.unpackClosure<ExecutionStrategy, WasmFunction, (WasmFunction, Pointer, Throwable)>(tierupCompile);
-			tierupCompileFunc = t.0;
-			tierupCompileObject = t.1;
-		}
-	}
 	def genTierUpCompileStub(w: DataWriter, ic: X86_64InterpreterCode) {
 		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 		var asm = X86_64Assembler.!(masm.asm);
@@ -844,19 +816,17 @@ component X86_64Spc {
 		interpreter_entry.pos = ic.intSpcEntryOffset;
 		asm.jc_rel_near(C.A, interpreter_entry);			// jump to interpreter if >= 0
 		// Call compiler
-		asm.pushq_r(G(regs.func_arg));				// push function onto stack
+		asm.pushq_r(G(regs.func_arg));					// push function onto stack
 		masm.emit_store_runtime_vsp(regs.vsp);
 		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
-		// Load {lazyCompileObject}.
-		var obj_ptr = int.view(u32.!((Pointer.atField(lazyCompileObject) - Pointer.NULL)));
-		asm.movq_r_m(Target.V3_PARAM_GPRS[0], X86_64Addr.new(null, null, 1, obj_ptr));
-		// Call the {tierupCompileFunc}.
-		var func_ptr = int.view(u32.!(Pointer.atField(tierupCompileFunc) - Pointer.NULL));
-		asm.icall_m(X86_64Addr.new(null, null, 1, func_ptr));
+		// Load {null} for the receiver.
+		asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+		// Call {X86_64Spc.tierupCompile} directly.
+		masm.emit_call_abs(codePointer(X86_64Spc.tierupCompile));
 		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
 		// Tail-call the result of the compile (which could be interpreter entry).
 		asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
-		asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);	// function
+		asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
 		masm.emit_load_runtime_vsp(regs.vsp);
 		asm.ijmp_r(scratch);						// jump to entrypoint
 		asm.invalid();
@@ -901,5 +871,18 @@ component X86_64Spc {
 	}
 	def estimateCodeSizeFor(decl: FuncDecl) -> int {
 		return 60 + decl.orig_bytecode.length * 20; // TODO: huge overestimate
+	}
+	private def codePointer<P, R>(f: P -> R) -> Pointer {
+		return CiRuntime.unpackClosure<X86_64Spc, P, R>(f).0;
+	}
+	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
+		// The global stub simply consults the execution strategy.
+		var result = X86_64SpcStrategy.!(Execute.tiering).lazyCompile(wf);
+		return (result.wf, result.entrypoint, result.thrown);
+	}
+	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
+		// The global stub simply consults the execution strategy.
+		var result = X86_64SpcStrategy.!(Execute.tiering).tierupCompile(wf);
+		return (result.wf, result.entrypoint, result.thrown);
 	}
 }

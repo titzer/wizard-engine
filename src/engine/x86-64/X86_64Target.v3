@@ -102,6 +102,9 @@ type TargetFrame(sp: Pointer) #unboxed {
 }
 
 class X86_64ExecutionStrategy extends ExecutionStrategy {
+	// Compilation methods called directly by stubs.
+	def lazyCompile(wf: WasmFunction) -> SpcResultForStub;
+	def tierupCompile(wf: WasmFunction) -> SpcResultForStub;
 }
 
 // One tier: fast-int, modules require no pre-processing.
@@ -119,38 +122,76 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 	}
 }
 
-// One tier: SPC, modules are eagerly compiled.
-class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64ExecutionStrategy {
-	var hasMonitors = false;
+// Base class of all strategies that use SPC.
+class X86_64SpcStrategy extends X86_64ExecutionStrategy {
+	def tierupCompile(wf: WasmFunction) -> SpcResultForStub {
+		return compileFunction(wf, "tierup");
+	}
+	def lazyCompile(wf: WasmFunction) -> SpcResultForStub {
+		return compileFunction(wf, "lazy");
+	}
+	private def compileFunction(wf: WasmFunction, how: string) -> SpcResultForStub {
+		var module = wf.instance.module;
+		var code = module.target_module.spc_code;
+		var compiler = newCompiler(module.filename); // XXX: cache per-thread
+		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
-	// Called if monitors will be attached to the (forthcoming) module.
-	def onMonitorsStart() {
-		hasMonitors = true;
-	}
-	// Called after a module is parsed.
-	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
-		// defer compilation for AOT mode until after monitors have been installed
-		if (!hasMonitors) compileEntireModule(module, size, err);
-	}
-	// Called after monitors have processed a module.
-	def onMonitorsFinish(module: Module, err: ErrorGen) {
-		compileEntireModule(module, 0, err);
-	}
-	// Called before a test function is run.
-	def onTestRun(wf: WasmFunction, err: ErrorGen) {
-		if (wf.decl.target_code.spc_entry == Pointer.NULL) {
-			compileEntireModule(wf.instance.module, 0, err); // XXX: compile individual functions in test
+		// generate code for the function
+		var success = compiler.gen(module, wf.decl, null);
+
+		// Check for remaining code space
+		var regionSize = code.mapping.range.size();
+		var remaining = regionSize - u64.!(code.codeEnd);
+		var codeSize = w.atEnd().pos;
+		if (codeSize > remaining) {
+			if (Trace.compiler) Trace.OUT.put3("exhausted code space for module (%d of %d bytes remaining, need %d)",
+				remaining, regionSize, codeSize).outln();
+			success = false;
 		}
+
+		var entrypoint: Pointer;
+		if (success) {
+			// Copy code into end of region
+			entrypoint = code.appendCode(masm);
+			Target.setTargetCode(wf.decl, entrypoint);
+		} else {
+			// Failed, enter interpreter
+			var f = wf.decl;
+			if (Trace.compiler) Trace.OUT.put2("func[%d] %s compile failed", f.func_index, how);
+			entrypoint = X86_64Spc.setInterpreterFallback(f);
+		}
+		return SpcResultForStub(wf, entrypoint, null);
 	}
-	// Call a function with arguments and return a result.
-	def call(func: Function, args: Array<Value>) -> Result {
-		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
-	}
-	private def compileEntireModule(module: Module, size: u32, err: ErrorGen) {
+	def installLazyCompileStubForModule(module: Module, err: ErrorGen) {
+		// TODO: lazy-allocate module code too
 		// ensure entrypoint and lazy compile stubs are generated
 		X86_64PreGenStubs.gen();
-		X86_64Spc.setLazyCompile(null);
-		X86_64Spc.setTierUpCompile(null);
+		// Set all functions to refer to the lazy compile stub.
+		var codeSize = MINIMUM_CODE_SIZE;
+		for (i = 0; err.ok() && i < module.functions.length; i++) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			X86_64Spc.setLazyCompileFor(f);
+			codeSize += X86_64Spc.estimateCodeSizeFor(f);
+		}
+		allocateCodeForModule(module, codeSize);
+	}
+	def installTierUpStubForModule(module: Module, err: ErrorGen) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
+		// Set all functions to refer to the tier-up compile stub.
+		var codeSize = MINIMUM_CODE_SIZE;
+		for (i = 0; err.ok() && i < module.functions.length; i++) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			X86_64Spc.setTierUpFor(f);
+			codeSize += X86_64Spc.estimateCodeSizeFor(f);
+		}
+		allocateCodeForModule(module, codeSize);
+	}
+	def compileEntireModule(module: Module, size: u32, interpreter_fallback: bool, err: ErrorGen) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
 
 		var compiler = newCompiler(module.filename);
 		var w = compiler.w;
@@ -201,13 +242,42 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64ExecutionSt
 		module.target_module.spc_code.keepAlive();
 		Debug.afterCompileModule(module);
 	}
+}
+
+// One tier: SPC, modules are eagerly compiled.
+class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy {
+	var hasMonitors = false;
+
+	// Called if monitors will be attached to the (forthcoming) module.
+	def onMonitorsStart() {
+		hasMonitors = true;
+	}
+	// Called after a module is parsed.
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		// defer compilation for AOT mode until after monitors have been installed
+		if (!hasMonitors) compileEntireModule(module, size, interpreter_fallback, err);
+	}
+	// Called after monitors have processed a module.
+	def onMonitorsFinish(module: Module, err: ErrorGen) {
+		compileEntireModule(module, 0, interpreter_fallback, err);
+	}
+	// Called before a test function is run.
+	def onTestRun(wf: WasmFunction, err: ErrorGen) {
+		if (wf.decl.target_code.spc_entry == Pointer.NULL) {
+			compileEntireModule(wf.instance.module, 0, interpreter_fallback, err); // XXX: compile individual functions in test
+		}
+	}
+	// Call a function with arguments and return a result.
+	def call(func: Function, args: Array<Value>) -> Result {
+		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
+	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
 		Target.setUnconditionalInterpreterEntryIfMultiTier(wf.decl);
 	}
 }
 
 // One tier: SPC, functions are lazily compiled.
-class X86_64SpcLazyStrategy extends X86_64ExecutionStrategy {
+class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installLazyCompileStubForModule(module, err);
@@ -220,60 +290,12 @@ class X86_64SpcLazyStrategy extends X86_64ExecutionStrategy {
 	def call(func: Function, args: Array<Value>) -> Result {
 		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
 	}
-	private def installLazyCompileStubForModule(module: Module, err: ErrorGen) {
-		// TODO: lazy-allocate module code too
-		// ensure entrypoint and lazy compile stubs are generated
-		X86_64PreGenStubs.gen();
-		X86_64Spc.setLazyCompile(lazyCompile);
-		X86_64Spc.setTierUpCompile(null);
-		// Set all functions to refer to the lazy compile stub.
-		var codeSize = MINIMUM_CODE_SIZE;
-		for (i = 0; err.ok() && i < module.functions.length; i++) {
-			var f = module.functions[i];
-			if (f.imported()) continue;
-			X86_64Spc.setLazyCompileFor(f);
-			codeSize += X86_64Spc.estimateCodeSizeFor(f);
-		}
-		allocateCodeForModule(module, codeSize);
-	}
-	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
-		var module = wf.instance.module;
-		var code = module.target_module.spc_code;
-		var compiler = newCompiler(module.filename); // XXX: cache per-thread
-		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
-
-		// generate code for the function
-		var success = compiler.gen(module, wf.decl, null);
-
-		// Check for remaining code space
-		var regionSize = code.mapping.range.size();
-		var remaining = regionSize - u64.!(code.codeEnd);
-		var codeSize = w.atEnd().pos;
-		if (codeSize > remaining) {
-			if (Trace.compiler) Trace.OUT.put3("exhausted code space for module (%d of %d bytes remaining, need %d)",
-				remaining, regionSize, codeSize).outln();
-			success = false;
-		}
-
-		var entrypoint: Pointer;
-		if (success) {
-			// Copy code into end of region
-			entrypoint = code.appendCode(masm);
-			Target.setTargetCode(wf.decl, entrypoint);
-		} else {
-			// Failed, enter interpreter
-			var f = wf.decl;
-			if (Trace.compiler) Trace.OUT.put1("func[%d] lazy compile failed", f.func_index);
-			entrypoint = X86_64Spc.setInterpreterFallback(f);
-		}
-		return (wf, entrypoint, null);
-	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
 		X86_64Spc.setLazyCompileFor(wf.decl);
 	}
 }
 // Two tiers: fast-int, frequently-executed functions are compiled with SPC.
-class X86_64DynamicStrategy extends X86_64ExecutionStrategy {
+class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installTierUpStubForModule(module, err);
@@ -285,54 +307,6 @@ class X86_64DynamicStrategy extends X86_64ExecutionStrategy {
 	// Call a function with arguments and return a result.
 	def call(func: Function, args: Array<Value>) -> Result {
 		return X86_64Runtime.run(func, args);
-	}
-	private def installTierUpStubForModule(module: Module, err: ErrorGen) {
-		// ensure entrypoint and lazy compile stubs are generated
-		X86_64PreGenStubs.gen();
-		X86_64Spc.setLazyCompile(null);
-		X86_64Spc.setTierUpCompile(tierupCompile);
-		// Set all functions to refer to the tier-up compile stub.
-		var codeSize = MINIMUM_CODE_SIZE;
-		for (i = 0; err.ok() && i < module.functions.length; i++) {
-			var f = module.functions[i];
-			if (f.imported()) continue;
-			X86_64Spc.setTierUpFor(f);
-			codeSize += X86_64Spc.estimateCodeSizeFor(f);
-		}
-		allocateCodeForModule(module, codeSize);
-	}
-	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
-		var module = wf.instance.module;
-		var code = module.target_module.spc_code;
-		var compiler = newCompiler(module.filename); // XXX: cache per-thread
-		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
-
-		// generate code for the function
-// XXX:		w.align(8);
-		var success = compiler.gen(module, wf.decl, null);
-
-		// Check for remaining code space
-		var regionSize = code.mapping.range.size();
-		var remaining =  regionSize - u64.!(code.codeEnd);
-		var codeSize = w.atEnd().pos;
-		if (codeSize > remaining) {
-			if (Trace.compiler) Trace.OUT.put3("exhausted code space for module (%d of %d bytes remaining, need %d)",
-				remaining, regionSize, codeSize).outln();
-			success = false;
-		}
-
-		var entrypoint: Pointer;
-		if (success) {
-			// Copy code into end of region
-			entrypoint = code.appendCode(masm);
-			Target.setTargetCode(wf.decl, entrypoint);
-		} else {
-			// Failed, enter interpreter
-			var f = wf.decl;
-			if (Trace.compiler) Trace.OUT.put1("func[%d] tierup compile failed", f.func_index);
-			entrypoint = X86_64Spc.setInterpreterFallback(f);
-		}
-		return (wf, entrypoint, null);
 	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
 		X86_64Spc.setTierUpFor(wf.decl);
