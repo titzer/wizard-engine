@@ -102,6 +102,10 @@ type TargetFrame(sp: Pointer) #unboxed {
 }
 
 class X86_64ExecutionStrategy extends ExecutionStrategy {
+	// Call a function with arguments and return a result.
+	def call(func: Function, args: Array<Value>) -> Result {
+		return X86_64Runtime.run(func, args); // XXX: specialize for different strategies?
+	}
 	// Compilation methods called directly by stubs.
 	def lazyCompile(wf: WasmFunction) -> SpcResultForStub;
 	def tierupCompile(wf: WasmFunction) -> SpcResultForStub;
@@ -109,10 +113,6 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 
 // One tier: fast-int, modules require no pre-processing.
 class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
-	// Call a function with arguments and return a result.
-	def call(func: Function, args: Array<Value>) -> Result {
-		return X86_64Runtime.run(func, args); // XXX: specialize for interpreter-only
-	}
 	def onFuncValidationFinish(module: Module, func: FuncDecl, err: ErrorGen) {
 		if (err != null && !err.ok()) return;
 		Target.setUnconditionalInterpreterEntryIfMultiTier(func);
@@ -124,6 +124,13 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 
 // Base class of all strategies that use SPC.
 class X86_64SpcStrategy extends X86_64ExecutionStrategy {
+	def onFuncProbeInsert1(module: Module, func: FuncDecl, offset: int, p: Probe) {
+		X86_64Spc.setLazyCompileFor(module, func);
+	}
+	def onFuncProbeInsert2(module: Module, func: FuncDecl, offset: int, p: Probe) {
+		X86_64Spc.setLazyCompileFor(module, func);
+	}
+
 	def tierupCompile(wf: WasmFunction) -> SpcResultForStub {
 		return compileFunction(wf, "tierup");
 	}
@@ -171,7 +178,7 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		for (i = 0; err.ok() && i < module.functions.length; i++) {
 			var f = module.functions[i];
 			if (f.imported()) continue;
-			X86_64Spc.setLazyCompileFor(f);
+			X86_64Spc.setLazyCompileFor(module, f);
 			codeSize += X86_64Spc.estimateCodeSizeFor(f);
 		}
 		allocateCodeForModule(module, codeSize);
@@ -184,12 +191,42 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		for (i = 0; err.ok() && i < module.functions.length; i++) {
 			var f = module.functions[i];
 			if (f.imported()) continue;
-			X86_64Spc.setTierUpFor(f);
+			X86_64Spc.setTierUpFor(module, f);
 			codeSize += X86_64Spc.estimateCodeSizeFor(f);
 		}
 		allocateCodeForModule(module, codeSize);
 	}
-	def compileEntireModule(module: Module, size: u32, interpreter_fallback: bool, err: ErrorGen) {
+}
+
+// One tier: SPC, modules are eagerly compiled.
+class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy {
+	var hasMonitors = false;
+
+	// Called if monitors will be attached to the (forthcoming) module.
+	def onMonitorsStart() {
+		hasMonitors = true;
+	}
+	// Called after a module is parsed.
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		// defer compilation for AOT mode until after monitors have been installed
+		if (!hasMonitors) compileEntireModule(module, size, interpreter_fallback, err, 1024);
+	}
+	// Called after monitors have processed a module.
+	def onMonitorsFinish(module: Module, err: ErrorGen) {
+		compileEntireModule(module, 0, interpreter_fallback, err, 1024);
+	}
+	// Called before a test function is run.
+	def onTestRun(wf: WasmFunction, err: ErrorGen) {
+		var module = wf.instance.module;
+		if (module.target_module.spc_code == null ||
+			wf.decl.target_code.spc_entry == Pointer.NULL) {
+			compileEntireModule(module, 0, interpreter_fallback, err, PAGE_SIZE); // XXX: compile individual functions in test
+		}
+	}
+	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
+		Target.setUnconditionalInterpreterEntryIfMultiTier(wf.decl); // XXX: use lazy compile
+	}
+	def compileEntireModule(module: Module, size: u32, interpreter_fallback: bool, err: ErrorGen, ballast: u32) {
 		// ensure entrypoint and lazy compile stubs are generated
 		X86_64PreGenStubs.gen();
 
@@ -208,7 +245,7 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		}
 
 		// copy and map code
-		var length = u64.view(w.atEnd().pos);
+		var length = u64.view(w.atEnd().pos) + ballast;
 		var mapping = Mmap.reserve(length, Mmap.PROT_WRITE), range = mapping.range; // TODO: handle failure
 		var masm = X86_64MacroAssembler.!(compiler.masm);
 		masm.setTargetAddress(u64.view(range.start - Pointer.NULL));
@@ -244,38 +281,6 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 	}
 }
 
-// One tier: SPC, modules are eagerly compiled.
-class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy {
-	var hasMonitors = false;
-
-	// Called if monitors will be attached to the (forthcoming) module.
-	def onMonitorsStart() {
-		hasMonitors = true;
-	}
-	// Called after a module is parsed.
-	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
-		// defer compilation for AOT mode until after monitors have been installed
-		if (!hasMonitors) compileEntireModule(module, size, interpreter_fallback, err);
-	}
-	// Called after monitors have processed a module.
-	def onMonitorsFinish(module: Module, err: ErrorGen) {
-		compileEntireModule(module, 0, interpreter_fallback, err);
-	}
-	// Called before a test function is run.
-	def onTestRun(wf: WasmFunction, err: ErrorGen) {
-		if (wf.decl.target_code.spc_entry == Pointer.NULL) {
-			compileEntireModule(wf.instance.module, 0, interpreter_fallback, err); // XXX: compile individual functions in test
-		}
-	}
-	// Call a function with arguments and return a result.
-	def call(func: Function, args: Array<Value>) -> Result {
-		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
-	}
-	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
-		Target.setUnconditionalInterpreterEntryIfMultiTier(wf.decl);
-	}
-}
-
 // One tier: SPC, functions are lazily compiled.
 class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
@@ -286,12 +291,8 @@ class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 	def onTestRun(wf: WasmFunction, err: ErrorGen) { // TODO: move this to onFuncValidationFinish
 		installLazyCompileStubForModule(wf.instance.module, err);
 	}
-	// Call a function with arguments and return a result.
-	def call(func: Function, args: Array<Value>) -> Result {
-		return X86_64Runtime.run(func, args); // XXX: specialize for JIT-only, do lazy compile
-	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
-		X86_64Spc.setLazyCompileFor(wf.decl);
+		X86_64Spc.setLazyCompileFor(wf.instance.module, wf.decl);
 	}
 }
 // Two tiers: fast-int, frequently-executed functions are compiled with SPC.
@@ -304,12 +305,8 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	def onTestRun(wf: WasmFunction, err: ErrorGen) {
 		installTierUpStubForModule(wf.instance.module, err);
 	}
-	// Call a function with arguments and return a result.
-	def call(func: Function, args: Array<Value>) -> Result {
-		return X86_64Runtime.run(func, args);
-	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
-		X86_64Spc.setTierUpFor(wf.decl);
+		X86_64Spc.setTierUpFor(wf.instance.module, wf.decl);
 	}
 	def onTierUp(wf: WasmFunction, pc: int) -> TargetOsrInfo {
 		var module = wf.instance.module;
