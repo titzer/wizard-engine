@@ -44,3 +44,28 @@
 (assert_return (invoke "xor" (v128.const i32x4 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678)
                              (v128.const i32x4 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef))
                              (v128.const i32x4 0x829f9b97 0x829f9b97 0x829f9b97 0x829f9b97))
+
+
+;; Type check
+(assert_invalid (module (func (result v128) (v128.xor (i32.const 0) (v128.const i32x4 0 0 0 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.xor (v128.const i32x4 0 0 0 0) (i32.const 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.xor (i32.const 0) (i32.const 0)))) "type mismatch")
+
+
+;; Test operation with empty argument
+(assert_invalid
+  (module
+    (func $v128.xor-1st-arg-empty (result v128)
+      (v128.xor (v128.const i32x4 0 0 0 0))
+    )
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module
+    (func $v128.xor-arg-empty (result v128)
+      (v128.xor)
+    )
+  )
+  "type mismatch"
+)

@@ -44,3 +44,27 @@
 (assert_return (invoke "or" (v128.const i32x4 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678)
                             (v128.const i32x4 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef))
                             (v128.const i32x4 0x92bfdfff 0x92bfdfff 0x92bfdfff 0x92bfdfff))
+
+
+;; Type check
+(assert_invalid (module (func (result v128) (v128.or (i32.const 0) (v128.const i32x4 0 0 0 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.or (v128.const i32x4 0 0 0 0) (i32.const 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.or (i32.const 0) (i32.const 0)))) "type mismatch")
+
+;; Test operation with empty argument
+(assert_invalid
+  (module
+    (func $v128.or-1st-arg-empty (result v128)
+      (v128.or (v128.const i32x4 0 0 0 0))
+    )
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module
+    (func $v128.or-arg-empty (result v128)
+      (v128.or)
+    )
+  )
+  "type mismatch"
+)
