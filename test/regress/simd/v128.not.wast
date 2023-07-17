@@ -18,3 +18,16 @@
                              (v128.const i32x4 3060399405 3060399405 3060399405 3060399405))
 (assert_return (invoke "not" (v128.const i32x4 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678 0x0_1234_5678))
                              (v128.const i32x4 0xedcba987 0xedcba987 0xedcba987 0xedcba987))
+
+;; Type check
+(assert_invalid (module (func (result v128) (v128.not (i32.const 0)))) "type mismatch")
+
+;; Test operation with empty argument
+(assert_invalid
+  (module
+    (func $v128.not-arg-empty (result v128)
+      (v128.not)
+    )
+  )
+  "type mismatch"
+)
