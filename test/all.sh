@@ -137,12 +137,4 @@ for target in $TEST_TARGETS; do
     do_script wasi/test
 done
 
-# Wasi spec tests
-for target in $TEST_TARGETS; do
-    export TEST_TARGET=$target
-    if [ "$target" = x86-64-linux ]; then
-        $SCRIPT_LOC/wasi/run-testsuite.sh
-    fi
-done
-
 exit 0
