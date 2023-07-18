@@ -28,3 +28,34 @@
                                    (v128.const i32x4 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef 0x0_90AB_cdef)
                                    (v128.const i32x4 0xcdefcdef 0xcdefcdef 0xcdefcdef 0xcdefcdef))
                                    (v128.const i32x4 0x10244468 0x10244468 0x10244468 0x10244468))
+
+;; Type check
+(assert_invalid (module (func (result v128) (v128.bitselect (i32.const 0) (v128.const i32x4 0 0 0 0) (v128.const i32x4 0 0 0 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.bitselect (v128.const i32x4 0 0 0 0) (v128.const i32x4 0 0 0 0) (i32.const 0)))) "type mismatch")
+(assert_invalid (module (func (result v128) (v128.bitselect (i32.const 0) (i32.const 0) (i32.const 0)))) "type mismatch")
+
+;; Test operation with empty argument
+(assert_invalid
+  (module
+    (func $v128.bitselect-1st-arg-empty (result v128)
+      (v128.bitselect (v128.const i32x4 0 0 0 0) (v128.const i32x4 0 0 0 0))
+    )
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module
+    (func $v128.bitselect-two-args-empty (result v128)
+      (v128.bitselect (v128.const i32x4 0 0 0 0))
+    )
+  )
+  "type mismatch"
+)
+(assert_invalid
+  (module
+    (func $v128.bitselect-arg-empty (result v128)
+      (v128.bitselect)
+    )
+  )
+  "type mismatch"
+)
