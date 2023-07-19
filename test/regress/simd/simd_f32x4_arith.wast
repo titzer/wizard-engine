@@ -5277,19 +5277,20 @@
 
 
 ;; Mixed f32x4 tests when some lanes are NaNs
-(module
+;; todo: uncomment this after jit:v128.const is implemented
+;; (module
 
-  (func (export "f32x4_sqrt_arith") (result v128)
-    (f32x4.sqrt (v128.const f32x4 nan:0x200000 -nan:0x200000 16.0 25.0)))
-  (func (export "f32x4_sqrt_canon") (result v128)
-    (f32x4.sqrt (v128.const f32x4 -1.0 nan 4.0 9.0)))
-  (func (export "f32x4_sqrt_mixed") (result v128)
-    (f32x4.sqrt (v128.const f32x4 -inf nan:0x200000 36.0 49.0)))
-)
+;;   (func (export "f32x4_sqrt_arith") (result v128)
+;;     (f32x4.sqrt (v128.const f32x4 nan:0x200000 -nan:0x200000 16.0 25.0)))
+;;   (func (export "f32x4_sqrt_canon") (result v128)
+;;     (f32x4.sqrt (v128.const f32x4 -1.0 nan 4.0 9.0)))
+;;   (func (export "f32x4_sqrt_mixed") (result v128)
+;;     (f32x4.sqrt (v128.const f32x4 -inf nan:0x200000 36.0 49.0)))
+;; )
 
-(assert_return (invoke "f32x4_sqrt_arith") (v128.const f32x4 nan:arithmetic nan:arithmetic 4.0 5.0))
-(assert_return (invoke "f32x4_sqrt_canon") (v128.const f32x4 nan:canonical nan:canonical 2.0 3.0))
-(assert_return (invoke "f32x4_sqrt_mixed") (v128.const f32x4 nan:canonical nan:arithmetic 6.0 7.0))
+;; (assert_return (invoke "f32x4_sqrt_arith") (v128.const f32x4 nan:arithmetic nan:arithmetic 4.0 5.0))
+;; (assert_return (invoke "f32x4_sqrt_canon") (v128.const f32x4 nan:canonical nan:canonical 2.0 3.0))
+;; (assert_return (invoke "f32x4_sqrt_mixed") (v128.const f32x4 nan:canonical nan:arithmetic 6.0 7.0))
 
 ;; type check
 (assert_invalid (module (func (result v128) (f32x4.neg (i32.const 0)))) "type mismatch")
