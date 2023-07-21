@@ -5276,28 +5276,27 @@
                                    (v128.const f64x2 -0x1.23456789abcdfp+61 -0x1.23456789abcdfp+61))
 
 ;; Mixed f64x2 tests when some lanes are NaNs
-;; todo: uncomment this after jit:v128.const is implemented
-;; (module
-;;   (func (export "f64x2_add_arith") (result v128)
-;;     (f64x2.add (v128.const f64x2 nan:0x8000000000000 1.0) (v128.const f64x2 nan 1.0)))
-;;   (func (export "f64x2_div_mixed") (result v128)
-;;     (f64x2.div (v128.const f64x2 nan 1.0) (v128.const f64x2 2.0 -nan:0x8000000000000)))
-;;   (func (export "f64x2_mul_mixed") (result v128)
-;;     (f64x2.mul (v128.const f64x2 nan:0x8000000000000 1.0) (v128.const f64x2 2.0 nan)))
-;;   (func (export "f64x2_neg_canon") (result v128)
-;;     (f64x2.neg (v128.const f64x2 nan 1.0)))
-;;   (func (export "f64x2_sqrt_canon") (result v128)
-;;     (f64x2.sqrt (v128.const f64x2 4.0 -nan)))
-;;   (func (export "f64x2_sub_arith") (result v128)
-;;     (f64x2.sub (v128.const f64x2 1.0 -1.0) (v128.const f64x2 -nan 1.0)))
-;; )
+(module
+  (func (export "f64x2_add_arith") (result v128)
+    (f64x2.add (v128.const f64x2 nan:0x8000000000000 1.0) (v128.const f64x2 nan 1.0)))
+  (func (export "f64x2_div_mixed") (result v128)
+    (f64x2.div (v128.const f64x2 nan 1.0) (v128.const f64x2 2.0 -nan:0x8000000000000)))
+  (func (export "f64x2_mul_mixed") (result v128)
+    (f64x2.mul (v128.const f64x2 nan:0x8000000000000 1.0) (v128.const f64x2 2.0 nan)))
+  (func (export "f64x2_neg_canon") (result v128)
+    (f64x2.neg (v128.const f64x2 nan 1.0)))
+  (func (export "f64x2_sqrt_canon") (result v128)
+    (f64x2.sqrt (v128.const f64x2 4.0 -nan)))
+  (func (export "f64x2_sub_arith") (result v128)
+    (f64x2.sub (v128.const f64x2 1.0 -1.0) (v128.const f64x2 -nan 1.0)))
+)
 
-;; (assert_return (invoke "f64x2_add_arith") (v128.const f64x2 nan:arithmetic 2.0))
-;; (assert_return (invoke "f64x2_div_mixed") (v128.const f64x2 nan:canonical nan:arithmetic))
-;; (assert_return (invoke "f64x2_mul_mixed") (v128.const f64x2 nan:arithmetic nan:canonical))
-;; (assert_return (invoke "f64x2_neg_canon") (v128.const f64x2 nan:canonical -1.0))
-;; (assert_return (invoke "f64x2_sqrt_canon") (v128.const f64x2 2.0 nan:canonical))
-;; (assert_return (invoke "f64x2_sub_arith") (v128.const f64x2 nan:canonical -2.0))
+(assert_return (invoke "f64x2_add_arith") (v128.const f64x2 nan:arithmetic 2.0))
+(assert_return (invoke "f64x2_div_mixed") (v128.const f64x2 nan:canonical nan:arithmetic))
+(assert_return (invoke "f64x2_mul_mixed") (v128.const f64x2 nan:arithmetic nan:canonical))
+(assert_return (invoke "f64x2_neg_canon") (v128.const f64x2 nan:canonical -1.0))
+(assert_return (invoke "f64x2_sqrt_canon") (v128.const f64x2 2.0 nan:canonical))
+(assert_return (invoke "f64x2_sub_arith") (v128.const f64x2 nan:canonical -2.0))
 
 ;; type check
 (assert_invalid (module (func (result v128) (f64x2.neg (i64.const 0)))) "type mismatch")
