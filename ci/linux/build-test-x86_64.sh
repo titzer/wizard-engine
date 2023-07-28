@@ -14,8 +14,14 @@ make
 cd ../wizard-engine
 make -j x86-64-linux
 
-# Install OCaml for specification tests
-sudo apt install -y ocaml ocamlbuild
+# Install Opam for specification tests
+sudo apt install -y opam
+opam init
+
+# Install Dune
+opam install dune
+# Make dune available in PATH
+eval $(opam config env)
 
 # Set up specification tests
 cd test/wasm-spec
