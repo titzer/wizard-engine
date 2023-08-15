@@ -639,10 +639,22 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	def visit_F64X2_CONVERT_LOW_I32X4_U() { do_op1_x_gtmp_xtmp(ValueKind.V128, mmasm.emit_f64x2_convert_low_i32x4_u); }
 	def visit_F64X2_PROMOTE_LOW_F32X4() { do_op1_x_x(ValueKind.V128, asm.cvtps2pd_s_s); }
 
-	def visit_V128_LOAD_8_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, asm.q.movb_r_m, asm.pinsrb_s_r_i); }
-	def visit_V128_LOAD_16_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, asm.q.movw_r_m, asm.pinsrw_s_r_i); }
-	def visit_V128_LOAD_32_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, asm.q.movd_r_m, asm.pinsrd_s_r_i); }
-	def visit_V128_LOAD_64_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, asm.q.movq_r_m, asm.pinsrq_s_r_i); }
+	def visit_V128_LOAD_8_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, loadMemarg_b, asm.pinsrb_s_r_i); }
+	def visit_V128_LOAD_16_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, loadMemarg_w, asm.pinsrw_s_r_i); }
+	def visit_V128_LOAD_32_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, loadMemarg_d, asm.pinsrd_s_r_i); }
+	def visit_V128_LOAD_64_LANE(imm: MemArg, lane: byte) { visit_V128_LOAD_LANE(imm, lane, loadMemarg_q, asm.pinsrq_s_r_i); }
+	def visit_V128_LOAD_8X8_S(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovsxbw_s_m); }
+	def visit_V128_LOAD_8X8_U(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovzxbw_s_m); }
+	def visit_V128_LOAD_16X4_S(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovsxwd_s_m); }
+	def visit_V128_LOAD_16X4_U(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovzxwd_s_m); }
+	def visit_V128_LOAD_32X2_S(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovsxdq_s_m); }
+	def visit_V128_LOAD_32X2_U(imm: MemArg) { visit_V128_LOAD_EXTEND(imm, asm.pmovzxdq_s_m); }
+	def visit_V128_LOAD_32_ZERO(imm: MemArg) { visit_V128_LOAD_ZERO(imm, loadMemarg_d, asm.pinsrd_s_r_i); }
+	def visit_V128_LOAD_64_ZERO(imm: MemArg) { visit_V128_LOAD_ZERO(imm, loadMemarg_q, asm.pinsrq_s_r_i); }
+	def visit_V128_LOAD_8_SPLAT(imm: MemArg) { visit_V128_LOAD_SPLAT(imm, loadMemarg_b, mmasm.emit_i8x16_splat(_, _, X(allocTmp(ValueKind.V128)))); }
+	def visit_V128_LOAD_16_SPLAT(imm: MemArg) { visit_V128_LOAD_SPLAT(imm, loadMemarg_w, mmasm.emit_i16x8_splat); }
+	def visit_V128_LOAD_32_SPLAT(imm: MemArg) { visit_V128_LOAD_SPLAT(imm, loadMemarg_d, mmasm.emit_i32x4_splat); }
+	def visit_V128_LOAD_64_SPLAT(imm: MemArg) { visit_V128_LOAD_SPLAT(imm, loadMemarg_q, mmasm.emit_i64x2_splat); }
 
 	def visit_I8X16_REPLACELANE(lane: byte) { visit_V128_REPLACE_LANE(lane, asm.pinsrb_s_r_i); }
 	def visit_I16X8_REPLACELANE(lane: byte) { visit_V128_REPLACE_LANE(lane, asm.pinsrw_s_r_i); }
@@ -726,8 +738,8 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		state.push(a.kindFlagsMatching(ValueKind.V128, IN_REG), a.reg, 0);
 	}
 
-	private def visit_V128_LOAD_LANE<T>(imm: MemArg, lane: byte, asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> T, asm_pins_s_r_i: (X86_64Xmmr, X86_64Gpr, byte) -> T) {
-		var sv = popRegToOverwrite(), r = X(sv.reg);
+	// Decode memarg and return the mem address and trap reason if any
+	private def decodeMemarg(imm: MemArg) -> (X86_64Addr, TrapReason) {
 		var base_reg = regs.mem0_base;
 		if (imm.memory_index != 0) {
 			// XXX: cache the base register for memories > 0
@@ -743,14 +755,30 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		var offset = imm.offset;
 		if (iv.isConst()) {
 			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
+			if (sum > u32.max) return (null, TrapReason.MEM_OUT_OF_BOUNDS); 
 			offset = u32.view(sum);
 		} else {
 			index_reg = ensureReg(iv, state.sp);
 		}
-		var lane_val = allocTmp(ValueKind.I64); // XXX: can reuse index reg if frequency == 1 and ValueKind.I32
-		mmasm.emit_v128_load_lane_r_m(lane_val, base_reg, index_reg, u32.!(offset), asm_mov_r_m);
-		asm_pins_s_r_i(r, G(lane_val), lane);
+		return (mmasm.decode_memarg_addr(base_reg, index_reg, u32.!(offset)), TrapReason.NONE);
+	}
+	// Utilities to load a memarg into a register
+	private def loadMemarg<T>(dst: Reg, imm: MemArg, asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> T) {
+		def t = decodeMemarg(imm);
+		if (t.1 != TrapReason.NONE) return emitTrap(t.1);
+		def addr = t.0;
+		mmasm.emit_v128_load_lane_r_m(dst, addr, asm_mov_r_m);
+	}
+	private def loadMemarg_b(dst: Reg, imm: MemArg) { loadMemarg(dst, imm, asm.q.movb_r_m); }
+	private def loadMemarg_w(dst: Reg, imm: MemArg) { loadMemarg(dst, imm, asm.q.movw_r_m); }
+	private def loadMemarg_d(dst: Reg, imm: MemArg) { loadMemarg(dst, imm, asm.q.movd_r_m); }
+	private def loadMemarg_q(dst: Reg, imm: MemArg) { loadMemarg(dst, imm, asm.q.movq_r_m); }
+
+	private def visit_V128_LOAD_LANE<T>(imm: MemArg, lane: byte, loadMem: (Reg, MemArg) -> void, asm_pins_s_r_i: (X86_64Xmmr, X86_64Gpr, byte) -> T) {
+		var sv = popRegToOverwrite(), r = X(sv.reg);
+		var val = allocTmp(ValueKind.I64);
+		loadMem(val, imm);
+		asm_pins_s_r_i(r, G(val), lane);
 		state.push(sv.kindFlagsMatching(ValueKind.V128, IN_REG), sv.reg, 0);
 	}
 	
@@ -774,6 +802,33 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm_pext_r_s_i(G(d), X(a.reg), lane);
 		asm_movext_s_s(G(d), G(d));
 		state.push(SpcConsts.kindToFlags(kind) | IN_REG, d, 0);
+	}
+
+	private def visit_V128_LOAD_EXTEND<T>(imm: MemArg, asm_pmov_s_m: (X86_64Xmmr, X86_64Addr) -> T) {
+		var d = allocRegTos(ValueKind.V128);
+		var val = allocTmp(ValueKind.I64);
+		def t = decodeMemarg(imm);
+		if (t.1 != TrapReason.NONE) return emitTrap(t.1);
+		def addr = t.0;
+		asm_pmov_s_m(X(d), addr);
+		state.push(KIND_V128 | IN_REG, d, 0);
+	}
+
+	private def visit_V128_LOAD_ZERO<T>(imm: MemArg, loadMem: (Reg, MemArg) -> void, asm_pins_s_r_i: (X86_64Xmmr, X86_64Gpr, byte) -> T) {
+		var val = allocTmp(ValueKind.I64);
+		var d = allocRegTos(ValueKind.V128);
+		loadMem(val, imm);
+		mmasm.emit_v128_zero(X(d));
+		asm_pins_s_r_i(X(d), G(val), 0);
+		state.push(KIND_V128 | IN_REG, d, 0);
+	}
+
+	private def visit_V128_LOAD_SPLAT<T>(imm: MemArg, loadMem: (Reg, MemArg) -> void, masm_splat: (X86_64Xmmr, X86_64Gpr) -> void) {
+		var val = allocTmp(ValueKind.I64);
+		var d = allocRegTos(ValueKind.V128);
+		loadMem(val, imm);
+		masm_splat(X(d), G(val));
+		state.push(KIND_V128 | IN_REG, d, 0);
 	}
 
 	// r1 = op(r1)
