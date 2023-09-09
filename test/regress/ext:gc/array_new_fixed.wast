@@ -3,7 +3,7 @@
   (type $mvec (array (mut f32)))
 
   (func $new (export "new") (result (ref $vec))
-    (array.new_fixed $vec 2 (f32.const 1) (f32.const 2) (rtt.canon $vec))
+    (array.new_fixed $vec 2 (f32.const 1) (f32.const 2))
   )
 )
 
