@@ -1,0 +1,28 @@
+(module
+  (type $t1 (sub (func)))
+  (type $t2 (sub final (func)))
+
+  (func $f1 (type $t1))
+  (func $f2 (type $t2))
+  (table funcref (elem $f1 $f2))
+
+  (func (export "fail1")
+    (block (call_indirect (type $t1) (i32.const 1)))
+  )
+  (func (export "fail2")
+    (block (call_indirect (type $t2) (i32.const 0)))
+  )
+
+  (func (export "fail3")
+    (ref.cast (ref $t1) (table.get (i32.const 1)))
+    (drop)
+  )
+  (func (export "fail4")
+    (ref.cast (ref $t2) (table.get (i32.const 0)))
+    (drop)
+  )
+)
+(assert_trap (invoke "fail1") "indirect call")
+(assert_trap (invoke "fail2") "indirect call")
+(assert_trap (invoke "fail3") "cast")
+(assert_trap (invoke "fail4") "cast")
