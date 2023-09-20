@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wave|wasi|jawa|spectest|unittest> <x86-linux|x86-64-linux|jvm|wave>"
+    echo "Usage: build.sh <wave|wasi|spectest|unittest> <x86-linux|x86-64-linux|jvm|wave>"
     exit 1
 }
 
@@ -42,7 +42,6 @@ WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
-JAWA="src/jawa/*.v3"
 
 PROGRAM=$1
 TARGET=$2
@@ -75,7 +74,7 @@ if [ "$PROGRAM" = "wizeng" ]; then
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
-    SOURCES="$ENGINE $UNITTEST $JAWA"
+    SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $UNITTEST_X86_64_LINUX"
     fi

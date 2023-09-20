@@ -22,15 +22,14 @@ X86_64=src/engine/x86-64/*.v3
 WAVE=src/modules/wave/*.v3
 WASI=src/modules/wasi/*.v3
 WASI_X86_64_LINUX=src/modules/wasi/x86-64-linux/*.v3
-JAWA=src/jawa/*.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
 SPECTEST=$(ENGINE) test/wasm-spec/*.v3 test/spectest.main.v3
-UNITTEST=$(ENGINE) $(JAWA) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
+UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
-TAGS: $(ENGINE) $(WIZENG) $(WAVE) $(WASI) $(JAWA) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
-	vctags -e $(ENGINE) $(WAVE) $(WASI) $(JAWA) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
+TAGS: $(ENGINE) $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
+	vctags -e $(ENGINE) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
 
 # JVM targets
 bin/unittest.jvm: $(UNITTEST) build.sh
