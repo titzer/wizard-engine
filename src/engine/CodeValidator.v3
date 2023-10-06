@@ -18,6 +18,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	var func: FuncDecl;
 	var sig: SigDecl;
 	var opcode_pos: int;
+	var validatingInitExpr = false;
+	var init_stack: ArrayStack<InitExpr>;
 
 	new() {
 		codeptr.onError = err.onDataReaderError;
@@ -28,28 +30,17 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		return validate(f, codeptr);
 	}
 	def validate(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
-		return Metrics.validate_time_us.run(validate0, (func, d));
+		return Metrics.validate_time_us.run(validateFunc0, (func, d));
 	}
-	private def validate0(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
+	def validateInitExpr(expected: SigDecl, d: DataReader) -> CodeValidatorResult {
+		return Metrics.validate_time_us.run(validateExpr0, (expected, d));
+	}
+	private def validateFunc0(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
 		// Reset internal state.
+		if (Trace.validation) OUT.put2("validate(func #%d: %q)", func.func_index, func.sig.render).outln();
 		this.func = func;
-		sig = func.sig;
-		if (Trace.validation) OUT.put2("validate(func #%d: %q)", func.func_index, sig.render).outln();
-		codeptr.reset(d.data, d.pos, d.limit);
-		parser.reset(codeptr);
-		func_start_pos = d.pos;
-		err.section = BpSection.Code;
-		err.index = func.func_index;
-		ctl_stack.clear();
-		val_stack.clear();
-		ctlxfer.reset(codeptr.pos);
-		ex_handlers.resize(0);
-
-		// Setup params.
-		locals.resize(0);
-		init_status.resize(0);
-		locals.puta(sig.params);
-		init_status.putn(InitStatus.INIT, sig.params.length);
+		resetSig(func.sig);
+		resetCode(d);
 
 		// Read and initialize locals.
 		if (!readLocals(locals)) return reterr();
@@ -82,6 +73,46 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			return CodeValidatorResult.Ok;
 		}
 		return reterr();
+	}
+	private def validateExpr0(sig: SigDecl, d: DataReader) -> CodeValidatorResult {
+		if (Trace.validation) OUT.put1("validate(expr: %q)", sig.render).outln();
+		resetSig(sig);
+		resetCode(d);
+		opcode_pos = codeptr.pos;
+		pushControl(Opcode.UNREACHABLE.code, sig.params, sig.results, 0);
+		if (init_stack == null) init_stack = ArrayStack.new();
+		else init_stack.top = 0;
+
+		// Run validation.
+		validatingInitExpr = true;
+		validateCode();
+		d.reset(codeptr.data, codeptr.pos, d.limit);
+		if (ctl_stack.top != 0 && err.ok()) {
+			err.rel(codeptr, codeptr.pos).UnterminatedInitExpr();
+		}
+		if (err.ok()) {
+			// Metric collection.
+			Metrics.validate_bytes.val += u32.view(d.pos - func_start_pos);
+			// Return success.
+			return CodeValidatorResult.Ok;
+		}
+		return reterr();
+	}
+	private def resetSig(sig: SigDecl) {
+		this.sig = sig;
+		val_stack.clear();
+		locals.resize(0);
+		init_status.resize(0);
+		locals.puta(sig.params);
+		init_status.putn(InitStatus.INIT, sig.params.length);
+	}
+	private def resetCode(d: DataReader) {
+		codeptr.reset(d.data, d.pos, d.limit);
+		parser.reset(codeptr);
+		func_start_pos = d.pos;
+		ctl_stack.clear();
+		ctlxfer.reset(codeptr.pos);
+		ex_handlers.resize(0);
 	}
 	def readLocals(vec: Vector<ValueType>) -> bool {
 		var start = vec.length, max = limits.max_num_locals;
@@ -118,12 +149,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	}
 	def validateCode() {
 		while (codeptr.pos < codeptr.limit) {
+			var constExpr = false;
 			opcode_pos = codeptr.pos;
-			var b = codeptr.peek1();
 			var opcode = codeptr.read_opcode();
 			if (Trace.validation) { traceOpcode(); traceStack(true); }
 			// FAST: Handle short operators (predictable direct branch)
-			if (Opcodes.attributes[b].SHORT_OP) {
+			if (Opcodes.attributes[opcode.prefix].SHORT_OP) {
 				checkSignature(opcode.sig);
 				if (Trace.validation) traceStack(false);
 				continue;
@@ -215,6 +246,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					setUnreachable();
 				}
 				END => {
+					constExpr = true;
 					if (ctl_stack.top == 0) return err_atpc().EmptyControlStack();
 					checkArgsAndTransfer();
 					var ctl = ctl_stack.peek();
@@ -238,7 +270,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					}
 					resetInit();
 					ctl_stack.pop();
-					ctl_top = ctl_stack.peek();
+					if (validatingInitExpr && ctl_stack.empty()) { // END finished the init expr
+						codeptr.reset(codeptr.data, codeptr.pos, codeptr.pos);
+					} else {
+						ctl_top = ctl_stack.peek();
+					}
 				}
 				BR => {
 					var depth = parser.readLabel();
@@ -398,6 +434,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				GLOBAL_GET => {
 					var g = parser.readGlobalRef();
 					if (g == null) return;
+					if (validatingInitExpr) {
+						if (g.mutable) err_atpc().ExpectedImmutableGlobalInInit(g);
+						else if (g.imp == null) err_atpc().ExpectedImportedGlobalInInit(g);
+						else constExpr = true;
+						init_stack.push(InitExpr.Global(g.global_index, g));
+					}
 					push(g.valtype);
 				}
 				GLOBAL_SET => {
@@ -454,37 +496,49 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					checkSignature(opcode.sig);
 				}
 				I32_CONST => {
-					codeptr.read_sleb32();
+					constExpr = true;
+					var val = codeptr.read_sleb32();
 					push(ValueType.I32);
+					if (validatingInitExpr) init_stack.push(InitExpr.I32(val));
 				}
 				I64_CONST => {
-					codeptr.read_sleb64();
+					constExpr = true;
+					var val = codeptr.read_sleb64();
 					push(ValueType.I64);
+					if (validatingInitExpr) init_stack.push(InitExpr.I64(val));
 				}
 				F32_CONST => {
-					codeptr.skipN(4);
+					constExpr = true;
+					var val = codeptr.read_u32();
 					push(ValueType.F32);
+					if (validatingInitExpr) init_stack.push(InitExpr.F32(val));
 				}
 				F64_CONST => {
-					codeptr.skipN(8);
+					constExpr = true;
+					var val = codeptr.read_u64();
 					push(ValueType.F64);
+					if (validatingInitExpr) init_stack.push(InitExpr.F64(val));
 				}
 				REF_NULL => {
+					constExpr = true;
 					var ht = parser.readHeapType();
 					push(ValueType.Ref(true, ht));
+					if (validatingInitExpr) init_stack.push(InitExpr.ExternRefNull); // TODO: add heap type
 				}
 				REF_IS_NULL => {
 					popRef();
 					push(ValueType.I32);
 				}
 				REF_FUNC => {
+					constExpr = true;
 					var func = parser.readFuncRef();
 					if (func == null) return;
-					if (!func.reffed) err_atpc().IllegalFuncRef(func);
+					if (!func.reffed && !validatingInitExpr) err_atpc().IllegalFuncRef(func);
 					var ftype = if(extensions.FUNCTION_REFERENCES,
 						ValueTypes.RefFunc(false, func.sig),
 						ValueTypes.FUNCREF);
 					push(ftype);
+					if (validatingInitExpr) init_stack.push(InitExpr.FuncRef(func.func_index, func));
 				}
 				REF_AS_NON_NULL => {
 					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
@@ -520,18 +574,32 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				STRUCT_NEW => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
 					var st = parser.readStructType();
 					if (st == null) return;
 					checkAndPopFields(st.field_types);
 					push(ValueTypes.RefStruct(false, st));
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(st.field_types.length);
+						for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop();
+						var ht = HeapType.Struct(st);
+						init_stack.push(InitExpr.Struct(ht, vals));
+					}
 				}
 				STRUCT_NEW_DEFAULT => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
 					var st = parser.readStructType();
 					if (st == null) return;
 					var stt = ValueTypes.RefStruct(false, st);
 					if (!st.defaultable) err_atpc().ExpectedDefaultableHeapType(stt);
 					push(stt);
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(st.field_types.length);
+						for (i < vals.length) vals[i] = InitExpr.Const(Values.default(st.field_types[i].valtype));
+						var ht = HeapType.Struct(st);
+						init_stack.push(InitExpr.Struct(ht, vals));
+					}
 				}
 				STRUCT_GET => {
 					if (noGC(opcode)) return;
@@ -569,20 +637,34 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				ARRAY_NEW => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
 					var at = parser.readArrayType();
 					if (at == null) return;
 					popE(ValueType.I32);
 					checkAndPopFields(at.elem_types);
 					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var elem = init_stack.pop();
+						var ht = HeapType.Array(at);
+						init_stack.push(InitExpr.Array(ht, len, elem));
+					}
 				}
 				ARRAY_NEW_DEFAULT => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
 					var at = parser.readArrayType();
 					if (at == null) return;
 					var att = ValueTypes.RefArray(false, at);
 					if (!at.defaultable) err_atpc().ExpectedDefaultableHeapType(att);
 					popE(ValueType.I32);
 					push(att);
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var elem = InitExpr.Const(Values.default(at.elem_types[0].valtype));
+						var ht = HeapType.Array(at);
+						init_stack.push(InitExpr.Array(ht, len, elem));
+					}
 				}
 				ARRAY_GET => {
 					if (noGC(opcode)) return;
@@ -670,14 +752,21 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				ARRAY_NEW_FIXED => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
 					var at = parser.readArrayType();
 					if (at == null) return;
-					var size = codeptr.read_uleb32();
+					var size = codeptr.read_uleb31();
 					for (i < size) checkAndPopFields(at.elem_types);
 					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(size);
+						for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop();
+						init_stack.push(InitExpr.FixedArray(HeapType.Array(at), vals));
+					}
 				}
 				ARRAY_NEW_DATA => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
 					var at = parser.readArrayType();
 					if (at == null) return;
 					var index = parser.readDataIndex();
@@ -685,9 +774,15 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					popE(ValueType.I32);
 					popE(ValueType.I32);
 					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var offset = init_stack.pop();
+						init_stack.push(InitExpr.ArrayNewData(HeapType.Array(at), index, offset, len));
+					}
 				}
 				ARRAY_NEW_ELEM => {
 					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
 					var at = parser.readArrayType();
 					if (at == null) return;
 					var elem = parser.readElemRef();
@@ -698,11 +793,18 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					popE(ValueType.I32);
 					popE(ValueType.I32);
 					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var offset = init_stack.pop();
+						init_stack.push(InitExpr.ArrayNewElem(HeapType.Array(at), elem.elem_index, offset, len));
+					}
 				}
 				I31_NEW => {
 					if (noGC(opcode)) return;
+					constExpr = true;
 					popE(ValueType.I32);
 					push(ValueTypes.I31REF_NONNULL);
+					if (validatingInitExpr) init_stack.push(InitExpr.I31(init_stack.pop()));
 				}
 				I31_GET_S => {
 					if (noGC(opcode)) return;
@@ -857,8 +959,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				V128_LOAD_64_LANE	=> { checkLaneLoad(opcode, 3);  checkLane(1); }
 				V128_STORE_64_LANE	=> { checkLaneStore(opcode, 3);  checkLane(1); }
 				V128_CONST => {
-					codeptr.skipN(16);
+					constExpr = true;
+					var low = codeptr.read_u64();
+					var high = codeptr.read_u64();
 					push(ValueType.V128);
+					if (validatingInitExpr) init_stack.push(InitExpr.V128(low, high));
 				}
 				I8X16_SHUFFLE => {
 					checkLanes(31, 16);
@@ -957,6 +1062,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 			}
 			if (Trace.validation) traceStack(false);
+			if (validatingInitExpr && !constExpr) err_atpc().UnexpectedOpcodeInInit(opcode.prefix, opcode.code);
 		}
 	}
 	def startExHandler() -> (int, int) {

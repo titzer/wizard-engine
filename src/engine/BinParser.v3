@@ -214,7 +214,6 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 	err: ErrorGen, var decoder: DataReader) {
 	def cache = Canon.globalCache;
 	var eof = false;
-	var init_stack: ArrayStack<(ValueType, InitExpr)>;
 	var max_fw_index = if(module != null, module.heaptypes.length);
 	var max_legal_index = max_fw_index;
 	var subtype_list: Vector<(int, int)>;
@@ -680,137 +679,21 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		return readInitExpr(quantity, ValueType.I32);
 	}
 	def readInitExpr(quantity: string, expected: ValueType) -> InitExpr {
-		// TODO: reduce duplication with CodeValidator
-		if (init_stack == null) init_stack = ArrayStack.new();
-		else init_stack.clear();
-		var wasEnd = false;
-		var pt = decoder.pos;
-		var last: byte;
-		while (decoder.pos < decoder.limit) {
-			pt = decoder.pos;
-			last = readByte("opcode", Opcodes.render);
-			match (last) {
-				Opcode.I32_CONST.code => {
-					var val = readI32();
-					init_stack.push(ValueType.I32, InitExpr.I32(int.view(val)));
-				}
-				Opcode.I64_CONST.code => {
-					var val = readI64();
-					init_stack.push(ValueType.I64, InitExpr.I64(long.view(val)));
-				}
-				Opcode.F32_CONST.code => {
-					var val = decoder.read_u32();
-					init_stack.push(ValueType.F32, InitExpr.F32(val));
-				}
-				Opcode.F64_CONST.code => {
-					var val = decoder.read_u64();
-					init_stack.push(ValueType.F64, InitExpr.F64(val));
-				}
-				Opcode.REF_NULL.code => {
-					init_stack.push(ValueType.Ref(true, readHeapType()), InitExpr.ExternRefNull);
-				}
-				Opcode.REF_FUNC.code => {
-					var f = readFuncRef();
-					if (f != null) {
-						f.reffed = true;
-						init_stack.push(ValueTypes.RefFunc(false, f.sig), InitExpr.FuncRef(f.func_index, f));
-					}
-				}
-				Opcode.GLOBAL_GET.code => {
-					var g = readGlobalRef();
-					if (g != null) {
-						if (g.mutable) err.rel(decoder, pt).ExpectedImmutableGlobalInInit(g);
-						if (g.imp == null) err.rel(decoder, pt).ExpectedImportedGlobalInInit(g);
-						init_stack.push(g.valtype, InitExpr.Global(g.global_index, g));
-					}
-				}
-				Opcode.END.code => {
-					break;
-				}
-				0xFB => if (extensions.GC) {
-					var b2 = readU32("opcode", 1024);
-					match (b2) {
-						Opcode.STRUCT_NEW.code => {
-							var st = readStructType();
-							if (st == null) break;
-							var vals = Array<InitExpr>.new(st.field_types.length);
-							for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop().1; // TODO: typecheck
-							var ht = HeapType.Struct(st);
-							init_stack.push(ValueType.Ref(false, ht), InitExpr.Struct(ht, vals));
-						}
-						Opcode.STRUCT_NEW_DEFAULT.code => {
-							var st = readStructType();
-							if (st == null) break;
-							var vals = Array<InitExpr>.new(st.field_types.length); // TODO: proper default values
-							var ht = HeapType.Struct(st);
-							init_stack.push(ValueType.Ref(false, ht), InitExpr.Struct(ht, vals));
-						}
-						Opcode.ARRAY_NEW.code => {
-							var at = readArrayType();
-							if (at == null) break;
-							var len = init_stack.pop().1; // TODO: typecheck
-							var elem = init_stack.pop().1; // TODO: typecheck
-							var ht = HeapType.Array(at);
-							init_stack.push(ValueType.Ref(false, ht), InitExpr.Array(ht, len, elem));
-						}
-						Opcode.ARRAY_NEW_DEFAULT.code => {
-							var at = readArrayType();
-							if (at == null) break;
-							var len = init_stack.pop().1; // TODO: typecheck
-							var elem: InitExpr;
-							match (at.elem_types[0].valtype) {
-								I32 => elem = InitExpr.I32(0);
-								I64 => elem = InitExpr.I64(0);
-								F32 => elem = InitExpr.F32(0);
-								F64 => elem = InitExpr.F64(0);
-								V128 => elem = InitExpr.V128(0, 0);
-								BOTTOM, Ref, Abstract, Host => elem = InitExpr.ExternRefNull;
-							}
-							var ht = HeapType.Array(at);
-							init_stack.push(ValueType.Ref(false, ht), InitExpr.Array(ht, len, elem));
-						}
-						Opcode.ARRAY_NEW_FIXED.code => {
-							var at = readArrayType();
-							var length = readU32_i("array length", limits.max_array_length);
-							var vals = Array<InitExpr>.new(length);
-							for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop().1;
-							var ht = HeapType.Array(at);
-							init_stack.push(ValueType.Ref(false, ht), InitExpr.FixedArray(ht, vals));
-						}
-						Opcode.I31_NEW.code => {
-							var e = init_stack.pop();
-							if (e.0 == ValueType.I32) {
-								init_stack.push(ValueTypes.I31REF_NONNULL, InitExpr.I31(e.1));
-							} else {
-								err.rel(decoder, pt).TypeMismatchIn(Strings.format1("i31.new in %s", quantity), ValueType.I32, e.0);
-							}
-						}
-						_ => err.rel(decoder, pt).UnexpectedOpcodeInInit(last, b2);
-					}
-				}
-				0xFD => {
-					var b2 = decoder.read_uleb32();
-					match (Opcodes.page_FD[b2]) {
-						V128_CONST => {
-							decoder.skipN(16); // TODO: read v128 const initializer
-							init_stack.push(ValueType.V128, InitExpr.V128(0, 0));
-						}
-						_ => err.rel(decoder, pt).UnexpectedOpcodeInInit(last, b2);
-					}
-				}
-				_ => {
-					err.rel(decoder, pt).UnexpectedOpcodeInInit(0, last);
-				}
-			}
+		var prev_pos = decoder.pos;
+		var validator = CodeValidator.new(extensions, limits, module, err); // TODO: cache
+		var sig: SigDecl;
+		match (expected) {
+			I32 => sig = SigCache.v_i;
+			I64 => sig = SigCache.v_l;
+			F32 => sig = SigCache.v_f;
+			F64 => sig = SigCache.v_d;
+			V128 => sig = SigCache.v_s;
+			_ => sig = SigDecl.new(true, ValueTypes.NO_HEAPTYPES, SigCache.arr_v, [expected]);
 		}
-		if (last != Opcode.END.code) err.rel(decoder, pt).ExpectedEndInInit(0);
-		if (init_stack.top != 1) {
-			err.rel(decoder, decoder.pos).TypeMismatchIn(quantity, expected, ValueType.BOTTOM); // TODO: proper msg for multiple
-			return InitExpr.ExternRefNull;
-		} else {
-			var t = init_stack.pop();
-			if (!ValueTypes.isAssignable(t.0, expected)) err.rel(decoder, decoder.pos).TypeMismatchIn(quantity, expected, t.0);
-			return t.1;
+		var r = validator.validateInitExpr(sig, decoder);
+		match (r) {
+			Ok => return validator.init_stack.pop();
+			_ => return InitExpr.I32(0); // TODO: return invalid initexpr?
 		}
 	}
 	def readDefType(index: int) {
