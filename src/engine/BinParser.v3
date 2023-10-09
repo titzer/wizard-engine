@@ -5,21 +5,24 @@
 // representation. The parser uses a "push" model which allows the creator to
 // input segments of data into the parser incrementally, e.g. if streaming it
 // over a network.
-def OUT = Trace.OUT;
 class BinParser(extensions: Extension.set, limits: Limits, filename: string) extends BpFsmCallback {
 	def err = ErrorGen.new(filename);
 	var tiering: ExecutionStrategy;
 	var validate_code = true;
 
+	private def cache = Canon.globalCache;
 	private var validator: CodeValidator;
 	private var parser: WasmParser;
+	private var decoder: DataReader;
 	private var fsm: BpFsm;
 	private var seen_sections = Array<bool>.new(BpSection.count);
 	private var declared_func_count: u32;
 	private var func_body_cursor: int;
+	private var subtype_list: Vector<(int, int)>;
 
 	new() super(Module.new(filename)) {
 		fsm = BpFsm.new(extensions, limits, err, this);
+		decoder = fsm.decoder;
 		parser = WasmParser.new(extensions, limits, module, err, fsm.decoder);
 		if (tiering != null) tiering.onModuleStart(module, 0);
 	}
@@ -42,18 +45,18 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 	private def finish0() -> BinParserResult {
 		var func_count = declared_func_count;
 		if (func_count > 0 && !seen_sections[BpSection.Code.code]) {
-			err.at(parser.decoder).MissingCodeSection(func_count);
+			err.at(decoder).MissingCodeSection(func_count);
 		}
 		var data_count = module.explicit_data_count;
 		if (data_count > 0 && !seen_sections[BpSection.Data.code]) {
-			err.at(parser.decoder.atLimit()).MissingDataSection(data_count);
+			err.at(decoder.atLimit()).MissingDataSection(data_count);
 		}
 		return fsm.finish(if(tiering != null, tiering.onModuleFinish));
 	}
 
 	def decodeSection(kind: BpSection, size: u32, d: DataReader) {
 		var start = d.pos;
-		parser.decoder = d;
+		decoder = parser.decoder = d;
 //		parser.debugBuffer();
 		if (kind != BpSection.Unknown) {
 			if (seen_sections[kind.code]) {
@@ -66,58 +69,58 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		match (kind) {
 			Unknown => readCustomSection(size);
 			Type => {
-				var count = parser.readCountAndReserve("types", module.heaptypes, limits.max_num_types);
-				readLoop("type", count, parser.readDefType);
+				var count = readCountAndReserve("types", module.heaptypes, limits.max_num_types);
+				readLoop("type", count, readDefType);
 			}
 			Import => {
-				var count = parser.readCountAndReserve("imports", module.imports, limits.max_num_imports);
-				readLoop("imports", count, parser.readImportDecl);
+				var count = readCountAndReserve("imports", module.imports, limits.max_num_imports);
+				readLoop("imports", count, readImportDecl);
 			}
 			Function => {
-				var count = parser.readCountAndReserve("functions", module.functions, limits.max_num_functions);
+				var count = readCountAndReserve("functions", module.functions, limits.max_num_functions);
 				declared_func_count = u32.!(count);
-				readLoop("functions", count, parser.readFuncDecl);
+				readLoop("functions", count, readFuncDecl);
 			}
 			Table => {
-				var count = parser.readCountAndReserve("tables", module.tables, limits.max_num_tables);
-				readLoop("tables", count, parser.readTableDecl);
+				var count = readCountAndReserve("tables", module.tables, limits.max_num_tables);
+				readLoop("tables", count, readTableDecl);
 			}
 			Memory => {
-				var count = parser.readCountAndReserve("memories", module.memories, limits.max_num_memories);
-				readLoop("memories", count, parser.readMemoryDecl);
+				var count = readCountAndReserve("memories", module.memories, limits.max_num_memories);
+				readLoop("memories", count, readMemoryDecl);
 			}
 			Tag => {
-				var count = parser.readCountAndReserve("tags", module.tags, limits.max_num_tags);
-				readLoop("tags", count, parser.readTagDecl);
+				var count = readCountAndReserve("tags", module.tags, limits.max_num_tags);
+				readLoop("tags", count, readTagDecl);
 			}
 			Global => {
-				var count = parser.readCountAndReserve("globals", module.globals, limits.max_num_globals);
-				readLoop("globals", count, parser.readGlobalDecl);
+				var count = readCountAndReserve("globals", module.globals, limits.max_num_globals);
+				readLoop("globals", count, readGlobalDecl);
 			}
 			Export => {
-				var count = parser.readCountAndReserve("exports", module.exports, limits.max_num_exports);
+				var count = readCountAndReserve("exports", module.exports, limits.max_num_exports);
 				var set = StringSet.new(count);
-				readLoop("exports", count, parser.readExportDecl(_, set));
+				readLoop("exports", count, readExportDecl(_, set));
 			}
 			// note: Code section handled specially by BpFsm.
 			Data => {
-				var pos = parser.decoder.pos;
-				var count = parser.readCountAndReserve("data segments", module.data, limits.max_num_data_segments);
+				var pos = decoder.pos;
+				var count = readCountAndReserve("data segments", module.data, limits.max_num_data_segments);
 				if (module.explicit_data_count >= 0 && count != module.explicit_data_count) {
-					return err.rel(parser.decoder, pos).DataCountMismatch(module.explicit_data_count, u32.!(count));
+					return err.rel(decoder, pos).DataCountMismatch(module.explicit_data_count, u32.!(count));
 				}
-				readLoop("data segments", count, parser.readDataDecl);
+				readLoop("data segments", count, readDataDecl);
 			}
 			Element => {
-				var count = parser.readCountAndReserve("elements", module.elems, limits.max_num_table_entries);
-				readLoop("elements", count, parser.readElemDecl);
+				var count = readCountAndReserve("elements", module.elems, limits.max_num_table_entries);
+				readLoop("elements", count, readElemDecl);
 			}
 			Start => readStartSection();
 			DataCount => readDataCountSection();
 			_ => return err.at(d).InvalidSectionCode(kind.code);
 		}
 		if (Trace.binparse) {
-			OUT.put2("======== end section code %d (%s) ========", kind.code, kind.name).outln();
+			Trace.OUT.put2("======== end section code %d (%s) ========", kind.code, kind.name).outln();
 		}
 
 		err.section = BpSection.Unknown;
@@ -140,7 +143,6 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		if (tiering != null) tiering.onCodeSectionStart(module, count, 0); // TODO: size
 	}
 	def readCustomSection(size: u32) {
-		var decoder = parser.decoder;
 		var start = decoder.pos;
 		var name = parser.readUtf8String("custom section name");
 		var payload_len = int.!(size) - (decoder.pos - start);
@@ -155,12 +157,11 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		for (i < count) {
 			if (err.error()) break;
 			err.index = i;
-			if (Trace.binparse) OUT.put2("-->%s #%d", thing_name, i).outln();
+			if (Trace.binparse) Trace.OUT.put2("-->%s #%d", thing_name, i).outln();
 			read(i);
 		}
 	}
 	def readStartSection() {
-		var decoder = parser.decoder;
 		var pt = decoder.pos;
 		var f = parser.readFuncRef();
 		if (f != null) {
@@ -177,7 +178,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		module.explicit_data_count = count;
 	}
 	def decodeFunctionBody(index: u32, size: u32, decoder: DataReader) {
-		if (Trace.binparse) OUT.put1("-->body #%d", index).outln();
+		if (Trace.binparse) Trace.OUT.put1("-->body #%d", index).outln();
 		parser.decoder = decoder;
 		var start = decoder.pos;
 		var f: FuncDecl, i = func_body_cursor;
@@ -202,485 +203,12 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		var r = validator.validate(f, decoder);
 		if (tiering != null) tiering.onFuncValidationFinish(module, f, err);
 	}
-}
-
-type BinParserResult {
-	case Ok(module: Module) { }
-	case Error(code: WasmError, filename: string, section: BpSection, error_index: int, error_pos: int, error_msg: string) { }
-}
-
-// Contains common routines for the module parser and function body parser.
-class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
-	err: ErrorGen, var decoder: DataReader) {
-	def cache = Canon.globalCache;
-	var eof = false;
-	var max_fw_index = if(module != null, module.heaptypes.length);
-	var max_legal_index = max_fw_index;
-	var subtype_list: Vector<(int, int)>;
-
-	def eof_set_flag(d: DataReader, pos: int, size: int, msg: string) {
-		eof = true;
-	}
-	def reset(d: DataReader) {
-		this.decoder = d;
-		max_fw_index = max_legal_index = module.heaptypes.length;
-	}
-	def readTableRef() -> TableDecl {
-		return readIndex("table", module.tables);
-	}
-	def readTableIndex() -> u31 {
-		return readAndCheckIndex("table", module.tables.length).1;
-	}
-	def readTableImm() -> int {
-		return readTableIndex();
-	}
-	def readSigRef() -> SigDecl {
-		var pt = decoder.pos;
-		var ht = readIndex("signature", module.heaptypes);
-		if (SigDecl.?(ht)) return SigDecl.!(ht);
-		err.rel(decoder, pt).ExpectedSignature(ht);
-		return null;
-	}
-	def readSigIndex() -> int {
-		var pt = decoder.pos;
-		var t = readAndCheckIndex("signature", module.heaptypes.length);
-		if (t.0) {
-			var ht = module.heaptypes[t.1];
-			if (!SigDecl.?(ht)) err.rel(decoder, pt).ExpectedSignature(ht);
-			return t.1;
-		}
-		return 0;
-	}
-	def readFuncRef() -> FuncDecl {
-		return readIndex("function", module.functions);
-	}
-	def readFuncIndex() -> u31 {
-		return readAndCheckIndex("function", module.functions.length).1;
-	}
-	def readMemoryRef() -> MemoryDecl {
-		return readIndex("memory", module.memories);
-	}
-	def readMemoryIndex() -> u31 {
-		return readAndCheckIndex("memory", module.memories.length).1;
-	}
-	def readDataIndex() -> u31 {
-		var max = module.data.length, ex = module.explicit_data_count;
-		if (ex > max) max = ex;
-		return readAndCheckIndex("data", max).1;
-	}
-	def readElemRef() -> ElemDecl {
-		return readIndex("elem", module.elems);
-	}
-	def readMemoryImm() -> int {
-		var pt = decoder.pos;
-		if (extensions.MULTI_MEMORY) {
-			return readMemoryIndex();
-		} else {
-			var b = readByte("memory index", StringBuilder.putd);
-			if (b != 0) err.rel(decoder, pt).ExpectedMemoryIndexZeroByte(b);
-			checkIndex(pt, "memory", 0, module.memories.length);
-			return 0;
-		}
-	}
-	def readGlobalRef() -> GlobalDecl {
-		return readIndex("global", module.globals);
-	}
-	def readTagRef() -> TagDecl {
-		return readIndex("tag", module.tags);
-	}
-	def readAbsTypeRef() -> AbsTypeDecl {
-		return readIndex("abstract type", module.abstypes);
-	}
-	def readIndex<T>(quantity: string, space: Vector<T>) -> T {
-		var t = readAndCheckIndex(quantity, space.length);
-		return if(t.0, space[t.1]);
-	}
-	def readAndCheckIndex(quantity: string, max: int) -> (bool, u31) {
-		var pt = decoder.pos;
-		var index = decoder.read_uleb32();
-		if (Trace.binparse) {
-			traceBytes(pt, quantity);
-			OUT.putd(index).outln();
-		}
-		return checkIndex(pt, quantity, index, max);
-	}
-	def checkIndex(pt: int, quantity: string, index: u32, max: int) -> (bool, u31) {
-		if (index >= max) {
-			err.rel(decoder, pt).OobIndex(quantity, index, u32.!(max));
-			return (false, u31.!(index));
-		}
-		return (true, u31.!(index));
-	}
-	def readValueType() -> ValueType {
-		var pt = decoder.pos, code = readTypeCode();
-		return readValueTypeSuffix(pt, code);
-	}
-	def readValueTypeSuffix(pt: int, code: int) -> ValueType {
-		match (code) {
-			BpTypeCode.I32.val => return ValueType.I32;
-			BpTypeCode.I64.val => return ValueType.I64;
-			BpTypeCode.F32.val => return ValueType.F32;
-			BpTypeCode.F64.val => return ValueType.F64;
-			BpTypeCode.V128.val => return ValueType.V128;
-			BpTypeCode.FUNCREF.val => return ValueTypes.FUNCREF;
-			BpTypeCode.EXTERNREF.val => return ValueTypes.EXTERNREF;
-			BpTypeCode.ANYREF.val => if (extensions.GC) return ValueTypes.ANYREF;
-			BpTypeCode.REF.val => return ValueType.Ref(false, readHeapType());
-			BpTypeCode.REF_NULL.val => return ValueType.Ref(true, readHeapType());
-			BpTypeCode.STRUCTREF.val => if (extensions.GC) return ValueTypes.STRUCTREF;
-			BpTypeCode.I31REF.val => if (extensions.GC) return ValueTypes.I31REF;
-			BpTypeCode.NULLFUNCREF.val => if (extensions.GC) return ValueTypes.NULLFUNCREF;
-			BpTypeCode.NULLEXTERNREF.val => if (extensions.GC) return ValueTypes.NULLEXTERNREF;
-			BpTypeCode.ARRAYREF.val => if (extensions.GC) return ValueTypes.ARRAYREF;
-			BpTypeCode.NULLREF.val => if (extensions.GC) return ValueTypes.NULLREF;
-			BpTypeCode.ABS.val => if (extensions.TYPE_IMPORTS) {
-				var pt = decoder.pos;
-				var at = readIndex("type", module.abstypes);
-				if (at != null) return ValueType.Abstract(at);
-				return ValueType.I32;
-			}
-		}
-
-		err.rel(decoder, pt).InvalidValueTypecon(code);
-		return ValueType.I32;
-	}
-	def readRefType(isTable: bool) -> ValueType.Ref {
-		var pt = decoder.pos, code = readTypeCode();
-		match (code) {
-			BpTypeCode.FUNCREF.val => return ValueTypes.FUNCREF;
-			BpTypeCode.EXTERNREF.val => return ValueTypes.EXTERNREF;
-			BpTypeCode.ANYREF.val => return ValueTypes.ANYREF;
-			BpTypeCode.EQREF.val => return ValueTypes.EQREF;
-			BpTypeCode.I31REF.val => return ValueTypes.I31REF;
-			BpTypeCode.NULLFUNCREF.val => return ValueTypes.NULLFUNCREF;
-			BpTypeCode.NULLEXTERNREF.val => return ValueTypes.NULLEXTERNREF;
-			BpTypeCode.STRUCTREF.val => return ValueTypes.STRUCTREF;
-			BpTypeCode.ARRAYREF.val => return ValueTypes.ARRAYREF;
-			BpTypeCode.NULLREF.val => return ValueTypes.NULLREF;
-			BpTypeCode.REF.val => return ValueType.Ref(false, readHeapType());
-			BpTypeCode.REF_NULL.val => return ValueType.Ref(true, readHeapType());
-		}
-		if (isTable) err.rel(decoder, pt).IllegalTableElementType(code);
-		else err.rel(decoder, pt).InvalidRefTypecon(code);
-		return ValueTypes.ANYREF;
-	}
-	def readHeapType() -> HeapType {
-		var pt = decoder.pos;
-		var index = readTypeCode();
-		match (index) { // TODO: check extension set
-			BpHeapTypeCode.FUNC.val => return HeapType.Func(null);
-			BpHeapTypeCode.EXTERN.val => return HeapType.EXTERN;
-			BpHeapTypeCode.ANY.val => return HeapType.ANY;
-			BpHeapTypeCode.EQ.val => if (extensions.GC) return HeapType.EQ;
-			BpHeapTypeCode.I31.val => if (extensions.GC) return HeapType.I31;
-			BpHeapTypeCode.NOFUNC.val => if (extensions.GC) return HeapType.NOFUNC;
-			BpHeapTypeCode.NOEXTERN.val => if (extensions.GC) return HeapType.NOEXTERN;
-			BpHeapTypeCode.STRUCT.val => if (extensions.GC) return ValueTypes.STRUCTREF.heap;
-			BpHeapTypeCode.ARRAY.val => if (extensions.GC) return ValueTypes.ARRAYREF.heap;
-			BpHeapTypeCode.NONE.val => if (extensions.GC) return HeapType.NONE;
-		}
-		var NONE: Extension.set;
-		if (index < 0 || (extensions & (Extension.FUNCTION_REFERENCES | Extension.GC)) == NONE) {
-			err.rel(decoder, decoder.pos - 1).InvalidHeapType(index);
-			return HeapType.ANY;
-		}
-		return toHeapType(pt, index);
-	}
-	def readBrCastImms() -> (u32, ValueType.Ref, ValueType.Ref) {
-		var flags = decoder.read1();
-		var label = readLabel();
-		var ht1 = readHeapType();
-		var ht2 = readHeapType();
-		return (label, ValueType.Ref((flags & 1) != 0, ht1), ValueType.Ref((flags & 2) != 0, ht2));
-	}
-	def toHeapType(pt: int, index: int) -> HeapType {
-		if (index >= max_legal_index) {
-			err.rel(decoder, pt).OobIndex("heap type", u32.view(index), u32.view(max_legal_index));
-			return HeapType.ANY;
-		}
-		if (index >= max_fw_index) {
-			return HeapType.FwRef(index - max_fw_index);
-		}
-		match (module.heaptypes[index]) {
-			x: StructDecl => return HeapType.Struct(x);
-			x: SigDecl => return HeapType.Func(x);
-			x: ArrayDecl => return HeapType.Array(x);
-			_ => return HeapType.ANY;
-		}
-	}
-	def readStructType() -> StructDecl {
-		var pt = decoder.pos;
-		var ht = readIndex("struct", module.heaptypes);
-		if (StructDecl.?(ht)) return StructDecl.!(ht);
-		err.rel(decoder, pt).ExpectedStructType(ht);
-		return null;
-	}
-	def readFieldIndex(sdecl: StructDecl) -> int {
-		var pt = decoder.pos;
-		var index = readU32("field index", limits.max_num_struct_fields);
-		if (sdecl == null) return -1;
-		var max = u32.view(sdecl.field_types.length);
-		if (index >= max) {
-			err.rel(decoder, pt).OobIndex("field index", index, max);
-			return -1;
-		}
-		return int.view(index);
-	}
-	def readArrayType() -> ArrayDecl {
-		var pt = decoder.pos;
-		var ht = readIndex("array", module.heaptypes);
-		if (ArrayDecl.?(ht)) return ArrayDecl.!(ht);
-		err.rel(decoder, pt).ExpectedArrayType(ht);
-		return null;
-	}
-	def readU32_i(quantity: string, max: u32) -> int {
-		return int.!(readU32(quantity, max));
-	}
-	def readU32(quantity: string, max: u32) -> u32 {
-		var pt = decoder.pos;
-		var val = decoder.read_uleb32();
-		if (eof) return 0;
-		if (val > max) err.rel(decoder, pt).QuantityExceededMaximum(quantity, val, max);
-		if (Trace.binparse) {
-			traceBytes(pt, quantity);
-			OUT.putd(val).outln();
-		}
-		return val;
-	}
-	def readU64(quantity: string, max: u64) -> u64 {
-		var pt = decoder.pos;
-		var val = decoder.read_uleb64();
-		if (eof) return 0;
-		if (val > max) err.rel(decoder, pt).QuantityExceededMaximum(quantity, val, max);
-		if (Trace.binparse) {
-			traceBytes(pt, quantity);
-			OUT.putd(val).outln();
-		}
-		return val;
-	}
-	def readUtf8String(quantity: string) -> string {
-		var len = readU32_i("string length", limits.max_module_size);
-		var pt = decoder.pos;
-		var str = decoder.readN(len);
-		if (Trace.binparse) {
-			traceBytes(pt, quantity);
-			OUT.puts("\"");
-			var max = 24;
-			var count = decoder.pos - pt;
-			for (i = 0; i < count && i < max; i++) {
-				OUT.put1("%c", toPrintableChar(decoder.data[pt + i]));
-			}
-			OUT.puts("\"").outln();
-		}
-		if (!Utf8.validate(str)) err.rel(decoder, pt).InvalidUtf8String();
-		return str;
-	}
-	def readByte(quantity: string, render: (StringBuilder, byte) -> StringBuilder) -> byte {
-		var pt = decoder.pos;
-		var ok = pt < decoder.limit;
-		var r = decoder.read1();
-		if (Trace.binparse && ok) {
-			traceBytes(pt, quantity);
-			OUT.put2("%d (%q)", r, render(_, r)).outln();
-		}
-		return r;
-	}
-	def readBlockType() -> (Array<ValueType>, Array<ValueType>) {
-		var pt = decoder.pos, code = readTypeCode();
-		match (code) {
-			BpTypeCode.EmptyBlock.val => return (SigCache.arr_v, SigCache.arr_v);
-			BpTypeCode.I32.val => return (SigCache.arr_v, SigCache.arr_i);
-			BpTypeCode.I64.val => return (SigCache.arr_v, SigCache.arr_l);
-			BpTypeCode.F32.val => return (SigCache.arr_v, SigCache.arr_f);
-			BpTypeCode.F64.val => return (SigCache.arr_v, SigCache.arr_d);
-			BpTypeCode.V128.val => return (SigCache.arr_v, SigCache.arr_s);
-			BpTypeCode.FUNCREF.val => return (SigCache.arr_v, SigCache.arr_g);
-			BpTypeCode.EXTERNREF.val => return (SigCache.arr_v, SigCache.arr_e);
-			BpTypeCode.ANYREF.val => return (SigCache.arr_v, SigCache.arr_r);
-			BpTypeCode.REF.val => {
-				var heap = readHeapType();
-				var vt = ValueType.Ref(false, heap);
-				return (SigCache.arr_v, [vt]);
-			}
-			BpTypeCode.REF_NULL.val => {
-				var heap = readHeapType();
-				var vt = ValueType.Ref(true, heap);
-				return (SigCache.arr_v, [vt]);
-			}
-			BpTypeCode.I31REF.val => if (extensions.GC) {
-				return (SigCache.arr_v, SigCache.arr_h);
-			}
-			BpTypeCode.NULLFUNCREF.val => if (extensions.GC) {
-				return (SigCache.arr_v, [ValueTypes.NULLFUNCREF]);
-			}
-			BpTypeCode.NULLEXTERNREF.val => if (extensions.GC) {
-				return (SigCache.arr_v, [ValueTypes.NULLEXTERNREF]);
-			}
-			BpTypeCode.STRUCTREF.val => if (extensions.GC) {
-				return (SigCache.arr_v, [ValueTypes.STRUCTREF]);
-			}
-			BpTypeCode.ARRAYREF.val => if (extensions.GC) {
-				return (SigCache.arr_v, [ValueTypes.ARRAYREF]);
-			}
-			BpTypeCode.NULLREF.val => if (extensions.GC) {
-				return (SigCache.arr_v, [ValueTypes.NULLREF]);
-			}
-			BpTypeCode.ABS.val => if (extensions.TYPE_IMPORTS) {
-				var pt = decoder.pos;
-				var at = readIndex("type", module.abstypes);
-				if (at != null) return (SigCache.arr_v, [ValueType.Abstract(at)]);
-				return (SigCache.arr_v, SigCache.arr_v);
-			}
-		}
-		decoder.at(pt); // backup and try again as full signed LEB
-		var index = decoder.read_sleb32();
-		if (index >= 0 && index < module.heaptypes.length) {
-			match (module.heaptypes[index]) {
-				x: SigDecl => return (x.params, x.results);
-			}
-		}
-		err.rel(decoder, pt).InvalidBlockType(index);
-		return (SigCache.arr_v, SigCache.arr_v);
-	}
-	def readLabel() -> u32 {
-		var depth = decoder.read_uleb32();
-		return depth;
-	}
-	def readLabels() -> Array<u32> {
-		var pt = decoder.pos;
-		var count = decoder.read_uleb32(), max = limits.max_func_size;
-		if (count > max) {
-			err.rel(decoder, pt).QuantityExceededMaximum("label count", count, max);
-			return null;
-		}
-		var length = int.!(count + 1);
-		var result = Array<u32>.new(length);
-		for (i < length) result[i] = decoder.read_uleb32();
-		return result;
-	}
-	def readLocalIndex() -> u32 {
-		var index = decoder.read_uleb32();
-		return index;
-	}
-	def readMemoryArg() -> MemArg {
-		var pt = decoder.pos;
-		var flags = readU32("memarg flags", u32.max); // TODO render
-		var mem_index: u31 = 0;
-		if (extensions.MULTI_MEMORY && ((flags & BpConstants.MEMARG_INDEX_FLAG)) != 0) {
-			mem_index = readMemoryIndex();
-			flags ^= 0x40;  // flip flag back
-		} else {
-			checkIndex(pt, "memory", 0, module.memories.length);
-		}
-		var offset: u64;
-		if (mem_index < module.memories.length && module.memories[mem_index].indexType == ValueType.I64) {
-			offset = readU64("memarg offset", u64.max);
-		} else {
-			offset = readU32("memarg offset", u32.max);
-		}
-		return MemArg(flags, mem_index, offset);
-	}
-	def readTypeCode() -> i32 {
-		var pt = decoder.pos;
-		var htcode = decoder.read_sleb32();
-		if (Trace.binparse) {
-			traceBytes(pt, "type code");
-			OUT.puts(" (");
-			BpConstants.renderTypeCode(OUT, htcode);
-			OUT.puts(")").outln();
-		}
-		return htcode;
-	}
-	def readI32() -> i32 {
-		var pt = decoder.pos;
-		var val = decoder.read_sleb32();
-		if (Trace.binparse) {
-			traceBytes(pt, "i32 leb");
-			OUT.putd(val).outln();
-		}
-		return val;
-	}
-	def readI64() -> i64 {
-		var pt = decoder.pos;
-		var val = decoder.read_sleb64();
-		if (Trace.binparse) {
-			traceBytes(pt, "i64 leb");
-			OUT.putd(val).outln();
-		}
-		return val;
-	}
-	def readF32() -> u32 {
-		var pt = decoder.pos;
-		var val = decoder.read_u32();
-		if (Trace.binparse) {
-			traceBytes(pt, "f32 bytes");
-			OUT.outln();
-		}
-		return val;
-	}
-	def readF64() -> u64 {
-		var pt = decoder.pos;
-		var val = decoder.read_u64();
-		if (Trace.binparse) {
-			traceBytes(pt, "f64 bytes");
-			OUT.outln();
-		}
-		return val;
-	}
-	def readTableLimits() -> (u32, Max) {
-		var pt = decoder.pos;
-		var flags = readByte("table flags", BpConstants.renderTableFlags);
-		if ((flags & ~(limits.ok_table_flags)) != 0) err.rel(decoder, pt).InvalidTableFlags(flags);
-		var initial = readU32("initial", limits.max_num_table_entries);
-		var has_max = (flags & BpMemoryFlag.HasMax.mask) != 0;
-		var max: Max = Max.None;
-		if (has_max) {
-			var pt = decoder.pos;
-			var val = readU32("maximum", limits.max_num_table_entries);
-			if (val < initial) err.rel(decoder, pt).MaximumLessThanInitial("table", val, initial);
-			max = Max.Set(val);
-		}
-		return (initial, max);
-
-	}
-	def readMemLimits() -> MemLimits {
-		var pt = decoder.pos;
-		var flags = readByte("memory flags", BpConstants.renderMemoryFlags);
-		if ((flags & ~(limits.ok_memory_flags)) != 0) err.rel(decoder, pt).InvalidMemoryFlags(flags);
-		var initial: u64;
-		if (extensions.MEMORY64) {
-			initial = readU64("initial", limits.max_legal_memory_pages);
-		} else {
-			initial = readU32("initial", u32.!(limits.max_legal_memory_pages));
-		}
-
-		var has_max = (flags & BpMemoryFlag.HasMax.mask) != 0;
-		var max: Max = Max.None;
-		if (has_max) {
-			var pt = decoder.pos;
-			var val: u64;
-			if (extensions.MEMORY64) {
-				val = readU64("maximum", limits.max_legal_memory_pages);
-			} else {
-				val = readU32("maximum", u32.!(limits.max_legal_memory_pages));
-			}
-			if (val < initial) err.rel(decoder, pt).MaximumLessThanInitial("memory", val, initial);
-			max = Max.Set(val);
-		}
-		var shared = (flags & BpMemoryFlag.Shared.mask) != 0;
-		if (shared && !has_max) err.rel(decoder, pt).ExpectedSharedMemoryMaximum();
-		var indexType = if((flags & BpMemoryFlag.Is64.mask) != 0, ValueType.I64, ValueType.I32);
-		return MemLimits(initial, max, shared, indexType);
-	}
-	def readElemType() -> ValueType.Ref {
-		return readRefType(true);
-	}
 	def readI32Expr(quantity: string) -> InitExpr {
 		return readInitExpr(quantity, ValueType.I32);
 	}
 	def readInitExpr(quantity: string, expected: ValueType) -> InitExpr {
 		var prev_pos = decoder.pos;
-		var validator = CodeValidator.new(extensions, limits, module, err); // TODO: cache
+		if (validator == null) validator = CodeValidator.new(extensions, limits, module, err);
 		var sig: SigDecl;
 		match (expected) {
 			I32 => sig = SigCache.v_i;
@@ -696,205 +224,11 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			_ => return InitExpr.I32(0); // TODO: return invalid initexpr?
 		}
 	}
-	def readDefType(index: int) {
-		var recgrp_start = module.heaptypes.length;
-		max_fw_index = recgrp_start;
-		var pt = decoder.pos;
-		var code = readDefTypeCode();
-		if (extensions.GC) {
-			var count = 1;
-			if (code == BpDefTypeCode.REC.code) { // parse as a recursion group
-				count = readU32_i("recursion group count", limits.max_num_types);
-				max_legal_index = recgrp_start + count;
-				for (i < count) {
-					var pt = decoder.pos;
-					var code = readDefTypeCode();
-					readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
-				}
-			} else { // treat as a single type in its own recursion group
-				max_legal_index = recgrp_start + count;
-				readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
-			}
-			if (err.ok()) {
-				cache.doGroup(module.heaptypes, recgrp_start, count);
-				max_fw_index = max_legal_index = module.heaptypes.length;
-				if (subtype_list != null && subtype_list.length > 0) { // check declared subtypes
-					for (i < subtype_list.length) {
-						var t = subtype_list[i];
-						if (t.1 >= module.heaptypes.length) continue; // potential decode error
-						HeapTypeDecls.checkSupertypes(t.0, module.heaptypes[t.1], err);
-					}
-					subtype_list.clear();
-				}
-			}
-		} else {
-			// parse a single type
-			max_legal_index = max_fw_index;
-			readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
-			if (err.ok()) {
-				var i = module.heaptypes.length - 1;
-				module.heaptypes[i] = cache.doOne(module.heaptypes[i]);
-				max_fw_index = max_legal_index = module.heaptypes.length;
-			}
-		}
-	}
-	def readDefTypeCode() -> byte {
-		return readByte("deftype code", BpConstants.renderDefTypeCode); // XXX: LEB not allowed here
-	}
-	def readDefSingleType(pt: int, code: byte, supertypes: Array<HeapType>) {
-		var final = 1;
-		if (extensions.GC) {
-			if (code == BpDefTypeCode.SUB.code) final = 0;
-			else if (code == BpDefTypeCode.SUB_FINAL.code) final = 1;
-			else final = 2;
-			if (final != 2) {
-				var count = readU32_i("supertype count", limits.max_supertypes);
-				supertypes = Array<HeapType>.new(count);
-				for (i < count) {
-					var pt = decoder.pos;
-					var index = readU32_i("type index", u32.view(module.heaptypes.length));
-					supertypes[i] = toHeapType(pt, index);
-				}
-				pt = decoder.pos;
-				code = readDefTypeCode();
-
-				if (subtype_list == null) subtype_list = Vector.new();
-				subtype_list.put(pt, module.heaptypes.length);
-			}
-		}
-
-		match (code) {
-			BpDefTypeCode.Function.code => return readDefFuncType(final != 0, supertypes);
-			BpDefTypeCode.Struct.code => if (extensions.GC) return readDefStructType(final != 0, supertypes);
-			BpDefTypeCode.Array.code => if (extensions.GC) return readDefArrayType(final != 0, supertypes);
-		}
-		err.rel(decoder, pt).InvalidTypeDeclCode(code);
-	}
-	def readDefFuncType(final: bool, supertypes: Array<HeapType>) {
-		var ptypes = readValueTypes("param count", limits.max_num_func_params);
-		if (!err.ok()) return;
-		var rtypes = readValueTypes("result count", limits.max_num_func_results);
-		if (!err.ok()) return;
-		var decl = SigDecl.new(final, supertypes, ptypes, rtypes);
-		module.addDecl(decl);
-		decl.recgrp_index = decl.heaptype_index - max_fw_index;
-	}
-	def readDefStructType(final: bool, supertypes: Array<HeapType>) {
-		var count = readU32_i("field count", limits.max_num_struct_fields);
-		if (!err.ok()) return;
-		var field_types = Array<StorageType>.new(count);
-		for (j < field_types.length) {
-			field_types[j] = readStorageType();
-		}
-		if (!err.ok()) return;
-		var decl = StructDecl.new(final, supertypes, field_types);
-		module.addDecl(decl);
-		decl.recgrp_index = decl.heaptype_index - max_fw_index;
-	}
-	def readDefArrayType(final: bool, supertypes: Array<HeapType>) {
-		var elem_type = readStorageType();
-		if (!err.ok()) return;
-		var decl = ArrayDecl.new(final, supertypes, [elem_type]);
-		module.addDecl(decl);
-		decl.recgrp_index = decl.heaptype_index - max_fw_index;
-	}
-	def readStorageType() -> StorageType {
-		var pt = decoder.pos;
-		var code = readTypeCode();
-		var vt: ValueType, packed: Packedness;
-		match (code) {
-			BpTypeCode.I8.val => { vt = ValueType.I32; packed = Packedness.PACKED_I8; }
-			BpTypeCode.I16.val => { vt = ValueType.I32; packed = Packedness.PACKED_I16; }
-			_ => vt = readValueTypeSuffix(pt, code);
-		}
-		var mut = readMutability();
-		return StorageType(vt, packed, mut);
-	}
-	def readValueTypes(quantity: string, limit: u32) -> Array<ValueType> {
-		var count = readU32_i(quantity, limit);
-		if (!err.ok()) return ValueTypes.NONE;
-		var types = Array<ValueType>.new(count);
-		for (j < types.length) {
-			types[j] = readValueType();
-		}
-		return types;
-	}
-	def readImportDecl(index: int) {
-		var module_name = readUtf8String("import module name");
-		var field_name = readUtf8String("import field name");
-		var pt = decoder.pos;
-		var kind = readByte("import kind", BpConstants.renderImportKind);
-		var decl: Decl;
-		var args = Modules.NO_IMPORT_ARGS;
-		if (extensions.TYPE_IMPORTS && kind == BpImportExportKind.Args.code) {
-			var count = readU32_i("import arg count", limits.max_num_exports);
-			if (!err.ok()) return;
-			args = Array<Decl>.new(count);
-			for (i < count) args[i] = readExportWithoutName();
-			kind = readByte("import kind", BpConstants.renderImportKind);
-		}
-		match (kind) {
-			BpImportExportKind.Function.code => {
-				reserveOne(pt, "functions", module.functions, limits.max_num_functions);
-				var sig_index = readSigIndex();
-				decl = FuncDecl.new(sig_index);
-			}
-			BpImportExportKind.Table.code => {
-				reserveOne(pt, "tables", module.tables, limits.max_num_tables);
-				var et = readElemType();
-				var l = readTableLimits();
-				decl = TableDecl.new(et, l.0, l.1);
-			}
-			BpImportExportKind.Memory.code => {
-				reserveOne(pt, "memories", module.memories, limits.max_num_memories);
-				var l = readMemLimits();
-				decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
-			}
-			BpImportExportKind.Global.code => {
-				reserveOne(pt, "globals", module.globals, limits.max_num_globals);
-				var t = readValueType();
-				var mut = readMutability();
-				decl = GlobalDecl.new(t, mut, InitExpr.I32(0));
-			}
-			BpImportExportKind.Tag.code => {
-				reserveOne(pt, "tags", module.tags, limits.max_num_tags);
-				var b = readByte("attribute", BpConstants.renderAttribute);
-				var sig_index = readSigIndex();
-				decl = TagDecl.new(sig_index);
-			}
-			BpImportExportKind.AbsType.code => if (extensions.TYPE_IMPORTS) {
-				var flags = readByte("flags", BpConstants.renderAbsTypeFlags);
-				var has_default = (flags & BpAbsTypeFlag.HasDefault.mask) != 0;
-				var is_externref = (flags & BpAbsTypeFlag.IsExternRef.mask) != 0;
-				var count = readU32_i("constraint count", limits.max_num_type_constraints);
-				var vec = Vector<ValueType>.new();
-				if (count < limits.max_grow_size) vec.grow(count);
-				for (i < count) {
-					var b = readByte("constraint type", BpConstants.renderNone);
-					if (b != 0) err.rel(decoder, pt).InvalidTypeConstraint(b);
-					var t = readValueType();
-					vec.put(t);
-				}
-				decl = AbsTypeDecl.new(has_default, is_externref, vec.extract());
-			}
-			BpImportExportKind.Command.code => if (extensions.TYPE_IMPORTS) {
-				decl = ImportCommandDecl.new();
-			}
-		}
-		if (decl == null) err.rel(decoder, pt).InvalidImportKind(kind);
-		else module.addImport(module_name, field_name, args, decl);
-	}
-	def readFuncDecl(index: int) {
-		var pt = decoder.pos;
-		var sig_index = readSigIndex();
-		var decl = FuncDecl.new(sig_index);
-		module.addDecl(decl);
-	}
 	def readTableDecl(index: int) {
 		var pt = decoder.pos;
 		var decl: TableDecl;
 		if (extensions.FUNCTION_REFERENCES && decoder.peek1() == 0x40) {
-			readByte("table type", BpConstants.renderNone);
+			parser.readByte("table type", BpConstants.renderNone);
 			var zero = decoder.read1();
 			if (zero != 0) err.rel(decoder, pt + 1).ExpectedTableTypeZeroByte(zero);
 			var elemType = readElemType();
@@ -912,240 +246,9 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 		}
 		module.addDecl(decl);
 	}
-	def readMemoryDecl(index: int) {
-		var l = readMemLimits();
-		var decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
-		module.addDecl(decl);
-	}
-	def readTagDecl(index: int) {
-		var pt = decoder.pos;
-		var b = readByte("attribute", BpConstants.renderAttribute);
-		if (b != 0) err.rel(decoder, pt).InvalidTagAttribute(b);
-		pt = decoder.pos;
-		var sig_index = readSigIndex();
-		var decl = TagDecl.new(sig_index);
-		module.addDecl(decl);
-		if (u32.view(sig_index) < module.heaptypes.length) {
-			var sig = SigDecl.!(module.heaptypes[sig_index]);
-			if (sig.results.length > 0) err.rel(decoder, pt).InvalidTagSignature(sig);
-		}
-	}
-	def readGlobalDecl(index: int) {
-		var vt = readValueType();
-		var mut = readMutability();
-		var pos = decoder.pos;
-		var expr = readInitExpr("global initializer", vt);
-		var decl = GlobalDecl.new(vt, mut, expr);
-		module.addDecl(decl);
-	}
-	def readMutability() -> bool {
-		var pt = decoder.pos;
-		var flags = readByte("mutability", BpConstants.renderMutability);
-		if ((flags & 0xFE) != 0) {
-			err.rel(decoder, pt).InvalidGlobalFlags(flags);
-		}
-		return (flags & BpGlobalFlag.Mutable.mask) != 0;
-	}
-	def readExportDecl(index: int, exportSet: StringSet) {
-		var pt = decoder.pos;
-		var name = readUtf8String("export name");
-		if (exportSet != null && exportSet.add(name)) {
-			err.rel(decoder, pt).DuplicateExport(index);
-		}
-		var decl = readExportWithoutName();
-		module.exports.put(name, decl);
-	}
-	def readExportWithoutName() -> Decl {
-		var pt = decoder.pos;
-		var kind = readByte("export kind", BpConstants.renderImportKind);
-		var decl: Decl;
-		match (kind) {
-			BpImportExportKind.Function.code => decl = readFuncRef();
-			BpImportExportKind.Table.code => decl = readTableRef();
-			BpImportExportKind.Memory.code => decl = readMemoryRef();
-			BpImportExportKind.Global.code => decl = readGlobalRef();
-			BpImportExportKind.Tag.code => decl = readTagRef();
-			BpImportExportKind.AbsType.code => decl = readAbsTypeRef();
-			_ => err.rel(decoder, pt).InvalidExportKind(kind);
-		}
-		return decl;
-	}
-	def readElemDecl(index: int) {
-		var pt = decoder.pos;
-		var flags = readByte("elem flags", BpConstants.renderNone);
-		var vt: ValueType = ValueTypes.FUNCREF, mode: SegmentMode, details: ElemDetails;
-		match (flags) {
-			0 => {
-				var t = checkTableIndex(pt, 0);
-				var offset = readI32Expr("elements offset");
-				mode = SegmentMode.Active(t.1, offset);
-				details = readElemFuncIndexes(t.1);
-			}
-			1 => {
-				mode = SegmentMode.Passive;
-				readElemKind();
-				details = readElemFuncIndexes(int.max);
-			}
-			2 => {
-				var t = readAndCheckTableIndex();
-				var offset = readI32Expr("elements offset");
-				readElemKind();
-				mode = SegmentMode.Active(t.1, offset);
-				details = readElemFuncIndexes(t.1);
-			}
-			3 => {
-				mode = SegmentMode.Declarative;
-				readElemKind();
-				details = readElemFuncIndexes(int.max);
-			}
-			4 => {
-				var t = checkTableIndex(pt, 0);
-				var offset = readI32Expr("elements offset");
-				mode = SegmentMode.Active(t.1, offset);
-				var vt = if(t.0 != null, t.0.elemtype, ValueTypes.FUNCREF);
-				details = readElemInitExprs(vt);
-			}
-			5 => {
-				mode = SegmentMode.Passive;
-				vt = readRefType(false);
-				details = readElemInitExprs(vt);
-			}
-			6 => {
-				var t = readAndCheckTableIndex();
-				var offset = readI32Expr("elements offset");
-				mode = SegmentMode.Active(t.1, offset);
-				vt = readRefType(false);
-				checkElemsType(pt, t.0, vt);
-				details = readElemInitExprs(vt);
-			}
-			7 => {
-				mode = SegmentMode.Declarative;
-				vt = readRefType(false);
-				details = readElemInitExprs(vt);
-			}
-			_ => {
-				err.rel(decoder, pt).InvalidElemFlags(flags);
-			}
-		}
-		var d = ElemDecl.new(vt, mode, details);
-		module.elems.put(d);
-	}
-	def checkTableIndex(pt: int, index: u32) -> (TableDecl, int) {
-		var t = checkIndex(pt, "table", 0, module.tables.length);
-		var i = int.!(index);
-		return (if(t.0, module.tables[i]), i);
-	}
-	def readAndCheckTableIndex() -> (TableDecl, int) {
-		var t = readAndCheckIndex("table", module.tables.length);
-		return (if(t.0, module.tables[t.1]), t.1);
-	}
-	def checkElemsType(pt: int, table: TableDecl, vt: ValueType) {
-		if (table == null) return;
-		if (ValueTypes.isAssignable(vt, table.elemtype)) return;
-		err.rel(decoder, pt).ElementTypeMismatch(table.elemtype, vt);
-	}
-	def readElemKind() {
-		var pt = decoder.pos;
-		var elem_kind = readByte("elem kind", BpConstants.renderNone);
-		if (elem_kind != 0) err.rel(decoder, pt).ExpectedElemKindZeroByte(elem_kind);
-	}
-	def readElemFuncIndexes(table_index: int) -> ElemDetails.FuncRefs {
-		var count = readU32_i("element count", limits.max_num_table_entries);
-		var elemType: ValueType, expected_sig: SigDecl;
-		if (table_index < module.tables.length) {
-			elemType = module.tables[table_index].elemtype;
-			match (elemType) {
-				Ref(nullable, heap) => match (heap) {
-					Func(sig) => expected_sig = sig;
-					_ => err.at(decoder).TypeMismatchInElemInit(elemType, ValueTypes.FUNCREF);
-				}
-				_ => err.at(decoder).TypeMismatchInElemInit(elemType, ValueTypes.FUNCREF);
-			}
-		}
-		var array = Array<int>.new(count);
-		for (i < array.length) {
-			var pt = decoder.pos;
-			var f = readFuncRef();
-			if (f != null) {
-				f.reffed = true;
-				array[i] = f.func_index;
-				if (expected_sig != null && !f.sig.isAssignableSig(expected_sig)) {
-					err.rel(decoder, pt).TypeMismatchInElemInit(elemType, ValueTypes.RefFunc(false, f.sig));
-				}
-			}
-		}
-		return ElemDetails.FuncRefs(array);
-	}
-	def readElemInitExprs(elemType: ValueType) -> ElemDetails.Exprs {
-		var count = readU32_i("element count", limits.max_num_table_entries);
-		var array = Array<InitExpr>.new(count);
-		for (i < array.length) {
-			var pt = decoder.pos;
-			var expr = readInitExpr("element", elemType);
-			array[i] = expr;
-		}
-		return ElemDetails.Exprs(array);
-	}
-	def readDataDecl(index: int) {
-		var pt = decoder.pos;
-		var flags = readByte("data flags", BpConstants.renderNone);
-		var mode: SegmentMode;
-		match (flags) {
-			0 => {
-				var mem_index = checkIndex(pt, "memory", 0, module.memories.length).1;
-				var offset = readI32Expr("data element offset");
-				mode = SegmentMode.Active(mem_index, offset);
-			}
-			1 => {
-				mode = SegmentMode.Passive;
-			}
-			2 => {
-				var mem_index = readMemoryIndex();
-				var offset = readI32Expr("data element offset");
-				mode = SegmentMode.Active(mem_index, offset);
-			}
-			_ => {
-				err.rel(decoder, pt).InvalidDataFlags(flags);
-			}
-		}
-		var len = readU32_i("data segment size", limits.max_data_segment_size);
-		var data = decoder.readN(len);
-		var d = DataDecl.new(mode, data);
-		module.data.put(d);
-	}
-	def traceBytes(pt: int, quantity: string) {
-		if (quantity == null) return;
-		var count = decoder.pos - pt;
-		OUT.put1("%x: ", decoder.abs_of(pt));
-		for (i < count) {
-			if (i > 0 && (i % 8) == 0) OUT.puts("\n          ");
-			OUT.put1("%x ", decoder.data[pt + i]);
-		}
-		var rounded = ((count + 7) / 8) * 8;
-		for (i < rounded - count) OUT.puts("   ");
-		OUT.put1(" %s = ", quantity);
-	}
-
-	def debugBuffer() {
-		if (!Trace.binparse) return;
-		OUT.put2("[buf@+%d limit=%d ", decoder.pos, decoder.limit);
-		if (eof) OUT.puts("eof ");
-		if (err.error_pos < int.max) {
-			OUT.put1("err@+%d ", err.error_pos);
-		}
-		if (err.error_msg != null) {
-			OUT.put1("msg=\"%s\"", err.error_msg);
-		}
-		OUT.putc(']').outln();
-	}
-
-	def toPrintableChar(b: byte) -> byte {
-		if (b < ' ' || b > 127) b = '.';
-		return b;
-	}
 	def readCountAndReserve<T>(quantity: string, vec: Vector<T>, max: u32) -> int {
 		var pt = decoder.pos;
-		var count = readU32_i(quantity, max);
+		var count = parser.readU32_i(quantity, max);
 		var total = vec.length + count;
 		if (total > max) {
 			err.rel(decoder, pt).TotalExceededMaximum(quantity, u32.!(total), max);
@@ -1160,6 +263,431 @@ class WasmParser(extensions: Extension.set, limits: Limits, module: Module,
 			err.rel(decoder, pt).TotalExceededMaximum(quantity, total, max);
 		}
 	}
+	def readTableLimits() -> (u32, Max) {
+		var pt = decoder.pos;
+		var flags = parser.readByte("table flags", BpConstants.renderTableFlags);
+		if ((flags & ~(limits.ok_table_flags)) != 0) err.rel(decoder, pt).InvalidTableFlags(flags);
+		var initial = parser.readU32("initial", limits.max_num_table_entries);
+		var has_max = (flags & BpMemoryFlag.HasMax.mask) != 0;
+		var max: Max = Max.None;
+		if (has_max) {
+			var pt = decoder.pos;
+			var val = parser.readU32("maximum", limits.max_num_table_entries);
+			if (val < initial) err.rel(decoder, pt).MaximumLessThanInitial("table", val, initial);
+			max = Max.Set(val);
+		}
+		return (initial, max);
+
+	}
+	def readMemLimits() -> MemLimits {
+		var pt = decoder.pos;
+		var flags = parser.readByte("memory flags", BpConstants.renderMemoryFlags);
+		if ((flags & ~(limits.ok_memory_flags)) != 0) err.rel(decoder, pt).InvalidMemoryFlags(flags);
+		var initial: u64;
+		if (extensions.MEMORY64) {
+			initial = parser.readU64("initial", limits.max_legal_memory_pages);
+		} else {
+			initial = parser.readU32("initial", u32.!(limits.max_legal_memory_pages));
+		}
+
+		var has_max = (flags & BpMemoryFlag.HasMax.mask) != 0;
+		var max: Max = Max.None;
+		if (has_max) {
+			var pt = decoder.pos;
+			var val: u64;
+			if (extensions.MEMORY64) {
+				val = parser.readU64("maximum", limits.max_legal_memory_pages);
+			} else {
+				val = parser.readU32("maximum", u32.!(limits.max_legal_memory_pages));
+			}
+			if (val < initial) err.rel(decoder, pt).MaximumLessThanInitial("memory", val, initial);
+			max = Max.Set(val);
+		}
+		var shared = (flags & BpMemoryFlag.Shared.mask) != 0;
+		if (shared && !has_max) err.rel(decoder, pt).ExpectedSharedMemoryMaximum();
+		var indexType = if((flags & BpMemoryFlag.Is64.mask) != 0, ValueType.I64, ValueType.I32);
+		return MemLimits(initial, max, shared, indexType);
+	}
+	def readElemType() -> ValueType.Ref {
+		return parser.readRefType(true);
+	}
+	def readDefType(index: int) {
+		var recgrp_start = module.heaptypes.length;
+		parser.max_fw_index = recgrp_start;
+		var pt = decoder.pos;
+		var code = readDefTypeCode();
+		if (extensions.GC) {
+			var count = 1;
+			if (code == BpDefTypeCode.REC.code) { // parse as a recursion group
+				count = parser.readU32_i("recursion group count", limits.max_num_types);
+				parser.max_legal_index = recgrp_start + count;
+				for (i < count) {
+					var pt = decoder.pos;
+					var code = readDefTypeCode();
+					readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
+				}
+			} else { // treat as a single type in its own recursion group
+				parser.max_legal_index = recgrp_start + count;
+				readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
+			}
+			if (err.ok()) {
+				cache.doGroup(module.heaptypes, recgrp_start, count);
+				parser.max_fw_index = parser.max_legal_index = module.heaptypes.length;
+				if (subtype_list != null && subtype_list.length > 0) { // check declared subtypes
+					for (i < subtype_list.length) {
+						var t = subtype_list[i];
+						if (t.1 >= module.heaptypes.length) continue; // potential decode error
+						HeapTypeDecls.checkSupertypes(t.0, module.heaptypes[t.1], err);
+					}
+					subtype_list.clear();
+				}
+			}
+		} else {
+			// parse a single type
+			parser.max_legal_index = parser.max_fw_index;
+			readDefSingleType(pt, code, ValueTypes.NO_HEAPTYPES);
+			if (err.ok()) {
+				var i = module.heaptypes.length - 1;
+				module.heaptypes[i] = cache.doOne(module.heaptypes[i]);
+				parser.max_fw_index = parser.max_legal_index = module.heaptypes.length;
+			}
+		}
+	}
+	def readDefTypeCode() -> byte {
+		return parser.readByte("deftype code", BpConstants.renderDefTypeCode); // XXX: LEB not allowed here
+	}
+	def readDefSingleType(pt: int, code: byte, supertypes: Array<HeapType>) {
+		var final = 1;
+		if (extensions.GC) {
+			if (code == BpDefTypeCode.SUB.code) final = 0;
+			else if (code == BpDefTypeCode.SUB_FINAL.code) final = 1;
+			else final = 2;
+			if (final != 2) {
+				var count = parser.readU32_i("supertype count", limits.max_supertypes);
+				supertypes = Array<HeapType>.new(count);
+				for (i < count) {
+					var pt = decoder.pos;
+					var index = parser.readU32_i("type index", u32.view(module.heaptypes.length));
+					supertypes[i] = parser.toHeapType(pt, index);
+				}
+				pt = decoder.pos;
+				code = readDefTypeCode();
+
+				if (subtype_list == null) subtype_list = Vector.new();
+				subtype_list.put(pt, module.heaptypes.length);
+			}
+		}
+
+		match (code) {
+			BpDefTypeCode.Function.code => return readDefFuncType(final != 0, supertypes);
+			BpDefTypeCode.Struct.code => if (extensions.GC) return readDefStructType(final != 0, supertypes);
+			BpDefTypeCode.Array.code => if (extensions.GC) return readDefArrayType(final != 0, supertypes);
+		}
+		err.rel(decoder, pt).InvalidTypeDeclCode(code);
+	}
+	def readDefFuncType(final: bool, supertypes: Array<HeapType>) {
+		var ptypes = parser.readValueTypes("param count", limits.max_num_func_params);
+		if (!err.ok()) return;
+		var rtypes = parser.readValueTypes("result count", limits.max_num_func_results);
+		if (!err.ok()) return;
+		var decl = SigDecl.new(final, supertypes, ptypes, rtypes);
+		module.addDecl(decl);
+		decl.recgrp_index = decl.heaptype_index - parser.max_fw_index;
+	}
+	def readDefStructType(final: bool, supertypes: Array<HeapType>) {
+		var count = parser.readU32_i("field count", limits.max_num_struct_fields);
+		if (!err.ok()) return;
+		var field_types = Array<StorageType>.new(count);
+		for (j < field_types.length) {
+			field_types[j] = readStorageType();
+		}
+		if (!err.ok()) return;
+		var decl = StructDecl.new(final, supertypes, field_types);
+		module.addDecl(decl);
+		decl.recgrp_index = decl.heaptype_index - parser.max_fw_index;
+	}
+	def readDefArrayType(final: bool, supertypes: Array<HeapType>) {
+		var elem_type = readStorageType();
+		if (!err.ok()) return;
+		var decl = ArrayDecl.new(final, supertypes, [elem_type]);
+		module.addDecl(decl);
+		decl.recgrp_index = decl.heaptype_index - parser.max_fw_index;
+	}
+	def readStorageType() -> StorageType {
+		var pt = decoder.pos;
+		var code = parser.readTypeCode();
+		var vt: ValueType, packed: Packedness;
+		match (code) {
+			BpTypeCode.I8.val => { vt = ValueType.I32; packed = Packedness.PACKED_I8; }
+			BpTypeCode.I16.val => { vt = ValueType.I32; packed = Packedness.PACKED_I16; }
+			_ => vt = parser.readValueTypeSuffix(pt, code);
+		}
+		var mut = readMutability();
+		return StorageType(vt, packed, mut);
+	}
+	def readImportDecl(index: int) {
+		var module_name = parser.readUtf8String("import module name");
+		var field_name = parser.readUtf8String("import field name");
+		var pt = decoder.pos;
+		var kind = parser.readByte("import kind", BpConstants.renderImportKind);
+		var decl: Decl;
+		var args = Modules.NO_IMPORT_ARGS;
+		if (extensions.TYPE_IMPORTS && kind == BpImportExportKind.Args.code) {
+			var count = parser.readU32_i("import arg count", limits.max_num_exports);
+			if (!err.ok()) return;
+			args = Array<Decl>.new(count);
+			for (i < count) args[i] = readExportWithoutName();
+			kind = parser.readByte("import kind", BpConstants.renderImportKind);
+		}
+		match (kind) {
+			BpImportExportKind.Function.code => {
+				reserveOne(pt, "functions", module.functions, limits.max_num_functions);
+				var sig_index = parser.readSigIndex();
+				decl = FuncDecl.new(sig_index);
+			}
+			BpImportExportKind.Table.code => {
+				reserveOne(pt, "tables", module.tables, limits.max_num_tables);
+				var et = readElemType();
+				var l = readTableLimits();
+				decl = TableDecl.new(et, l.0, l.1);
+			}
+			BpImportExportKind.Memory.code => {
+				reserveOne(pt, "memories", module.memories, limits.max_num_memories);
+				var l = readMemLimits();
+				decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
+			}
+			BpImportExportKind.Global.code => {
+				reserveOne(pt, "globals", module.globals, limits.max_num_globals);
+				var t = parser.readValueType();
+				var mut = readMutability();
+				decl = GlobalDecl.new(t, mut, InitExpr.I32(0));
+			}
+			BpImportExportKind.Tag.code => {
+				reserveOne(pt, "tags", module.tags, limits.max_num_tags);
+				var b = parser.readByte("attribute", BpConstants.renderAttribute);
+				var sig_index = parser.readSigIndex();
+				decl = TagDecl.new(sig_index);
+			}
+			BpImportExportKind.AbsType.code => if (extensions.TYPE_IMPORTS) {
+				var flags = parser.readByte("flags", BpConstants.renderAbsTypeFlags);
+				var has_default = (flags & BpAbsTypeFlag.HasDefault.mask) != 0;
+				var is_externref = (flags & BpAbsTypeFlag.IsExternRef.mask) != 0;
+				var count = parser.readU32_i("constraint count", limits.max_num_type_constraints);
+				var vec = Vector<ValueType>.new();
+				if (count < limits.max_grow_size) vec.grow(count);
+				for (i < count) {
+					var b = parser.readByte("constraint type", BpConstants.renderNone);
+					if (b != 0) err.rel(decoder, pt).InvalidTypeConstraint(b);
+					var t = parser.readValueType();
+					vec.put(t);
+				}
+				decl = AbsTypeDecl.new(has_default, is_externref, vec.extract());
+			}
+			BpImportExportKind.Command.code => if (extensions.TYPE_IMPORTS) {
+				decl = ImportCommandDecl.new();
+			}
+		}
+		if (decl == null) err.rel(decoder, pt).InvalidImportKind(kind);
+		else module.addImport(module_name, field_name, args, decl);
+	}
+	def readFuncDecl(index: int) {
+		var pt = decoder.pos;
+		var sig_index = parser.readSigIndex();
+		var decl = FuncDecl.new(sig_index);
+		module.addDecl(decl);
+	}
+	def readMemoryDecl(index: int) {
+		var l = readMemLimits();
+		var decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
+		module.addDecl(decl);
+	}
+	def readTagDecl(index: int) {
+		var pt = decoder.pos;
+		var b = parser.readByte("attribute", BpConstants.renderAttribute);
+		if (b != 0) err.rel(decoder, pt).InvalidTagAttribute(b);
+		pt = decoder.pos;
+		var sig_index = parser.readSigIndex();
+		var decl = TagDecl.new(sig_index);
+		module.addDecl(decl);
+		if (u32.view(sig_index) < module.heaptypes.length) {
+			var sig = SigDecl.!(module.heaptypes[sig_index]);
+			if (sig.results.length > 0) err.rel(decoder, pt).InvalidTagSignature(sig);
+		}
+	}
+	def readGlobalDecl(index: int) {
+		var vt = parser.readValueType();
+		var mut = readMutability();
+		var pos = decoder.pos;
+		var expr = readInitExpr("global initializer", vt);
+		var decl = GlobalDecl.new(vt, mut, expr);
+		module.addDecl(decl);
+	}
+	def readMutability() -> bool {
+		var pt = decoder.pos;
+		var flags = parser.readByte("mutability", BpConstants.renderMutability);
+		if ((flags & 0xFE) != 0) {
+			err.rel(decoder, pt).InvalidGlobalFlags(flags);
+		}
+		return (flags & BpGlobalFlag.Mutable.mask) != 0;
+	}
+	def readExportDecl(index: int, exportSet: StringSet) {
+		var pt = decoder.pos;
+		var name = parser.readUtf8String("export name");
+		if (exportSet != null && exportSet.add(name)) {
+			err.rel(decoder, pt).DuplicateExport(index);
+		}
+		var decl = readExportWithoutName();
+		module.exports.put(name, decl);
+	}
+	def readExportWithoutName() -> Decl {
+		var pt = decoder.pos;
+		var kind = parser.readByte("export kind", BpConstants.renderImportKind);
+		var decl: Decl;
+		match (kind) {
+			BpImportExportKind.Function.code => decl = parser.readFuncRef();
+			BpImportExportKind.Table.code => decl = parser.readTableRef();
+			BpImportExportKind.Memory.code => decl = parser.readMemoryRef();
+			BpImportExportKind.Global.code => decl = parser.readGlobalRef();
+			BpImportExportKind.Tag.code => decl = parser.readTagRef();
+			BpImportExportKind.AbsType.code => decl = parser.readAbsTypeRef();
+			_ => err.rel(decoder, pt).InvalidExportKind(kind);
+		}
+		return decl;
+	}
+	def readElemDecl(index: int) {
+		var pt = decoder.pos;
+		var flags = parser.readByte("elem flags", BpConstants.renderNone);
+		var vt: ValueType = ValueTypes.FUNCREF, mode: SegmentMode, details: ElemDetails;
+		match (flags) {
+			0 => {
+				var t = parser.checkTableIndex(pt, 0);
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(t.1, offset);
+				details = readElemFuncIndexes(t.1);
+			}
+			1 => {
+				mode = SegmentMode.Passive;
+				parser.readElemKind();
+				details = readElemFuncIndexes(int.max);
+			}
+			2 => {
+				var t = parser.readAndCheckTableIndex();
+				var offset = readI32Expr("elements offset");
+				parser.readElemKind();
+				mode = SegmentMode.Active(t.1, offset);
+				details = readElemFuncIndexes(t.1);
+			}
+			3 => {
+				mode = SegmentMode.Declarative;
+				parser.readElemKind();
+				details = readElemFuncIndexes(int.max);
+			}
+			4 => {
+				var t = parser.checkTableIndex(pt, 0);
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(t.1, offset);
+				var vt = if(t.0 != null, t.0.elemtype, ValueTypes.FUNCREF);
+				details = readElemInitExprs(vt);
+			}
+			5 => {
+				mode = SegmentMode.Passive;
+				vt = parser.readRefType(false);
+				details = readElemInitExprs(vt);
+			}
+			6 => {
+				var t = parser.readAndCheckTableIndex();
+				var offset = readI32Expr("elements offset");
+				mode = SegmentMode.Active(t.1, offset);
+				vt = parser.readRefType(false);
+				checkElemsType(pt, t.0, vt);
+				details = readElemInitExprs(vt);
+			}
+			7 => {
+				mode = SegmentMode.Declarative;
+				vt = parser.readRefType(false);
+				details = readElemInitExprs(vt);
+			}
+			_ => {
+				err.rel(decoder, pt).InvalidElemFlags(flags);
+			}
+		}
+		var d = ElemDecl.new(vt, mode, details);
+		module.elems.put(d);
+	}
+	def readElemFuncIndexes(table_index: int) -> ElemDetails.FuncRefs {
+		var count = parser.readU32_i("element count", limits.max_num_table_entries);
+		var elemType: ValueType, expected_sig: SigDecl;
+		if (table_index < module.tables.length) {
+			elemType = module.tables[table_index].elemtype;
+			match (elemType) {
+				Ref(nullable, heap) => match (heap) {
+					Func(sig) => expected_sig = sig;
+					_ => err.at(decoder).TypeMismatchInElemInit(elemType, ValueTypes.FUNCREF);
+				}
+				_ => err.at(decoder).TypeMismatchInElemInit(elemType, ValueTypes.FUNCREF);
+			}
+		}
+		var array = Array<int>.new(count);
+		for (i < array.length) {
+			var pt = decoder.pos;
+			var f = parser.readFuncRef();
+			if (f != null) {
+				f.reffed = true;
+				array[i] = f.func_index;
+				if (expected_sig != null && !f.sig.isAssignableSig(expected_sig)) {
+					err.rel(decoder, pt).TypeMismatchInElemInit(elemType, ValueTypes.RefFunc(false, f.sig));
+				}
+			}
+		}
+		return ElemDetails.FuncRefs(array);
+	}
+	def readElemInitExprs(elemType: ValueType) -> ElemDetails.Exprs {
+		var count = parser.readU32_i("element count", limits.max_num_table_entries);
+		var array = Array<InitExpr>.new(count);
+		for (i < array.length) {
+			var pt = decoder.pos;
+			var expr = readInitExpr("element", elemType);
+			array[i] = expr;
+		}
+		return ElemDetails.Exprs(array);
+	}
+	def readDataDecl(index: int) {
+		var pt = decoder.pos;
+		var flags = parser.readByte("data flags", BpConstants.renderNone);
+		var mode: SegmentMode;
+		match (flags) {
+			0 => {
+				var mem_index = parser.checkIndex(pt, "memory", 0, module.memories.length).1;
+				var offset = readI32Expr("data element offset");
+				mode = SegmentMode.Active(mem_index, offset);
+			}
+			1 => {
+				mode = SegmentMode.Passive;
+			}
+			2 => {
+				var mem_index = parser.readMemoryIndex();
+				var offset = readI32Expr("data element offset");
+				mode = SegmentMode.Active(mem_index, offset);
+			}
+			_ => {
+				err.rel(decoder, pt).InvalidDataFlags(flags);
+			}
+		}
+		var len = parser.readU32_i("data segment size", limits.max_data_segment_size);
+		var data = decoder.readN(len);
+		var d = DataDecl.new(mode, data);
+		module.data.put(d);
+	}
+	def checkElemsType(pt: int, table: TableDecl, vt: ValueType) {
+		if (table == null) return;
+		if (ValueTypes.isAssignable(vt, table.elemtype)) return;
+		err.rel(decoder, pt).ElementTypeMismatch(table.elemtype, vt);
+	}
+} // end BinParser
+
+type BinParserResult {
+	case Ok(module: Module) { }
+	case Error(code: WasmError, filename: string, section: BpSection, error_index: int, error_pos: int, error_msg: string) { }
 }
 
 // A finite state machine that implements a push-based parser for binary
@@ -1229,12 +757,12 @@ class BpFsm extends WasmParser {
 		current_pos = decoder.pos;
 		if (Trace.binparse) {
 // TODO: this is debug code, not tracing code
-//			OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.abspos(),
+//			Trace.OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.abspos(),
 //				decoder.available(), state.name).outln();
 		}
 		match (state) {
 			MAGIC => {
-				if (Trace.binparse) OUT.puts("======== begin module ========").outln();
+				if (Trace.binparse) Trace.OUT.puts("======== begin module ========").outln();
 				var pt = decoder.pos;
 				var magic = decoder.read_u32();
 				if (eof) return if(!retry(), err.at(decoder).EOFMagicWord());
@@ -1256,7 +784,7 @@ class BpFsm extends WasmParser {
 				}
 				current_section = checkSectionCode(b);
 				if (Trace.binparse) {
-					OUT.put2("======== begin section code %d (%s) ========", current_section.code, current_section.name).outln();
+					Trace.OUT.put2("======== begin section code %d (%s) ========", current_section.code, current_section.name).outln();
 				}
 				state = BpFsmState.SECTION;
 			}
