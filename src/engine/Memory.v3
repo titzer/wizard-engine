@@ -2,33 +2,99 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // An instantiated Wasm memory.
+def OOB_RANGE = MaybeTrap<Range<byte>>(null, TrapReason.MEM_OUT_OF_BOUNDS);
 class Memory(decl: MemoryDecl) extends Exportable {
+	private var data: Range<byte>;
 	var oom = false;  // set if allocation fails due to out-of-memory
-	def size() -> u32; // size in pages
-	def length() -> u64; // length in bytes
-	def deallocate() {
-		// default: do nothing
+
+	def size() -> u32 {
+		return u32.!(length() >> 16);
 	}
-	def grow(pages: u32) -> int {
-		return -1; // default: growing always fails
+	def length() -> u64 {
+		return u64.!(data.length);
 	}
-	def read1(offset: u32, index: u32) -> (TrapReason, u8);
-	def read1w(address: u64) -> (TrapReason, u8);
-	def read_u16(offset: u32, index: u32) -> (TrapReason, u16);
-	def read_u32(offset: u32, index: u32) -> (TrapReason, u32);
-	def read_u64(offset: u32, index: u32) -> (TrapReason, u64);
-	def read_u128(offset: u32, index: u32) -> (TrapReason, (u64, u64));
-	def write_u8(offset: u32, index: u32, val: u8) -> TrapReason;
-	def write_u16(offset: u32, index: u32, val: u16) -> TrapReason;
-	def write_u32(offset: u32, index: u32, val: u32) -> TrapReason;
-	def write_u64(offset: u32, index: u32, val: u64) -> TrapReason;
-	def write_u128(offset: u32, index: u32, val: (u64, u64)) -> TrapReason;
-	def extract(offset: u32, len: u32) -> Array<byte>;
-	def copyIn(dst_offset: u32, src: Array<byte>, src_offset: u32, size: u32) -> TrapReason;
-	def readIn(fd: int, dst_offset: u32, size: u32) -> int;
-	def writeOut(fd: int, src_offset: u32, size: u32) -> int;
-	def fill(dest: u32, val: u8, size: u32) -> TrapReason;
-	def copyM(dst_offset: u32, src: Memory, src_offset: u32, size: u32) -> TrapReason;
+
+	// Get a range of memory from [offset ..+ size], if possible (32-bit)
+	def range_ol_32(index: u32, size: u32) -> MaybeTrap<Range<byte>> {
+		var pos = u64.!(index);
+		var end = pos + u64.!(size);
+		if (end > u64.view(data.length)) return OOB_RANGE;
+		return MaybeTrap(data[pos ..+ size], TrapReason.NONE);
+	}
+	// Get a range of memory from [offset ..+ size], if possible (64-bit)
+	def range_ol_64(offset: u64, size: u64) -> MaybeTrap<Range<byte>> {
+		if (size == 0) return MaybeTrap<Range<byte>>(null, TrapReason.NONE);
+		if (offset >= data.length) return OOB_RANGE;
+		if (size >= data.length) return OOB_RANGE;
+		var pos = u64.!(offset);
+		var end = pos + u64.!(size);
+		if (end > u64.view(data.length)) return OOB_RANGE;
+		return MaybeTrap(data[pos ..+ size], TrapReason.NONE);
+	}
+	// Get a range of memory from [(offset + index) ..+ size], if possible (32-bit)
+	def range_oil_32(offset: u32, index: u32, size: u32) -> MaybeTrap<Range<byte>> {
+		var pos = u64.!(offset) + u64.!(index);
+		var end = pos + u64.!(size);
+		if (end > u64.view(data.length)) return OOB_RANGE;
+		return MaybeTrap(data[pos ..+ size], TrapReason.NONE);
+	}
+	// Get a range of memory from [(offset + index) ..+ size], if possible (64-bit)
+	def range_oil_64(offset: u64, index: u64, size: u64) -> MaybeTrap<Range<byte>> {
+		if (size == 0) return MaybeTrap<Range<byte>>(null, TrapReason.NONE);
+		if (offset >= data.length) return OOB_RANGE;
+		if (index >= data.length) return OOB_RANGE;
+		if (size >= data.length) return OOB_RANGE;
+		var pos = offset + index;
+		var end = pos + u64.!(size);
+		if (end > u64.view(data.length)) return OOB_RANGE;
+		return MaybeTrap(data[pos ..+ size], TrapReason.NONE);
+	}
+
+	// Fill in the range [dest ..+ size] with {val}.
+	def fill(dest: u32, val: u8, size: u32) -> TrapReason {
+		var r = range_ol_32(dest, size);
+		if (!r.ok()) return r.reason;
+		for (i < size) r.result[i] = val; // XXX: use word copy
+		return TrapReason.NONE;
+	}
+	// Memory copy.
+	def copyM(dst_offset: u32, src: Memory, src_offset: u32, size: u32) -> TrapReason {
+		var dst = this.range_ol_32(dst_offset, size);
+		if (!dst.ok()) return dst.reason;
+		var src = src.range_ol_32(src_offset, size);
+		if (!src.ok()) return src.reason;
+		if (src_offset > dst_offset) for (i < size) dst.result[i] = src.result[i]; // forwards copy
+		else for (i = size - 1; i < size; i--) dst.result[i] = src.result[i]; // backwards copy
+		return TrapReason.NONE;
+	}
+	def copyIn(dst_offset: u32, src: Array<byte>, src_offset: u32, size: u32) -> TrapReason {
+		var dst = this.range_ol_32(dst_offset, size);
+		if (!dst.ok()) return dst.reason;
+		var j = ArrayUtil.boundsCheck(src, src_offset, 0, size);
+		if (j < 0) return TrapReason.MEM_OUT_OF_BOUNDS;
+		var src_range = src[src_offset ..+ size];
+		for (i < size) dst.result[i] = src_range[i]; // forwards copy
+		return TrapReason.NONE;
+	}
+	def readIn(fd: int, dst_offset: u32, size: u32) -> int {
+		var dst = range_ol_32(dst_offset, size);
+		if (!dst.ok()) return -1;
+		return System.read(fd, dst.result);
+	}
+	def writeOut(fd: int, src_offset: u32, size: u32) -> int {
+		var src = range_ol_32(src_offset, size);
+		if (!src.ok()) return -1;
+		System.write(fd, src.result);
+		return int.!(size);
+	}
+	def extract(src_offset: u32, size: u32) -> Array<byte> {
+		var src = range_ol_32(src_offset, size);
+		if (!src.ok()) return null;
+		var result = Array<byte>.new(src.result.length);
+		for (i < result.length) result[i] = src.result[i];
+		return result;
+	}
+
 	def boundsCheck(offset: u32, index: u32, len: u32) -> i64 {
 		var i = i64.view(offset) + index;
 		if ((i + len) > length()) return -1;
@@ -38,9 +104,71 @@ class Memory(decl: MemoryDecl) extends Exportable {
 		def OUT = Trace.OUT;
 		OUT.put1("@%d[", offset);
 		for (i < size) {
-			OUT.putx_8(read1(offset, i).1);
+			OUT.putx_8(read_u8(offset, i).result);
 		}
 		OUT.puts("]").outln();
 	}
-}
+	// NOTE: only used by subclasses to get/set the {data} field, other code should not use directly.
+	def platform_specific_getData() -> Range<byte> {
+		return this.data;
+	}
+	def platform_specific_setData(ndata: Range<byte>) {
+		this.data = ndata;
+	}
 
+	// =============================================================================
+	// Utility methods for reading individual scalar values
+	def read_u8(offset: u32, index: u32) -> MaybeTrap<u8> {
+		return range_oil_32(offset, index, 1).then(DataReaders.read_range_u8);
+	}
+	def read_u16(offset: u32, index: u32) -> MaybeTrap<u16> {
+		return range_oil_32(offset, index, 2).then(DataReaders.read_range_u16);
+	}
+	def read_u32(offset: u32, index: u32) -> MaybeTrap<u32> {
+		return range_oil_32(offset, index, 4).then(DataReaders.read_range_u32);
+	}
+	def read_u64(offset: u32, index: u32) -> MaybeTrap<u64> {
+		return range_oil_32(offset, index, 8).then(DataReaders.read_range_u64);
+	}
+	def read_float(offset: u32, index: u32) -> MaybeTrap<float> {
+		return range_oil_32(offset, index, 4).then(DataReaders.read_range_float);
+	}
+	def read_double(offset: u32, index: u32) -> MaybeTrap<double> {
+		return range_oil_32(offset, index, 8).then(DataReaders.read_range_double);
+	}
+	def read_u128(offset: u32, index: u32) -> MaybeTrap<(u64, u64)> {
+		return range_oil_32(offset, index, 16).then(DataReaders.read_range_u128);
+	}
+
+	// =============================================================================
+	// Utility methods for writing individual scalar values
+	def write_u8(offset: u32, index: u32, val: u8) -> TrapReason {
+		return range_oil_32(offset, index, 1).thenP(DataWriters.write_range_u8, val).reason;
+	}
+	def write_u16(offset: u32, index: u32, val: u16) -> TrapReason {
+		return range_oil_32(offset, index, 2).thenP(DataWriters.write_range_u16, val).reason;
+	}
+	def write_u32(offset: u32, index: u32, val: u32) -> TrapReason {
+		return range_oil_32(offset, index, 4).thenP(DataWriters.write_range_u32, val).reason;
+	}
+	def write_u64(offset: u32, index: u32, val: u64) -> TrapReason {
+		return range_oil_32(offset, index, 8).thenP(DataWriters.write_range_u64, val).reason;
+	}
+	def write_float(offset: u32, index: u32, val: float) -> TrapReason {
+		return range_oil_32(offset, index, 4).thenP(DataWriters.write_range_float, val).reason;
+	}
+	def write_double(offset: u32, index: u32, val: double) -> TrapReason {
+		return range_oil_32(offset, index, 8).thenP(DataWriters.write_range_double, val).reason;
+	}
+	def write_u128(offset: u32, index: u32, val: (u64, u64)) -> TrapReason {
+		return range_oil_32(offset, index, 16).thenP(DataWriters.write_range_u128, val).reason;
+	}
+
+	// =============================================================================
+	// Target-specific implementation
+	def deallocate() { }				// default: do nothing
+	def grow(pages: u32) -> int {
+		return -1; // default: growing always fails
+	}
+
+}
