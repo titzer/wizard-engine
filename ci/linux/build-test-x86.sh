@@ -20,7 +20,7 @@ opam init
 
 # Install Dune
 opam install dune
-opam install menhir
+opam install menhir -y
 # Make dune available in PATH
 eval $(opam config env)
 
