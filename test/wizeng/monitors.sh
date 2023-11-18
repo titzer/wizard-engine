@@ -24,7 +24,7 @@ if [ $# -gt 0  ]; then
 else
     MONITORS=("loops" "loops{c}" 
         "coverage" "coverage{c}" "coverage{c=i}" 
-        "calls" "calls{c}" 
+        "calls" 
         "branches" "branches{c}" 
         "hotness" "hotness{c}"
         "globals" 

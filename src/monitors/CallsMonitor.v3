@@ -1,42 +1,21 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Implements a simple monitor that prints each call as it happens and also keeps statistics.
+// Implements a monitor that records and reports statistics for calls, including direct and indirect calls.
 class CallsMonitor extends Monitor {
-	def entries = Vector<WasmFunction>.new(); 
-	def counts = Vector<u64>.new();
-	var depth = 0;
+	def entries = Vector<FuncStats>.new();
+	def visitor = CallsMonitorBytecodeVisitor.new(null, BytecodeIterator.new());
+	var module: Module;
 	var filter: DeclFilter;
-	var inCodeMode = false;
-
-	def configure(args: string) -> string {
-		def argMap = MonitorUtil.argMapFrom(args);
-		if (argMap.has("code") || argMap.has("c")) {
-			inCodeMode = true;
-			var codeArg = if (argMap.has("code"), argMap["code"], argMap["c"]);
-			if (codeArg == null) return null;
-			filter = DeclFilter.new(codeArg);
-			return null;
-		}
-		def buf = StringBuilder.new();
-		buf.put1("invalid argument(s) \"%s\"", args);
-		return buf.toString();
-	}
 
 	def onParse(module: Module) {
 		var mm = ModuleMonitor.new(module);
-		if (!inCodeMode) {
-			entries.putn(null, module.functions.length);
-			counts.putn(0, module.functions.length);
-			mm.forEachFunc(isFuncMonitored, mm.beforeFuncExec(_, beforeFuncExec));
-		} else {
-			mm.forEachFunc(isFuncMonitored, mm.beforeFuncExecAndReturn(_, beforeFuncExec, beforeFuncReturn));
-		}
+		this.module = module;
+		mm.forEachFunc(isFuncMonitored, instrumentFunc);
 	}
 
 	def onFinish(i: Instance) {
-		if (inCodeMode) return;
-		report(entries, counts);
+		report(entries);
 	}
 
 	private def isFuncMonitored(module: Module, func: FuncDecl) -> bool {
@@ -45,54 +24,114 @@ class CallsMonitor extends Monitor {
 		return true;
 	}
 
-	private def beforeFuncExec(dynamicLoc: DynamicLoc) -> Resumption {
-		var func = dynamicLoc.func;
-		depth++;
-		if (inCodeMode) reportCall(func, depth);
-		else {
-			var idx = func.decl.func_index;
-			entries[idx] = func;
-			counts[idx]++;
-		}
-		return Resumption.Continue;
-	}
-
-	private def beforeFuncReturn(dynamicLoc: DynamicLoc) -> Resumption {
-		depth--;
-		return Resumption.Continue;
+	private def instrumentFunc(func: FuncDecl) {
+		var stats = visitor.stats = FuncStats.new(module, func);
+		entries.put(stats);
+		Instrumentation.insertProbeAt(module, func.func_index, 0, stats.entry);
+		visitor.bi.reset(func).dispatchAll(visitor);
 	}
 }
 
-// Output single call info to STDOUT
-def OUT = Trace.OUT;
-def reportCall(func: WasmFunction, depth: int) {
-	match (depth) {
-		0 => OUT.puts(Palette.BW_VERY_LOW);
-		1 => OUT.puts(Palette.BW_LOW);
-		2 => OUT.puts(Palette.BW_MEDIUM);
-		3 => OUT.puts(Palette.BW_HIGH);
-		_ => OUT.puts(Palette.BW_VERY_HIGH);
+// Bytecode visitor that inserts instrumentation at each call site.
+private class CallsMonitorBytecodeVisitor(var stats: FuncStats, bi: BytecodeIterator) extends BytecodeVisitor {
+	def visit_CALL(func_index: u31)					 { insert(CallProbe.new(false, func_index)); }
+	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31)	 { insert(CallIndirectProbe.new(false, table_index)); }
+	def visit_RETURN_CALL(func_index: u31)				 { insert(CallProbe.new(true, func_index)); }
+	def visit_RETURN_CALL_INDIRECT(sig_index: u31, table_index: u31) { insert(CallIndirectProbe.new(true, table_index)); }
+	def visit_CALL_REF(sig_index: u31)				 { insert(CallRefProbe.new(false)); }
+	def visit_RETURN_CALL_REF(sig_index: u31)			 { insert(CallRefProbe.new(true)); }
+	def insert(probe: Probe) {
+		stats.sites = List.new((bi.pc, probe), stats.sites);
+		Instrumentation.insertProbeAt(stats.module, stats.func.func_index, bi.pc, probe);
 	}
-	for (i < depth) OUT.puts(" . ");
-	func.render(OUT);
-	OUT.outln();
+}
+
+// All of the statistics collected for a function.
+private class FuncStats(module: Module, func: FuncDecl) {
+	def entry = CountProbe.new();
+	var sites: List<(int, Probe)>;
+}
+
+// Statistics for an indirect call site; i.e. invocation counts for each target.
+private class IndirectCallStats {
+	def counts = Vector<(Function, u64)>.new();
+	def increment(func: Function) {
+		for (i < counts.length) { // XXX: linear search in IndirectCallStats
+			var e = counts[i];
+			if (e.0 == func) {
+				counts[i] = (func, e.1 + 1);
+				return;
+			}
+		}
+		counts.put((func, 1));
+	}
+}
+// The probe inserted at direct callsites (CALL and RETURN_CALL).
+private class CallProbe(tail: bool, func_index: u31) extends CountProbe { }
+// The probe inserted at table-based indirect call sites (CALL_INDIRECT and RETURN_CALL_INDIRECT).
+private class CallIndirectProbe(tail: bool, table_index: u31) extends Probe { // XXX: use OperandProbe_i_v, but need instance
+	def stats = IndirectCallStats.new();
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var target_index = Values.v_u(dynamicLoc.frame.getFrameAccessor().getOperand(0));
+		var table = dynamicLoc.func.instance.tables[table_index];
+		if (table_index >= table.funcs.length) return Resumption.Continue; // will trap
+		stats.increment(table.funcs[target_index]);
+		return Resumption.Continue;
+	}
+}
+// The probe inserted at ref-based indirect call sites (CALL_REF and RETURN_CALL_REF).
+private class CallRefProbe(tail: bool) extends Probe { // XXX: use OperandProbe_r_v, but need instance
+	def stats = IndirectCallStats.new();
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var target = Function.!(Value.Ref.!(dynamicLoc.frame.getFrameAccessor().getOperand(0)).val);
+		stats.increment(target); // null function is OK
+		return Resumption.Continue;
+	}
 }
 
 // Output summary to STDOUT
-def report(entries: Vector<WasmFunction>, counts: Vector<u64>) {
-	// Output summary when not in code mode
+def OUT = Trace.OUT;
+def report(entries: Vector<FuncStats>) {
 	for (i < entries.length) {
-		var count = counts[i], e = entries[i];
-		if (count > 0) {
-			OUT.puts(Palette.FUNC)
-				.rjustify(' ', TraceUtil.renderedLength(OUT, e.render), 20)
-				.puts(Palette.DEFAULT)
-				.putc(':')
-				.puts(Palette.COUNT)
-				.puts("  ")
-				.putd(count)
-				.puts(Palette.DEFAULT);
-			OUT.outln();
+		var stats = entries[i];
+		if (stats.entry.count == 0) continue; // TODO: add an option to print all
+		OUT.puts(Palette.FUNC)
+			.put1("func %q: ", stats.func.render(stats.module.names, _))
+			.puts(Palette.COUNT)
+			.putd(stats.entry.count)
+			.puts(Palette.DEFAULT)
+			.outln();
+		for (l = Lists.reverse(stats.sites); l != null; l = l.tail) {
+			OUT.put1("  +%d: ", l.head.0);
+			match (l.head.1) {
+				x: CallProbe => {
+					// TODO: print actual receiver function (from instance), which is more useful for imports
+					OUT.put2("%scall [%d]: ", if(x.tail, "return_", ""), x.func_index)
+					   .puts(Palette.COUNT)
+					   .putd(x.count)
+					   .puts(Palette.DEFAULT)
+					   .outln();
+				}
+				x: CallIndirectProbe => {
+					OUT.put1("%scall_indirect:", if(x.tail, "return_", "")).outln();
+					reportIndirectStats(x.stats);
+				}
+				x: CallRefProbe => {
+					OUT.put1("%scall_ref:", if(x.tail, "return_", "")).outln();
+					reportIndirectStats(x.stats);
+				}
+			}
 		}
+	}
+}
+def reportIndirectStats(stats: IndirectCallStats) {
+	for (i < stats.counts.length) {
+		var e = stats.counts[i];
+		OUT.puts("    ")
+		   .put1("%q: ", e.0.render)
+		   .puts(Palette.COUNT)
+		   .putd(e.1)
+		   .puts(Palette.DEFAULT)
+		   .outln();
 	}
 }
