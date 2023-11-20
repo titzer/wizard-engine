@@ -635,7 +635,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			if (t.0 == 0) continue; // main dispatch table
 			var pos = w.atEnd().pos;
 			computeCurIpForTrap(-1);
-			genDispatch(ip_ptr, t.1, true);
+			genDispatch0(ip_ptr, t.1, true);
 			writeDispatchEntry(ref0, t.0, pos);
 		}
 
@@ -645,12 +645,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var pos = w.pos;
 			if (t.2 != null) {
 				// TODO: some code in this page are in the upper 128; read extended LEB
-				genDispatch(null, t.2, false);
+				genDispatch0(null, t.2, false);
 			} else {
 				// all codes in this page are in the lower 128; just skip extended LEB
 				genSkipLeb();
 				asm.d.and_r_i(r_tmp0, 0x7F);
-				genDispatch(null, t.1, false);
+				genDispatch0(null, t.1, false);
 			}
 			for (i = 128; i < 256; i++) {
 				writeDispatchEntry(t.1, i, pos);
@@ -889,7 +889,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(countGpr);
 			asm.movd_r_r(r_tmp1, countGpr);
 			asm.imul_r_i(r_tmp1, 4 * Sidetables.ex_entry_size);
-			asm.q.add_r_r(r_stp, r_tmp1);
+			asm.q.add_r_r(r_stp, r_tmp1);   // adjust sidetable pointer
 			var start = X86_64Label.new(), done = X86_64Label.new(), catch_all = X86_64Label.new();
 			asm.bind(start);
 			asm.d.dec_r(countGpr);		// while (--count >= 0) {
@@ -962,14 +962,22 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genCallsAndRet() {
 		bindHandler(Opcode.END);
+		var returnLabel = X86_64Label.new();
 		asm.q.cmp_r_r(r_ip, r_eip);
-		// XXX: END: jump over inlined dispatch?
-		asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
-		// end falls through to return bytecode
+		if (FastIntTuning.threadedDispatch) {
+			// jump over inlined dispatch
+			asm.jc_rel_near(C.GE, returnLabel);
+			genDispatch();
+		} else {
+			// jump to first dispatch
+			asm.jc_rel(C.L, firstDispatchOffset - w.pos); // jump to dispatch (loop)
+			// fall through to return bytecode
+		}
 
 		var callFunction = X86_64Label.new();
 		var func_arg = r_func_arg;
 		bindHandlerNoAlign(Opcode.RETURN); {
+			asm.bind(returnLabel);
 			// Copy return values from stack to overwrite locals
 			var cnt = r_tmp0;
 			asm.movq_r_m(cnt, r_func_decl.plus(offsets.FuncDecl_sig));
@@ -1851,7 +1859,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_m(origIp, r_func_decl.plus(offsets.FuncDecl_orig_bytecode));
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
-			genDispatch(origIp.indirect(), dispatchTables[0].1, false);
+			genDispatch0(origIp.indirect(), dispatchTables[0].1, false);
 		}
 		if (!FeatureDisable.globalProbes) {
 			var offset = w.atEnd().pos;
@@ -1866,7 +1874,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			// TODO: reload code from function, as local probes may have been inserted or removed
 			asm.sub_r_i(r_ip, 1);
-			genDispatch(r_ip.indirect(), dispatchTables[0].1, true);
+			genDispatch0(r_ip.indirect(), dispatchTables[0].1, true);
 		}
 	}
 	def genFloatMinAndMax() {
@@ -3128,14 +3136,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			firstDispatchOffset = w.pos;
 			gen = true;
 		}
-		if (gen) {
-			genDispatch(ip_ptr, if (FeatureDisable.globalProbes, dispatchTables[0].1), true);
-		} else {
-			asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
-		}
+		if (gen) genDispatch();
+		else asm.jmp_rel(firstDispatchOffset - w.atEnd().pos);
+	}
+	// Generate a dispatch from the main dispatch table.
+	def genDispatch() {
+		genDispatch0(ip_ptr, if (FeatureDisable.globalProbes, dispatchTables[0].1), true);
 	}
 	// Generate a load of the next bytecode and a dispatch through the dispatch table.
-	def genDispatch(ptr: X86_64Addr, table: IcCodeRef, increment: bool) {
+	def genDispatch0(ptr: X86_64Addr, table: IcCodeRef, increment: bool) {
 		var opcode = r_tmp0;
 		var base = r_tmp1;
 		if (ptr != null) asm.movbzx_r_m(opcode, ptr);
