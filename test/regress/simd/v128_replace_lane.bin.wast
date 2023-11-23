@@ -254,7 +254,7 @@
 (assert_return
   (invoke "i8x16_replace_lane-last"
     (v128.const i32x4 0x55_0055 0x55_0055 0x55_0055 0xff55_0155)
-    (i32.const 0x1)
+    (i32.const 0x0)
   )
   (v128.const i8x16
     0x55
@@ -272,7 +272,7 @@
     0x55
     0x1
     0x55
-    0x1
+    0x0
   )
 )
 (assert_return

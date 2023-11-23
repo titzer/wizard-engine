@@ -158,6 +158,19 @@
 ;; Combination with each other
 
 (module
+  (func (export "test") (param v128 v128) (result v128)
+    (i8x16.shuffle 16 1 18 3 20 5 22 7 24 9 26 11 28 13 30 15
+      (local.get 0)
+      (local.get 1)))
+)
+
+(assert_return (invoke "test"
+  (v128.const i8x16 1 255 0 255 15 255 0 255 255 255 0 255 127 255 0 255)
+  (v128.const i8x16 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 1 0x55 0))
+  (v128.const i8x16 0x55 0xff 0x55 0xff 0x55 0xff 0x55 0xff 0x55 0xff 0x55 0xff 0x55 0xff 0x55 0xff)
+)
+
+(module
   (func (export "as-v8x16_shuffle-operands") (param v128 i32 v128 i32) (result v128)
     (i8x16.shuffle 16 1 18 3 20 5 22 7 24 9 26 11 28 13 30 15
       (i8x16.replace_lane 0 (local.get 0) (local.get 1))
