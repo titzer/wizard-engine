@@ -80,6 +80,8 @@ elif [ "$PROGRAM" = "unittest" ]; then
     fi
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
+elif [ "$PROGRAM" = "funcdup" ]; then
+    SOURCES="$ENGINE src/funcdup.main.v3"
 else
     exit_usage
 fi

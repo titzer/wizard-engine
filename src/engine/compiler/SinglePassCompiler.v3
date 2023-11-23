@@ -83,7 +83,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var num_unrefs = 0;
 
 	// Abstract state of the value stack
-	def state = SpcState.new(regAlloc);
+	def state = SpcState.new(regAlloc, resolver);
 	// Other state
 	def trap_labels = Vector<(TrapReason, MasmLabel)>.new();
 	var start_pos = 0;
@@ -709,9 +709,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_LOCAL_GET(index: u31) {
 		var lv = state.get(index);
 		if (lv.inReg()) {
-			regAlloc.assign(lv.reg, int.!(state.sp));
-			var isConst = lv.flags & IS_CONST;
-			state.push(lv.kindFlags(isConst | IN_REG), lv.reg, lv.const);
+			if (SpcTuning.multiReg) {
+				regAlloc.assign(lv.reg, int.!(state.sp));
+				var isConst = lv.flags & IS_CONST;
+				state.push(lv.kindFlags(isConst | IN_REG), lv.reg, lv.const);
+			} else {
+				regAlloc.reassign(lv.reg, index, int.!(state.sp));
+				masm.emit_mov_s_r(lv.kind(), index, lv.reg);
+				var isConst = lv.flags & IS_CONST;
+				state.set(index, (lv.flags & ~IN_REG) | IS_STORED, NO_REG, lv.const);
+				state.push(lv.kindFlags(isConst | IN_REG), lv.reg, lv.const);
+			}
 		} else if (lv.isConst()) {
 			state.push(lv.kindFlags(IS_CONST), NO_REG, lv.const);
 		} else {
@@ -719,7 +727,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var reg = allocRegTos(kind);
 			masm.emit_mov_r_s(kind, reg, index);
 			state.push(lv.kindFlags(IN_REG), reg, 0);
-			state.state[index] = SpcVal(lv.flags | IN_REG, reg, 0);
+			if (SpcTuning.multiReg) {
+				state.state[index] = SpcVal(lv.flags | IN_REG, reg, 0);
+			}
 			regAlloc.assign(reg, index);
 		}
 	}
@@ -752,18 +762,29 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		regAlloc.unassign(lv.reg, index); // unref existing register
 		var sv = state.peek();
 		if (sv.inReg()) {
-			regAlloc.assign(sv.reg, index);
-			var isConst = sv.flags & IS_CONST;
-			state.set(index, lv.kindFlagsAndTag(IN_REG | isConst), sv.reg, sv.const);
+			if (SpcTuning.multiReg) {
+				regAlloc.assign(sv.reg, index);
+				var isConst = sv.flags & IS_CONST;
+				state.set(index, lv.kindFlagsAndTag(IN_REG | isConst), sv.reg, sv.const);
+			} else {
+				masm.emit_mov_s_r(lv.kind(), index, sv.reg);
+				var isConst = sv.flags & IS_CONST;
+				state.set(index, lv.kindFlagsAndTag(isConst | IS_STORED), NO_REG, sv.const);
+			}
 		} else if (sv.isConst()) {
 			state.set(index, lv.kindFlagsAndTag(IS_CONST), NO_REG, sv.const);
 		} else {
 			var tos = state.sp - 1;
 			var kind = lv.kind();
 			var reg = allocReg(kind, tos);
-			regAlloc.assign(reg, index);
 			masm.emit_mov_r_s(kind, reg, tos);
-			state.set(index, lv.kindFlagsAndTag(IN_REG), reg, 0);
+			if (SpcTuning.multiReg) {
+				regAlloc.assign(reg, index);
+				state.set(index, lv.kindFlagsAndTag(IN_REG), reg, 0);
+			} else {
+				masm.emit_mov_s_r(kind, index, reg);
+				state.set(index, lv.kindFlagsAndTag(IS_STORED), NO_REG, 0);
+			}
 			state.overwrite(sv.kindFlagsAndTag(IN_REG | IS_STORED), reg, 0);
 		}
 	}
@@ -832,7 +853,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 
 	def visit_I32_CONST(val: i32) {
-		state.push(KIND_I32 | IS_CONST, NO_REG, val);
+		if (SpcTuning.intConst) {
+			state.push(KIND_I32 | IS_CONST, NO_REG, val);
+		} else {
+			var reg = allocRegTos(ValueKind.I32);
+			masm.emit_mov_r_i(reg, val);
+			state.push(KIND_I32 | IN_REG, reg, 0);
+		}
 	}
 	def visit_I64_CONST(val: i64) {
 		if (i32.view(val) == val) {
@@ -1099,6 +1126,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 	// Fold an unary operation if a constant is on the top of the stack.
 	def tryFold_i_i(f: i32 -> i32) -> bool {
+		if (!SpcTuning.constantFolding) return false;
 		var sv = state.peek();
 		if (sv.isConst()) {
 			var r = f(sv.const);
@@ -1111,6 +1139,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return false;
 	}
 	def tryFold_x_y<X, Y>(kind: ValueKind, f: X -> Y, toX: i32 -> X, toY: i32 -> Y, fromY: Y -> i32) -> bool {
+		if (!SpcTuning.constantFolding) return false;
 		var a = state.peek();
 		if (a.isConst()) {
 			var rY = f(toX(a.const));
@@ -1133,6 +1162,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Utilities to try to constant-fold using the given evaluation function {f}. Since all SPC constants
 	// are represented by the V3 type {i32}, this is the fast path.
 	def tryFold_ii_i(f: (i32, i32) -> i32) -> bool {
+		if (!SpcTuning.constantFolding) return false;
 		var sv = state.peek2(), a = sv.0, b = sv.1;
 		if (a.isConst() && b.isConst()) {
 			var r = f(a.const, b.const);
@@ -1145,6 +1175,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	// For evaluation functions that are not of type {i32}, adapt them polymorphically.
 	def tryFold_xx_y<X, Y>(kind: ValueKind, f: (X, X) -> Y, toX: i32 -> X, toY: i32 -> Y, fromY: Y -> i32) -> bool {
+		if (!SpcTuning.constantFolding) return false;
 		var sv = state.peek2(), a = sv.0, b = sv.1;
 		if (a.isConst() && b.isConst()) {
 			var rY = f(toX(a.const), toX(b.const));
@@ -1524,7 +1555,7 @@ def I32_ROTL = to_ii_i(V3Eval.I32_ROTL, _, _);
 def I32_ROTR = to_ii_i(V3Eval.I32_ROTR, _, _);
 
 // Contains both the abstract control and abstract value stack.
-class SpcState(regAlloc: RegAlloc) {
+class SpcState(regAlloc: RegAlloc, resolver: SpcMoveResolver) {
 	// Abstract state of the value stack
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
 	var sp: u32;
@@ -1562,6 +1593,7 @@ class SpcState(regAlloc: RegAlloc) {
 		for (j < count) {
 			var k = j + sp;
 			state[k] = SpcVal(flags, NO_REG, 0);
+			aggressivelyStoreTag(k);
 		}
 		sp = nlength;
 	}
@@ -1670,6 +1702,9 @@ class SpcState(regAlloc: RegAlloc) {
 			var nv = SpcVal(nflags, NO_REG, sv.const);
 			state[i] = nv;
 			if (stored == (oflags & stored)) continue;
+			if (SpcTuning.lazySlotZeroing && sv.isConst() && sv.const == 0) {
+				sv = SpcVal(sv.flags | IS_STORED, sv.reg, 0);
+			}
 			var slot = u32.view(i);
 			resolver.addMove((slot, nv), (slot, sv));
 		}
@@ -1718,13 +1753,19 @@ class SpcState(regAlloc: RegAlloc) {
 		var sp = this.sp;
 		if (sp >= state.length) grow(8 + state.length * 2);
 		state[sp] = SpcVal(flags, reg, const);
+		aggressivelyStoreTag(sp);
 		this.sp++;
 	}
-	def pushV(v: SpcVal) {
-		var sp = this.sp;
-		if (sp >= state.length) grow(8 + state.length * 2);
-		state[sp] = v;
-		this.sp++;
+	def aggressivelyStoreTag(slot: u32) {
+		match (SpcTuning.tagging) {
+			EAGERTAGS => ;
+			EAGERTAGS_L => if (slot >= num_locals) return;
+			EAGERTAGS_O => if (slot < num_locals) return;
+			_ => return;
+		}
+		var sv = state[slot];
+		resolver.storeTag(sv.kind(), slot);
+		state[slot] = SpcVal(sv.flags | TAG_STORED, sv.reg, sv.const);
 	}
 	def get(slot: u32) -> SpcVal {
 		return state[slot];
@@ -1754,9 +1795,11 @@ class SpcState(regAlloc: RegAlloc) {
 		var old = state[sp - 1];
 		var tag_stored = if((old.flags & KIND_MASK) == (flags & KIND_MASK), old.flags & TAG_STORED);
 		state[sp - 1] = SpcVal(tag_stored | flags, reg, const);
+		aggressivelyStoreTag(sp - 1);
 	}
 	def set(slot: u32, flags: byte, reg: Reg, const: int) {
 		state[slot] = SpcVal(flags, reg, const);
+		aggressivelyStoreTag(slot);
 	}
 	def setStored(slot: u32) {
 		var b = state[slot];
@@ -1869,6 +1912,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 	private var numMoves = 0;
 	private def constRegMoves = Vector<(ValueKind, int, Reg)>.new();
 	private def constSlotMoves = Vector<(ValueKind, int, u32)>.new();
+	var num_locals: u16;
 
 	// Add a move or moves to the collection of parallel moves to transfer the
 	// abstract value in one slot to another. The abstract value may be a constant,
@@ -1886,7 +1930,7 @@ class SpcMoveResolver(masm: MacroAssembler) {
 		if (masm.valuerep.tagged && tv.tagStored()) { // XXX: move tag store operation into state?
 			if (from.0 != to.0 || !fv.tagStored()) {
 				// store the tag into to-slot
-				masm.emit_mov_m_i(masm.tagAddr(to.0), fv.kind().code);
+				storeTag(fv.kind(), to.0);
 			}
 		}
 		if (fv.isConst()) {
@@ -1910,6 +1954,11 @@ class SpcMoveResolver(masm: MacroAssembler) {
 				mov(kind, r(tv.reg), s(from.0));
 			}
 		}
+	}
+	def storeTag(kind: ValueKind, slot: u32) {
+		if (SpcTuning.tagging.lazy_locals && slot < num_locals) return;
+		if (SpcTuning.tagging.lazy_ops && slot >= num_locals) return;
+		masm.emit_mov_m_i(masm.tagAddr(slot), kind.code);
 	}
 	// Order and emit the moves to the macro assembler.
 	def emitMoves() {
