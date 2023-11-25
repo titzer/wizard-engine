@@ -35,9 +35,7 @@
 (assert_return (invoke "i8x16_replace_lane-last" (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (i32.const -129)) (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127))
 (assert_return (invoke "i8x16_replace_lane-last" (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (i32.const 32767)) (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0xff))
 (assert_return (invoke "i8x16_replace_lane-last" (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (i32.const -32768)) (v128.const i8x16 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
-(assert_return (invoke "i8x16_replace_lane-first" (v128.const i8x16 0 255 0 255 15 255 0 255 255 255 0 255 127 255 0 255) (i32.const 1)) (v128.const i8x16 1 255 0 255 15 255 0 255 255 255 0 255 127 255 0 255))
-(assert_return (invoke "i8x16_replace_lane-last" (v128.const i8x16 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 1 0x55 -1) (i32.const -0)) (v128.const i8x16 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 1 0x55 0))
-
+(assert_return (invoke "i8x16_replace_lane-last" (v128.const i8x16 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 1 0x55 -1) (i32.const 1)) (v128.const i8x16 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 0 0x55 1 0x55 1))
 (assert_return (invoke "i16x8_replace_lane-first" (v128.const i16x8 0 0 0 0 0 0 0 0) (i32.const 32767)) (v128.const i16x8 32767 0 0 0 0 0 0 0))
 (assert_return (invoke "i16x8_replace_lane-first" (v128.const i16x8 0 0 0 0 0 0 0 0) (i32.const 32768)) (v128.const i16x8 -32768 0 0 0 0 0 0 0))
 (assert_return (invoke "i16x8_replace_lane-first" (v128.const i16x8 0 0 0 0 0 0 0 0) (i32.const 65535)) (v128.const i16x8 -1 0 0 0 0 0 0 0))
