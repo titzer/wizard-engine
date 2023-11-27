@@ -139,11 +139,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.reset(sig, end_label);
 		state.num_locals = func.num_locals;
 
-		// Visit all local declarations.
-		it.dispatchLocalDecls(this);
-
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
+
+		// Visit all local declarations.
+		it.dispatchLocalDecls(this);
 
 		// Emit function entry probe, if any.
 		if (!FeatureDisable.entryProbes && func.entry_probed) {
@@ -232,13 +232,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		for (i = 1; i < config.regSet.length; i++) {
 			var r = Reg(byte.view(i));
 //TODO			var slot = regAlloc.get(r);
-			var slot: int;
+			var buf = StringBuilder.new().puts("{");
+			regAlloc.forEachAssignment(r, appendSlots(buf, _));
+			var slots = buf.puts("}").toString();
 			if (regRefCounts[i] == 0) {
-				assert2(regAlloc.isFree(r), "%s should be free, got slot = %d", config.regSet.getName(r), slot);
+				assert2(regAlloc.isFree(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
 			} else {
-				assert2(!regAlloc.isFree(r), "%s should be allocated, got slot = %d", config.regSet.getName(r), slot);
+				assert2(!regAlloc.isFree(r), "%s should be allocated, got slots = %s", config.regSet.getName(r), slots);
 			}
 		}
+	}
+	def appendSlots(buf: StringBuilder, slot: int) -> StringBuilder {
+		if (buf.length > 1) buf.csp();
+		return buf.putd(slot);
 	}
 	def assert1<T>(cond: bool, msg: string, param: T) {
 		if (!cond) bailout(Strings.format1(msg, param));
@@ -758,7 +764,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			regAlloc.assign(reg, index);
 			masm.emit_mov_r_s(kind, reg, tos);
 			state.set(index, lv.kindFlagsAndTag(IN_REG), reg, 0);
-			state.overwrite(lv.kindFlagsAndTag(IN_REG | IS_STORED), reg, 0);
+			state.overwrite(sv.kindFlagsAndTag(IN_REG | IS_STORED), reg, 0);
 		}
 	}
 	def visit_GLOBAL_GET(index: u31) {
@@ -1265,8 +1271,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (regAlloc.isFree(reg)) {
 			regAlloc.assign(reg, TMP_SLOT);
 		} else {
-			spillReg(reg);
-			reassignReg(reg, TMP_SLOT);
+			spillRegAndFree(reg);
+			regAlloc.assign(reg, TMP_SLOT);
 		}
 		unrefLater(reg, TMP_SLOT);
 		return reg;
@@ -1296,8 +1302,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def findAndSpillReg(kind: ValueKind, slot: int) -> Reg {
 		var reg = regAlloc.findSpillCandidate(kind, addSpillCost);
 		if (reg != NO_REG) {
-			spillReg(reg);
-			reassignReg(reg, slot);
+			spillRegAndFree(reg);
+			regAlloc.assign(reg, slot);
 			return reg;
 		}
 		bailout("out of registers");
@@ -1337,7 +1343,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def popReg() -> SpcVal {
 		var sv = state.pop();
 		if (sv.inReg()) {
+			if (Trace.compiler) Trace.OUT.put1("popReg() in %s", masm.regConfig.regSet.getName(sv.reg)).outln();
 			regAlloc.reassign(sv.reg, int.!(state.sp), TMP_SLOT);
+			if (Trace.compiler) { regAlloc.render(Trace.OUT, masm.regConfig.regSet); Trace.OUT.outln(); }
 			unrefLater(sv.reg, TMP_SLOT);
 			return sv;
 		}
@@ -1356,9 +1364,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			unrefLater(sv.reg, TMP_SLOT);
 			return sv;
 		}
-		spillReg(reg);
-		regAlloc.assign(reg, slot);
 		var kind = sv.kind();
+		allocTmpFixed(kind, reg);
 		if (sv.inReg()) {
 			masm.emit_mov_r_r(reg, sv.reg);
 			regAlloc.unassign(sv.reg, slot);
@@ -1367,12 +1374,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		} else {
 			masm.emit_mov_r_s(kind, reg, state.sp);
 		}
-		unrefLater(reg, slot);
 		return SpcVal(sv.flags | IN_REG, reg, sv.const);
-	}
-	def reassignReg(reg: Reg, slot: int) {
-		regAlloc.free(reg);
-		regAlloc.assign(reg, slot);
 	}
 	// Pop the top of stack into a register and prepare for it to be overwritten.
 	def popRegToOverwrite() -> SpcVal {
@@ -1391,8 +1393,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return SpcVal(sv.flags | IN_REG, reg, sv.const);
 	}
 	// Spill a register to its slot(s), if it has been allocated.
-	def spillReg(reg: Reg) {
+	def spillRegAndFree(reg: Reg) {
 		regAlloc.forEachAssignment(reg, emitSpill); // XXX: iterate assignment list directly?
+		regAlloc.free(reg);
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
