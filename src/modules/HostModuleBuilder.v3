@@ -1,23 +1,66 @@
 // Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-class HostModuleBuilder(name: string) {
-	private var module = SimpleHostModule.new(name);
+// Builds simple modules that do not have any instance state.
+// Simplifies the more complicated interface of the superclass {HostModuleBuilderOf}, so that
+// a user can simply instantiate this class without type parameters.
+class HostModuleBuilder extends HostModuleBuilderOf<void> {
+	new(name: string) super(name, void.!<void>) { }
+}
 
+// Builds more complex modules that have instance state in the form of the <C> type parameter.
+// The {tnew} function should create the state object <C>.
+class HostModuleBuilderOf<C>(name: string, tnew: void -> C) {
+	private var module = HostModuleOf<C>.new(name, tnew);
+
+	// Adds a simple named function with a static signature.
 	def func(name: string, sig: SigDecl, hf: Range<Value> -> HostResult) -> this {
 		module.map[name] = HostFunction.new(name, sig, hf);
 	}
+	// Adds a simple named function with a static signature, but the function is created from a <C>.
+	def func_C(name: string, sig: SigDecl, hfp: C -> (Range<Value> -> HostResult)) -> this {
+		module.closures[name] = ClosureEntry<C>(name, sig, hfp);
+	}
+	// Adds a simple named function with a static signature, but the function is a "member" of <C>.
+	def func_M(name: string, sig: SigDecl, hfp: (C, Range<Value>) -> HostResult) -> this {
+		module.closures[name] = ClosureEntry<C>(name, sig, closeOver<C, Range<Value>, HostResult>(_, hfp));
+	}
+	// Adds a post-processing function for an instance, e.g. to examine its exports.
+	def postprocess(f: (C, Instance) -> void) -> this {
+		module.postprocess_f = f;
+	}
+	// Adds a function that implements {HostModule.getMain()}.
+	def getMain(f: Instance -> (Function, Array<Value>)) -> this {
+		module.getMain_f = f;
+	}
+	// Adds a function that implements {HostModule.init()}.
+	def init(f: (Array<string>, bool, ErrorGen) -> void) -> this {
+		module.init_f = f;
+	}
+	// Finishes a module and registers it with the registry.
 	def register(exposed: bool) {
 		ModuleRegistry.add(module, exposed);
 		module = null;
 	}
 }
+// Needed to adapt a member function to a function that binds the receiver.
+def closeOver<C, P, R>(c: C, func: (C, P) -> R) -> P -> R {
+	return func(c, _);
+}
 
-// A simple host module that only has static mappings to names.
-class SimpleHostModule extends HostModule {
-	private def map = Strings.newMap<Exportable>();
+// Implements a host module that has stateful bindings.
+// Will instantiate a new <C> for each module that imports from this host module, automatically.
+private class HostModuleOf<C> extends HostModule {
+	def none: C;
+	var last: C;
+	def tnew: void -> C;
+	def map = Strings.newMap<Exportable>();
+	def closures = Strings.newMap<ClosureEntry<C>>();
+	var postprocess_f: (C, Instance) -> void;
+	var init_f: (Array<string>, bool, ErrorGen) -> void;
+	var getMain_f: Instance -> (Function, Array<Value>);
 
-	new(name: string) super(name) { }
+	new(name: string, tnew) super(name) { }
 
 	def preprocess(module: Module, result: Array<Exportable>) {
 		var imports = module.imports;
@@ -25,8 +68,28 @@ class SimpleHostModule extends HostModule {
 			var i = imports[j];
 			if (result[j] != null) continue;                             // don't overwrite existing binding
 			if (!Strings.equal(this.name, i.imp.module_name)) continue;  // not this module
-			var found = map[i.imp.field_name];
-			result[j] = found;
+			var simple = map[i.imp.field_name];                          // find simple binding
+			if (simple != null) {
+				result[j] = simple;
+				continue;
+			}
+			var closure = closures[i.imp.field_name];
+			if (closure.name != null) {
+				if (last == none) last = tnew(); // lazily allocate a <C> object
+				result[j] = HostFunction.new(closure.name, closure.sig, closure.cnew(last));
+			}
 		}
 	}
+	def postprocess(instance: Instance) {
+		if (postprocess_f != null) postprocess_f(last, instance);
+		last = none;
+	}
+	def init(args: Array<string>, trace: bool, err: ErrorGen) {
+		if (init_f != null) init_f(args, trace, err);
+	}
+	def getMain(instance: Instance) -> (Function, Array<Value>) {
+		if (getMain_f != null) return getMain_f(instance);
+		return (null, null);
+	}
 }
+private type ClosureEntry<C>(name: string, sig: SigDecl, cnew: C -> (Range<Value> -> HostResult)) #unboxed;

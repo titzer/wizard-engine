@@ -1,77 +1,64 @@
 // Copyright 2020 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Enumeration of the exported functions
-def OUT = Trace.OUT;
-enum WaveExports(sig: SigDecl, invoke: (WaveModule, Range<Value>) -> HostResult) {
-	arg_len(SigCache.i_i, WaveModule.arg_len),
-	arg_copy(SigCache.iii_i, WaveModule.arg_copy),
-	fs_size(SigCache.ii_i, WaveModule.fs_size),
-	fs_chmod(SigCache.iii_i, WaveModule.fs_chmod),
-	fs_open(SigCache.iii_i, WaveModule.fs_open),
-	fs_read(SigCache.iii_i, WaveModule.fs_read),
-	fs_write(SigCache.iii_i, WaveModule.fs_write),
-	fs_avail(SigCache.i_i, WaveModule.fs_avail),
-	fs_close(SigCache.i_v, WaveModule.fs_close),
-	ticks_ms(SigCache.v_i, WaveModule.ticks_ms),
-	ticks_us(SigCache.v_i, WaveModule.ticks_us),
-	ticks_ns(SigCache.v_i, WaveModule.ticks_ns),
-	throw_ex(SigCache.iiii_v, WaveModule.throw_ex)
+// The "wave" module provides an execution environment for Virgil programs compiled to Wasm.
+def Y = HostModuleBuilderOf<WaveInstance>.new("wave", WaveInstance.new)
+	.func_M("arg_len", SigCache.i_i, WaveInstance.arg_len)
+	.func_M("arg_copy", SigCache.iii_i, WaveInstance.arg_copy)
+	.func_M("fs_size", SigCache.ii_i, WaveInstance.fs_size)
+	.func_M("fs_chmod", SigCache.iii_i, WaveInstance.fs_chmod)
+	.func_M("fs_open", SigCache.iii_i, WaveInstance.fs_open)
+	.func_M("fs_read", SigCache.iii_i, WaveInstance.fs_read)
+	.func_M("fs_write", SigCache.iii_i, WaveInstance.fs_write)
+	.func_M("fs_avail", SigCache.i_i, WaveInstance.fs_avail)
+	.func_M("fs_close", SigCache.i_v, WaveInstance.fs_close)
+	.func_M("ticks_ms", SigCache.v_i, WaveInstance.ticks_ms)
+	.func_M("ticks_us", SigCache.v_i, WaveInstance.ticks_us)
+	.func_M("ticks_ns", SigCache.v_i, WaveInstance.ticks_ns)
+	.func_M("throw_ex", SigCache.iiii_v, WaveInstance.throw_ex)
+	.postprocess(WaveInstance.setMemory)
+	.init(init)
+	.getMain(getMain)
+	.register(true); // TODO: don't expose wave by default
+
+// Global state. TODO: should be part of {WaveInstance}.
+var fdmap: FileDescriptorMap;
+var lastfd: int;
+var trace: bool;
+var cmdline_args: Array<string>;
+def OOB = HostResult.Throw(Trap.new(TrapReason.MEM_OUT_OF_BOUNDS, null, null));
+
+def init(args: Array<string>, t: bool, err: ErrorGen) {
+	fdmap = FileDescriptorMap.new(MAX_FDS);
+	cmdline_args = args;
+	trace = t;
 }
 
-// Implements the "wave" module interface for programs compiled from Virgil.
-class WaveModule extends HostModule("wave") {
-	private var fdmap: FileDescriptorMap;
-	private var lastfd: int;
-	private def oob = HostResult.Throw(Trap.new(TrapReason.MEM_OUT_OF_BOUNDS, null, null));
-	private var memory: Memory;
-	private var cmdline_args: Array<string>;
-	private var trace: bool;
-
-	def init(args: Array<string>, trace: bool, err: ErrorGen) {
-		this.fdmap = FileDescriptorMap.new(MAX_FDS);
-		this.cmdline_args = args;
-		this.trace = trace;
-	}
-
-	def preprocess(module: Module, result: Array<Exportable>) {
-		var imports = module.imports;
-		for (j < imports.length) {
-			var i = imports[j];
-			if (!Strings.equal(this.name, i.imp.module_name)) continue;
-			if (!FuncDecl.?(i)) continue;
-			var impf = FuncDecl.!(i);
-			for (ex in WaveExports) {
-				if (Strings.equal(ex.name, i.imp.field_name)) {
-					var func = ex.invoke(this, _);
-					result[j] = HostFunction.new(ex.name, ex.sig, func);
-					break;
-				}
-			}
-		}
-	}
-	def postprocess(instance: Instance) {
-		// Find memory and save internally
-		memory = findExport<Memory>(instance, null);
-	}
-	def getMain(instance: Instance) -> (Function, Array<Value>) {
-		var found = findExport<Function>(instance, GlobMatcher.new("main"));
-		if (found != null) return toEntry(found);
-
+def getMain(instance: Instance) -> (Function, Array<Value>) {
+	var main = instance.findExportOfType<Function>(GlobMatcher.new("main"));
+	if (main == null) {
 		for (iex in instance.exports) {
 			match (iex) {
 				x: Function => {
 					// If more than one exported function, don't know
-					if (found != null) return (null, null);
-					found = x;
+					if (main != null) return (null, null);
+					main = x;
 				}
 			}
 		}
-		return if(found != null, toEntry(found)); // only one exported function, assume it is main
 	}
-	def toEntry(main: Function) -> (Function, Array<Value>) {
-		if (Arrays.equal(main.sig.params, SigCache.arr_i)) return (main, [Values.i_v(cmdline_args.length)]);
-		return (main, Arrays.map(main.sig.params, Values.default));
+	if (main == null) return (null, null);
+	if (Arrays.equal(main.sig.params, SigCache.arr_i)) return (main, [Values.i_v(cmdline_args.length)]);
+	return (main, Arrays.map(main.sig.params, Values.default));
+}
+
+// Implements the "wave" module interface for programs compiled from Virgil.
+class WaveInstance {
+	private var memory: Memory;
+
+	def setMemory(instance: Instance) {
+		// Find memory and save internally
+		memory = instance.findExportOfType<Memory>(null);
 	}
 	def deinit(result: Result) {
 		fdmap.closeAll();
@@ -84,7 +71,7 @@ class WaveModule extends HostModule("wave") {
 		return i(cmdline_args[arg].length);
 	}
 	def arg_copy(args: Range<Value>) -> HostResult {
-		if (memory == null) return oob;
+		if (memory == null) return OOB;
 		var arg = Values.v_u(args[0]);
 		var ptr = Values.v_u(args[1]);
 		var len = Values.v_u(args[2]);
@@ -92,7 +79,7 @@ class WaveModule extends HostModule("wave") {
 		var data = cmdline_args[arg];
 		if (len > data.length) len = u32.!(data.length);
 		var i = memory.boundsCheck(0, ptr, len);
-		if (i < 0) return oob;
+		if (i < 0) return OOB;
 		memory.copyIn(ptr, data, 0, len);
 		return this.i(int.!(len));
 	}
@@ -125,7 +112,7 @@ class WaveModule extends HostModule("wave") {
 		return i(fd);
 	}
 	def fs_read(args: Range<Value>) -> HostResult {
-		if (memory == null) return oob;
+		if (memory == null) return OOB;
 		var fd = Values.v_i(args[0]);
 		var buf = Values.v_u(args[1]);
 		var len = Values.v_u(args[2]);
@@ -134,7 +121,7 @@ class WaveModule extends HostModule("wave") {
 		return i(memory.readIn(s, buf, len));
 	}
 	def fs_write(args: Range<Value>) -> HostResult {
-		if (memory == null) return oob;
+		if (memory == null) return OOB;
 		var fd = Values.v_i(args[0]);
 		var buf = Values.v_u(args[1]);
 		var len = Values.v_u(args[2]);
@@ -167,7 +154,7 @@ class WaveModule extends HostModule("wave") {
 		return i(System.ticksNs());
 	}
 	def throw_ex(args: Range<Value>) -> HostResult {
-		if (memory == null) return oob;
+		if (memory == null) return OOB;
 		var ex = Values.v_u(args[0]);
 		var ex_len = Values.v_u(args[1]);
 		var msg = Values.v_u(args[2]);
@@ -178,6 +165,10 @@ class WaveModule extends HostModule("wave") {
 		return NONE;
 	}
 	// ===================================================================
+	def copyString(memory: Memory, offset: Value, size: Value) -> MaybeTrap<string> {
+		if (memory == null) return MaybeTrap<string>(null, TrapReason.NO_EXPORTED_MEM);
+		return memory.range_ol_32(Values.v_u(offset), Values.v_u(size)).then(Ranges.dup<byte>);
+	}
 
 	private def i(v: int) -> HostResult {
 		return HostResult.Value1(Value.I32(u32.view(v)));
@@ -186,5 +177,3 @@ class WaveModule extends HostModule("wave") {
 def MINUS_1 = HostResult.Value1(Value.I32(0xFFFFFFFFu));
 def NONE = HostResult.Value0;
 def MAX_FDS = 256;
-def TRACE_BUILDER = TraceBuilder.new();
-def WaveModule_installed = ModuleRegistry.add(WaveModule.new(), true); // TODO: don't expose by default
