@@ -10,6 +10,8 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 . $HERE/common.sh spec
 
+TEST_SIMD=${TEST_SIMD:=1}
+
 function run {
     BRANCH=$1
     cd $WIZENG_LOC
