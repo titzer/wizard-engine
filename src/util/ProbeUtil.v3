@@ -1,0 +1,132 @@
+// Copyright 2023 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a timeout, returning a trap when a countdown expires.
+class TimeoutProbe(var count: int) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		if (--count <= 0) return Resumption.Trap(TrapReason.TIMEOUT, true);
+		return Resumption.Continue;
+	}
+}
+// Increments a counter each time it is fired; optimized by SPC.
+class CountProbe extends Probe {
+	var count: u64 = 0;
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		count++;
+		return Resumption.Continue;
+	}
+}
+// Wraps a callback {f} to allow it to be called as a probe.
+class ClosureProbe<P, R>(f: P -> R, param: P) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		f(param);
+		return Resumption.Continue;
+	}
+}
+// Adapts a callback function {f} into a {Probe} instance.
+class CallbackProbe(f: DynamicLoc -> Resumption) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		return f(dynamicLoc);
+	}
+}
+// Traces an instruction, including operands, when fired.
+class TraceProbe extends Probe {
+	def tracer = InstrTracer.new();
+	def codeptr = DataReader.new([]);
+
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var func = dynamicLoc.func;
+		var offset = dynamicLoc.pc;
+		codeptr.reset(func.decl.cur_bytecode, offset, func.decl.cur_bytecode.length);
+		var module = if(func.instance != null, func.instance.module);
+		var out = Trace.OUT;
+		var len = out.length;
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		out.pad(' ', len + 2 * accessor.depth());
+		out.putc('+').putd(offset).puts(": ");
+
+		var opcode = codeptr.data[codeptr.pos];
+		if (opcode == InternalOpcode.PROBE.code) {
+			out.puts("<probe> ");
+			var prev = (codeptr.data, codeptr.pos, codeptr.limit);
+			codeptr.reset(func.decl.orig_bytecode, prev.1, prev.2);
+			tracer.putInstr(out, module, codeptr);
+			codeptr.reset(prev.0, prev.1, prev.2);
+		} else {
+			tracer.putInstr(out, module, codeptr);
+		}
+		if (Trace.operands) {
+			for (i < accessor.numLocals()) {
+				out.putv(accessor.getLocal(i)).sp();
+			}
+			var count = accessor.numOperands();
+			out.puts(" |");
+			for (j = 1 - count; j <= 0; j++) {
+				out.putv(accessor.getOperand(j)).sp();
+			}
+		}
+		out.outln();
+		return Resumption.Continue;
+	}
+}
+// Probes that use the top of the stack, optimized by SPC.
+class OperandProbe extends Probe { }
+class OperandProbe_i_v extends OperandProbe {
+	def fire_i(i: u32) {}
+
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var value = accessor.getOperand(0);
+		fire_i(Values.v_u(value));
+		return Resumption.Continue;
+	}
+}
+// A utility class that implements a probe that can be enabled, disabled, or temporarily
+// enabled/disabled.
+class SamplingProbe(probe: Probe) extends Probe {
+	var counter: i64 = -1;
+
+	// Unconditionally enables this probe.
+	def enable() {
+		counter = i64.max;
+	}
+	// Unconditionally disables this probe.
+	def disable() {
+		counter = -1;
+	}
+	// Enables this probe for the next {n} fires, after which it reverts to disabled.
+	def enableFor(n: u63) {
+		counter = n;
+	}
+	// Disables this probe for the next {n} fires, after which it reverts to enabled.
+	def disableFor(n: u63) {
+		counter = i64.min + n;
+	}
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var next = counter - 1;
+		var r = if(next >= 0, probe.fire(dynamicLoc), Resumption.Continue);
+		counter = next;
+		return r;
+		// x86 asm (biased toward disabled):
+		//   sub [s1.counter], 1
+		//   ja fire_probe[s1]
+		// this_pc:
+		//   ...
+		//   <end of func>
+		// fire_probe[s1]:
+		//   <spill regs>
+		//   <call s1.probe.fire()>
+		//   <restore regs>
+		//   jmp this_pc
+
+		// x86 asm (biased toward enabled):
+		//   sub [s1.counter], 1
+		//   jna this_pc
+		//   <spill regs>
+		//   <call s1.probe.fire()>
+		//   <restore regs>
+		// this_pc:
+		//   ...
+		//   <end of func>
+	}
+}
