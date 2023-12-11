@@ -1,4 +1,5 @@
 (module
+ (memory (export "memory") 1)
  (func $fib (param $n i32) (result i32)
   (if
    (i32.lt_s
@@ -27,6 +28,7 @@
   )
  )
  (func $main (export "main")
-   (drop (call $fib (i32.const 22))) ;; tunable
+   (drop (call $fib (i32.const 27))) ;; tunable
  )
+ (export "_start" (func $main))
 )
