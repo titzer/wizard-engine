@@ -30,7 +30,7 @@
  )
  (func $main (export "main")
    (local $n i32)
-   (local.set $n (i32.sub (i32.const 32) (i32.clz (i32.const __INNER_ITERATIONS__))))
+   (local.set $n (i32.sub (i32.const 32) (i32.clz (i32.const 110000000))))
    (drop (call $fib (local.get $n)))
  )
  (export "_start" (func $main))

@@ -1,3 +1,4 @@
+;; INNER_CALIBRATION = 0.2
 (module
   (memory 1)
   (func (export "_start")
@@ -17,7 +18,7 @@
   (func $main (export "main")
     (local $y i32)
 
-    (local.set $y (i32.const 10000))
+    (local.set $y (i32.const __INNER_ITERATIONS__))
     (loop $l
       (call $find (i32.const 6677))
       (drop)
