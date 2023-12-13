@@ -1,4 +1,4 @@
-;; INNER_CALIBRATION = 7250
+;; INNER_CALIBRATION = 725
 (module
   (func $main (export "main")
     (local $y i32)

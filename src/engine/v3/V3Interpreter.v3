@@ -3,6 +3,7 @@
 
 // Executes wasm code using portable Virgil III code and datastructures.
 def OUT = Trace.OUT;
+def RUN_INT_LOOP = true;
 component V3Interpreter {
 	private var instrTracer: InstrTracer;
 	def val_stack = ArrayStack<Value>.new();	// XXX: inline value stack array and top
@@ -15,6 +16,7 @@ component V3Interpreter {
 	var host_frame: V3Frame = null;		// points to the top host frame
 
 	def call(f: Function, args: Range<Value>) -> Result {
+		if (RUN_INT_LOOP) return doCallIntLoop(WasmFunction.!(f), args);
 		var val_stack_top = val_stack.top;
 
 		// Push arguments onto the stack
@@ -54,6 +56,75 @@ component V3Interpreter {
 		}
 		return Result.Value(popN(f.sig.results.length));
 	}
+//---- fast int-stack experiment ------------------------------------------
+	var int_stack = Array<int>.new(4096);
+	var sp: int;
+	def doCallIntLoop(func: WasmFunction, args: Range<Value>) -> Result {
+		sp = 0;
+		for (a in args) int_stack[sp++] = Values.v_i(a);
+		run_int_loop(func, sp);
+		return Result.Value(Arrays.map(Ranges.dup(int_stack[0 ... sp]), Values.i_v));
+	}
+	def run_int_loop(func: WasmFunction, sp: int) {
+		var code = func.decl.cur_bytecode;
+		var fp = sp - func.decl.sig.params.length;
+		var stp = 0;
+		codeptr.reset(code, 0, code.length);
+		this.sp = sp;
+		codeptr.iterate_local_codes(push_int_locals);
+		sp = this.sp;
+		// interpreter loop
+		while (codeptr.pos < code.length) {
+			var b = codeptr.read1();
+			match (b) {
+				Opcode.NOP.code => {
+				}
+				Opcode.I32_CONST.code => {
+					var value = codeptr.read_sleb32();
+					int_stack[sp++] = value;
+				}
+				Opcode.I32_SUB.code => {
+					var p = sp - 2;
+					int_stack[p] = int_stack[p] - int_stack[--sp];
+				}
+				Opcode.LOCAL_TEE.code => {
+					var index = codeptr.read_uleb32();
+					int_stack[fp + int.view(index)] = int_stack[sp - 1];
+				}
+				Opcode.LOCAL_GET.code => {
+					var index = codeptr.read_uleb32();
+					int_stack[sp++] = int_stack[fp + int.view(index)];
+				}
+				Opcode.BR_IF.code => {
+					var cond = int_stack[--sp];
+					if (cond != 0) {
+						var e = func.decl.sidetable.getBrEntry(stp);
+						codeptr.at((codeptr.pos - 1) + e.dpc);
+						stp = stp + e.dstp;
+						if (e.popcount > 0) System.error("V3IntError", "should not poppy");
+					} else {
+						codeptr.skip_label();
+						stp += 4;
+					}
+				}
+				Opcode.LOOP.code => {
+					codeptr.skip_leb();
+				}
+				Opcode.END.code => {
+				}
+				Opcode.LOCAL_SET.code => {
+					var index = codeptr.read_uleb32();
+					int_stack[fp + int.view(index)] = int_stack[--sp];
+				}
+				_ => System.error("V3IntError", "unsupported opcode");
+			}
+		}
+		this.sp = sp;
+	}
+	def push_int_locals(count: u32, vtc: ValueTypeCode) {
+		for (i < count) int_stack[sp++] = 0;
+	}
+//-------------------------------------------------------------------------
 	def finish(ret: Throwable) -> Result {
 		return Result.Throw(Trap.!(ret));
 	}
