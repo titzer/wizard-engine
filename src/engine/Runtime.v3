@@ -1,0 +1,117 @@
+// Copyright 2023 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Shared runtime routines that are called by different execution tiers, both the
+// pure-Virgil (V3) implementation, and any native implementations.
+component Runtime {
+	def ARRAY_NEW_DATA(i: Instance, index: u32, dindex: u32, offset: u32, len: u32) -> MaybeTrap<HeapArray> {
+		if (!i.dropped_data[dindex]) {
+			var rtt = ArrayDecl.!(i.heaptypes[index]);
+			var ddecl = i.module.data[int.!(dindex)];
+			if (len <= Execute.limits.max_array_length) {
+				var t = bytesToVals(rtt.elem_types[0], ddecl.data, offset, len);
+				if (t.0) return ok(HeapArray.new(rtt, t.1));
+				else return trap(TrapReason.MEM_OUT_OF_BOUNDS);
+			} else {
+				return trap(TrapReason.OOM);
+			}
+		} else {
+			return trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		}
+	}
+	def ARRAY_NEW_ELEM(i: Instance, index: u32, eindex: u32, offset: u32, len: u32) -> MaybeTrap<HeapArray>  {
+		if (!i.dropped_elems[eindex]) {
+			var rtt = ArrayDecl.!(i.heaptypes[index]);
+			var edecl = i.module.elems[int.!(eindex)];
+			if (len <= Execute.limits.max_array_length) {
+				var vals = Array<Value>.new(int.!(len));
+				var r = Execute.copyElemsInto(vals, i, 0, edecl, offset, len);
+				if (r) return ok(HeapArray.new(rtt, vals));
+				else return trap(TrapReason.TABLE_OUT_OF_BOUNDS); // TODO: elem out of bounds
+			} else {
+				return trap(TrapReason.OOM);
+			}
+		} else {
+			return trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		}
+	}
+	def ARRAY_FILL(obj: HeapArray, offset: u32, val: Value, size: u32) -> MaybeTrap<void> {
+		if (obj == null) return trap(TrapReason.NULL_DEREF);
+		var index = ArrayUtil.boundsCheck(obj.vals, offset, 0, size);
+		if (index < 0) return trap(TrapReason.ARRAY_INDEX_OOB);
+		var r = obj.vals[index ..+ size];
+		for (i < r.length) r[i] = val;
+		return OK;
+	}
+	def ARRAY_COPY(dst: HeapArray, dst_offset: u32, src: HeapArray, src_offset: u32, size: u32) -> MaybeTrap<void> {
+		if (src == null || dst == null) return trap(TrapReason.NULL_DEREF);
+		var r = ArrayUtil.safeCopy(dst.vals, dst_offset, src.vals, src_offset, size);
+		if (!r) return trap(TrapReason.ARRAY_INDEX_OOB);
+		return OK;
+	}
+	def ARRAY_INIT_DATA(i: Instance, index: u32, dindex: u32, obj: HeapArray, dst_offset: u32, src_offset: u32, size: u32) -> MaybeTrap<void> {
+		if (obj == null) return trap(TrapReason.NULL_DEREF);
+		var rtt = ArrayDecl.!(i.heaptypes[index]);
+		if (i.dropped_data[dindex]) return if(size > 0, trap(TrapReason.DATA_SEGMENT_DROPPED), OK);
+		var data = i.module.data[int.!(dindex)].data;
+		if (ArrayUtil.boundsCheck(obj.vals, dst_offset, 0, size) < 0) return trap(TrapReason.ARRAY_INDEX_OOB);
+		var t = bytesToVals(rtt.elem_types[0], data, src_offset, size);
+		if (!t.0) return trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		ArrayUtil.safeCopy(obj.vals, dst_offset, t.1, 0, size);
+		return OK;
+	}
+	def ARRAY_INIT_ELEM(i: Instance, index: u32, eindex: u32, obj: HeapArray, dst_offset: u32, src_offset: u32, size: u32) -> MaybeTrap<void> {
+		var rtt = ArrayDecl.!(i.heaptypes[index]);
+		if (obj == null) return trap(TrapReason.NULL_DEREF);
+		if (i.dropped_elems[eindex]) return if(size > 0, trap(TrapReason.ELEM_SEGMENT_DROPPED), OK);
+		var edecl = i.module.elems[int.!(eindex)];
+		var r = Execute.copyElemsInto(obj.vals, i, dst_offset, edecl, src_offset, size);
+		if (!r) return trap(TrapReason.ARRAY_INDEX_OOB);
+		return OK;
+	}
+}
+def bytesToVals(storage: StorageType, data: Array<byte>, offset: u32, length: u32) -> (bool, Array<Value>) { // TODO: MaybeTrap
+	var vals = Array<Value>.new(int.!(length));
+	var start = ArrayUtil.boundsCheck(data, offset, 0, length);
+	if (start < 0) return (false, null);
+	var limit = sizeOfStorage(storage) * length + offset;
+	if (limit > data.length) return (false, null);
+	var d = DataReader.new(data).reset(data, start, int.!(limit));
+	match (storage.pack) {
+		UNPACKED => {
+			match (storage.valtype) {
+				I32 => for (i < vals.length) vals[i] = Value.I32(d.read_u32());
+				I64 => for (i < vals.length) vals[i] = Value.I64(d.read_u64());
+				F32 => for (i < vals.length) vals[i] = Value.F32(d.read_u32());
+				F64 => for (i < vals.length) vals[i] = Value.F64(d.read_u64());
+				V128 => for (i < vals.length) vals[i] = Value.V128(d.read_u64(), d.read_u64());
+				_ => ;
+			}
+		}
+		PACKED_I8 => for (i < vals.length) vals[i] = Value.I32(d.read1());
+		PACKED_I16 => for (i < vals.length) vals[i] = Value.I32(d.read1() | (u32.!(d.read1()) << 8));
+	}
+	return (d.ok, vals);
+}
+def sizeOfStorage(storage: StorageType) -> u32 {
+	match (storage.pack) {
+		UNPACKED => {
+			match (storage.valtype) {
+				I32, F32 => return 4;
+				I64, F64 => return 8;
+				V128 => return 16;
+				_ => return 8;
+			}
+		}
+		PACKED_I8 => return 1;
+		PACKED_I16 => return 2;
+	}
+}
+def trap<T>(reason: TrapReason) -> MaybeTrap<T> {
+	var d: T;
+	return MaybeTrap<T>(d, reason);
+}
+def ok<T>(d: T) -> MaybeTrap<T> {
+	return MaybeTrap<T>(d, TrapReason.NONE);
+}
+def OK: MaybeTrap<void>;
