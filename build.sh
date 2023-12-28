@@ -118,6 +118,11 @@ elif [ "$TARGET" = "wave" ]; then
     V3C_PATH=$(which v3c)
     V3C_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wave}
     $V3C_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+elif [ "$TARGET" = "wali" ]; then
+    # TODO: v3c-wave is not stable yet; compute its path from v3c
+    V3C_PATH=$(which v3c)
+    V3C_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wali}
+    $V3C_WAVE -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
