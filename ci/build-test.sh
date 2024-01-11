@@ -14,7 +14,6 @@ cd virgil
 
 # Set up latest version of virgil
 export PATH=$PATH:"$PWD/bin:$PWD/bin/dev:$PWD/test/config"
-./test/configure
 make
 
 # Set up wizard
