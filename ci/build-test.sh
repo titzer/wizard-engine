@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# first argument must be the target
+export TEST_TARGET=$1
+shift
+
+# remaining arguments are appended to V3C_OPTS
+V3C_OPTS="$V3C_OPTS $@"
+
+# Clone virgil
+cd ..
+git clone https://github.com/titzer/virgil
+cd virgil
+
+# Set up latest version of virgil
+export PATH=$PATH:"$PWD/bin:$PWD/bin/dev:$PWD/test/config"
+./test/configure
+make
+
+# Set up wizard
+cd ../wizard-engine
+make -j $TEST_TARGET
+
+# Install Opam for specification tests
+sudo apt install -y opam
+opam init
+
+# Install spec test dependencies
+opam install dune
+opam install menhir -y
+# Make dune available in PATH
+eval $(opam config env)
+
+# Set up specification tests
+cd test/wasm-spec
+./update.sh
+cd ../..
+
+# Run all tests
+PROGRESS_ARGS=c ./test/all.sh
