@@ -21,4 +21,6 @@
       (br_if $l3 (local.get $cnt))
     )
   )
+  (func $empty
+    (loop))
 )
