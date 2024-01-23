@@ -41,6 +41,7 @@ SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
+MODULES="src/modules/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
 
 PROGRAM=$1
@@ -76,7 +77,7 @@ elif [ "$PROGRAM" = "spectest" ]; then
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-        SOURCES="$SOURCES $UNITTEST_X86_64_LINUX"
+        SOURCES="$SOURCES $UNITTEST_X86_64_LINUX $MODULES $WASI $WASI_X86_64_LINUX"
     fi
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
