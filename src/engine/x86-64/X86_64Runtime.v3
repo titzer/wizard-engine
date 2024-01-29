@@ -6,27 +6,27 @@ def I: X86_64Interpreter;
 
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
 component X86_64Runtime {
-	var valueStack: X86_64Stack;
+	var curStack: X86_64Stack;
 
 	def run(f: Function, args: Range<Value>) -> Result {
-		if (valueStack == null) valueStack = X86_64Stack.new(EngineOptions.stackSize);
+		if (curStack == null) curStack = X86_64Stack.new(EngineOptions.stackSize);
 		// Unpack arguments into value stack format.
-		var prev_vsp = valueStack.vsp;
-		if (args != null) for (v in args) valueStack.push(v);
+		var prev_vsp = curStack.vsp;
+		if (args != null) for (v in args) curStack.push(v);
 
 		// Call the main loop which handles tail calls.
 		var thrown = runWithTailCalls(f, Pointer.NULL);
 		// Unpack the abrupt return value into a {Result}.
 		if (thrown == null) {
 			var result = popResult(f.sig);
-			if (valueStack.vsp != prev_vsp) {
+			if (curStack.vsp != prev_vsp) {
 				return Result.Throw(InternalError.new(
 					Strings.format2("stack height mismatch, expected vsp = 0x%x, got 0x%x",
-						prev_vsp - Pointer.NULL, valueStack.vsp - Pointer.NULL), null));
+						prev_vsp - Pointer.NULL, curStack.vsp - Pointer.NULL), null));
 			}
 			return result;
 		} else {
-			valueStack.vsp = prev_vsp;
+			curStack.vsp = prev_vsp;
 			return Result.Throw(thrown);
 		}
 	}
@@ -36,12 +36,12 @@ component X86_64Runtime {
 			var result: HostResult;
 			match (f) {
 				wf: WasmFunction => {
-					var vsp = valueStack.vsp;
+					var vsp = curStack.vsp;
 					if (Debug.runtime) Trace.OUT.put2("runWithTailCalls(wf=0x%x, vsp=0x%x)",
 						(Pointer.atObject(wf) - Pointer.NULL), vsp - Pointer.NULL).outln();
 					var ret = invoke(wf, vsp);
 					if (ret == null) {
-						valueStack.vsp = vsp + ((wf.sig.results.length - wf.sig.params.length) * valueStack.valuerep.slot_size);
+						curStack.vsp = vsp + ((wf.sig.results.length - wf.sig.params.length) * curStack.valuerep.slot_size);
 					}
 					return ret;
 				}
@@ -58,15 +58,15 @@ component X86_64Runtime {
 							break;
 						}
 						Value1(val) => {
-							valueStack.push(val);
+							curStack.push(val);
 							break;
 						}
 						ValueN(vals) => {
-							for (a in vals) valueStack.push(a);
+							for (a in vals) curStack.push(a);
 							break;
 						}
 						TailCall(target, args) => {
-							for (a in args) valueStack.push(a);
+							for (a in args) curStack.push(a);
 							f = target;
 							continue; // continue with next tail call
 						}
@@ -77,7 +77,7 @@ component X86_64Runtime {
 		return state;
 	}
 	private def doInvokeHostFunction(hf: HostFunction) -> HostResult {
-		var aN = valueStack.popN(hf.sig.params);
+		var aN = curStack.popN(hf.sig.params);
 		return hf.invoke(aN);
 	}
 	private def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
@@ -93,7 +93,7 @@ component X86_64Runtime {
 	private def popResult(sig: SigDecl) -> Result {
 		var rt = sig.results;
 		var r = Array<Value>.new(rt.length);
-		for (i = r.length - 1; i >= 0; i--) r[i] = valueStack.pop(rt[i]);
+		for (i = r.length - 1; i >= 0; i--) r[i] = curStack.pop(rt[i]);
 		return Result.Value(r);
 	}
 	def getFrameAccessor(sp: Pointer) -> FrameAccessor {
@@ -105,7 +105,7 @@ component X86_64Runtime {
 				if (prev != null) return prev;
 				// Interpreter frames store the {WasmFunction} _and_ {FuncDecl}.
 				var decl = (sp + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
-				var n = X86_64FrameAccessor.new(sp, decl);
+				var n = X86_64FrameAccessor.new(curStack, sp, decl);
 				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
 				return n;
 			}
@@ -115,7 +115,7 @@ component X86_64Runtime {
 				// SPC frames only store the {WasmFunction}.
 				var wf = (sp + X86_64InterpreterFrame.wasm_func.offset).load<WasmFunction>();
 				// TODO: assert wf.decl == x.decl()
-				var n = X86_64FrameAccessor.new(sp, wf.decl);
+				var n = X86_64FrameAccessor.new(curStack, sp, wf.decl);
 				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
 				return n;
 			}
@@ -132,16 +132,16 @@ component X86_64Runtime {
 	}
 	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
 		var memory = instance.memories[index];
-		var pages = Values.v_u(valueStack.pop(ValueType.I32));
+		var pages = Values.v_u(curStack.pop(ValueType.I32));
 		var result = memory.grow(pages);
-		valueStack.push(Values.i_v(result));
+		curStack.push(Values.i_v(result));
 	}
 	def runtime_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32) -> Throwable {
 		var memory = instance.memories[mindex];
 		var ddecl = if(!instance.dropped_data[dindex], instance.module.data[int.!(dindex)]);
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var dst_offset = valueStack.popu();
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var dst_offset = curStack.popu();
 		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
@@ -149,43 +149,43 @@ component X86_64Runtime {
 	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> Throwable { // XXX: inline
 		var dst = instance.memories[mindex1];
 		var src = instance.memories[mindex2];
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var dst_offset = valueStack.popu();
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var dst_offset = curStack.popu();
 		var t = dst.copyM(dst_offset, src, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> Throwable {
 		var memory = instance.memories[mindex];
-		var size = valueStack.popu();
-		var val = valueStack.popu();
-		var dest = valueStack.popu();
+		var size = curStack.popu();
+		var val = curStack.popu();
+		var dest = curStack.popu();
 		var t = memory.fill(dest, u8.view(val), size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
 		var val = instance.globals[index].value;
-		valueStack.push(val);
+		curStack.push(val);
 	}
 	def runtime_GLOBAL_SET(instance: Instance, index: u32) { // XXX: inline when Value rep known
 		var g = instance.globals[index];
-		var val = valueStack.pop(g.valtype);
+		var val = curStack.pop(g.valtype);
 		g.value = val;
 	}
 	def runtime_TABLE_GET(instance: Instance, index: u32) -> Throwable { // XXX: inline when Value rep known
 		var table = instance.tables[index];
-		var elem = Values.v_u(valueStack.pop(ValueType.I32));
+		var elem = Values.v_u(curStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		var val = table.elems[elem];
-		valueStack.push(val);
+		curStack.push(val);
 		return FINISHED;
 	}
 	def runtime_TABLE_SET(instance: Instance, index: u32) -> Throwable {
 		var table = instance.tables[index];
-		var val = valueStack.pop(table.elemtype);
-		var elem = Values.v_u(valueStack.pop(ValueType.I32));
+		var val = curStack.pop(table.elemtype);
+		var elem = Values.v_u(curStack.pop(ValueType.I32));
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		table[int.view(elem)] = val;
 		return FINISHED;
@@ -193,9 +193,9 @@ component X86_64Runtime {
 	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> Throwable {
 		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
 		var table = instance.tables[tindex];
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var dst_offset = valueStack.popu();
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var dst_offset = curStack.popu();
 		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
@@ -203,23 +203,23 @@ component X86_64Runtime {
 	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> Throwable {
 		var dst = instance.tables[t1];
 		var src = instance.tables[t2];
-		var size = valueStack.popu(), src_offset = valueStack.popu(), dst_offset = valueStack.popu();
+		var size = curStack.popu(), src_offset = curStack.popu(), dst_offset = curStack.popu();
 		var t = dst.copyT(dst_offset, src, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
 	}
 	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
 		var table = instance.tables[tindex];
-		var size = valueStack.popu();
-		var val = valueStack.pop(table.elemtype);
+		var size = curStack.popu();
+		var val = curStack.pop(table.elemtype);
 		var r = table.grow(size, val);
-		valueStack.push(Values.i_v(r));
+		curStack.push(Values.i_v(r));
 	}
 	def runtime_TABLE_FILL(instance: Instance, tindex: u32) -> Throwable { // XXX: inline when Value rep known
 		var table = instance.tables[tindex];
-		var size = valueStack.popu();
-		var val = valueStack.pop(table.elemtype);
-		var dest = valueStack.popu();
+		var size = curStack.popu();
+		var val = curStack.pop(table.elemtype);
+		var dest = curStack.popu();
 		var t = table.fill(dest, val, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
 		return FINISHED;
@@ -288,9 +288,9 @@ component X86_64Runtime {
 		var decl = StructDecl.!(instance.heaptypes[index]);
 		var fields = Array<Value>.new(decl.field_types.length);
 		for (i = fields.length - 1; i >= 0; i--) {
-			fields[i] = valueStack.pop(decl.field_types[i].valtype);
+			fields[i] = curStack.pop(decl.field_types[i].valtype);
 		}
-		valueStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+		curStack.push(Value.Ref(HeapStruct.new(decl, fields)));
 	}
 	def runtime_STRUCT_NEW_DEFAULT(instance: Instance, index: u32) { // XXX: unify with V3Interpreter
 		var decl = StructDecl.!(instance.heaptypes[index]);
@@ -298,89 +298,89 @@ component X86_64Runtime {
 		for (i < fields.length) {
 			fields[i] = Values.default(decl.field_types[i].valtype);
 		}
-		valueStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+		curStack.push(Value.Ref(HeapStruct.new(decl, fields)));
 	}
 	def runtime_STRUCT_GET(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(valueStack.popObject());
+		var obj = HeapStruct.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		valueStack.push(obj.vals[findex]);
+		curStack.push(obj.vals[findex]);
 		return null;
 	}
 	def runtime_STRUCT_GET_S(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(valueStack.popObject());
+		var obj = HeapStruct.!(curStack.popObject());
 		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		valueStack.push(V3Eval.signExtend(decl.field_types[findex], obj.vals[findex]));
+		curStack.push(V3Eval.signExtend(decl.field_types[findex], obj.vals[findex]));
 		return null;
 	}
 	def runtime_STRUCT_GET_U(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(valueStack.popObject());
+		var obj = HeapStruct.!(curStack.popObject());
 		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		valueStack.push(V3Eval.zeroExtend(decl.field_types[findex], obj.vals[findex]));
+		curStack.push(V3Eval.zeroExtend(decl.field_types[findex], obj.vals[findex]));
 		return null;
 	}
 	def runtime_STRUCT_SET(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
 		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
-		var val = valueStack.pop(decl.field_types[findex].valtype);
-		var obj = HeapStruct.!(valueStack.popObject());
+		var val = curStack.pop(decl.field_types[findex].valtype);
+		var obj = HeapStruct.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
 		obj.vals[findex] = val;
 		return null;
 	}
 	def runtime_ARRAY_NEW(instance: Instance, index: u32) -> Throwable {
 		var decl = ArrayDecl.!(instance.heaptypes[index]);
-		var len = valueStack.popu();
-		var elem = valueStack.pop(decl.elem_types[0].valtype);
+		var len = curStack.popu();
+		var elem = curStack.pop(decl.elem_types[0].valtype);
 		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
 		var length = int.view(len);
 		var vals = Array<Value>.new(length);
 		for (i < vals.length) vals[i] = elem;
-		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
 		return null;
 	}
 	def runtime_ARRAY_NEW_DEFAULT(instance: Instance, index: u32) -> Throwable {
 		var decl = ArrayDecl.!(instance.heaptypes[index]);
-		var len = valueStack.popu();
+		var len = curStack.popu();
 		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
 		var length = int.view(len);
 		var vals = Array<Value>.new(length);
 		var elem = Values.default(decl.elem_types[0].valtype);
 		for (i < vals.length) vals[i] = elem;
-		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
 		return null;
 	}
 	def runtime_ARRAY_GET(instance: Instance, ignore: u32) -> Throwable {
-		var index = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var index = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
 		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		valueStack.push(obj.vals[index]);
+		curStack.push(obj.vals[index]);
 		return null;
 	}
 	def runtime_ARRAY_GET_S(instance: Instance, aindex: u32) -> Throwable {
 		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var index = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var index = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
 		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		valueStack.push(V3Eval.signExtend(decl.elem_types[0], obj.vals[index]));
+		curStack.push(V3Eval.signExtend(decl.elem_types[0], obj.vals[index]));
 		return null;
 	}
 	def runtime_ARRAY_GET_U(instance: Instance, aindex: u32) -> Throwable {
 		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var index = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var index = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
 		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		valueStack.push(V3Eval.zeroExtend(decl.elem_types[0], obj.vals[index]));
+		curStack.push(V3Eval.zeroExtend(decl.elem_types[0], obj.vals[index]));
 		return null;
 	}
 	def runtime_ARRAY_SET(instance: Instance, aindex: u32) -> Throwable {
 		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var val = valueStack.pop(decl.elem_types[0].valtype);
-		var index = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var val = curStack.pop(decl.elem_types[0].valtype);
+		var index = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
 		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
 		obj.vals[index] = val;
@@ -392,66 +392,66 @@ component X86_64Runtime {
 		var length = int.view(len);
 		var vals = Array<Value>.new(length);
 		var t = decl.elem_types[0].valtype;
-		for (i = vals.length - 1; i >= 0; i--) vals[i] = valueStack.pop(t);
-		valueStack.push(Value.Ref(HeapArray.new(decl, vals)));
+		for (i = vals.length - 1; i >= 0; i--) vals[i] = curStack.pop(t);
+		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
 		return null;
 	}
 	def runtime_ARRAY_NEW_DATA(instance: Instance, index: u32, dindex: u32) -> Throwable {
-		var len = valueStack.popu();
-		var offset = valueStack.popu();
+		var len = curStack.popu();
+		var offset = curStack.popu();
 		var result = Runtime.ARRAY_NEW_DATA(instance, index, dindex, offset, len);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		valueStack.push(Value.Ref(result.result));
+		curStack.push(Value.Ref(result.result));
 		return null;
 	}
 	def runtime_ARRAY_NEW_ELEM(instance: Instance, index: u32, eindex: u32) -> Throwable {
-		var len = valueStack.popu();
-		var offset = valueStack.popu();
+		var len = curStack.popu();
+		var offset = curStack.popu();
 		var result = Runtime.ARRAY_NEW_ELEM(instance, index, eindex, offset, len);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		valueStack.push(Value.Ref(result.result));
+		curStack.push(Value.Ref(result.result));
 		return null;
 	}
 	def runtime_ARRAY_FILL(instance: Instance, index: u32) -> Throwable {
 		var rtt = ArrayDecl.!(instance.heaptypes[index]);
-		var size = valueStack.popu();
-		var val = valueStack.pop(rtt.elem_types[0].valtype); // XXX: polymorphic pop
-		var offset = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var size = curStack.popu();
+		var val = curStack.pop(rtt.elem_types[0].valtype); // XXX: polymorphic pop
+		var offset = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		var result = Runtime.ARRAY_FILL(obj, offset, val, size);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
 		return null;
 	}
 	def runtime_ARRAY_COPY(instance: Instance, unused1: u32, unused2: u32) -> Throwable {
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var src = HeapArray.!(valueStack.popObject());
-		var dst_offset = valueStack.popu();
-		var dst = HeapArray.!(valueStack.popObject());
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var src = HeapArray.!(curStack.popObject());
+		var dst_offset = curStack.popu();
+		var dst = HeapArray.!(curStack.popObject());
 		var result = Runtime.ARRAY_COPY(dst, dst_offset, src, src_offset, size);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
 		return null;
 	}
 	def runtime_ARRAY_INIT_DATA(instance: Instance, index: u32, dindex: u32) -> Throwable {
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var dst_offset = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var dst_offset = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		var result = Runtime.ARRAY_INIT_DATA(instance, index, dindex, obj, dst_offset, src_offset, size);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
 		return null;
 	}
 	def runtime_ARRAY_INIT_ELEM(instance: Instance, index: u32, eindex: u32) -> Throwable {
-		var size = valueStack.popu();
-		var src_offset = valueStack.popu();
-		var dst_offset = valueStack.popu();
-		var obj = HeapArray.!(valueStack.popObject());
+		var size = curStack.popu();
+		var src_offset = curStack.popu();
+		var dst_offset = curStack.popu();
+		var obj = HeapArray.!(curStack.popObject());
 		var result = Runtime.ARRAY_INIT_ELEM(instance, index, eindex, obj, dst_offset, src_offset, size);
 		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
 		return null;
 	}
 	def runtime_doCast(instance: Instance, nullable: byte, htcode: int) -> bool {
-		var val = valueStack.peekRef();
+		var val = curStack.peekRef();
 		return Execute.doCast(instance, (nullable & 2) != 0, htcode, val);
 	}
 }
