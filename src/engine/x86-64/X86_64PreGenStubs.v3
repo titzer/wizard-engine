@@ -11,6 +11,8 @@ def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 def pregen_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE_i);
 def pregen_header = Ref<X86_64PreGenHeader>.at(pregen_buffer, 0);
+var pregen_header_size = X86_64PreGenHeader.size;
+var global_stub_list: List<X86_64PreGenStub>;
 def X = pregen_header.magicWord = PREGEN_MAGIC_WORD;
 
 // A layout over {pregen_buffer} for storing global offsets into the generated code.
@@ -27,26 +29,49 @@ layout X86_64PreGenHeader {
 	+40	oobMemoryHandlerOffset:		i32;	// handler for signals caused by OOB memory access
 	+44	divZeroHandlerOffset:		i32;	// handler for signals caused by divide by zero
 	+48	stackOverflowHandlerOffset:	i32;	// handler for signals caused by (value- or call-) stack overflow
-	+52	spcV3EntryOffset:		i32;	// SPC jit entry from V3 calling code
-	+56	spcLazyCompileOffset:		i32;	// SPC lazy compile stub offset
-	+60	spcTierUpCompileOffset:		i32;	// SPC tierup compile stub offset
-	+64	spcTrapsStubOffset:		i32;	// SPC traps stub offset
-	+68	spcTrapsStubEnd:		i32;	// SPC traps stub end
-	+72	rdtscOffset:			i32;	// address of rdstc function
-	+76	codeEnd:			i32;	// end of all executable code
-	=80;
+	+56	codeEnd:			i32;	// end of all executable code
+	=60;
+}
+
+layout X86_64PreGenStubOffsets {
+	+0	start:	i32;
+	+4	end:	i32;
+	=8;
+}
+
+def allocPreGenHeaderOffsets() -> Ref<X86_64PreGenStubOffsets> {
+	var offset = pregen_header_size;
+	pregen_header_size += X86_64PreGenStubOffsets.size;
+	return Ref<X86_64PreGenStubOffsets>.at(pregen_buffer, offset);
+}
+
+// Base class of pre-generated stubs.
+class X86_64PreGenStub(
+	name: string,
+	userCode: RiUserCode,
+	gen: (X86_64InterpreterCode, DataWriter) -> void) {
+
+	def offsets = allocPreGenHeaderOffsets();
+
+	new() {
+		global_stub_list = List.new(this, global_stub_list);
+	}
+
+	// Get the start of this stub.
+	def getEntry() -> Pointer {
+		X86_64PreGenStubs.gen();
+		return Pointer.atContents(pregen_buffer) + offsets.start;
+	}
+	// Forge a closure using the entrypoint as the code pointer.
+	def forgeClosure<C, P, R>(c: C) -> P -> R {
+		return CiRuntime.forgeClosure<C, P, R>(getEntry(), c);
+	}
 }
 
 // Interface to pre-generated code stubs.
 def I: X86_64Interpreter;
 component X86_64PreGenStubs {
-	private var spcV3Entry: (WasmFunction, Pointer, Pointer) -> Throwable;
-	// XXX: the RiUserCode objects must be pre-allocated.
 	private def ic = X86_64InterpreterCode.new(Pointer.NULL, Pointer.NULL, pregen_header);
-	private def spcLazyCompileStub = X86_64SpcCompileStub.new("lazy", Pointer.NULL, Pointer.NULL);
-	private def spcTierUpCompileStub = X86_64SpcCompileStub.new("tierup", Pointer.NULL, Pointer.NULL);
-	private def spcTrapsStub = X86_64SpcTrapsStub.new(Pointer.NULL, Pointer.NULL);
-	private var rdtsc_func: () -> u64;
 
 	def getInterpreterCode() -> X86_64InterpreterCode {
 		return (gen(), I.interpreterCode).last;
@@ -54,24 +79,9 @@ component X86_64PreGenStubs {
 	def getIntV3Entry() -> (WasmFunction, Pointer) -> Throwable {
 		return (gen(), I.interpreterCode.intV3Entry).last;
 	}
-	def getSpcV3Entry() -> (WasmFunction, Pointer, Pointer) -> Throwable {
-		return (gen(), spcV3Entry).last;
-	}
-	def getSpcLazyCompileStub() -> X86_64SpcCompileStub {
-		return (gen(), spcLazyCompileStub).last;
-	}
-	def getSpcTierUpCompileStub() -> X86_64SpcCompileStub {
-		return (gen(), spcTierUpCompileStub).last;
-	}
-	def getSpcTrapsStub() -> X86_64SpcTrapsStub {
-		return (gen(), spcTrapsStub).last;
-	}
 	def getSpcIntEntry() -> Pointer {
 		gen();
 		return I.interpreterCode.start + I.interpreterCode.header.intSpcEntryOffset;
-	}
-	def getRdtscFunc() -> () -> u64 {
-		return (gen(), rdtsc_func).last;
 	}
 
 	def gen() {
@@ -134,7 +144,7 @@ component X86_64PreGenStubs {
 			// page ^                                1KiB  ^       page ^      page ^
 			var mask = 4095L;
 			var elem0_offset = (start - Pointer.NULL) & mask;
-			var alloc_offset = elem0_offset + 8 + X86_64PreGenHeader.size;
+			var alloc_offset = elem0_offset + 8 + pregen_header_size;
 			var aligned_offset = (alloc_offset + mask) & ~mask;
 			var skip = int.!(aligned_offset - elem0_offset);
 
@@ -149,22 +159,13 @@ component X86_64PreGenStubs {
 			var w = DataWriter.new().reset(pregen_buffer, skip, skip);
 			// Gen interpreter
 			X86_64InterpreterGen.new(ic, w).gen(range);
-			// Gen SPC entry
-			ic.header.spcV3EntryOffset = w.atEnd().pos;
-			X86_64Spc.genEntryStub(w);
-			// Gen SPC lazy compile
-			ic.header.spcLazyCompileOffset = w.atEnd().pos;
-			X86_64Spc.genLazyCompileStub(w);
-			// Gen SPC tierup compile
-			ic.header.spcTierUpCompileOffset = w.atEnd().pos;
-			X86_64Spc.genTierUpCompileStub(w, ic);
-			// Gen SPC traps stub
-			ic.header.spcTrapsStubOffset = w.atEnd().pos;
-			X86_64Spc.genTrapsStub(w, spcTrapsStub);
-			ic.header.spcTrapsStubEnd = w.atEnd().pos;
-			// Gen rdtsc function
-			ic.header.rdtscOffset = w.atEnd().pos;
-			genRdtsc(w);
+			// Gen all stubs.
+			for (l = global_stub_list; l != null; l = l.tail) {
+				var stub = l.head;
+				stub.offsets.start = w.atEnd().pos;
+				stub.gen(ic, w);
+				stub.offsets.end = w.atEnd().pos;
+			}
 			ic.header.codeEnd = w.atEnd().pos;
 			ic.header.codeMarker = PREGEN_CODE_MARKER;
 		}
@@ -183,29 +184,14 @@ component X86_64PreGenStubs {
 		// Register user code objects with the Virgil runtime.
 		RiRuntime.registerUserCode(ic);
 
-		// SPC entry point
-		spcV3Entry = CiRuntime.forgeClosure<void,
-			(WasmFunction, Pointer, Pointer), Throwable>(
-				range.start + ic.header.spcV3EntryOffset, ());
-
-		// SPC lazy compile
-		spcLazyCompileStub.start = range.start + ic.header.spcLazyCompileOffset;
-		spcLazyCompileStub.end = range.start + ic.header.spcTierUpCompileOffset;
-		RiRuntime.registerUserCode(spcLazyCompileStub);
-
-		// SPC tierup compile
-		spcTierUpCompileStub.start = range.start + ic.header.spcTierUpCompileOffset;
-		spcTierUpCompileStub.end = range.start + ic.header.spcTrapsStubOffset;
-		RiRuntime.registerUserCode(spcTierUpCompileStub);
-
-		// SPC traps stub
-		spcTrapsStub.start = range.start + ic.header.spcTrapsStubOffset;
-		spcTrapsStub.end = range.start + ic.header.spcTrapsStubEnd;
-		RiRuntime.registerUserCode(spcTrapsStub);
-
-		// RDTSC function
-		var rdtscCode = range.start + ic.header.rdtscOffset;
-		rdtsc_func = CiRuntime.forgeClosure<void, void, u64>(rdtscCode, ());
+		// Register all stubs that have user code with the Virgil runtime.
+		for (l = global_stub_list; l != null; l = l.tail) {
+			var stub = l.head;
+			if (stub.userCode == null) continue;
+			stub.userCode.start = range.start + stub.offsets.start;
+			stub.userCode.end = range.start + stub.offsets.end;
+			RiRuntime.registerUserCode(stub.userCode);
+		}
 
 		// Trace results to help in debugging
 		if (Debug.pregen || Debug.interpreter || Trace.compiler || Debug.compiler) {
@@ -221,23 +207,16 @@ component X86_64PreGenStubs {
 				.put1("\toob memory:         break *0x%x\n", s + ic.header.oobMemoryHandlerOffset)
 				.put1("\tdivide by zero:     break *0x%x\n", s + ic.header.divZeroHandlerOffset)
 				.put1("\tstack overflow:     break *0x%x\n", s + ic.header.stackOverflowHandlerOffset)
-				.put1("\tv3->entry:          break *0x%x\n", s + ic.header.spcV3EntryOffset)
-				.put1("\tspc lazy compile:   break *0x%x\n", s + ic.header.spcLazyCompileOffset)
-				.put1("\tspc tierup compile: break *0x%x\n", s + ic.header.spcTierUpCompileOffset)
-				.put2("\tspc traps stubs:           0x%x - 0x%x\n",
-					s + ic.header.spcTrapsStubOffset, s + ic.header.spcTrapsStubEnd)
-				.put1("\trdtsc:              break *0x%x\n", s + ic.header.rdtscOffset)
-				.put1("\tcode end:                  0x%x\n", s + ic.header.codeEnd)
-				.outln();
+				.put1("\tcode end:                  0x%x\n", s + ic.header.codeEnd);
+			for (l = global_stub_list; l != null; l = l.tail) {
+				var stub = l.head;
+				Trace.OUT
+					.tab().mark().puts(stub.name).putc(':').ljustify_mark(22)
+					.put2(" 0x%x - 0x%x\n",	s + stub.offsets.start, s + stub.offsets.end);
+			}
+			Trace.OUT.outln();
 		}
 		Debug.afterPregen();
 		return ic;
-	}
-	def genRdtsc(w: DataWriter) {
-		def asm = X86_64Assemblers.create64(w);
-		asm.rdtsc();
-		asm.q.shl_r_i(X86_64Regs.RDX, 32);
-		asm.q.or_r_r(X86_64Regs.RAX, X86_64Regs.RDX); // XXX: use V3 return register symbolic constant
-		asm.ret();
 	}
 }

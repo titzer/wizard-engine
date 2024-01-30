@@ -32,7 +32,7 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 
 	new(extensions: Extension.set, limits: Limits, config: RegConfig)
 		super(X86_64MasmRegs.SPC_EXEC_ENV, mmasm, X86_64MasmRegs.SPC_ALLOC.copy(), extensions, limits) {
-		mmasm.trap_stubs = X86_64PreGenStubs.getSpcTrapsStub();
+		mmasm.trap_stubs = TRAPS_STUB;
 	}
 
 	private def visitCompareI(asm: X86_64Assembler, cond: X86_64Cond) -> bool {
@@ -1158,8 +1158,7 @@ class X86_64SpcModuleCode extends X86_64SpcCode {
 			(p_rsp + X86_64InterpreterFrame.curpc.offset).store<int>(pc);
 		}
 
-		var stubs = X86_64PreGenStubs.getSpcTrapsStub();
-		var handler_ip = stubs.getIpForReason(reason);
+		var handler_ip = TRAPS_STUB.getIpForReason(reason);
 		(p_rip).store<Pointer>(handler_ip);
 	}
 	// Look up the source {pc} of a location {i} in this code. Returns {-1} if no exact entry is found.
@@ -1214,10 +1213,10 @@ class X86_64SpcModuleCode extends X86_64SpcCode {
 // Represents (shared) code that calls the runtime to generate a trap.
 // This is jumped to conditionally by SPC code or via the signal handler for the
 // {X86_64SpcModuleCode}.
+def TRAP_HANDLER_SIZE = 32;
 class X86_64SpcTrapsStub extends X86_64SpcCode {
-	def HANDLER_SIZE = 32;
 
-	new(start: Pointer, end: Pointer) super("spc-trap-stubs", start, end) { }
+	new() super("spc-trap-stubs", Pointer.NULL, Pointer.NULL) { }
 
 	// Get the program counter in the frame during trapping.
 	def getPcFromFrame(ip: Pointer, sp: Pointer) -> int {
@@ -1225,7 +1224,7 @@ class X86_64SpcTrapsStub extends X86_64SpcCode {
 	}
 	// Get the instruction pointer for the stub that will call the runtime for the given reason.
 	def getIpForReason(reason: TrapReason) -> Pointer {
-		return start + reason.tag * HANDLER_SIZE;
+		return start + reason.tag * TRAP_HANDLER_SIZE;
 	}
 }
 
@@ -1235,7 +1234,7 @@ class X86_64SpcCompileStub extends RiUserCode {
 	def stubName: string;
 	def frameSize = Pointer.SIZE;
 
-	new(stubName, start: Pointer, end: Pointer) super(start, end) { }
+	new(stubName) super(Pointer.NULL, Pointer.NULL) { }
 
 	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
@@ -1264,120 +1263,129 @@ class X86_64SpcCompileStub extends RiUserCode {
 	}
 }
 
-type SpcResultForStub(wf: WasmFunction, entrypoint: Pointer, thrown: Throwable) #unboxed { }
+def V3_SPC_ENTRY_STUB = X86_64PreGenStub.new("v3-spc-entry", null, genEntryStub);
+def LAZY_COMPILE_STUB = X86_64PreGenStub.new("spc-lazy-compile", X86_64SpcCompileStub.new("lazy"), genLazyCompileStub);
+def TIERUP_COMPILE_STUB = X86_64PreGenStub.new("spc-tierup-compile", X86_64SpcCompileStub.new("tierup"), genTierUpCompileStub);
+def TRAPS_STUB = X86_64SpcTrapsStub.new();
+def TRAPS_PREGEN = X86_64PreGenStub.new("spc-trap", TRAPS_STUB, genTrapsStub);
+
+def genEntryStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
+	var func_arg = G(regs.func_arg);
+	if (func_arg == Target.V3_PARAM_GPRS[2]) {
+		// XXX: use macro assembler to order moves
+		var scratch = masm.scratch;
+		asm.movq_r_r(scratch, func_arg);
+		asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
+		asm.movq_r_r(G(regs.vsp), scratch);			// vsp
+	} else {
+		asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
+		asm.movq_r_r(G(regs.vsp), Target.V3_PARAM_GPRS[2]);	// vsp
+	}
+	asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
+	asm.invalid();
+}
+def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
+	var func_arg = G(regs.func_arg);
+	asm.pushq_r(G(regs.func_arg));					// push function onto stack
+	masm.emit_store_curstack_vsp(regs.vsp);
+	asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
+	// Load {null} for the receiver.
+	asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+	// Call {X86_64Spc.lazyCompile} directly.
+	masm.emit_call_abs(codePointer(X86_64Spc.lazyCompile));
+	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
+	// Check for non-null abrupt return.
+	var unwind = X86_64Label.new();
+	asm.q.cmp_r_i(Target.V3_RET_GPRS[2], 0);
+	asm.jc_rel_near(C.NZ, unwind);
+	// Tail-call the result of the compile.
+	var scratch = X86_64Regs.R15;
+	asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
+	asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
+	masm.emit_load_curstack_vsp(regs.vsp);
+	asm.ijmp_r(scratch);						// jump to entrypoint
+	asm.invalid();
+	// Simply return the {Throwable} object.
+	asm.bind(unwind);
+	asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
+	asm.ret();
+}
+def genTierUpCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
+	var func_arg = G(regs.func_arg);
+	// Decrement execution counter by 1 and compile if <= 0
+	var scratch = X86_64Regs.R15; // XXX: regs.func_arg == scratch!
+	var offsets = V3Offsets.new();
+	asm.movq_r_m(scratch, G(regs.func_arg).plus(offsets.WasmFunction_decl));
+	asm.q.sub_m_i(scratch.plus(offsets.FuncDecl_tierup_trigger), FastIntTuning.entryTierUpDecrement);
+	var interpreter_entry = X86_64Label.new();
+	interpreter_entry.pos = ic.header.intSpcEntryOffset;
+	asm.jc_rel_near(C.A, interpreter_entry);			// jump to interpreter if >= 0
+	// Call compiler
+	asm.pushq_r(G(regs.func_arg));					// push function onto stack
+	masm.emit_store_curstack_vsp(regs.vsp);
+	asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
+	// Load {null} for the receiver.
+	asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+	// Call {X86_64Spc.tierupCompile} directly.
+	masm.emit_call_abs(codePointer(X86_64Spc.tierupCompile));
+	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
+	// Tail-call the result of the compile (which could be interpreter entry).
+	asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
+	asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
+	masm.emit_load_curstack_vsp(regs.vsp);
+	asm.ijmp_r(scratch);						// jump to entrypoint
+	asm.invalid();
+}
+def genTrapsStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	for (reason in TrapReason) {
+		var start = w.atEnd().pos;
+		if (reason == TrapReason.STACK_OVERFLOW) {
+			masm.emit_mov_r_trap(X86_64MasmRegs.SPC_EXEC_ENV.ret_throw, TrapReason.STACK_OVERFLOW);
+		} else {
+			var m_wasm_func = X86_64Regs.RSP.plus(X86_64InterpreterFrame.wasm_func.offset);
+			asm.movq_r_m(Target.V3_PARAM_GPRS[1], m_wasm_func);	// wasm_func
+			asm.movq_r_i(Target.V3_PARAM_GPRS[2], -1);		// pc
+			asm.movd_r_i(Target.V3_PARAM_GPRS[3], reason.tag);	// reason
+			masm.emit_call_runtime_TRAP();
+		}
+		asm.q.add_r_i(R.RSP, X86_64InterpreterFrame.size); // pop caller frame
+		asm.ret();
+		var skip = TRAP_HANDLER_SIZE - (w.atEnd().pos - start);
+		if (skip < 0) System.error("TrapsStubError", "handler size too big");
+		w.skipN(skip);
+	}
+}
+def codePointer<P, R>(f: P -> R) -> Pointer {
+	return CiRuntime.unpackClosure<X86_64Spc, P, R>(f).0;
+}
 
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
-	// Generate the SPC entry stub.
-	def genEntryStub(w: DataWriter) {
-		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
-		var asm = X86_64Assembler.!(masm.asm);
-		var regs = X86_64MasmRegs.SPC_EXEC_ENV;
-		var func_arg = G(regs.func_arg);
-		if (func_arg == Target.V3_PARAM_GPRS[2]) {
-			// XXX: use macro assembler to order moves
-			var scratch = masm.scratch;
-			asm.movq_r_r(scratch, func_arg);
-			asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
-			asm.movq_r_r(G(regs.vsp), scratch);			// vsp
-		} else {
-			asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
-			asm.movq_r_r(G(regs.vsp), Target.V3_PARAM_GPRS[2]);	// vsp
-		}
-		asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
-		asm.invalid();
-	}
-	def genLazyCompileStub(w: DataWriter) {
-		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
-		var asm = X86_64Assembler.!(masm.asm);
-		var regs = X86_64MasmRegs.SPC_EXEC_ENV;
-		var func_arg = G(regs.func_arg);
-		asm.pushq_r(G(regs.func_arg));				// push function onto stack
-		masm.emit_store_curstack_vsp(regs.vsp);
-		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
-		// Load {null} for the receiver.
-		asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
-		// Call {X86_64Spc.lazyCompile} directly.
-		masm.emit_call_abs(codePointer(X86_64Spc.lazyCompile));
-		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
-		// Check for non-null abrupt return.
-		var unwind = X86_64Label.new();
-		asm.q.cmp_r_i(Target.V3_RET_GPRS[2], 0);
-		asm.jc_rel_near(C.NZ, unwind);
-		// Tail-call the result of the compile.
-		var scratch = X86_64Regs.R15;
-		asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
-		asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);	// function
-		masm.emit_load_curstack_vsp(regs.vsp);
-		asm.ijmp_r(scratch);						// jump to entrypoint
-		asm.invalid();
-		// Simply return the {Throwable} object.
-		asm.bind(unwind);
-		asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
-		asm.ret();
-	}
-	def genTierUpCompileStub(w: DataWriter, ic: X86_64InterpreterCode) {
-		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
-		var asm = X86_64Assembler.!(masm.asm);
-		var regs = X86_64MasmRegs.SPC_EXEC_ENV;
-		var func_arg = G(regs.func_arg);
-		// Decrement execution counter by 1 and compile if <= 0
-		var scratch = X86_64Regs.R15; // XXX: regs.func_arg == scratch!
-		var offsets = V3Offsets.new();
-		asm.movq_r_m(scratch, G(regs.func_arg).plus(offsets.WasmFunction_decl));
-		asm.q.sub_m_i(scratch.plus(offsets.FuncDecl_tierup_trigger), FastIntTuning.entryTierUpDecrement);
-		var interpreter_entry = X86_64Label.new();
-		interpreter_entry.pos = ic.header.intSpcEntryOffset;
-		asm.jc_rel_near(C.A, interpreter_entry);			// jump to interpreter if >= 0
-		// Call compiler
-		asm.pushq_r(G(regs.func_arg));					// push function onto stack
-		masm.emit_store_curstack_vsp(regs.vsp);
-		asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
-		// Load {null} for the receiver.
-		asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
-		// Call {X86_64Spc.tierupCompile} directly.
-		masm.emit_call_abs(codePointer(X86_64Spc.tierupCompile));
-		asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
-		// Tail-call the result of the compile (which could be interpreter entry).
-		asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
-		asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
-		masm.emit_load_curstack_vsp(regs.vsp);
-		asm.ijmp_r(scratch);						// jump to entrypoint
-		asm.invalid();
-	}
-	def genTrapsStub(w: DataWriter, stub: X86_64SpcTrapsStub) {
-		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
-		var asm = X86_64Assembler.!(masm.asm);
-		for (reason in TrapReason) {
-			var start = w.atEnd().pos;
-			if (reason == TrapReason.STACK_OVERFLOW) {
-				masm.emit_mov_r_trap(X86_64MasmRegs.SPC_EXEC_ENV.ret_throw, TrapReason.STACK_OVERFLOW);
-			} else {
-				var m_wasm_func = X86_64Regs.RSP.plus(X86_64InterpreterFrame.wasm_func.offset);
-				asm.movq_r_m(Target.V3_PARAM_GPRS[1], m_wasm_func);	// wasm_func
-				asm.movq_r_i(Target.V3_PARAM_GPRS[2], -1);		// pc
-				asm.movd_r_i(Target.V3_PARAM_GPRS[3], reason.tag);	// reason
-				masm.emit_call_runtime_TRAP();
-			}
-			asm.q.add_r_i(R.RSP, X86_64InterpreterFrame.size); // pop caller frame
-			asm.ret();
-			var skip = stub.HANDLER_SIZE - (w.atEnd().pos - start);
-			if (skip < 0) System.error("TrapsStubError", "handler size too big");
-			w.skipN(skip);
-		}
-	}
-
+	private var v3Entry: (WasmFunction, Pointer, Pointer) -> Throwable;
+	
 	// A handy chokepoint for entering JIT code from V3.
 	def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
-		return X86_64PreGenStubs.getSpcV3Entry()(wf, sp, wf.decl.target_code.spc_entry);
+		if (v3Entry == null) v3Entry = V3_SPC_ENTRY_STUB.forgeClosure<void, (WasmFunction, Pointer, Pointer), Throwable>();
+		return v3Entry(wf, sp, wf.decl.target_code.spc_entry);
 	}
 	def setLazyCompileFor(module: Module, decl: FuncDecl) {
 		if (Debug.runtime) Trace.OUT.put1("setLazyCompile %q", decl.render(module.names, _)).outln();
-		decl.target_code = TargetCode(X86_64PreGenStubs.getSpcLazyCompileStub().start);
+		decl.target_code = TargetCode(LAZY_COMPILE_STUB.getEntry());
 	}
 	def setTierUpFor(module: Module, decl: FuncDecl) {
 		if (Debug.runtime) Trace.OUT.put1("setTierUp %q", decl.render(module.names, _)).outln();
-		decl.target_code = TargetCode(X86_64PreGenStubs.getSpcTierUpCompileStub().start);
+		decl.target_code = TargetCode(TIERUP_COMPILE_STUB.getEntry());
 		decl.tierup_trigger = SpcTuning.fastIntTierUpThreshold;
 	}
 	def setInterpreterFallback(decl: FuncDecl) -> Pointer {
@@ -1388,9 +1396,6 @@ component X86_64Spc {
 	}
 	def estimateCodeSizeFor(decl: FuncDecl) -> int {
 		return 60 + decl.orig_bytecode.length * 20; // TODO: huge overestimate
-	}
-	private def codePointer<P, R>(f: P -> R) -> Pointer {
-		return CiRuntime.unpackClosure<X86_64Spc, P, R>(f).0;
 	}
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.
