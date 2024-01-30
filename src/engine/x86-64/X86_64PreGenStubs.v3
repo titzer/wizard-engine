@@ -4,18 +4,37 @@
 // Statically-allocated buffer for pre-generated code (in compiled binary).
 def PAGE_SIZE = 4096u;
 def PAGE_SIZE_i: int = 4096;
-def GLOBAL_BUFFER_MARKER = 0x7ACEBEEF778899AA;
+def PREGEN_MAGIC_WORD = 0x7ACEBEEF778899AAu;
 def PREGEN_CODE_MARKER = 0x7FAACCEE;
-def GLOBAL_BUFFER_HEADER_SIZE = 64;
 def INL_SIZE = 60 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
-def global_buffer = allocGlobalBufferWithMarker(TOTAL_SIZE + PAGE_SIZE_i);
-def allocGlobalBufferWithMarker(size: int) -> Array<byte> {
-	var result = Array<byte>.new(size);
-	var w = DataWriter.new().reset(result, 0, result.length);
-	w.put_b64(GLOBAL_BUFFER_MARKER);
-	return result;
+def pregen_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE_i);
+def pregen_header = Ref<X86_64PreGenHeader>.at(pregen_buffer, 0);
+def X = pregen_header.magicWord = PREGEN_MAGIC_WORD;
+
+// A layout over {pregen_buffer} for storing global offsets into the generated code.
+layout X86_64PreGenHeader {
+	+0	magicWord:			u64;	// magic word for finding in the binary
+	+8	codeMarker:			i32;	// magic word for marking generated
+	+12	fastDispatchTableOffset:	i32;	// dispatch table when probes disabled
+	+16	probedDispatchTableOffset:	i32;	// dispatch table when probes enabled
+	+20	codeStart:			i32;	// start of all executable code
+	+24	intV3EntryOffset:		i32;	// entry into interpreter from V3 caller
+	+28	intSpcEntryOffset:		i32;	// entry into interpreter from SPC caller
+	+32	intIntEntryOffset:		i32;	// entry into interpreter from interpreter caller
+	+36	deoptReentryOffset:		i32;	// re-enter interpreter from optimized code
+	+40	oobMemoryHandlerOffset:		i32;	// handler for signals caused by OOB memory access
+	+44	divZeroHandlerOffset:		i32;	// handler for signals caused by divide by zero
+	+48	stackOverflowHandlerOffset:	i32;	// handler for signals caused by (value- or call-) stack overflow
+	+52	spcV3EntryOffset:		i32;	// SPC jit entry from V3 calling code
+	+56	spcLazyCompileOffset:		i32;	// SPC lazy compile stub offset
+	+60	spcTierUpCompileOffset:		i32;	// SPC tierup compile stub offset
+	+64	spcTrapsStubOffset:		i32;	// SPC traps stub offset
+	+68	spcTrapsStubEnd:		i32;	// SPC traps stub end
+	+72	rdtscOffset:			i32;	// address of rdstc function
+	+76	codeEnd:			i32;	// end of all executable code
+	=80;
 }
 
 // Interface to pre-generated code stubs.
@@ -23,7 +42,7 @@ def I: X86_64Interpreter;
 component X86_64PreGenStubs {
 	private var spcV3Entry: (WasmFunction, Pointer, Pointer) -> Throwable;
 	// XXX: the RiUserCode objects must be pre-allocated.
-	private def ic = X86_64InterpreterCode.new(Pointer.NULL, Pointer.NULL);
+	private def ic = X86_64InterpreterCode.new(Pointer.NULL, Pointer.NULL, pregen_header);
 	private def spcLazyCompileStub = X86_64SpcCompileStub.new("lazy", Pointer.NULL, Pointer.NULL);
 	private def spcTierUpCompileStub = X86_64SpcCompileStub.new("tierup", Pointer.NULL, Pointer.NULL);
 	private def spcTrapsStub = X86_64SpcTrapsStub.new(Pointer.NULL, Pointer.NULL);
@@ -49,7 +68,7 @@ component X86_64PreGenStubs {
 	}
 	def getSpcIntEntry() -> Pointer {
 		gen();
-		return I.interpreterCode.start + I.interpreterCode.intSpcEntryOffset;
+		return I.interpreterCode.start + I.interpreterCode.header.intSpcEntryOffset;
 	}
 	def getRdtscFunc() -> () -> u64 {
 		return (gen(), rdtsc_func).last;
@@ -66,92 +85,56 @@ component X86_64PreGenStubs {
 	def genAndWriteIntoExecutable(executable: string) -> bool {
 		// generate the code and write it into
 		gen();
-		// try to find {global_buffer} in {data}
+		// try to find {pregen_buffer} in {data}
 		var d = DataReader.new(executable);
-		// the global buffer contents will be at the same page alignment in the executable
-		var page_offset = int.!((Pointer.atContents(global_buffer) - Pointer.NULL) & (PAGE_SIZE - 1));
+		// the pregen buffer contents will be at the same page alignment in the executable
+		var ptr = Pointer.atRef(pregen_header) + X86_64PreGenHeader.magicWord.offset;
+		var page_offset = int.!((ptr - Pointer.NULL) & (PAGE_SIZE - 1));
 		var found = -1;
 		for (pos = page_offset; pos < d.limit; pos += PAGE_SIZE_i) {
 			var val = d.at(pos).read_u64();
-			if (val == GLOBAL_BUFFER_MARKER) { found = pos; break; }
+			if (val == PREGEN_MAGIC_WORD) { found = pos; break; }
 		}
-		if (found < 0) return false;
+		if (found < 0) {
+			if (Debug.pregen) Trace.OUT.puts("Pregen buffer not found").outln();
+			return false;
+		}
 		if (Debug.pregen) {
 			Trace.OUT.put2("Pregen buffer in executable @+%d (0x%x)", found, found).outln();
 		}
 		// Write the executable code and the offsets of {InterpreterCode} into the executable.
 		var w = DataWriter.new().reset(executable, found, found);
-		w.puta(global_buffer);		// write machine code
-		w.at(found);			// back up to write offsets
-		// Write the pregen code offsets to serialized memory (e.g. a file with global buffer).
-		var out = w.put_b32;
-		out(PREGEN_CODE_MARKER);
-		out(ic.fastDispatchTableOffset);
-		out(ic.probedDispatchTableOffset);
-		out(ic.codeStart);
-		out(ic.intV3EntryOffset);
-		out(ic.intSpcEntryOffset);
-		out(ic.intIntEntryOffset);
-		out(ic.deoptReentryOffset);
-		out(ic.oobMemoryHandlerOffset);
-		out(ic.divZeroHandlerOffset);
-		out(ic.stackOverflowHandlerOffset);
-		out(ic.spcV3EntryOffset);
-		out(ic.spcLazyCompileOffset);
-		out(ic.spcTierUpCompileOffset);
-		out(ic.spcTrapsStubOffset);
-		out(ic.spcTrapsStubEnd);
-		out(ic.rdtscOffset);
-		out(ic.codeEnd);
+		w.puta(pregen_buffer);		// write machine code
 		return true;
 	}
 	def deserializeOrGenerateCode() -> X86_64InterpreterCode {
-		def d = DataReader.new(global_buffer);
-
-		var start = Pointer.atContents(global_buffer);
-		var range = MemoryRange.new(start, start + global_buffer.length);
+		var start = Pointer.atContents(pregen_buffer);
+		var range = MemoryRange.new(start, start + pregen_buffer.length);
 
 		Debug.beforePregen();
 		ic.start = range.start;
 
 		// Try deserializing the pregen code offsets directly from the global buffer.
-		var marker = d.read_u32();
+		var marker = pregen_header.codeMarker;
 		if (Debug.pregen) {
 			Trace.OUT.put2("Pregen buffer marker = 0x%x (0x%x indicates generated)",
 				marker, PREGEN_CODE_MARKER).outln();
 		}
-		if (marker == PREGEN_CODE_MARKER) {
+		if (pregen_header.codeMarker == PREGEN_CODE_MARKER) {
 			if (Debug.pregen) {
 				Trace.OUT.put2("Pregen stubs exist in [0x%x ... 0x%x]",
 					(range.start - Pointer.NULL),
 					(range.end - Pointer.NULL));
 				Trace.OUT.outln();
 			}
-			ic.fastDispatchTableOffset	= int.view(d.read_u32());
-			ic.probedDispatchTableOffset	= int.view(d.read_u32());
-			ic.codeStart			= int.view(d.read_u32());
-			ic.intV3EntryOffset		= int.view(d.read_u32());
-			ic.intSpcEntryOffset		= int.view(d.read_u32());
-			ic.intIntEntryOffset		= int.view(d.read_u32());
-			ic.oobMemoryHandlerOffset	= int.view(d.read_u32());
-			ic.oobMemoryHandlerOffset	= int.view(d.read_u32());
-			ic.divZeroHandlerOffset		= int.view(d.read_u32());
-			ic.stackOverflowHandlerOffset	= int.view(d.read_u32());
-			ic.spcV3EntryOffset		= int.view(d.read_u32());
-			ic.spcLazyCompileOffset		= int.view(d.read_u32());
-			ic.spcTierUpCompileOffset	= int.view(d.read_u32());
-			ic.spcTrapsStubOffset		= int.view(d.read_u32());
-			ic.spcTrapsStubEnd		= int.view(d.read_u32());
-			ic.rdtscOffset			= int.view(d.read_u32());
-			ic.codeEnd			= int.view(d.read_u32());
 		} else {
-			//         global buffer v   [0 ...                                         TOTAL_SIZE  ]
-			//      |xxxxxxxxxxxxxxxx|h|l|marker|global_header|...|dispatch|...|inline_code|ool_code|___
+			//         pregen buffer v   [0 ...                                         TOTAL_SIZE  ]
+			//      |xxxxxxxxxxxxxxxx|h|l|pregen_header|...|dispatch|...|inline_code|ool_code|___
 			//      ^----elem0_offset----^
-			// page ^                                       1KiB  ^       page ^      page ^
+			// page ^                                1KiB  ^       page ^      page ^
 			var mask = 4095L;
 			var elem0_offset = (start - Pointer.NULL) & mask;
-			var alloc_offset = elem0_offset + 8 + GLOBAL_BUFFER_HEADER_SIZE;
+			var alloc_offset = elem0_offset + 8 + X86_64PreGenHeader.size;
 			var aligned_offset = (alloc_offset + mask) & ~mask;
 			var skip = int.!(aligned_offset - elem0_offset);
 
@@ -163,38 +146,39 @@ component X86_64PreGenStubs {
 				Trace.OUT.outln();
 			}
 
-			var w = DataWriter.new().reset(global_buffer, skip, skip);
+			var w = DataWriter.new().reset(pregen_buffer, skip, skip);
 			// Gen interpreter
 			X86_64InterpreterGen.new(ic, w).gen(range);
 			// Gen SPC entry
-			ic.spcV3EntryOffset = w.atEnd().pos;
+			ic.header.spcV3EntryOffset = w.atEnd().pos;
 			X86_64Spc.genEntryStub(w);
 			// Gen SPC lazy compile
-			ic.spcLazyCompileOffset = w.atEnd().pos;
+			ic.header.spcLazyCompileOffset = w.atEnd().pos;
 			X86_64Spc.genLazyCompileStub(w);
 			// Gen SPC tierup compile
-			ic.spcTierUpCompileOffset = w.atEnd().pos;
+			ic.header.spcTierUpCompileOffset = w.atEnd().pos;
 			X86_64Spc.genTierUpCompileStub(w, ic);
 			// Gen SPC traps stub
-			ic.spcTrapsStubOffset = w.atEnd().pos;
+			ic.header.spcTrapsStubOffset = w.atEnd().pos;
 			X86_64Spc.genTrapsStub(w, spcTrapsStub);
-			ic.spcTrapsStubEnd = w.atEnd().pos;
+			ic.header.spcTrapsStubEnd = w.atEnd().pos;
 			// Gen rdtsc function
-			ic.rdtscOffset = w.atEnd().pos;
+			ic.header.rdtscOffset = w.atEnd().pos;
 			genRdtsc(w);
-			ic.codeEnd = w.atEnd().pos;
+			ic.header.codeEnd = w.atEnd().pos;
+			ic.header.codeMarker = PREGEN_CODE_MARKER;
 		}
 		// Finish the interpreter code.
-		ic.end = range.start + ic.codeEnd;
+		ic.end = range.start + ic.header.codeEnd;
 		ic.setV3Entry();
 		I.interpreterCode = ic;
 		I.dispatchTable = ic.start +
 			if(Instrumentation.probes.elem != null,
-				ic.probedDispatchTableOffset,
-				ic.fastDispatchTableOffset);
+				ic.header.probedDispatchTableOffset,
+				ic.header.fastDispatchTableOffset);
 
 		// Write-protect the executable code for security and debugging
-		Mmap.protect(range.start + ic.codeStart, u64.!(ic.codeEnd - ic.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
+		Mmap.protect(range.start + ic.header.codeStart, u64.!(ic.header.codeEnd - ic.header.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
 
 		// Register user code objects with the Virgil runtime.
 		RiRuntime.registerUserCode(ic);
@@ -202,25 +186,25 @@ component X86_64PreGenStubs {
 		// SPC entry point
 		spcV3Entry = CiRuntime.forgeClosure<void,
 			(WasmFunction, Pointer, Pointer), Throwable>(
-				range.start + ic.spcV3EntryOffset, ());
+				range.start + ic.header.spcV3EntryOffset, ());
 
 		// SPC lazy compile
-		spcLazyCompileStub.start = range.start + ic.spcLazyCompileOffset;
-		spcLazyCompileStub.end = range.start + ic.spcTierUpCompileOffset;
+		spcLazyCompileStub.start = range.start + ic.header.spcLazyCompileOffset;
+		spcLazyCompileStub.end = range.start + ic.header.spcTierUpCompileOffset;
 		RiRuntime.registerUserCode(spcLazyCompileStub);
 
 		// SPC tierup compile
-		spcTierUpCompileStub.start = range.start + ic.spcTierUpCompileOffset;
-		spcTierUpCompileStub.end = range.start + ic.spcTrapsStubOffset;
+		spcTierUpCompileStub.start = range.start + ic.header.spcTierUpCompileOffset;
+		spcTierUpCompileStub.end = range.start + ic.header.spcTrapsStubOffset;
 		RiRuntime.registerUserCode(spcTierUpCompileStub);
 
 		// SPC traps stub
-		spcTrapsStub.start = range.start + ic.spcTrapsStubOffset;
-		spcTrapsStub.end = range.start + ic.spcTrapsStubEnd;
+		spcTrapsStub.start = range.start + ic.header.spcTrapsStubOffset;
+		spcTrapsStub.end = range.start + ic.header.spcTrapsStubEnd;
 		RiRuntime.registerUserCode(spcTrapsStub);
 
 		// RDTSC function
-		var rdtscCode = range.start + ic.rdtscOffset;
+		var rdtscCode = range.start + ic.header.rdtscOffset;
 		rdtsc_func = CiRuntime.forgeClosure<void, void, u64>(rdtscCode, ());
 
 		// Trace results to help in debugging
@@ -228,22 +212,22 @@ component X86_64PreGenStubs {
 			var s = range.start - Pointer.NULL;
 			Trace.OUT
 				.puts("Pregen interpreter and compiler stub addresses:\n")
-				.put1("\tcode start:                0x%x\n", s + ic.codeStart)
-				.put1("\tv3->int entry:      break *0x%x\n", s + ic.intV3EntryOffset)
-				.put1("\tspc->int entry:     break *0x%x\n", s + ic.intSpcEntryOffset)
-				.put1("\tint->int entry:     break *0x%x\n", s + ic.intIntEntryOffset)
-				.put1("\tfast dispatch:             0x%x\n", s + ic.fastDispatchTableOffset)
-				.put1("\tprobed dispatch:           0x%x\n", s + ic.probedDispatchTableOffset)
-				.put1("\toob memory:         break *0x%x\n", s + ic.oobMemoryHandlerOffset)
-				.put1("\tdivide by zero:     break *0x%x\n", s + ic.divZeroHandlerOffset)
-				.put1("\tstack overflow:     break *0x%x\n", s + ic.stackOverflowHandlerOffset)
-				.put1("\tv3->entry:          break *0x%x\n", s + ic.spcV3EntryOffset)
-				.put1("\tspc lazy compile:   break *0x%x\n", s + ic.spcLazyCompileOffset)
-				.put1("\tspc tierup compile: break *0x%x\n", s + ic.spcTierUpCompileOffset)
+				.put1("\tcode start:                0x%x\n", s + ic.header.codeStart)
+				.put1("\tv3->int entry:      break *0x%x\n", s + ic.header.intV3EntryOffset)
+				.put1("\tspc->int entry:     break *0x%x\n", s + ic.header.intSpcEntryOffset)
+				.put1("\tint->int entry:     break *0x%x\n", s + ic.header.intIntEntryOffset)
+				.put1("\tfast dispatch:             0x%x\n", s + ic.header.fastDispatchTableOffset)
+				.put1("\tprobed dispatch:           0x%x\n", s + ic.header.probedDispatchTableOffset)
+				.put1("\toob memory:         break *0x%x\n", s + ic.header.oobMemoryHandlerOffset)
+				.put1("\tdivide by zero:     break *0x%x\n", s + ic.header.divZeroHandlerOffset)
+				.put1("\tstack overflow:     break *0x%x\n", s + ic.header.stackOverflowHandlerOffset)
+				.put1("\tv3->entry:          break *0x%x\n", s + ic.header.spcV3EntryOffset)
+				.put1("\tspc lazy compile:   break *0x%x\n", s + ic.header.spcLazyCompileOffset)
+				.put1("\tspc tierup compile: break *0x%x\n", s + ic.header.spcTierUpCompileOffset)
 				.put2("\tspc traps stubs:           0x%x - 0x%x\n",
-					s + ic.spcTrapsStubOffset, s + ic.spcTrapsStubEnd)
-				.put1("\trdtsc:              break *0x%x\n", s + ic.rdtscOffset)
-				.put1("\tcode end:                  0x%x\n", s + ic.codeEnd)
+					s + ic.header.spcTrapsStubOffset, s + ic.header.spcTrapsStubEnd)
+				.put1("\trdtsc:              break *0x%x\n", s + ic.header.rdtscOffset)
+				.put1("\tcode end:                  0x%x\n", s + ic.header.codeEnd)
 				.outln();
 		}
 		Debug.afterPregen();
