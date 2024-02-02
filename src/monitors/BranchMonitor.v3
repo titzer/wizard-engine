@@ -54,6 +54,26 @@ private class BmBrProbe(taken: Array<u64>) extends OperandProbe_i_v {
 	}
 }
 
+private class BmBrOnNullProbe(taken: Array<u64>, null_taken: bool) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		match (loc.frame.getFrameAccessor().getOperand(0)) {
+			Ref(obj) => taken[if(null_taken == (obj == null), 1, 0)]++;
+			_ => taken[0]++;
+		}
+		return Resumption.Continue;
+	}
+}
+
+private class BmBrOnCastProbe(taken: Array<u64>, nullable: bool, htcode: int, success_taken: bool) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var accessor = loc.frame.getFrameAccessor();
+		var instance = accessor.func().instance;
+		var result = Execute.doCast(instance, nullable, htcode, accessor.getOperand(0));
+		taken[if(result == success_taken, 0, 1)]++;
+		return Resumption.Continue;
+	}
+}
+
 private class BmBrTableProbe(taken: Array<u64>) extends OperandProbe_i_v {
 	def fire_i(v: u32) {
 		if (v >= taken.length) taken[taken.length - 1]++;
@@ -67,15 +87,38 @@ private class BranchMonitorState(mm: ModuleMonitor, inCodeMode: bool) extends By
 	def tracer = InstrTracer.new();
 
 	def visit_IF(btc: BlockTypeCode) {
-		addBranchInfo(Opcode.IF, 2, false);
+		var taken = addBranchInfo(Opcode.IF, 2);
+		insertProbeHere(BmBrProbe.new(taken));
 	}
 
 	def visit_BR_IF(depth: u31) {
-		addBranchInfo(Opcode.BR_IF, 2, false);
+		var taken = addBranchInfo(Opcode.BR_IF, 2);
+		insertProbeHere(BmBrProbe.new(taken));
 	}
 
 	def visit_BR_TABLE(labels: Range<u31>) {
-		addBranchInfo(Opcode.BR_TABLE, labels.length, true);
+		var taken = addBranchInfo(Opcode.BR_TABLE, labels.length);
+		insertProbeHere(BmBrTableProbe.new(taken));
+	}
+
+	def visit_BR_ON_NULL(depth: u31) {
+		var taken = addBranchInfo(Opcode.BR_ON_NULL, 2);
+		insertProbeHere(BmBrOnNullProbe.new(taken, true));
+	}
+
+	def visit_BR_ON_NON_NULL(depth: u31) {
+		var taken = addBranchInfo(Opcode.BR_ON_NON_NULL, 2);
+		insertProbeHere(BmBrOnNullProbe.new(taken, false));
+	}
+
+	def visit_BR_ON_CAST(imm: BrOnCastImm) {
+		var taken = addBranchInfo(Opcode.BR_ON_CAST, 2);
+		insertProbeHere(BmBrOnCastProbe.new(taken, imm.null2(), imm.ht2, true));
+	}
+
+	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
+		var taken = addBranchInfo(Opcode.BR_ON_CAST_FAIL, 2);
+		insertProbeHere(BmBrOnCastProbe.new(taken, imm.null2(), imm.ht2, false));
 	}
 
 	def onFinish(i: Instance) {
@@ -83,12 +126,14 @@ private class BranchMonitorState(mm: ModuleMonitor, inCodeMode: bool) extends By
 		else report(i.module, entries);
 	}
 
-	private def addBranchInfo(opcode: Opcode, numTargets: int, isBrTable: bool) {
+	private def addBranchInfo(opcode: Opcode, numTargets: int) -> Array<u64> {
 		var f = bi.func;
 		var entry = BmEntry.new(f, bi.pc, opcode, numTargets);
 		entries.put(entry);
-		var probe = if(isBrTable, BmBrTableProbe.new(entry.taken), BmBrProbe.new(entry.taken));
-		Instrumentation.insertProbeAt(mm.module, f.func_index, bi.pc, probe);
+		return entry.taken;
+	}
+	private def insertProbeHere(probe: Probe) {
+		Instrumentation.insertProbeAt(mm.module, bi.func.func_index, bi.pc, probe);
 	}
 }
 private class BmEntry(func: FuncDecl, pc: int, op: Opcode, numTargets: int) {
@@ -154,7 +199,7 @@ def reportCode(module: Module, entries: Vector<BmEntry>, bi: BytecodeIterator, t
 		for (bi = bi.reset(func); bi.more(); bi.next()) {
 			def op = bi.current();
 			match(op) {
-				IF, BR_IF  => {
+				IF, BR_IF, BR_ON_NULL, BR_ON_NON_NULL => {
 					if (bi.pc == entries[entryCounter].pc) {
 						def entry = entries[entryCounter];
 						def stp = stMap[bi.pc];
