@@ -54,8 +54,15 @@ mkdir -p $T
 
 ### Configure fatal and trace options
 PROGRESS_PIPE=1
+PROGRESS_PARALLEL=0
 if [ "$(which progress)" = "" ]; then
     PROGRESS_PIPE=0
+else
+    progress p > /dev/null
+    if [ $? = 0 ]; then
+	PROGRESS_PARALLEL=1
+	PROCESSORS=$(getconf _NPROCESSORS_ONLN)
+    fi
 fi
 
 while [[ "$1" =~ ^\-.* ]]; do
@@ -128,11 +135,57 @@ function run_batched() {
     local cmd=$1
     shift
 
-
     local i=1
     while [ $i -le $# ]; do
 	local args=${@:$i:$batching}
         $cmd $args
 	i=$(($i + $batching))
     done
+}
+
+function run_progress() {
+    local cmd=$1
+    shift
+
+    local batching=${BATCHING:=1}
+    local parallel=${PARALLEL:=$PROCESSORS}
+
+    if [[ $parallel -gt 1 && PROGRESS_PARALLEL != 0 ]]; then
+	# run in parallel mode
+	local chunk=$(expr $# / $parallel)
+	if [ $chunk = 0 ]; then
+	    chunk=1
+	fi
+
+	local i=1
+	local f=3
+	local progress_cmd="progress p${PROGRESS_ARGS} "
+	while [ $i -le $# ]; do
+	    # divide the input up into chunks of 1 / p size
+	    files=${@:$i:$chunk}
+	    fifo=$T/fifo.$f
+	    rm -f $fifo
+	    mkfifo $fifo
+	    # run command on chunk and pipe to fifo
+	    if [ $chunk = 1 ]; then
+		$cmd $files > $fifo &
+	    else
+		run_batched $batching "$cmd" $files > $fifo &
+	    fi
+	    progress_cmd="$progress_cmd $f<$fifo"
+	    i=$(($i + $chunk))
+	    f=$(($f + 1))
+	done
+	# combine all fifos using the progress command
+	echo $progress_cmd > $T/progress.sh
+	chmod 755 $T/progress.sh
+	bash $T/progress.sh
+    else
+	# run in serial, possibly batched, mode
+	if [ $PROGRESS_PIPE = 1 ]; then
+	    run_batched $batching "$cmd" "$@" | $PROGRESS
+	else
+	    run_batched $batching "$cmd" "$@"
+	fi
+    fi
 }

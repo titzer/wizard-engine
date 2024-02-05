@@ -33,8 +33,6 @@ fi
 
 TESTS=$(ls *.wasm)
 
-RAW=${RAW:=0}
-
 function run_test {
     local flags=""
     local args=""
@@ -85,8 +83,4 @@ function run_tests {
     done
 }
 
-if [ "$RAW" = 0 ]; then
-    run_tests $TESTS | $PROGRESS
-else
-    run_tests $TESTS
-fi
+run_progress run_tests $TESTS
