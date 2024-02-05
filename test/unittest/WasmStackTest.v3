@@ -1,0 +1,220 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def T = UnitTests.registerT("stack:", _, WasmStackTester.new, _);
+
+def DEFAULT_LIMITS = Limits.new();
+def Z = [
+	T("reset0", test_reset0),
+	T("reset1", test_reset1),
+	T("reset2", test_reset2),
+	T("bind0", test_bind0),
+	T("resume_nop", test_resume_nop),
+	T("resume_add", test_resume_add),
+	T("resume_host", test_resume_host),
+	T("resume_host_throw", test_resume_host_throw),
+	T("resume_host_tc_host", test_resume_host_tc_host),
+	T("resume_host_tc_wasm", test_resume_host_tc_wasm),
+	()
+];
+
+class WasmStackTester(t: Tester) {
+	def assert_state(expected: StackState, stack: WasmStack) {
+		var got = stack.state();
+		if (got != expected) t.fail2("expected state == %s, got %s", expected.name, got.name);
+	}
+	def checkNop(r: Result) { // TODO: reduce duplication with ExeTester
+		match (r) {
+			Throw(thrown) => t.fail1("unexpected trap: %q", thrown.render);
+			Value(vals) => {
+				var len = if(vals != null, vals.length);
+				if (len > 0) t.fail1("expected no values, got %d value(s)", len);
+			}
+			Suspend(stack, tag, valrefs) => {
+				t.fail1("unexpected suspend: %q", tag.render);
+			}
+		}
+	}
+	def assert_r(expected: Result, got: Result) {
+		if (!expected.equals(got)) t.fail2("expected %q, got %q", expected.render, got.render);
+	}
+	def makeFunc(b: ModuleBuilder) -> Function {
+		var err = ErrorGen.new("WasmStackTest.v3");
+		var instance = Instantiator.new(b.extensions, b.module, [], err).run();
+		if (!err.ok()) {
+			t.fail(err.error_msg);
+			return null;
+		}
+		if (TestTiers.preprocess != null) TestTiers.preprocess(b.module);
+		return instance.functions[0];
+	}
+}
+
+def hf_i_i = HostFunction.new("dummy1", SigCache.i_i, null);
+def hf_v_i = HostFunction.new("dummy2", SigCache.v_i, null);
+
+def test_reset0(t: WasmStackTester) {
+	var stack = Target.newWasmStack();
+
+	t.assert_state(StackState.EMPTY, stack);
+
+	stack.reset(hf_i_i);
+	t.assert_state(StackState.SUSPENDED, stack);
+
+	stack.clear();
+	t.assert_state(StackState.EMPTY, stack);
+}
+
+def test_reset1(t: WasmStackTester) {
+	var s1 = Target.newWasmStack(), s2 = Target.newWasmStack();
+
+	t.t.assert_ne(s1, s2);
+	t.assert_state(StackState.EMPTY, s1);
+	t.assert_state(StackState.EMPTY, s2);
+
+	s1.reset(hf_i_i);
+	t.assert_state(StackState.SUSPENDED, s1);
+	t.assert_state(StackState.EMPTY, s2);
+
+	s2.reset(hf_i_i);
+	t.assert_state(StackState.SUSPENDED, s1);
+	t.assert_state(StackState.SUSPENDED, s2);
+
+	s1.clear();
+	t.assert_state(StackState.EMPTY, s1);
+	t.assert_state(StackState.SUSPENDED, s2);
+
+	s2.clear();
+	t.assert_state(StackState.EMPTY, s1);
+	t.assert_state(StackState.EMPTY, s2);
+}
+
+def test_reset2(t: WasmStackTester) {
+	var stack = Target.newWasmStack();
+
+	t.assert_state(StackState.EMPTY, stack);
+
+	stack.reset(hf_v_i);
+	t.assert_state(StackState.RESUMABLE, stack);
+
+	stack.clear();
+	t.assert_state(StackState.EMPTY, stack);
+}
+
+def test_bind0(t: WasmStackTester) {
+	var stack = Target.newWasmStack();
+
+	t.assert_state(StackState.EMPTY, stack);
+
+	stack.reset(hf_i_i);
+	t.assert_state(StackState.SUSPENDED, stack);
+
+	stack.bind([Value.I32(0)]);
+	t.assert_state(StackState.RESUMABLE, stack);
+
+	stack.clear();
+	t.assert_state(StackState.EMPTY, stack);
+}
+
+def test_resume_nop(t: WasmStackTester) {
+	var b = ModuleBuilder.new();
+	b.sig(SigCache.v_v).code([]);
+	var f = t.makeFunc(b);
+
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Value(Values.NONE), r);
+}
+
+def test_resume_add(t: WasmStackTester) {
+	var b = ModuleBuilder.new();
+	b.sig(SigCache.ii_i).code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.I32_ADD.code
+	]);
+	var f = t.makeFunc(b);
+	
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	s1.bind([Value.I32(44), Value.I32(33)]);
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Value([Value.I32(77)]), r);
+}
+
+def host_a_minus_2b(args: Range<Value>) -> HostResult {
+	var a = Values.v_i(args[0]), b = Values.v_i(args[1]);
+	return HostResult.Value1(Values.i_v(a - 2 * b));
+}
+
+def host_a_times_3_minus_b(args: Range<Value>) -> HostResult {
+	var a = Values.v_i(args[0]), b = Values.v_i(args[1]);
+	return HostResult.Value1(Values.i_v(a * 3 - b));
+}
+
+def host_return_k(args: Range<Value>, r: HostResult) -> HostResult {
+	return r;
+}
+
+def test_resume_host(t: WasmStackTester) {
+	var f = HostFunction.new("host_a_minus_2b", SigCache.ii_i, host_a_minus_2b);
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	s1.bind([Value.I32(444), Value.I32(333)]);
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Value([Values.i_v(-222)]), r);
+}
+
+def test_resume_host_throw(t: WasmStackTester) {
+	var thrown = Trap.new(TrapReason.EXIT, null, null);
+	var f = HostFunction.new("host_throw", SigCache.ii_i, host_return_k(_, HostResult.Throw(thrown)));
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	s1.bind([Value.I32(444), Value.I32(333)]);
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Throw(thrown), r);
+}
+
+def host_tailcall_f(args: Range<Value>, f: Function) -> HostResult {
+	return HostResult.TailCall(f, Ranges.dup(args));
+}
+
+def test_resume_host_tc_host(t: WasmStackTester) {
+	var g = HostFunction.new("host_a_times_3_minus_b", SigCache.ii_i, host_a_times_3_minus_b);
+	var f = HostFunction.new("host_tc_host", SigCache.ii_i, host_tailcall_f(_, g));
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	s1.bind([Value.I32(22222), Value.I32(11111)]);
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Value([Values.i_v(55555)]), r);
+}
+
+def test_resume_host_tc_wasm(t: WasmStackTester) {
+	var b = ModuleBuilder.new();
+	b.sig(SigCache.ii_i).code([
+		Opcode.LOCAL_GET.code, 0,
+		Opcode.LOCAL_GET.code, 1,
+		Opcode.I32_SUB.code
+	]);
+	var g = t.makeFunc(b);
+	
+	var f = HostFunction.new("host_tc_host", SigCache.ii_i, host_tailcall_f(_, g));
+	var s1 = Target.newWasmStack();
+	s1.reset(f);
+	if (Trace.interpreter) Trace.OUT.puts("resume ").outln();
+	s1.bind([Value.I32(333333), Value.I32(111111)]);
+	var r = s1.resume(null);
+	if (Trace.interpreter) Trace.OUT.put1(" -> %q\n", r.render).outln();
+	t.assert_r(Result.Value([Values.i_v(222222)]), r);
+}
