@@ -2,8 +2,6 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def FINISHED: Throwable = null;
-def I: X86_64Interpreter;
-
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
 component X86_64Runtime {
 	var curStack: X86_64Stack;
@@ -96,39 +94,51 @@ component X86_64Runtime {
 		for (i = r.length - 1; i >= 0; i--) r[i] = curStack.pop(rt[i]);
 		return Result.Value(r);
 	}
-	def getFrameAccessor(sp: Pointer) -> FrameAccessor {
-		var retip = (sp + -Pointer.SIZE).load<Pointer>();
-		var code = RiRuntime.findUserCode(retip);
-		match (code) {
-			x: X86_64InterpreterCode => {
-				var prev = (sp + X86_64InterpreterFrame.accessor.offset).load<X86_64FrameAccessor>();
-				if (prev != null) return prev;
-				// Interpreter frames store the {WasmFunction} _and_ {FuncDecl}.
-				var decl = (sp + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
-				var n = X86_64FrameAccessor.new(curStack, sp, decl);
-				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
-				return n;
-			}
-			x: X86_64SpcCode => {
-				var prev = (sp + X86_64InterpreterFrame.accessor.offset).load<X86_64FrameAccessor>();
-				if (prev != null) return prev;
-				// SPC frames only store the {WasmFunction}.
-				var wf = (sp + X86_64InterpreterFrame.wasm_func.offset).load<WasmFunction>();
-				// TODO: assert wf.decl == x.decl()
-				var n = X86_64FrameAccessor.new(curStack, sp, wf.decl);
-				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
-				return n;
-			}
-		}
-		return null;
-	}
-
 	//=====================================================================
 	// Standard callbacks for complex bytecodes
 	//=====================================================================
 	def runtime_callHost(f: Function) -> Throwable {
 		var state = runWithTailCalls(f, CiRuntime.callerSp());
 		return state;
+	}
+	def runtime_callHost2(hf: HostFunction) -> (Throwable, WasmFunction) {
+		var stack = curStack; // XXX: accept as parameter?
+		var args: Range<Value> = stack.popN(hf.sig.params);
+		while (hf != null) {
+			if (Trace.interpreter) Execute.traceCallHostFunction(hf);
+			var result = hf.invoke(args);
+			match (result) {
+				Throw(thrown) => {
+					if (stack.catch(thrown)) return (null, null);
+					else return (thrown, null);
+				}
+				Value0 => {
+					break;
+				}
+				Value1(val) => {
+					stack.push(val);
+					break;
+				}
+				ValueN(vals) => {
+					for (a in vals) stack.push(a);
+					break;
+				}
+				TailCall(ntarget, nargs) => {
+					match (ntarget) {
+						x: HostFunction => { // loop above will handle tail-call to host
+							hf = x;
+							args = nargs;
+							continue;
+						}
+						x: WasmFunction => { // caller Wasm code will handle tail-call
+							for (a in nargs) stack.push(a);
+							return (null, x);
+						}
+					}
+				}
+			}
+		}
+		return (null, null);
 	}
 	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
 		var memory = instance.memories[index];
@@ -226,13 +236,13 @@ component X86_64Runtime {
 	}
 	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		var ret = Instrumentation.fireProbes(DynamicLoc(func, pc, frame));
+		var ret = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, frame));
 		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
 		return ret;
 	}
 	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(CiRuntime.callerSp());
-		var ret = Instrumentation.fireProbesAt(DynamicLoc(func, pc, frame));
+		var ret = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, frame));
 		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
 		return ret;
 	}

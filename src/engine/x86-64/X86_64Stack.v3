@@ -1,22 +1,108 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Implements a value stack using raw (Pointer) memory, with explicitly tagged values.
-// Maps a value stack red zone at the end to catch and report stack overflow.
-class X86_64Stack {
+// Implements a Wasm stack using native memory in {mapping}. Stores explicitly tagged values
+// and execution frames within the mapping, containing a custom GC scan routine.
+// See diagram at the end of the file for mapping layout.
+class X86_64Stack extends WasmStack {
 	def valuerep = Target.tagging;
 	def size: u32;
 	def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var vsp: Pointer;
+	var rsp: Pointer;
+	var func: Function;
+	var parent_rsp: Pointer;
+	private var params_arity = -1;
+	private var return_results: Array<ValueType>;
+	private var state_: StackState;
 
 	new(size) {
 		if (mapping == null) fatal("out of memory allocating value stack");
-		vsp = mapping.range.start;
+		clear();
 		def PAGE_SIZE = 4096u;
-		var ok = RedZones.addRedZone(mapping, size - PAGE_SIZE, PAGE_SIZE);
+		var ok = RedZones.addRedZone(mapping, size - 2u * PAGE_SIZE, PAGE_SIZE);
 		if (!ok) fatal("could not protect value stack red zone");
 		if (valuerep.tagged) RiGc.registerScanner(this, X86_64Stack.scan);
 	}
+	// Gets the state of this stack.
+	def state() -> StackState {
+		return state_;
+	}
+	// Requires {state == EMPTY}.
+	// Resets this stack to be {SUSPENDED}, awaiting arguments for {func}.
+	def reset(func: Function) -> this {
+		checkState("reset()", StackState.EMPTY);
+		this.func = func;
+		params_arity = func.sig.params.length;
+		return_results = func.sig.results;
+		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
+		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry());
+		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry());
+	}
+	// Requires {state == SUSPENDED}.
+	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
+	// when enough arguments are pushed.
+	def bind(args: Range<Value>) -> this {
+		checkState("bind()", StackState.SUSPENDED);
+		if (params_arity < args.length) fatal(Strings.format2("bind() expected %d arguments, got %d", params_arity, args.length));
+		for (v in args) push(v);
+		params_arity -= args.length;
+		if (params_arity == 0) state_ = StackState.RESUMABLE;
+	}
+	// Requires {state == RESUMABLE}.
+	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
+	// or suspends itself.
+	def resume(parent: WasmStack) -> Result {
+		checkState("resume()", StackState.RESUMABLE);
+		var bottom = this;
+		while (bottom.parent != null) bottom = X86_64Stack.!(bottom.parent); // find bottom of this stack
+		var thrown = V3_STACK_RESUME_FUNC.get()(this, bottom);
+		if (thrown != null) return Result.Throw(thrown);
+		// TODO: deal with suspend
+		var r = popResult(return_results);
+		clear();
+		return r;
+	}
+	// Gets a {FrameLoc} for the top of the stack.
+	def where() -> FrameLoc;
+	// Gets the caller of a given {FrameLoc}.
+	def caller(loc: FrameLoc) -> FrameLoc;
+	// Tries to catch an exception.
+	def catch(thrown: Throwable) -> bool {
+		return false; // TODO: prepend stacktrace
+	}
+	// Pops all the frames off this stack, leaving it in {state == EMPTY}.
+	// Returns a {StackSegment} if {stacktrace == true}.
+	def popAllFrames(stacktrace: bool) -> StackSegment;
+	// Throws an exception with {tag} and {vals} on this stack.
+	// If the stack has no handler for the given tag, all frames will be popped
+	// and an {Exception} will be created and returned.
+	// If the stack does have a handler for the given tag, some frames may be popped
+	// and control transferred to the handler, leaving this stack either as {state == RESUMABLE},
+	// or {state == RUNNING_WASM}.
+	def throwTag(tag: Tag, vals: Range<Value>, stacktrace: bool) -> Exception;
+	// Empties all the frames on this stack and sets it back to the {StackState.EMPTY} state.
+	def clear() {
+		state_ = StackState.EMPTY;
+		vsp = mapping.range.start;
+		rsp = mapping.range.end;
+		params_arity = -1;
+		return_results = null;
+		parent = null;
+		parent_rsp = Pointer.NULL;
+		func = null;
+	}
+
+	private def pushRspPointer(p: Pointer) -> Pointer {
+		rsp = rsp + -Pointer.SIZE;
+		(rsp + 0).store<Pointer>(p);
+		return rsp;
+	}
+
+	private def checkState(op: string, expected: StackState) {
+		if (state_ != expected) fatal(Strings.format3("%s requires state == %s, got %s", op, expected.name, state_.name));
+	}
+
 	def push(v: Value) {
 		match (v) {
 			Ref(obj) => pushPair(BpTypeCode.REF_NULL.code, obj);
@@ -142,9 +228,11 @@ class X86_64Stack {
 	}
 	// GC callback to scan (tagged) values on this stack
 	def scan() {
+		// Iterate values on the value stack.
 		for (p = mapping.range.start; p < vsp; p += valuerep.slot_size) {
-			if (p.load<byte>() == BpTypeCode.REF_NULL.code) RiGc.scanRoot(p + valuerep.tag_size);
+			if (p.load<byte>() == BpTypeCode.REF_NULL.code) RiGc.scanRoot(p + valuerep.tag_size); // TODO: i31ref
 		}
+		// Iterate Wasm execution frames. TODO
 	}
 	def readValue(base: Pointer, offset: int) -> Value {
 		if (!valuerep.tagged) fatal("untyped frame access requires value tagging to be enabled");
@@ -206,10 +294,227 @@ class X86_64Stack {
 		var obj = vp.load<Object>();
 		return Value.Ref(obj);
 	}
-	def reset() {
-		vsp = mapping.range.start;
+	def popResult(rt: Array<ValueType>) -> Result {
+		var r = Array<Value>.new(rt.length);
+		for (i = r.length - 1; i >= 0; i--) r[i] = pop(rt[i]);
+		return Result.Value(r);
 	}
 	def fatal(msg: string) {
 		System.error("X86_64StackError", msg);
 	}
 }
+
+def RT: X86_64Runtime;
+def I: X86_64Interpreter;
+
+// Native frame states used in the implementation of {FrameStateAccessor}. Since a frame
+// can be optimized or deoptimized in place, the frame state accessor has to check the
+// state for every call.
+enum X86_64InterpreterFrameState {
+	INVALID, INTERPRETER, SPC, SPC_TRAPS_STUB
+}
+
+def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
+
+component X86_64Stacks {
+	def getFrameAccessor(sp: Pointer) -> FrameAccessor {
+		var retip = (sp + -Pointer.SIZE).load<Pointer>();
+		var code = RiRuntime.findUserCode(retip);
+		match (code) {
+			x: X86_64InterpreterCode => {
+				var prev = (sp + X86_64InterpreterFrame.accessor.offset).load<X86_64FrameAccessor>();
+				if (prev != null) return prev;
+				// Interpreter frames store the {WasmFunction} _and_ {FuncDecl}.
+				var decl = (sp + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
+				var n = X86_64FrameAccessor.new(X86_64Runtime.curStack, sp, decl);
+				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
+				return n;
+			}
+			x: X86_64SpcCode => {
+				var prev = (sp + X86_64InterpreterFrame.accessor.offset).load<X86_64FrameAccessor>();
+				if (prev != null) return prev;
+				// SPC frames only store the {WasmFunction}.
+				var wf = (sp + X86_64InterpreterFrame.wasm_func.offset).load<WasmFunction>();
+				// TODO: assert wf.decl == x.decl()
+				var n = X86_64FrameAccessor.new(X86_64Runtime.curStack, sp, wf.decl);
+				(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(n);
+				return n;
+			}
+		}
+		return null;
+	}
+}
+
+// The lazy-compile stub needs special handling in the Virgil runtime because it has
+// a frame that stores the function being compiled.
+class X86_64StackStub extends RiUserCode {
+	def stubName: string;
+	def frameSize: int;
+
+	new(stubName, frameSize: int) super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		var msg = "\tin [";
+		out(msg, 0, msg.length);
+		out(stubName, 0, stubName.length);
+		msg = "-stub]\n";
+		out(msg, 0, msg.length);
+	}
+	// Called from V3 runtime for a frame where {ip} is in the stub code.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp += frameSize;	 // assume frame is allocated
+		ip = sp.load<Pointer>(); // return address on stack
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+}
+
+
+
+def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64StackStub.new("v3-stack-resume", 0), genV3StackResumeStub);
+def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64StackStub.new("stack-return-parent", 0), genStackReturnParentStub);
+def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64StackStub.new("stack-enter-func", 0), genStackEnterFuncStub);
+
+// Called by V3 code to resume a stack.
+// Sets up {X86_64Runtime.curStack}, VSP, and switches the machine stack pointer,
+// then pops the resume address off the stack and jumps to it.
+def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var r_stack = X86_64MasmRegs.PARAM_GPRS[1];	// this stack
+	var r_bottom = X86_64MasmRegs.PARAM_GPRS[2];	// bottom of this stack
+	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
+	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
+	// mov [cur_stack], %stack
+	masm.emit_mov_m_r(ValueKind.REF, m_curStack, r_stack);
+	// mov [%bottom.parent_rsp_ptr], %rsp
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent_rsp), xenv.sp);
+	// mov [%bottom.parent_ptr], 0
+	masm.emit_mov_m_l(MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent), 0);
+	// mov rsp, [%stack.rsp]
+	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp));
+	// mov vsp, [%stack.vsp]
+	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
+	// pop %tmp  ; pop resume address on top of the stack and jump there.
+	masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+	// jump *%tmp
+	masm.emit_jump_r(xenv.scratch);
+}
+
+// Returned to by Wasm code when it pops its last frame.
+// Inspects the parent stack and switches to it, which might be the host (V3) stack.
+def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
+	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
+	var r_stack = xenv.tmp0;
+	var r_parent = xenv.tmp1;
+
+	// mov %stack, [cur_stack]
+	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+	// mov [%stack.vsp], %vsp
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp), xenv.vsp);
+	// mov %parent, [%stack.parent]
+	masm.emit_mov_r_m(ValueKind.REF, r_parent, MasmAddr(r_stack, masm.offsets.X86_64Stack_parent));
+	// if %parent == 0 goto l_return ; don't copy values onto parent stack
+	var l_return = masm.newLabel(-1);
+	masm.emit_br_r(r_parent, MasmBrCond.REF_NULL, l_return);
+	// TODO: mov %vsp, [%parent.vsp]
+	// TODO: do_value_copy(%parent.vsp, %vsp, %stack.return_arity)
+	// mov [%stack.parent], nullptr
+	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
+	// mov [%stack.parent_rsp], nullptr
+	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp), 0);
+	// l_return:
+	masm.bindLabel(l_return);
+	// mov [cur_stack], %parent
+	masm.emit_mov_m_r(ValueKind.REF, m_curStack, r_parent);
+	// mov %rsp, [%stack.parent_rsp]
+	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp));
+	// ret
+	masm.emit_ret();
+}
+
+// Called when resuming a stack that has a function entry on the top of the stack.
+def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
+	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
+	var r_stack = xenv.tmp0;
+	var r_func = xenv.func_arg;
+
+	// mov %stack, [cur_stack]    ; load stack from (thread-local) curStack
+	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+	// mov %func, [%stack.func]   ; load function from stack object
+	masm.emit_mov_r_m(ValueKind.REF, r_func, MasmAddr(r_stack, masm.offsets.X86_64Stack_func));
+	var call_host = masm.newLabel(-1);
+	var call_wasm = masm.newLabel(-1);
+	masm.bindLabel(call_wasm);
+	// Check if function is a WasmFunction or a HostFunction.
+	masm.emit_br_r(r_func, MasmBrCond.IS_NOT_WASM_FUNC, call_host); // XXX: near jump
+
+	// mov %vsp, [%stack.vsp]    ; load VSP from stack object
+	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
+	// WasmFunction: call into interpreter reentry or target code
+	if (FeatureDisable.multiTier) {
+		// jump to interpreter directly as if tail-calling from SPC code
+		var entry = ic.start + ic.header.intSpcEntryOffset;
+		asm.jmp_rel_addr(masm.absPointer(entry));
+	} else {
+		masm.emit_mov_r_m(ValueKind.REF, xenv.tmp2, MasmAddr(r_func, masm.offsets.WasmFunction_decl));
+		asm.ijmp_m(G(xenv.tmp2).plus(masm.offsets.FuncDecl_target_code));
+	}
+
+	// Handle a call to a host function.
+	masm.bindLabel(call_host);
+	// mov [%stack.rsp], %sp - 8
+	masm.emit_mov_r_r(xenv.tmp3, xenv.sp);
+	masm.emit_subw_r_i(xenv.tmp3, Pointer.SIZE);
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp), xenv.tmp3);
+	// Call runtime to do a host call
+	masm.emit_mov_r_r(xenv.runtime_arg0, r_func);
+	masm.emit_call_runtime_callHost2(r_func);
+	// mov %stack, [cur_stack]    ; reload stack object from (thread-local) curStack
+	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+	// mov %vsp, [%stack.vsp]
+	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
+	// mov %func, %runtime_ret1   ; move WasmFunction return into r_func
+	masm.emit_mov_r_r(r_func, xenv.runtime_ret1);
+	// Check if WasmFunction != null, which means host tail-called Wasm
+	masm.emit_br_r(r_func, MasmBrCond.REF_NONNULL, call_wasm); // XXX: near jump
+	// Otherwise return throwable
+	masm.emit_ret();
+}
+
+// X86_64Stack object
+//================================================================================================
+// state =      SUSPENDED                 RESUMABLE                  RUNNING
+//
+//                stack                      stack             stack <------ X86_64Runtime.curStack
+//                  |                          |                  |
+//                  |                          |                  +-----+
+//                  |                          |                        |
+//                  V                          V                        V
+// start ->  [     value     ]         [     value     ]         [     value     ]
+// vsp ->                              [     value     ]         [     value     ]
+//                              vsp -> [     value     ]         [     value     ]
+//                                                        vsp -> [     value     ]
+//
+//             ..............           ...............           ...............
+//
+//                                                        rsp -> [  wasm frame   ]
+//                              rsp -> [ enter/reenter ]         [  wasm frame   ]
+// rsp ->    [     entry     ]         [  wasm frame   ]         [  wasm frame   ]
+//           [ parent return ]         [ parent return ]         [ parent return ]
+// end ->
+//
+//                                                            stack.parent_rsp
+//                                                               |
+//                                                         +-----+
+//                                                         |
+//                                                         |
+//                                                         +--> [ virgil frame  ]
+//                                                              [ virgil frame  ]
+//                                                              [ virgil frame  ]
