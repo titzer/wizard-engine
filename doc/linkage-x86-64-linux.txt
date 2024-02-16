@@ -1,0 +1,104 @@
+Calling conventions and stack usage on x86-64-linux
+
+V3_PARAM_GPRS = [RDI, RSI, RDX, RCX, R8, R9];
+V3_RET_GPRS   = [RAX, RDX, RCX, RSI];
+
+func_arg:     WasmFunction                      %RDX
+vsp:          Pointer<Value>                    %RSI
+vfp:          Pointer<Value>                    %R11
+thrown:       Throwable                         %RAX
+dispatch:     Pointer<CodePointer * 256>        %R14
+sp:           Pointer                           %RSP
+mem0_base:    Pointer<byte>                     %R10
+instance:     Instance 	                        %RDI
+runtime_arg0:                            	%RSI
+runtime_arg1:                                   %RDX
+runtime_arg2:                                   %RCX
+runtime_ret0:                                   %RAX
+runtime_ret1:                                   %RDX
+scratch:                                        %RBP
+
+Wasm -> Wasm call: (func_arg, vsp) -> (thrown, vsp)
+
+SPC -> Wasm call: (func_arg, vsp) -> (thrown) // vsp ignored
+  => caller-save all allocated regs
+  // frame.(instance, vfp, mem0_base) already saved
+  => vsp = vfp + #stack_height
+  => var f = instance.functions[#index]
+  // jump or call runtime_callHost if not Wasm
+  => thrown = call f.decl.target_code
+  => unwind check thrown
+  => vfp = frame.vfp
+  => mem0_base = frame.mem0_base
+
+INT -> Wasm call: (func_arg, vsp) -> (thrown, vsp)
+  => var curpc = (ip - &cur_bytecode[0])
+  => frame.(ip, stp, curpc) = (ip, stp, curpc)
+  // frame.(instance, vfp, eip, mem0_base, func_decl) already saved
+  => var f = instance.functions[#index]
+  // jump or call runtime_callHost if not Wasm
+  => (thrown, vsp) = call f.decl.target_code
+  => unwind check thrown
+  => (ip, stp, eip, instance, func_decl, mem0_base, vfp) = frame.(ip, stp, eip, instance, func_decl, mem0_base, vfp)
+  => interpreter dispatch
+
+
+SPC-INT-entry: (func_arg, vsp)
+  => alloc frame
+  => frame.vsp = vsp
+  => dispatch = globalDispatchTable
+
+INT-reentry: (func_arg, vsp)
+  => alloc frame
+  => frame.vsp = vsp
+  => fallthrough INT-shared-entry
+
+INT-shared-entry: (func_arg, vsp, dispatch)
+  => frame.accessor = null
+  => frame.wasm_func = func_arg
+  => frame.instance = instance = func_arg.instance
+  => frame.func_decl = func_decl = func_arg.decl
+  => frame.vfp = vfp = vsp - (#slot_size * func_decl.sig.params.length)
+  => fallthrough INT-tail-call-reentry
+
+INT-tail-call-reentry: (func_arg, vsp, vfp, dispatch, func_decl, instance)
+  => frame.ip = ip = &func_decl.cur_bytecode[0]
+  => frame.eip = eip = &func_decl.cur_bytecode[func_decl.cur_bytecode.length]
+  => frame.stp = &func_decl.sidetable[0]
+  => frame.mem0_base = mem0_base = instance.memories[0].start
+  => (decode locals and dispatch)
+
+INT-tail-call -> Wasm
+  => overwrite locals with args
+  => vsp = vfp + (#slot_size * arg_count)
+  => frame.accessor = null
+  // jump or call runtime_callHost if not Wasm
+  => frame.instance = instance = func_arg.instance
+  => frame.func_decl = func_decl = func_arg.decl
+  => jump INT-tail-call-reentry
+
+
+RESUME-enter-func: (stack) -> (thrown, vsp)
+ => func_arg = stack.func
+ => vsp = stack.vsp
+ => fallthrough CALL-func
+
+CALL-func: (func_arg, vsp) -> (thrown, vsp)
+  => if (HostFunction.?(func_arg)) goto CALL-host-func
+CALL-wasm-func:
+  => jump func_arg.decl.target_code
+CALL-host-func: (func_arg, vsp) -> (thrown, vsp)
+  => curStack.vsp = vsp
+  => curStack.rsp = rsp;
+  => (thrown, wasm_func) = call RT-call-host
+  => vsp = curStack.vsp
+  => func_arg = wasm_func
+  => if (wasm_func != null) goto CALL-wasm-func
+  => rsp = curStack.rsp
+  => return (thrown, vsp)
+
+RT-call-host: (func_arg: runtime_arg1) -> (thrown: runtime_ret0, wasm_func: runtime_ret1)
+  => stack = curStack
+  => args = stack.popN(func_arg.sig.params.length)
+  => func_arg.invoke(args)
+  ...
