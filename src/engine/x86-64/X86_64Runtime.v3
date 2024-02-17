@@ -3,10 +3,16 @@
 
 def FINISHED: Throwable = null;
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
+def runOnSeparateStack = false;
 component X86_64Runtime {
 	var curStack: X86_64Stack;
 
 	def run(f: Function, args: Range<Value>) -> Result {
+		// Check whether to run on a separate physical stack.
+		if (runOnSeparateStack) {
+			var stack = X86_64Stack.new(EngineOptions.stackSize);
+			return stack.reset(f).bind(args).resume();
+		}
 		if (curStack == null) curStack = X86_64Stack.new(EngineOptions.stackSize);
 		// Unpack arguments into value stack format.
 		var prev_vsp = curStack.vsp;
@@ -29,6 +35,7 @@ component X86_64Runtime {
 		}
 	}
 	private def runWithTailCalls(f: Function, sp: Pointer) -> Throwable {
+		var stack = curStack;
 		var state = FINISHED;
 		while (true) { // handle repeated tail calls
 			var result: HostResult;
@@ -38,6 +45,7 @@ component X86_64Runtime {
 					if (Debug.runtime) Trace.OUT.put2("runWithTailCalls(wf=0x%x, vsp=0x%x)",
 						(Pointer.atObject(wf) - Pointer.NULL), vsp - Pointer.NULL).outln();
 					var ret = invoke(wf, vsp);
+					curStack = stack;
 					if (ret == null) {
 						curStack.vsp = vsp + ((wf.sig.results.length - wf.sig.params.length) * curStack.valuerep.slot_size);
 					}
@@ -45,7 +53,9 @@ component X86_64Runtime {
 				}
 				hf: HostFunction => {
 					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var result = doInvokeHostFunction(hf);
+					var args = curStack.popN(hf.sig.params);
+					var result = hf.invoke(args);
+					curStack = stack;
 					match (result) {
 						Throw(thrown) => {
 							if (sp != Pointer.NULL) prependFrames(thrown, hf, sp);
@@ -73,10 +83,6 @@ component X86_64Runtime {
 			}
 		}
 		return state;
-	}
-	private def doInvokeHostFunction(hf: HostFunction) -> HostResult {
-		var aN = curStack.popN(hf.sig.params);
-		return hf.invoke(aN);
 	}
 	private def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
 		Debug.invoke(wf);
@@ -142,7 +148,7 @@ component X86_64Runtime {
 	}
 	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
 		var memory = instance.memories[index];
-		var pages = Values.v_u(curStack.pop(ValueType.I32));
+		var pages = curStack.popu();
 		var result = memory.grow(pages);
 		curStack.push(Values.i_v(result));
 	}
@@ -186,7 +192,7 @@ component X86_64Runtime {
 	}
 	def runtime_TABLE_GET(instance: Instance, index: u32) -> Throwable { // XXX: inline when Value rep known
 		var table = instance.tables[index];
-		var elem = Values.v_u(curStack.pop(ValueType.I32));
+		var elem = curStack.popu();
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		var val = table.elems[elem];
 		curStack.push(val);
@@ -195,7 +201,7 @@ component X86_64Runtime {
 	def runtime_TABLE_SET(instance: Instance, index: u32) -> Throwable {
 		var table = instance.tables[index];
 		var val = curStack.pop(table.elemtype);
-		var elem = Values.v_u(curStack.pop(ValueType.I32));
+		var elem = curStack.popu();
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		table[int.view(elem)] = val;
 		return FINISHED;
