@@ -28,8 +28,8 @@ UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
-TAGS: $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
-	vctags -e $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(X86_64)
+TAGS: $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
+	vctags -e $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
 
 # JVM targets
 bin/unittest.jvm: $(UNITTEST) build.sh
