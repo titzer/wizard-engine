@@ -73,6 +73,35 @@ class X86_64Stack extends WasmStack {
 	def catch(thrown: Throwable) -> bool {
 		return false; // TODO: prepend stacktrace
 	}
+	// Prepends frames from this stack to the given throwable.
+	def prependFrames(thrown: Throwable, hf: HostFunction) -> Throwable {
+		return prependFrames0(thrown, hf, rsp);
+	}
+	def prependFrames0(thrown: Throwable, hf: HostFunction, sp: Pointer) -> Throwable {
+		var trace = Vector<(WasmFunction, int)>.new();
+		var estimate = (mapping.range.end - rsp) / X86_64InterpreterFrame.size;
+		trace.grow(int.view(estimate)); // preallocate frame entries
+		while (sp < mapping.range.end) {
+			var retip = (sp + -Pointer.SIZE).load<Pointer>();
+			var code = RiRuntime.findUserCode(retip);
+			var accessor: FrameAccessor;
+			match (code) {
+				x: X86_64InterpreterCode => accessor = TargetFrame(sp).getFrameAccessor();
+				x: X86_64SpcModuleCode => accessor = TargetFrame(sp).getFrameAccessor();
+			}
+			if (accessor != null) trace.put(accessor.func(), accessor.pc());
+			if (code == null) break;
+			var t = code.nextFrame(retip, sp);
+			sp = t.1;
+		}
+
+		var result = Array<(WasmFunction, int)>.new(trace.length); // reverse frames
+		for (i < result.length) {
+			result[i] = trace[result.length - i - 1];
+		}
+		thrown.prepend(result, hf);
+		return thrown;
+	}
 	// Pops all the frames off this stack, leaving it in {state == EMPTY}.
 	// Returns a {StackSegment} if {stacktrace == true}.
 	def popAllFrames(stacktrace: bool) -> StackSegment;
@@ -340,35 +369,9 @@ component X86_64Stacks {
 	}
 }
 
-// The lazy-compile stub needs special handling in the Virgil runtime because it has
-// a frame that stores the function being compiled.
-class X86_64StackStub extends RiUserCode {
-	def stubName: string;
-	def frameSize: int;
-
-	new(stubName, frameSize: int) super(Pointer.NULL, Pointer.NULL) { }
-
-	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
-	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
-		var msg = "\tin [";
-		out(msg, 0, msg.length);
-		out(stubName, 0, stubName.length);
-		msg = "-stub]\n";
-		out(msg, 0, msg.length);
-	}
-	// Called from V3 runtime for a frame where {ip} is in the stub code.
-	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
-		sp += frameSize;	 // assume frame is allocated
-		ip = sp.load<Pointer>(); // return address on stack
-		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
-	}
-}
-
-
-
-def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64StackStub.new("v3-stack-resume", 0), genV3StackResumeStub);
-def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64StackStub.new("stack-return-parent", 0), genStackReturnParentStub);
-def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64StackStub.new("stack-enter-func", 0), genStackEnterFuncStub);
+def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
+def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64SimpleStub.new("stack-return-parent", 0), genStackReturnParentStub);
+def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
 
 // Called by V3 code to resume a stack.
 // Sets up {X86_64Runtime.curStack}, VSP, and switches the machine stack pointer,
@@ -479,7 +482,7 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp), xenv.tmp3);
 	// Call runtime to do a host call
 	masm.emit_mov_r_r(xenv.runtime_arg0, r_func);
-	masm.emit_call_runtime_callHost2(r_func);
+	masm.emit_call_runtime_callHost(r_func);
 	// mov %stack, [cur_stack]    ; reload stack object from (thread-local) curStack
 	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
 	// mov %vsp, [%stack.vsp]

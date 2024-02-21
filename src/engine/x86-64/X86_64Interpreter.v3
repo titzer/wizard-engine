@@ -85,7 +85,9 @@ class X86_64InterpreterCode extends RiUserCode {
 		var instance = (sp + X86_64InterpreterFrame.instance.offset).load<Instance>();
 		var func = (sp + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
 		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
-		func.render(instance.module.names, buf);
+		if (func == null) buf.puts("(func=null)");
+		else if (instance == null) func.render(null, buf);
+		else func.render(instance.module.names, buf);
 		buf.ln().out(out);
 		buf.reset();
 	}
@@ -264,6 +266,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var handlerEndOffset: int;
 	var callReentryLabel = X86_64Label.new();
 	var tailCallReentryLabel = X86_64Label.new();
+	var hostTailCallStubLabel = masm.newLabel(-1);
+	var hostCallStubLabel = masm.newLabel(-1);
+	var spcEntryLabel = X86_64Label.new();
 	var abruptRetLabel = X86_64Label.new();
 	var controlFallThruLabel = X86_64Label.new();
 	var controlTransferLabel = X86_64Label.new();
@@ -370,6 +375,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// Reserve space for the dispatch tables.
 		reserveDispatchTables();
 		// Begin code generation
+		genHostCallStub();
 		genInterpreterEntry();
 		genOpcodeHandlers();
 		handlerEndOffset = w.atEnd().pos;
@@ -444,6 +450,68 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			dispatchTables[i + 1] = (page.prefix, ref, ref2);
 		}
 	}
+	def genHostCallStub() {
+		var offsets = masm.getOffsets();
+		var m_curStack = MasmAddr(Reg(0), int.!(offsets.X86_64Runtime_curStack - Pointer.NULL));
+		var r_stack = xenv.tmp0;
+		var r_func = xenv.func_arg;
+
+		// Tail-calls deallocate their interpreter frame first.
+		masm.bindLabel(hostTailCallStubLabel);
+		asm.q.add_r_i(r_sp, k_frame_size);
+
+		// Fall through to host call
+		masm.bindLabel(hostCallStubLabel);
+		ic.header.hostCallStubOffset = w.pos;
+		// mov %stack, [cur_stack]    ; reload stack object from (thread-local) curStack
+		masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+		// prepare for possible unwind of stack
+		if (!FeatureDisable.separateStacks) {
+			// mov [%stack.rsp], %rsp
+			masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, offsets.X86_64Stack_rsp), xenv.sp);
+		}
+		// mov [%stack.vsp], %vsp
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, offsets.X86_64Stack_vsp), xenv.vsp);
+		// move function into correct register
+		masm.emit_mov_r_r(xenv.runtime_arg0, r_func);
+		// call runtime
+		masm.emit_call_runtime_callHost(xenv.func_arg);
+
+		// mov %stack, [cur_stack]    ; reload stack object from curStack
+		masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+		// mov %vsp, [%stack.vsp]     ; reload VSP from stack object
+		masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
+		// mov %func, %runtime_ret1   ; move WasmFunction return into r_func
+		masm.emit_mov_r_r(r_func, xenv.runtime_ret1);
+		// Check if WasmFunction != null, which means host tail-called Wasm
+		var call_wasm = masm.newLabel(-1);
+		masm.emit_br_r(r_func, MasmBrCond.REF_NONNULL, call_wasm); // XXX: near jump
+		// possibly unwind stack
+		if (!FeatureDisable.separateStacks) {
+			// mov [%stack.rsp], %rsp
+			masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, offsets.X86_64Stack_rsp));
+		}
+		// Otherwise return (possibly null) throwable
+		masm.emit_ret();
+
+		// call into interpreter reentry or target code
+		masm.bindLabel(call_wasm);
+		if (FeatureDisable.multiTier) {
+			// jump to interpreter directly as if tail-calling from SPC code
+			// XXX: could save a jump above
+			asm.jmp_rel_far(spcEntryLabel);
+		} else {
+			// Load entrypoint from r_func.decl.target_code
+			var do_jump = masm.newLabel(-1);
+			masm.emit_mov_r_m(ValueKind.REF, xenv.tmp2, MasmAddr(r_func, masm.offsets.WasmFunction_decl));
+			masm.emit_mov_r_m(ValueKind.REF, xenv.tmp2, MasmAddr(xenv.tmp2, masm.offsets.FuncDecl_target_code));
+			// Jump to interpreter if entrypoint not set
+			asm.q.cmp_r_i(G(xenv.tmp2), 0);
+			asm.jc_rel_far(C.Z, spcEntryLabel);
+			masm.emit_jump_r(xenv.tmp2);
+		}
+		ic.header.hostCallStubEnd = w.pos;
+	}
 	def genInterpreterEntry() {
 		var shared_entry = X86_64Label.new();
 		var tmp = r_scratch;
@@ -465,6 +533,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		{ // Entrypoint for calls coming from SPC code
 			ic.header.intSpcEntryOffset = w.pos;
+			asm.bind(spcEntryLabel);
 
 			// Allocate and initialize interpreter stack frame from incoming SPC args.
 			asm.q.sub_r_i(r_sp, k_frame_size);
@@ -615,6 +684,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			callRuntime(refRuntimeCall(RT.runtime_PROBE_instr), [r_tmp0, r_curpc], true);
 			// fall through
 			restoreCallerIVars();
+			//TODO: restoreDispatchTableReg();
 			genJumpToDispatch();
 		}
 		ic.header.deoptReentryOffset = w.atEnd().pos;
@@ -1041,10 +1111,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			if (!FeatureDisable.multiTier) restoreDispatchTableReg();
 			genDispatchOrJumpToDispatch();
 
-			// HostFunction: call into interpreter runtimeCall to enter into V3 code
+			// HostFunction: call into runtime
 			asm.bind(call_host.label);
-			callRuntime(refRuntimeCall(RT.runtime_callHost), [func_arg], true);
+			asm.call_rel_far(hostCallStubLabel.label);
+			genAbruptRetCheck();
 			restoreCallerIVars();
+			restoreDispatchTableReg();
 			genJumpToDispatch();
 		}
 
@@ -1112,40 +1184,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genCopyStackValsToVfp(cnt, r_tmp2);
 
 			// Check if the target function is a WasmFunction or HostFunction
-			var tail_call_host = masm.newLabel(-1);
-			masm.emit_br_r(xenv.func_arg, MasmBrCond.IS_NOT_WASM_FUNC, tail_call_host); // XXX: near jump
+			masm.emit_br_r(xenv.func_arg, MasmBrCond.IS_NOT_WASM_FUNC, hostTailCallStubLabel);
 
 			// WasmFunction: jump into interpreter reentry
-			// TODO: store frame.wasm_func?
-			// TODO: call SPC code?
 			asm.q.lea(r_vsp, r_vfp.plusR(cnt, 1, 0)); // set VSP properly
 			asm.movq_r_m(r_instance, func_arg.plus(offsets.WasmFunction_instance));
 			saveIVar(r_instance);
 			asm.movq_r_m(r_func_decl, func_arg.plus(offsets.WasmFunction_decl));
 			saveIVar(r_func_decl);
 			asm.jmp_rel_far(tailCallReentryLabel);
-
-			// HostFunction: jump into interpreter runtimeCall to enter into V3 code
-			masm.bindLabel(tail_call_host);
-
-			// Custom code to tail-call the runtime
-			asm.movq_r_r(r_tmp3, r_vsp); // save VSP from being overwritten
-			var abs = refRuntimeCall(RT.runtime_callHost);
-			var args = [func_arg];
-			// Generate parallel moves from args into param gprs; assume each src register used only once
-			var dst = Array<X86_64Gpr>.new(GPRs.length);
-			for (i < args.length) {
-				var sreg = args[i];
-				var dreg = Target.V3_PARAM_GPRS[i + 1];
-				if (sreg != dreg) dst[sreg.regnum] = dreg;
-			}
-			var stk = Array<i8>.new(GPRs.length);
-			for (i < dst.length) orderMoves(dst, stk, i);
-			// save a copy of VSP into interpreter.valueStack.sp
-			asm.movq_r_m(r_scratch, masm.absPointer(offsets.X86_64Runtime_curStack));
-			asm.movq_m_r(r_scratch.plus(offsets.X86_64Stack_vsp), r_tmp3);
-			asm.q.add_r_i(r_sp, k_frame_size); // deallocate interpreter frame
-			asm.jmp_rel(int.!(abs - (ic.start + w.pos))); // tail-call into runtime
 		}
 
 		bindHandler(Opcode.RETURN_CALL_INDIRECT); {
