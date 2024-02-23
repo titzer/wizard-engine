@@ -11,7 +11,7 @@ class X86_64Stack extends WasmStack {
 	var vsp: Pointer;
 	var rsp: Pointer;
 	var func: Function;
-	var parent_rsp: Pointer;
+	var parent_rsp_ptr: Pointer;
 	private var params_arity = -1;
 	private var return_results: Array<ValueType>;
 	private var state_: StackState;
@@ -20,7 +20,9 @@ class X86_64Stack extends WasmStack {
 		if (mapping == null) fatal("out of memory allocating value stack");
 		clear();
 		def PAGE_SIZE = 4096u;
-		var ok = RedZones.addRedZone(mapping, size - 2u * PAGE_SIZE, PAGE_SIZE);
+		// insert redzone roughly in the middle of the mapping.
+		var redzone_start = (size >> 1) & ~(PAGE_SIZE - 1u);
+		var ok = RedZones.addRedZone(mapping, redzone_start, PAGE_SIZE);
 		if (!ok) fatal("could not protect value stack red zone");
 		if (valuerep.tagged) RiGc.registerScanner(this, X86_64Stack.scan);
 	}
@@ -36,8 +38,9 @@ class X86_64Stack extends WasmStack {
 		params_arity = func.sig.params.length;
 		return_results = func.sig.results;
 		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
-		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry());
-		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry());
+		parent_rsp_ptr = pushRspPointer(Pointer.NULL); // placeholder for parent pointer
+		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
+		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
 	}
 	// Requires {state == SUSPENDED}.
 	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
@@ -55,6 +58,7 @@ class X86_64Stack extends WasmStack {
 	// or suspends itself.
 	def resume() -> Result {
 		checkState("resume()", StackState.RESUMABLE);
+		if (Trace.stack) traceFrames("stack.resume", rsp + Pointer.SIZE);
 		var bottom = this;
 		while (bottom.parent != null) bottom = X86_64Stack.!(bottom.parent); // find bottom of this stack
 		state_ = StackState.RUNNING;
@@ -102,6 +106,19 @@ class X86_64Stack extends WasmStack {
 		thrown.prepend(result, hf);
 		return thrown;
 	}
+	def traceFrames(when: string, sp: Pointer) {
+		Trace.OUT.puts(when);
+		if (Debug.stack) Trace.OUT.put1(" rsp=0x%x", rsp - Pointer.NULL);
+		Trace.OUT.outln();
+		while (sp >= mapping.range.start && sp < mapping.range.end) {
+			var retip = (sp + -Pointer.SIZE).load<Pointer>();
+			var code = RiRuntime.findUserCode(retip);
+			if (code == null) break;
+			code.describeFrame(retip, sp, Trace.STDOUT_p);
+			var t = code.nextFrame(retip, sp);
+			sp = t.1;
+		}
+	}
 	// Pops all the frames off this stack, leaving it in {state == EMPTY}.
 	// Returns a {StackSegment} if {stacktrace == true}.
 	def popAllFrames(stacktrace: bool) -> StackSegment;
@@ -120,7 +137,7 @@ class X86_64Stack extends WasmStack {
 		params_arity = -1;
 		return_results = null;
 		parent = null;
-		parent_rsp = Pointer.NULL;
+		parent_rsp_ptr = Pointer.NULL;
 		func = null;
 	}
 
@@ -367,10 +384,16 @@ component X86_64Stacks {
 		}
 		return null;
 	}
+	def traceIpAndSp(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		var buf = X86_64Runtime.globalFrameDescriptionBuf;
+		buf.put2("\t@[ip=0x%x, sp=0x%x] ", ip - Pointer.NULL, sp - Pointer.NULL).out(out);
+		buf.reset();
+	}
 }
 
+def NOP_ENTRY = 1;
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
-def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64SimpleStub.new("stack-return-parent", 0), genStackReturnParentStub);
+def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(), genStackReturnParentStub);
 def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
 
 // Called by V3 code to resume a stack.
@@ -385,18 +408,46 @@ def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
 	// mov [cur_stack], %stack
 	masm.emit_mov_m_r(ValueKind.REF, m_curStack, r_stack);
-	// mov [%bottom.parent_rsp_ptr], %rsp
-	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent_rsp), xenv.sp);
+	// mov %tmp, [%bottom.parent_rsp_ptr]
+	masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent_rsp_ptr));
+	// mov [%tmp == [%bottom.parent_rsp_ptr]], %rsp
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(xenv.scratch, 0), xenv.sp);
 	// mov [%bottom.parent_ptr], 0
 	masm.emit_mov_m_l(MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent), 0);
-	// mov rsp, [%stack.rsp]
+	// mov rsp, [%stack.rsp]  ; switch machine stack pointer
 	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp));
-	// mov vsp, [%stack.vsp]
+	// mov vsp, [%stack.vsp]  ; load VSP
 	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
 	// pop %tmp  ; pop resume address on top of the stack and jump there.
 	masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 	// jump *%tmp
 	masm.emit_jump_r(xenv.scratch);
+}
+
+// The parent return stub requires special handling for Virgil stackwalking to continue
+// the stackwalk on the parent stack.
+class X86_64ReturnParentStub extends RiUserCode {
+	new() super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		if (Debug.stack) X86_64Stacks.traceIpAndSp(ip, sp, out);
+		var buf = X86_64Runtime.globalFrameDescriptionBuf;
+		buf.puts("\tin [parent-return-stub]");
+		if (Debug.stack) {
+			var parent_rsp = sp.load<Pointer>();
+			buf.put1(" parent_rsp=0x%x", parent_rsp - Pointer.NULL);
+		}
+		buf.ln().out(out);
+		buf.reset();
+	}
+	// Called from V3 runtime to get to the next frame.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp = sp.load<Pointer>(); // parent_rsp on stack
+		if (sp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
+		ip = sp.load<Pointer>();
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
 }
 
 // Returned to by Wasm code when it pops its last frame.
@@ -409,6 +460,9 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var r_stack = xenv.tmp0;
 	var r_parent = xenv.tmp1;
 
+	// Nothing calls this stub; it is only returned to. A nop serves as a placeholder for a non-existent
+	// call instruction so that stackwalking logic works properly.
+	asm.nop1();
 	// mov %stack, [cur_stack]
 	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
 	// mov [%stack.vsp], %vsp
@@ -420,16 +474,16 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_br_r(r_parent, MasmBrCond.REF_NULL, l_return);
 	// TODO: mov %vsp, [%parent.vsp]
 	// TODO: do_value_copy(%parent.vsp, %vsp, %stack.return_arity)
-	// mov [%stack.parent], nullptr
+	// mov [%stack.parent], nullptr ; XXX: redundant?
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
-	// mov [%stack.parent_rsp], nullptr
-	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp), 0);
+	// mov [%stack.parent_rsp_ptr], nullptr ; XXX: redundant?
+	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp_ptr), 0);
 	// l_return:
 	masm.bindLabel(l_return);
 	// mov [cur_stack], %parent
 	masm.emit_mov_m_r(ValueKind.REF, m_curStack, r_parent);
-	// mov %rsp, [%stack.parent_rsp]
-	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp));
+	// pop %rsp
+	masm.emit_pop_r(ValueKind.REF, xenv.sp);
 	// ret
 	masm.emit_ret();
 }
@@ -443,6 +497,10 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var r_stack = xenv.tmp0;
 	var r_func = xenv.func_arg;
 
+	// Nothing calls this stub. Instead the stack resume stub "returns" to this stub by popping it off
+	// the stack and jumping to it. A nop serves as a placeholder for a non-existent call instruction so
+	// that stackwalking logic works properly.
+	asm.nop1();
 	// mov %stack, [cur_stack]    ; load stack from (thread-local) curStack
 	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
 	// mov %func, [%stack.func]   ; load function from stack object
@@ -455,7 +513,7 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 
 	// mov %vsp, [%stack.vsp]    ; load VSP from stack object
 	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
-	// WasmFunction: call into interpreter reentry or target code
+	// WasmFunction: call into interpreter reentry or target code. XXX: factor out to MacroAssembler?
 	if (FeatureDisable.multiTier) {
 		// jump to interpreter directly as if tail-calling from SPC code
 		var entry = ic.start + ic.header.intSpcEntryOffset;
@@ -471,10 +529,9 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 		masm.emit_mov_r_k(ValueKind.I32, xenv.tmp2, int.!(entry - Pointer.NULL));
 		masm.bindLabel(do_jump);
 		masm.emit_jump_r(xenv.tmp2);
-//TODO:		asm.ijmp_m(G(xenv.tmp2).plus(masm.offsets.FuncDecl_target_code));
 	}
 
-	// Handle a call to a host function.
+	// Handle a call to a host function. XXX: jump to CallHostStub instead.
 	masm.bindLabel(call_host);
 	// mov [%stack.rsp], %sp - 8
 	masm.emit_mov_r_r(xenv.tmp3, xenv.sp);
