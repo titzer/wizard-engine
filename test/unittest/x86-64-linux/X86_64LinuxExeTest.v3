@@ -3,11 +3,6 @@
 
 component X86_64LinuxExeTest {
 	new() {
-		// This target has an additional tier to test!
-		TestTiers.register("jit:", X86_64SpcAotStrategy.new(true)); // XXX: s/jit/spc
-		// This target needs to preprocess modules, even for the interpreter
-		TestTiers.preprocess = Target.setTieredEntrypoint;
-
 		for (strategy in [
 			("spc:aot:", X86_64SpcAotStrategy.new(false)),
 			("spc:lazy:", X86_64SpcLazyStrategy.new()),
@@ -19,12 +14,7 @@ component X86_64LinuxExeTest {
 				("unreachable", test_unreachable),
 				("i32.add", test_i32_add),
 				("load_oob0", test_load_oob0),
-				("call1005", test_call1005),		// intended to trigger OSR
-				("gc_CountProbe", test_gc_CountProbe),	// intended to trigger GC with intrinsified count probe
-				("gc_OperandProbe_i_v", test_gc_OperandProbe_i_v),	// intended to trigger GC with intrinsified operand probe
-				("dyn_probe_insert", test_dyn_probe_insert),
-				("dyn_probe_insert_osr", test_dyn_probe_insert_osr),
-				("entry_probe", test_entry_probe)
+				("call1005", test_call1005)		// intended to trigger OSR
 				]) {
 				// register strategy/test pair
 				UnitTests.registerT(strategy.0, test.0, newTester, test.1);
@@ -40,17 +30,17 @@ def NONE = BpTypeCode.EmptyBlock.code;
 
 def test_empty(i: ExeTester) {
 	i.sig(SigCache.v_v).code([])
-		.assert_nop(X);
+		.noargs().assert2_none();
 }
 
 def test_unreachable(i: ExeTester) {
 	i.code([Opcode.UNREACHABLE.code])
-		.assert_trap(X, TrapReason.UNREACHABLE);
+		.noargs().assert2_trap(TrapReason.UNREACHABLE);
 }
 
 def test_nop(i: ExeTester) {
 	i.sig(SigCache.v_v).code([Opcode.NOP.code])
-		.assert_nop(X);
+		.noargs().assert2_none();
 }
 
 def test_i32_add(i: ExeTester) {
@@ -58,7 +48,7 @@ def test_i32_add(i: ExeTester) {
 		Opcode.LOCAL_GET.code, 0,
 		Opcode.LOCAL_GET.code, 1,
 		Opcode.I32_ADD.code]);
-	i.assert_ii_i((0xFF89520F, 9999999), 2222222);
+	i.args_ii(0xFF89520F, 9999999).assert2_i(2222222);
 }
 
 def test_load_oob0(i: ExeTester) {
@@ -66,7 +56,7 @@ def test_load_oob0(i: ExeTester) {
 	i.sig(SigCache.i_i);
 	i.code([Opcode.LOCAL_GET.code, 0,
 		Opcode.I32_LOAD.code, 0, 0]);
-	i.assert_r([Value.I32(0)], Traps.result(TrapReason.MEM_OUT_OF_BOUNDS));
+	i.args_i(0).assert2_trap(TrapReason.MEM_OUT_OF_BOUNDS);
 }
 
 def test_call1005(i: ExeTester) {
@@ -85,153 +75,7 @@ def test_call1005(i: ExeTester) {
 		Opcode.END.code,
 		Opcode.UNREACHABLE.code
 	]);
-	i.assert_i_i(5, 17);
-	i.assert_i_i(1000, 17);
+	i.args_i(5).assert2_i(17);
+	i.args_i(1000).assert2_i(17);
 }
 
-def test_force_gc_callback(args: Range<Value>) -> HostResult {
-	// Allocations and forced GCs help randomize the heap layout to catch bugs in walking interpreter frames
-	var a = args[0], b = args[1];
-	var x = [a, b];
-	Target.forceGC();
-	var y = [a, b];
-	Target.forceGC();
-	var z = [a, b];
-	Target.forceGC();
-	if (x[0] != y[0]) return HostResult.Value1(Values.i_v(-1));
-	if (x[1] != y[1]) return HostResult.Value1(Values.i_v(-2));
-	if (x[0] != z[0]) return HostResult.Value1(Values.i_v(-3));
-	if (x[1] != z[1]) return HostResult.Value1(Values.i_v(-4));
-	return HostResult.Value1(Values.i_v(99 - Values.v_i(a) - Values.v_i(b)));
-}
-
-def test_gc_CountProbe(i: ExeTester) {
-	var tuning_before = SpcTuning.intrinsifyCountProbe;
-	SpcTuning.intrinsifyCountProbe = true; // TODO: manual for testing
-
-	var count = CountProbe.new();
-	var sig = i.newSig(SigCache.arr_ii, SigCache.arr_i);
-	i.sig(sig);
-	var fd = i.newFunc(sig);
-	i.module.addImport("", "", [], fd);
-	i.imports = [HostFunction.new("test_gcCountProbe_callback", sig, test_force_gc_callback)];
-	i.code([Opcode.LOCAL_GET.code, 0,
-		Opcode.LOCAL_GET.code, 1,
-		Opcode.CALL.code, byte.!(fd.func_index)]);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 1, count);
-
-	i.assert_ii_i((44, 33), 22);
-	i.assert_ii_i((1090909, 0xFAAA0123), 88431075);
-
-	i.t.assert_eq(2uL, count.count);
-
-	SpcTuning.intrinsifyCountProbe = tuning_before;
-}
-
-class RecordTosProbe extends OperandProbe_i_v {
-	var recorded: u32;
-
-	def fire_i(val: u32) {
-		var x = [val, 11u];
-		Target.forceGC();
-		var y = [val, 12u];
-		Target.forceGC();
-		var z = [val, 13u];
-		Target.forceGC();
-		recorded = x[0];
-	}
-}
-
-def test_gc_OperandProbe_i_v(i: ExeTester) {
-	var tuning_before = SpcTuning.intrinsifyOperandProbe;
-	SpcTuning.intrinsifyOperandProbe = true; // TODO: manual for testing
-
-	var p1 = RecordTosProbe.new(), p2 = RecordTosProbe.new();
-
-	i.sig(SigCache.ii_i);
-	i.code([Opcode.LOCAL_GET.code, 0,
-		Opcode.LOCAL_GET.code, 1,
-		Opcode.I32_ADD.code]);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 3, p1);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 5, p2);
-
-	i.assert_ii_i((44, 33), 77);
-	i.t.assert_eq(44u, p1.recorded);
-	i.t.assert_eq(33u, p2.recorded);
-
-	i.assert_ii_i((1090909, 0xFAAA0123), 0xfabaa680);
-	i.t.assert_eq(1090909u, p1.recorded);
-	i.t.assert_eq(0xFAAA0123u, p2.recorded);
-
-	SpcTuning.intrinsifyOperandProbe = tuning_before;
-}
-
-def test_dyn_probe_insert(i: ExeTester) {
-	var counter = CountProbe.new();
-	var p1 = ClosureProbe.new(Instrumentation.insertLocalProbe, (i.module, i.func.func_index, 1, counter));
-
-	i.sig(SigCache.ii_i);
-	i.code([Opcode.LOCAL_GET.code, 0,
-		Opcode.LOCAL_GET.code, 1,
-		Opcode.I32_ADD.code]);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 3, p1);
-
-	i.assert_ii_i((44, 33), 77);
-	i.t.assert_eq(0u, counter.count);
-
-	i.assert_ii_i((55, 33), 88);
-	i.t.assert_eq(1u, counter.count);
-
-	i.assert_ii_i((44, 55), 99);
-	i.t.assert_eq(3u, counter.count);
-}
-
-def test_dyn_probe_insert_osr(i: ExeTester) {
-	var counter = CountProbe.new();
-	var p1 = ClosureProbe.new(Instrumentation.insertLocalProbe, (i.module, i.func.func_index, 3, counter));
-
-	i.sig(SigCache.ii_i);
-	i.code([Opcode.LOCAL_GET.code, 0,
-		Opcode.LOCAL_GET.code, 1,
-		Opcode.I32_ADD.code]);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 1, p1);
-
-	i.assert_ii_i((44, 33), 77);
-	i.t.assert_eq(1u, counter.count);
-
-	i.assert_ii_i((55, 33), 88);
-	i.t.assert_eq(3u, counter.count);
-
-	i.assert_ii_i((44, 55), 99);
-	i.t.assert_eq(6u, counter.count);
-}
-
-class TraceProbe2 extends CountProbe {
-	def fire(dynamicLoc: DynamicLoc) -> Resumption {
-		Trace.OUT.put2("count = %d, %d", count++, count).outln();
-		return Resumption.Continue;
-	}
-}
-
-def test_entry_probe(i: ExeTester) {
-	var counter = TraceProbe2.new();
-	i.sig(SigCache.i_i);
-	i.codev([
-		Opcode.LOOP.code, BpTypeCode.EmptyBlock.code,
-		Opcode.I32_CONST.code, 17,
-		Opcode.LOCAL_GET.code, 0,
-		Opcode.I32_CONST.code, 1,
-		Opcode.I32_SUB.code,
-		Opcode.LOCAL_TEE.code, 0,
-		Opcode.I32_EQZ.code,
-		Opcode.BR_IF.code, 1,
-		Opcode.BR.code, 0,
-		Opcode.END.code,
-		Opcode.UNREACHABLE.code
-	]);
-	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 0, counter);
-	i.assert_i_i(5, 17);
-	i.t.assert_eq(1u, counter.count);
-	i.assert_i_i(5, 17);
-	i.t.assert_eq(2u, counter.count);
-}

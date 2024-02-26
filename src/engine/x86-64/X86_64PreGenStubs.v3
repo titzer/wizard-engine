@@ -29,8 +29,10 @@ layout X86_64PreGenHeader {
 	+40	oobMemoryHandlerOffset:		i32;	// handler for signals caused by OOB memory access
 	+44	divZeroHandlerOffset:		i32;	// handler for signals caused by divide by zero
 	+48	stackOverflowHandlerOffset:	i32;	// handler for signals caused by (value- or call-) stack overflow
-	+56	codeEnd:			i32;	// end of all executable code
-	=60;
+	+56	hostCallStubOffset:		i32;	// host call stub that calls runtime
+	+60	hostCallStubEnd:		i32;	// host call stub that calls runtime
+	+64	codeEnd:			i32;	// end of all executable code
+	=68;
 }
 
 layout X86_64PreGenStubOffsets {
@@ -80,10 +82,35 @@ class X86_64PreGenFunc<P, R> extends X86_64PreGenStub {
 	}
 }
 
+// Simple stubs have no references in their frame and have a fixed size frame.
+class X86_64SimpleStub extends RiUserCode {
+	def stubName: string;
+	def frameSize: int;
+
+	new(stubName, frameSize: int) super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		if (Debug.stack) X86_64Stacks.traceIpAndSp(ip, sp, out);
+		var msg = "\tin [";
+		out(msg, 0, msg.length);
+		out(stubName, 0, stubName.length);
+		msg = "-stub]\n";
+		out(msg, 0, msg.length);
+	}
+	// Called from V3 runtime for a frame where {ip} is in the stub code.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp += frameSize;	 // assume frame is allocated
+		ip = sp.load<Pointer>(); // return address on stack
+		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+}
+
 // Interface to pre-generated code stubs.
 def I: X86_64Interpreter;
 component X86_64PreGenStubs {
 	private def ic = X86_64InterpreterCode.new(Pointer.NULL, Pointer.NULL, pregen_header);
+	private def hostCallStub = X86_64SimpleStub.new("host-call", 0);
 
 	def getInterpreterCode() -> X86_64InterpreterCode {
 		return (gen(), I.interpreterCode).last;
@@ -193,8 +220,14 @@ component X86_64PreGenStubs {
 		// Write-protect the executable code for security and debugging
 		Mmap.protect(range.start + ic.header.codeStart, u64.!(ic.header.codeEnd - ic.header.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
 
+		// The host call stub is part of interpreter code (TODO: does it need to be?)
+		hostCallStub.start = ic.start + ic.header.hostCallStubOffset;
+		hostCallStub.end = ic.start + ic.header.hostCallStubEnd;
+
 		// Register user code objects with the Virgil runtime.
 		RiRuntime.registerUserCode(ic);
+
+		RiRuntime.registerUserCode(hostCallStub);
 
 		// Register all stubs that have user code with the Virgil runtime.
 		for (l = global_stub_list; l != null; l = l.tail) {
@@ -211,6 +244,7 @@ component X86_64PreGenStubs {
 			Trace.OUT
 				.puts("Pregen interpreter and compiler stub addresses:\n")
 				.put1("\tcode start:                0x%x\n", s + ic.header.codeStart)
+				.put1("\thost call stub:     break *0x%x\n", s + ic.header.hostCallStubOffset)
 				.put1("\tv3->int entry:      break *0x%x\n", s + ic.header.intV3EntryOffset)
 				.put1("\tspc->int entry:     break *0x%x\n", s + ic.header.intSpcEntryOffset)
 				.put1("\tint->int entry:     break *0x%x\n", s + ic.header.intIntEntryOffset)
