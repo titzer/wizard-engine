@@ -1,111 +1,15 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def FINISHED: Throwable = null;
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
 component X86_64Runtime {
 	def globalFrameDescriptionBuf = StringBuilder.new().grow(256);  // avoid allocations when describing frames
 	var curStack: X86_64Stack;
 
-	def run(f: Function, args: Range<Value>) -> Result {
-		// Check whether to run on a separate physical stack.
-		if (!FeatureDisable.separateStacks) {
-			var prev = curStack;
-			var stack = X86_64Stack.new(EngineOptions.stackSize);
-			var result = stack.reset(f).bind(args).resume();
-			curStack = prev;
-			return result;
-		}
-		if (curStack == null) curStack = X86_64Stack.new(EngineOptions.stackSize);
-		// Unpack arguments into value stack format.
-		var prev_vsp = curStack.vsp;
-		if (args != null) for (v in args) curStack.push(v);
-
-		// Call the main loop which handles tail calls.
-		var thrown = runWithTailCalls(f, Pointer.NULL);
-		// Unpack the abrupt return value into a {Result}.
-		if (thrown == null) {
-			var result = popResult(f.sig);
-			if (curStack.vsp != prev_vsp) {
-				return Result.Throw(InternalError.new(
-					Strings.format2("stack height mismatch, expected vsp = 0x%x, got 0x%x",
-						prev_vsp - Pointer.NULL, curStack.vsp - Pointer.NULL), null));
-			}
-			return result;
-		} else {
-			curStack.vsp = prev_vsp;
-			return Result.Throw(thrown);
-		}
-	}
-	private def runWithTailCalls(f: Function, sp: Pointer) -> Throwable {
-		var stack = curStack;
-		var state = FINISHED;
-		while (true) { // handle repeated tail calls
-			var result: HostResult;
-			match (f) {
-				wf: WasmFunction => {
-					var vsp = curStack.vsp;
-					if (Debug.runtime) Trace.OUT.put2("runWithTailCalls(wf=0x%x, vsp=0x%x)",
-						(Pointer.atObject(wf) - Pointer.NULL), vsp - Pointer.NULL).outln();
-					var ret = invoke(wf, vsp);
-					curStack = stack;
-					if (ret == null) {
-						curStack.vsp = vsp + ((wf.sig.results.length - wf.sig.params.length) * curStack.valuerep.slot_size);
-					}
-					return ret;
-				}
-				hf: HostFunction => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var args = curStack.popN(hf.sig.params);
-					var result = hf.invoke(args);
-					curStack = stack;
-					match (result) {
-						Throw(thrown) => {
-							if (sp != Pointer.NULL) prependFrames(thrown, hf, sp);
-							state = thrown;
-							break;
-						}
-						Value0 => {
-							break;
-						}
-						Value1(val) => {
-							curStack.push(val);
-							break;
-						}
-						ValueN(vals) => {
-							for (a in vals) curStack.push(a);
-							break;
-						}
-						TailCall(target, args) => {
-							for (a in args) curStack.push(a);
-							f = target;
-							continue; // continue with next tail call
-						}
-					}
-				}
-			}
-		}
-		return state;
-	}
-	private def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
-		Debug.invoke(wf);
-		if (wf.decl.target_code.spc_entry != Pointer.NULL) {
-			Debug.invokeSpc(wf);
-			return X86_64Spc.invoke(wf, sp);
-		} else {
-			Debug.invokeInterpreter(wf);
-			return X86_64PreGenStubs.getIntV3Entry()(wf, sp);
-		}
-	}
-	private def popResult(sig: SigDecl) -> Result {
-		var rt = sig.results;
-		var r = Array<Value>.new(rt.length);
-		for (i = r.length - 1; i >= 0; i--) r[i] = curStack.pop(rt[i]);
-		return Result.Value(r);
-	}
-	//=====================================================================
-	// Standard callbacks for complex bytecodes
-	//=====================================================================
+	// Callback for running host functions. Since host functions can trap, throw exceptions, and
+	// tail-call other functions, this routine must handle all these cases. Trapping/throwing
+	// is handled by returning a non-null {Throwable} and tail-calling a {WasmFunction} is handled
+	// by returning that function to the (Wasm) caller, with the stack already containing its arguments.
 	def runtime_callHost(hf: HostFunction) -> (Throwable, WasmFunction) {
 		var stack = curStack; // XXX: accept as parameter?
 		var args: Range<Value> = stack.popN(hf.sig.params);
@@ -114,8 +18,7 @@ component X86_64Runtime {
 			var result = hf.invoke(args);
 			match (result) {
 				Throw(thrown) => {
-					if (FeatureDisable.separateStacks) stack.prependFrames0(thrown, hf, CiRuntime.callerSp());
-					else stack.prependFrames(thrown, hf);
+					stack.prependFrames(thrown, hf);
 					return (thrown, null);
 				}
 				Value0 => {
@@ -146,6 +49,9 @@ component X86_64Runtime {
 		}
 		return (null, null);
 	}
+	//=====================================================================
+	// Callbacks for complex bytecodes
+	//=====================================================================
 	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
 		var memory = instance.memories[index];
 		var pages = curStack.popu();
@@ -160,7 +66,7 @@ component X86_64Runtime {
 		var dst_offset = curStack.popu();
 		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> Throwable { // XXX: inline
 		var dst = instance.memories[mindex1];
@@ -170,7 +76,7 @@ component X86_64Runtime {
 		var dst_offset = curStack.popu();
 		var t = dst.copyM(dst_offset, src, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> Throwable {
 		var memory = instance.memories[mindex];
@@ -179,7 +85,7 @@ component X86_64Runtime {
 		var dest = curStack.popu();
 		var t = memory.fill(dest, u8.view(val), size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
 		var val = instance.globals[index].value;
@@ -196,7 +102,7 @@ component X86_64Runtime {
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		var val = table.elems[elem];
 		curStack.push(val);
-		return FINISHED;
+		return null;
 	}
 	def runtime_TABLE_SET(instance: Instance, index: u32) -> Throwable {
 		var table = instance.tables[index];
@@ -204,7 +110,7 @@ component X86_64Runtime {
 		var elem = curStack.popu();
 		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
 		table[int.view(elem)] = val;
-		return FINISHED;
+		return null;
 	}
 	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> Throwable {
 		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
@@ -214,7 +120,7 @@ component X86_64Runtime {
 		var dst_offset = curStack.popu();
 		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> Throwable {
 		var dst = instance.tables[t1];
@@ -222,7 +128,7 @@ component X86_64Runtime {
 		var size = curStack.popu(), src_offset = curStack.popu(), dst_offset = curStack.popu();
 		var t = dst.copyT(dst_offset, src, src_offset, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
 		var table = instance.tables[tindex];
@@ -238,7 +144,7 @@ component X86_64Runtime {
 		var dest = curStack.popu();
 		var t = table.fill(dest, val, size);
 		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+		return null;
 	}
 	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(CiRuntime.callerSp());
