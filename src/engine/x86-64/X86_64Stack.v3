@@ -58,7 +58,7 @@ class X86_64Stack extends WasmStack {
 	// or suspends itself.
 	def resume() -> Result {
 		checkState("resume()", StackState.RESUMABLE);
-		if (Trace.stack) traceFrames("stack.resume", rsp + Pointer.SIZE);
+		if (Trace.stack) traceFrames("stack.resume", rsp + RETADDR_SIZE);
 		var bottom = this;
 		while (bottom.parent != null) bottom = X86_64Stack.!(bottom.parent); // find bottom of this stack
 		state_ = StackState.RUNNING;
@@ -73,45 +73,61 @@ class X86_64Stack extends WasmStack {
 	def where() -> FrameLoc;
 	// Gets the caller of a given {FrameLoc}.
 	def caller(loc: FrameLoc) -> FrameLoc;
-	// Prepends frames from this stack to the given throwable.
-	def prependFrames(thrown: Throwable, hf: HostFunction) -> Throwable {
+	// "Throw" a trap on this stack.
+	def trap(reason: TrapReason) -> Throwable {
+		return throw(Trap.new(reason, null, null));
+	}
+	// Throw a throwable on this stack, unwinding to the handler, if there is one.
+	def throw(thrown: Throwable) -> Throwable {
+		if (Trace.stack) traceFrames(Strings.format1("stack.throw(%q)", thrown.render), rsp + RETADDR_SIZE);
+		// Perform a stackwalk, starting from the RSP stored in this object, gathering frames.
 		var sp = this.rsp;
-		var trace = Vector<(WasmFunction, int)>.new();
-		var estimate = (mapping.range.end - rsp) / X86_64InterpreterFrame.size;
-		trace.grow(int.view(estimate)); // preallocate frame entries
+		var gatherTrace = !FeatureDisable.stacktraces;
+		var trace = if (gatherTrace, Vector<(WasmFunction, int)>.new());
+		var return_parent_sp = walk(if(gatherTrace, addFrameToTrace), trace, sp);
+		if (!FeatureDisable.stackUnwind) {
+			// Unwind this stack to the return parent stub and overwrite the caller's return IP.
+			unwind(sp + -RETADDR_SIZE, return_parent_sp);
+		}
+
+		// Append the (reversed) stacktrace to the throwable.
+		if (trace != null) thrown.prependFrames(ArrayUtil.copyReverse(trace));
+		return thrown;
+	}
+	// Walk the stack, applying {f} to every target frame (i.e. no stubs). If {f} returns {false},
+	// stop the stackwalk. Otherwise stop at the return-parent stub. In any case, return the last
+	// valid stack pointer.
+	// (XXX: takes a function {f} with an additional parameter, and the parameter, to avoid a closure).
+	private def walk<P>(f: (TargetFrame, P) -> bool, param: P, start_sp: Pointer) -> Pointer {
+		var sp = start_sp;
+		var return_parent_sp: Pointer;
 		while (sp < mapping.range.end) {
-			var retip = (sp + -Pointer.SIZE).load<Pointer>();
+			var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			var accessor: FrameAccessor;
-			match (code) {
-				x: X86_64InterpreterCode => accessor = TargetFrame(sp).getFrameAccessor();
-				x: X86_64SpcModuleCode => accessor = TargetFrame(sp).getFrameAccessor();
-				x: X86_64SpcTrapsStub => accessor = TargetFrame(sp).getFrameAccessor();
-			}
-			if (accessor != null) trace.put(accessor.func(), accessor.pc());
 			if (Trace.stack && Debug.stack) {
 				Trace.OUT.put1("\tretip=0x%x", retip - Pointer.NULL);
 				if (code != null) code.describeFrame(retip, sp, Trace.OUT.putk_void);
 				else Trace.OUT.outln();
 			}
-			if (code == null) break;
+			match (code) {
+				null => break;
+				x: X86_64InterpreterCode => if (f != null && !f(TargetFrame(sp), param)) break;
+				x: X86_64SpcModuleCode => if (f != null && !f(TargetFrame(sp), param)) break;
+				x: X86_64SpcTrapsStub => if (f != null && !f(TargetFrame(sp), param)) break;
+				x: X86_64ReturnParentStub => return_parent_sp = sp;
+			}
 			var t = code.nextFrame(retip, sp);
 			sp = t.1;
 		}
-
-		var result = Array<(WasmFunction, int)>.new(trace.length); // reverse frames
-		for (i < result.length) {
-			result[i] = trace[result.length - i - 1];
-		}
-		thrown.prepend(result, hf);
-		return thrown;
+		return return_parent_sp;
 	}
 	def traceFrames(when: string, sp: Pointer) {
 		Trace.OUT.puts(when);
 		if (Debug.stack) Trace.OUT.put1(" rsp=0x%x", rsp - Pointer.NULL);
 		Trace.OUT.outln();
 		while (sp >= mapping.range.start && sp < mapping.range.end) {
-			var retip = (sp + -Pointer.SIZE).load<Pointer>();
+			var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			if (code == null) break;
 			code.describeFrame(retip, sp, Trace.STDOUT_p);
@@ -122,13 +138,27 @@ class X86_64Stack extends WasmStack {
 	def setRsp(ptr: Pointer) -> this {
 		rsp = ptr;
 	}
-	def trap(reason: TrapReason) -> Throwable {
-		if (Trace.stack) traceFrames(Strings.format1("stack.trap(%s)", reason.name), rsp + Pointer.SIZE);
-		var trap = Trap.new(reason, null, null);
-		return prependFrames(trap, null);
+	private def addFrameToTrace(frame: TargetFrame, trace: Vector<(WasmFunction, int)>) -> bool {
+		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
+		trace.put(accessor.func(), accessor.pc());
+		return true;
 	}
-	def throw(t: Throwable) -> Throwable {
-		return prependFrames(t, null);
+	private def unwind(p_retaddr: Pointer, return_parent_sp: Pointer) {
+		this.vsp = mapping.range.start; // clear value stack
+		if (return_parent_sp != this.rsp) { // unwind by updating return address
+			this.rsp = (return_parent_sp + -RETADDR_SIZE);
+			if (p_retaddr != Pointer.NULL) p_retaddr.store<Pointer>(STACK_UNWIND_STUB.getEntry() + NOP_ENTRY);
+		}
+	}
+	def handleOverflow(ip: Pointer, sp: Pointer) -> Pointer {
+		if (Trace.stack) traceFrames("stack.overflow (before)", sp);
+		// Unwind the stack, skipping the top frame (which might have triggered the overflow)
+		var return_parent_sp = walk<void>(null, (), sp);
+		// Unwind without updating any return addresses.
+		unwind(Pointer.NULL, return_parent_sp);
+		// Instead, return from the signal to the stack overflow stub, which will unwind with a Trap.STACK_OVERFLOW throwable.
+		if (Trace.stack) traceFrames("stack.overflow (after)", this.rsp + RETADDR_SIZE);
+		return STACK_OVERFLOW_STUB.getEntry() + NOP_ENTRY;
 	}
 	// Throws an exception with {tag} and {vals} on this stack.
 	// If the stack has no handler for the given tag, all frames will be popped
@@ -369,7 +399,7 @@ def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
 
 component X86_64Stacks {
 	def getFrameAccessor(sp: Pointer) -> FrameAccessor {
-		var retip = (sp + -Pointer.SIZE).load<Pointer>();
+		var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 		var code = RiRuntime.findUserCode(retip);
 		match (code) {
 			x: X86_64InterpreterCode => {
@@ -402,10 +432,12 @@ component X86_64Stacks {
 }
 
 def NOP_ENTRY = 1;
+def RETADDR_SIZE = Pointer.SIZE;
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
 def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(), genStackReturnParentStub);
 def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
-def STACK_UNWIND_STUB = X86_64PreGenStub.new("stack-unwind", X86_64SimpleStub.new("stack-unwind", 0), genStackUnwindStub);
+def STACK_UNWIND_STUB = X86_64PreGenStub.new("stack-unwind", X86_64UnwindStub.new("stack-unwind"), genStackUnwind(_, _, null));
+def STACK_OVERFLOW_STUB = X86_64PreGenStub.new("stack-overflow", X86_64UnwindStub.new("stack-overflow"), genStackUnwind(_, _, Execute.trapObjects[TrapReason.STACK_OVERFLOW.tag]));
 
 // Called by V3 code to resume a stack.
 // Sets up {X86_64Runtime.curStack}, VSP, and switches the machine stack pointer,
@@ -423,8 +455,6 @@ def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent_rsp_ptr));
 	// mov [%tmp == [%bottom.parent_rsp_ptr]], %rsp
 	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(xenv.scratch, 0), xenv.sp);
-	// mov [%bottom.parent_ptr], 0
-	masm.emit_mov_m_l(MasmAddr(r_bottom, masm.offsets.X86_64Stack_parent), 0);
 	// mov rsp, [%stack.rsp]  ; switch machine stack pointer
 	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp));
 	// mov vsp, [%stack.vsp]  ; load VSP
@@ -457,7 +487,38 @@ class X86_64ReturnParentStub extends RiUserCode {
 		sp = sp.load<Pointer>(); // parent_rsp on stack
 		if (sp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
 		ip = sp.load<Pointer>();
-		return (ip + -1, sp + Pointer.SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+		return (ip + -1, sp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+}
+
+// The unwind stub is used to remove frames that have been logically unwound but still remain
+// on the stack because, e.g. host code has not yet returned to Wasm.
+//  [     host frame*    ]                 [     host frame*    ]
+//  [   host call stub   ]  == unwind ==>  [     unwind stub    ]
+//  [     wasm frame*    ]                 [        ...         ]
+//  [ return parent stub ]                 [ return parent stub ]
+class X86_64UnwindStub extends RiUserCode {
+	def name: string;
+	new(name) super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
+		if (Debug.stack) X86_64Stacks.traceIpAndSp(ip, sp, out);
+		var buf = X86_64Runtime.globalFrameDescriptionBuf;
+		buf.puts("\tin [").puts(name).puts("-stub]");
+		if (Debug.stack) {
+			var next_rsp = X86_64Runtime.curStack.rsp;
+			buf.put1(" next_rsp=0x%x", next_rsp - Pointer.NULL);
+		}
+		buf.ln().out(out);
+		buf.reset();
+	}
+	// Called from V3 runtime to get to the next frame.
+	def nextFrame(ip: Pointer, sp: Pointer) -> (Pointer, Pointer) {
+		sp = X86_64Runtime.curStack.rsp;
+		if (sp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
+		ip = sp.load<Pointer>();
+		return (ip + -1, sp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
 	}
 }
 
@@ -565,7 +626,7 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 
 // Returned to by host code to unwind frames on the stack, e.g. to exit because of a trap or catch
 // an exception.
-def genStackUnwindStub(ic: X86_64InterpreterCode, w: DataWriter) {
+def genStackUnwind(ic: X86_64InterpreterCode, w: DataWriter, thrown: Throwable) {
 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	var asm = X86_64Assembler.!(masm.asm);
 	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
@@ -575,11 +636,17 @@ def genStackUnwindStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	// Nothing calls this stub; it is only returned to. A nop serves as a placeholder for a non-existent
 	// call instruction so that stackwalking logic works properly.
 	asm.nop1();
-	// mov %stack, [cur_stack]    ; reload stack object from curStack
+	// mov %stack, [cur_stack]          ; reload stack object from curStack
 	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
-	// mov %vsp, [%stack.vsp]     ; reload VSP from stack object
+	// mov %vsp, [%stack.vsp]           ; reload VSP from stack object
 	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
-	// mov [%stack.rsp], %rsp     ; unwind stack
+	if (thrown != null) {
+		// TODO: instead of a dedicated stack overflow stub, overwrite %ret_throw in the ucontext.
+		// mov %ret_throw, #thrown  ; for stack overflow, load a trap object into a register
+		var ptr = Pointer.atObject(thrown);
+		asm.movq_r_l(G(xenv.ret_throw), ptr - Pointer.NULL);
+	}
+	// mov [%stack.rsp], %rsp           ; unwind stack
 	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp));
 	// and return
 	masm.emit_ret();
@@ -693,8 +760,8 @@ class X86_64FrameAccessor(stack: X86_64Stack, sp: Pointer, decl: FuncDecl) exten
 		var depth = 0;
 		var next_sp = sp;
 		while (true) {
-			next_sp = next_sp + X86_64InterpreterFrame.size + Pointer.SIZE;
-			var retip = (next_sp + -Pointer.SIZE).load<Pointer>();
+			next_sp = next_sp + X86_64InterpreterFrame.size + RETADDR_SIZE;
+			var retip = (next_sp + -RETADDR_SIZE).load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			match (code) {
 				x: X86_64InterpreterCode => ;
@@ -762,11 +829,11 @@ class X86_64FrameAccessor(stack: X86_64Stack, sp: Pointer, decl: FuncDecl) exten
 	}
 	// Read the instruction pointer from the frame.
 	private def readIp() -> Pointer {
-		return (sp + -Pointer.SIZE).load<Pointer>();
+		return (sp + -RETADDR_SIZE).load<Pointer>();
 	}
 	// Compute the caller frame's stack pointer.
 	def callerSp() -> Pointer {
-		return sp + X86_64InterpreterFrame.size + Pointer.SIZE;
+		return sp + X86_64InterpreterFrame.size + RETADDR_SIZE;
 	}
 	def isSpc() -> bool {
 		var ip = readIp();
@@ -783,16 +850,16 @@ class X86_64FrameAccessor(stack: X86_64Stack, sp: Pointer, decl: FuncDecl) exten
 	private def deoptToInterpreter() {
 		var wf = func(), func = wf.decl, code = func.cur_bytecode;
 		var pc = this.pc();
-		(sp + X86_64InterpreterFrame.func_decl.offset)	.store<FuncDecl>(func);
-		(sp + X86_64InterpreterFrame.curpc.offset)		.store<int>(pc);
-		(sp + X86_64InterpreterFrame.code.offset)		.store<Array<byte>>(code);
-		(sp + X86_64InterpreterFrame.ip.offset)		.store<Pointer>(Pointer.atElement(code, pc));
-		(sp + X86_64InterpreterFrame.eip.offset)		.store<Pointer>(Pointer.atEnd(code));
 		var map = SidetableMap.new(func); // TODO: cache in FuncDecl?
 		var stp = map[pc];
-		(sp + X86_64InterpreterFrame.stp.offset)		.store<Pointer>(Pointer.atElement(func.sidetable.entries, stp));
 		var ic = X86_64PreGenStubs.getInterpreterCode();
-		(sp + -Pointer.SIZE)			.store<Pointer>(ic.start + ic.header.deoptReentryOffset);
+		(sp + X86_64InterpreterFrame.func_decl.offset)	.store<FuncDecl>(func);
+		(sp + X86_64InterpreterFrame.curpc.offset)	.store<int>(pc);
+		(sp + X86_64InterpreterFrame.code.offset)	.store<Array<byte>>(code);
+		(sp + X86_64InterpreterFrame.ip.offset)		.store<Pointer>(Pointer.atElement(code, pc));
+		(sp + X86_64InterpreterFrame.eip.offset)	.store<Pointer>(Pointer.atEnd(code));
+		(sp + X86_64InterpreterFrame.stp.offset)	.store<Pointer>(Pointer.atElement(func.sidetable.entries, stp));
+		(sp + -RETADDR_SIZE)				.store<Pointer>(ic.start + ic.header.deoptReentryOffset);
 	}
 }
 private class X86_64FrameWriter extends FrameWriter {
