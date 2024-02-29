@@ -32,7 +32,11 @@ function run {
         batching=20
     fi
 
-    run_batched $batching "$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS" $TESTS
+    if [[ "$BRANCH" != "spec" && "$BRANCH" != "" ]]; then
+	EXT_OPTS="-ext:$BRANCH"
+    fi
+    
+    run_batched $batching "$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS $EXT_OPTS" $TESTS
 }
 
 BRANCHES="$*"
