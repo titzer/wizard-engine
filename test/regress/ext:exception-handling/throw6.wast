@@ -1,0 +1,35 @@
+(module
+  (tag $e-i32 (param i32))
+  (tag $e-f32 (param f32))
+  (tag $e-i64 (param i64))
+  (tag $e-f64 (param f64))
+
+  (func (export "test-throw-catch-i32") (param i32) (result i32)
+    (try_table (catch $e-i32 0) (local.get 0) (throw $e-i32))
+    (i32.const 99)
+  )
+  (func (export "test-throw-catch-f32") (param f32) (result f32)
+    (try_table (catch $e-f32 0) (local.get 0) (throw $e-f32))
+    (f32.const 99)
+  )
+  (func (export "test-throw-catch-i64") (param i64) (result i64)
+    (try_table (catch $e-i64 0) (local.get 0) (throw $e-i64))
+    (i64.const 99)
+  )
+  (func (export "test-throw-catch-f64") (param f64) (result f64)
+    (try_table (catch $e-f64 0) (local.get 0) (throw $e-f64))
+    (f64.const 99)
+  )
+)
+
+(assert_return (invoke "test-throw-catch-i32" (i32.const 773)) (i32.const 773))
+(assert_return (invoke "test-throw-catch-i32" (i32.const -99991)) (i32.const -99991))
+
+(assert_return (invoke "test-throw-catch-f32" (f32.const 773)) (f32.const 773))
+(assert_return (invoke "test-throw-catch-f32" (f32.const -99991)) (f32.const -99991))
+
+(assert_return (invoke "test-throw-catch-i64" (i64.const 773)) (i64.const 773))
+(assert_return (invoke "test-throw-catch-i64" (i64.const -99991)) (i64.const -99991))
+
+(assert_return (invoke "test-throw-catch-f64" (f64.const 773)) (f64.const 773))
+(assert_return (invoke "test-throw-catch-f64" (f64.const -99991)) (f64.const -99991))
