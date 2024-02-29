@@ -73,15 +73,9 @@ class X86_64Stack extends WasmStack {
 	def where() -> FrameLoc;
 	// Gets the caller of a given {FrameLoc}.
 	def caller(loc: FrameLoc) -> FrameLoc;
-	// Tries to catch an exception.
-	def catch(thrown: Throwable) -> bool {
-		return false; // TODO: prepend stacktrace
-	}
 	// Prepends frames from this stack to the given throwable.
 	def prependFrames(thrown: Throwable, hf: HostFunction) -> Throwable {
-		return prependFrames0(thrown, hf, rsp);
-	}
-	def prependFrames0(thrown: Throwable, hf: HostFunction, sp: Pointer) -> Throwable {
+		var sp = this.rsp;
 		var trace = Vector<(WasmFunction, int)>.new();
 		var estimate = (mapping.range.end - rsp) / X86_64InterpreterFrame.size;
 		trace.grow(int.view(estimate)); // preallocate frame entries
@@ -92,8 +86,14 @@ class X86_64Stack extends WasmStack {
 			match (code) {
 				x: X86_64InterpreterCode => accessor = TargetFrame(sp).getFrameAccessor();
 				x: X86_64SpcModuleCode => accessor = TargetFrame(sp).getFrameAccessor();
+				x: X86_64SpcTrapsStub => accessor = TargetFrame(sp).getFrameAccessor();
 			}
 			if (accessor != null) trace.put(accessor.func(), accessor.pc());
+			if (Trace.stack && Debug.stack) {
+				Trace.OUT.put1("\tretip=0x%x", retip - Pointer.NULL);
+				if (code != null) code.describeFrame(retip, sp, Trace.OUT.putk_void);
+				else Trace.OUT.outln();
+			}
 			if (code == null) break;
 			var t = code.nextFrame(retip, sp);
 			sp = t.1;
@@ -119,9 +119,17 @@ class X86_64Stack extends WasmStack {
 			sp = t.1;
 		}
 	}
-	// Pops all the frames off this stack, leaving it in {state == EMPTY}.
-	// Returns a {StackSegment} if {stacktrace == true}.
-	def popAllFrames(stacktrace: bool) -> StackSegment;
+	def setRsp(ptr: Pointer) -> this {
+		rsp = ptr;
+	}
+	def trap(reason: TrapReason) -> Throwable {
+		if (Trace.stack) traceFrames(Strings.format1("stack.trap(%s)", reason.name), rsp + Pointer.SIZE);
+		var trap = Trap.new(reason, null, null);
+		return prependFrames(trap, null);
+	}
+	def throw(t: Throwable) -> Throwable {
+		return prependFrames(t, null);
+	}
 	// Throws an exception with {tag} and {vals} on this stack.
 	// If the stack has no handler for the given tag, all frames will be popped
 	// and an {Exception} will be created and returned.
@@ -130,13 +138,13 @@ class X86_64Stack extends WasmStack {
 	// or {state == RUNNING_WASM}.
 	def throwTag(tag: Tag, vals: Range<Value>, stacktrace: bool) -> Exception;
 	// Empties all the frames on this stack and sets it back to the {StackState.EMPTY} state.
-	def clear() {
+	def clear() -> this {
 		state_ = StackState.EMPTY;
 		vsp = mapping.range.start;
 		rsp = mapping.range.end;
 		params_arity = -1;
 		return_results = null;
-		parent = null;
+		parent =  null;
 		parent_rsp_ptr = Pointer.NULL;
 		func = null;
 	}
@@ -167,10 +175,16 @@ class X86_64Stack extends WasmStack {
 			}
 		}
 	}
+	def pushi(v: int) {
+		pushPair(BpTypeCode.I32.code, u64.view(v));
+	}
 	def popN(t: Array<ValueType>) -> Array<Value> {
 		var r = Array<Value>.new(t.length);
 		for (j = t.length - 1; j >= 0; j--) r[j] = pop(t[j]);
 		return r;
+	}
+	def popV(t: ValueType) -> Value {
+		return pop(t);
 	}
 	def pop(t: ValueType) -> Value {
 		match (t) {
@@ -254,10 +268,6 @@ class X86_64Stack extends WasmStack {
 		}
 		vsp += -(valuerep.slot_size);
 		return (vsp + valuerep.tag_size).load<Object>();
-	}
-	def popFunction() -> Function {
-		var obj = popObject();
-		return Function.!(obj);
 	}
 	def checkTopTag(tag: byte) -> byte {
 		if (!valuerep.tagged) return tag;
@@ -395,6 +405,7 @@ def NOP_ENTRY = 1;
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
 def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(), genStackReturnParentStub);
 def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
+def STACK_UNWIND_STUB = X86_64PreGenStub.new("stack-unwind", X86_64SimpleStub.new("stack-unwind", 0), genStackUnwindStub);
 
 // Called by V3 code to resume a stack.
 // Sets up {X86_64Runtime.curStack}, VSP, and switches the machine stack pointer,
@@ -424,7 +435,7 @@ def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_jump_r(xenv.scratch);
 }
 
-// The parent return stub requires special handling for Virgil stackwalking to continue
+// The return parent stub requires special handling for Virgil stackwalking to continue
 // the stackwalk on the parent stack.
 class X86_64ReturnParentStub extends RiUserCode {
 	new() super(Pointer.NULL, Pointer.NULL) { }
@@ -433,7 +444,7 @@ class X86_64ReturnParentStub extends RiUserCode {
 	def describeFrame(ip: Pointer, sp: Pointer, out: (Array<byte>, int, int) -> ()) {
 		if (Debug.stack) X86_64Stacks.traceIpAndSp(ip, sp, out);
 		var buf = X86_64Runtime.globalFrameDescriptionBuf;
-		buf.puts("\tin [parent-return-stub]");
+		buf.puts("\tin [return-parent-stub]");
 		if (Debug.stack) {
 			var parent_rsp = sp.load<Pointer>();
 			buf.put1(" parent_rsp=0x%x", parent_rsp - Pointer.NULL);
@@ -552,6 +563,28 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_ret();
 }
 
+// Returned to by host code to unwind frames on the stack, e.g. to exit because of a trap or catch
+// an exception.
+def genStackUnwindStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+	var asm = X86_64Assembler.!(masm.asm);
+	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
+	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
+	var r_stack = xenv.tmp0;
+
+	// Nothing calls this stub; it is only returned to. A nop serves as a placeholder for a non-existent
+	// call instruction so that stackwalking logic works properly.
+	asm.nop1();
+	// mov %stack, [cur_stack]    ; reload stack object from curStack
+	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+	// mov %vsp, [%stack.vsp]     ; reload VSP from stack object
+	masm.emit_mov_r_m(ValueKind.REF, xenv.vsp, MasmAddr(r_stack, masm.offsets.X86_64Stack_vsp));
+	// mov [%stack.rsp], %rsp     ; unwind stack
+	masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, masm.offsets.X86_64Stack_rsp));
+	// and return
+	masm.emit_ret();
+}
+
 // X86_64Stack object
 //================================================================================================
 // state =      SUSPENDED                 RESUMABLE                  RUNNING
@@ -571,7 +604,7 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 //                                                        rsp -> [  wasm frame   ]
 //                              rsp -> [ enter/reenter ]         [  wasm frame   ]
 // rsp ->    [     entry     ]         [  wasm frame   ]         [  wasm frame   ]
-//           [ parent return ]         [ parent return ]         [ parent return ]
+//           [ return parent ]         [ return parent ]         [ return parent ]
 // end ->
 //
 //                                                            stack.parent_rsp
@@ -774,5 +807,29 @@ private class X86_64FrameWriter extends FrameWriter {
 		var vfp = (accessor.sp + X86_64InterpreterFrame.vfp.offset).load<Pointer>();
 		accessor.stack.writeValue(vfp, i, v);
 		if (accessor.isSpc()) accessor.deoptToInterpreter();
+	}
+}
+
+// Manages stack space.
+component X86_64StackManager {
+	var cache: X86_64Stack;
+
+	def getFreshStack() -> X86_64Stack {
+		if (cache == null) return X86_64Stack.new(EngineOptions.stackSize);
+		var result = cache;
+		cache = null;
+		return result;
+	}
+	def recycleStack(stack: X86_64Stack) {
+		if (cache == null) cache = stack; // XXX: save the larger/smaller of the stacks?
+	}
+	def runOnFreshStack(f: Function, args: Range<Value>) -> Result {
+		// Always run functions on a separate, fresh stack.
+		var prev = X86_64Runtime.curStack; // handle reentrancy
+		var stack = X86_64StackManager.getFreshStack();
+		var result = stack.reset(f).bind(args).resume();
+		X86_64Runtime.curStack = prev;
+		X86_64StackManager.recycleStack(stack.clear());
+		return result;
 	}
 }

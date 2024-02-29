@@ -1,121 +1,24 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-def FINISHED: Throwable = null;
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
 component X86_64Runtime {
 	def globalFrameDescriptionBuf = StringBuilder.new().grow(256);  // avoid allocations when describing frames
 	var curStack: X86_64Stack;
 
-	def run(f: Function, args: Range<Value>) -> Result {
-		// Check whether to run on a separate physical stack.
-		if (!FeatureDisable.separateStacks) {
-			var prev = curStack;
-			var stack = X86_64Stack.new(EngineOptions.stackSize);
-			var result = stack.reset(f).bind(args).resume();
-			curStack = prev;
-			return result;
-		}
-		if (curStack == null) curStack = X86_64Stack.new(EngineOptions.stackSize);
-		// Unpack arguments into value stack format.
-		var prev_vsp = curStack.vsp;
-		if (args != null) for (v in args) curStack.push(v);
-
-		// Call the main loop which handles tail calls.
-		var thrown = runWithTailCalls(f, Pointer.NULL);
-		// Unpack the abrupt return value into a {Result}.
-		if (thrown == null) {
-			var result = popResult(f.sig);
-			if (curStack.vsp != prev_vsp) {
-				return Result.Throw(InternalError.new(
-					Strings.format2("stack height mismatch, expected vsp = 0x%x, got 0x%x",
-						prev_vsp - Pointer.NULL, curStack.vsp - Pointer.NULL), null));
-			}
-			return result;
-		} else {
-			curStack.vsp = prev_vsp;
-			return Result.Throw(thrown);
-		}
-	}
-	private def runWithTailCalls(f: Function, sp: Pointer) -> Throwable {
-		var stack = curStack;
-		var state = FINISHED;
-		while (true) { // handle repeated tail calls
-			var result: HostResult;
-			match (f) {
-				wf: WasmFunction => {
-					var vsp = curStack.vsp;
-					if (Debug.runtime) Trace.OUT.put2("runWithTailCalls(wf=0x%x, vsp=0x%x)",
-						(Pointer.atObject(wf) - Pointer.NULL), vsp - Pointer.NULL).outln();
-					var ret = invoke(wf, vsp);
-					curStack = stack;
-					if (ret == null) {
-						curStack.vsp = vsp + ((wf.sig.results.length - wf.sig.params.length) * curStack.valuerep.slot_size);
-					}
-					return ret;
-				}
-				hf: HostFunction => {
-					if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-					var args = curStack.popN(hf.sig.params);
-					var result = hf.invoke(args);
-					curStack = stack;
-					match (result) {
-						Throw(thrown) => {
-							if (sp != Pointer.NULL) prependFrames(thrown, hf, sp);
-							state = thrown;
-							break;
-						}
-						Value0 => {
-							break;
-						}
-						Value1(val) => {
-							curStack.push(val);
-							break;
-						}
-						ValueN(vals) => {
-							for (a in vals) curStack.push(a);
-							break;
-						}
-						TailCall(target, args) => {
-							for (a in args) curStack.push(a);
-							f = target;
-							continue; // continue with next tail call
-						}
-					}
-				}
-			}
-		}
-		return state;
-	}
-	private def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
-		Debug.invoke(wf);
-		if (wf.decl.target_code.spc_entry != Pointer.NULL) {
-			Debug.invokeSpc(wf);
-			return X86_64Spc.invoke(wf, sp);
-		} else {
-			Debug.invokeInterpreter(wf);
-			return X86_64PreGenStubs.getIntV3Entry()(wf, sp);
-		}
-	}
-	private def popResult(sig: SigDecl) -> Result {
-		var rt = sig.results;
-		var r = Array<Value>.new(rt.length);
-		for (i = r.length - 1; i >= 0; i--) r[i] = curStack.pop(rt[i]);
-		return Result.Value(r);
-	}
-	//=====================================================================
-	// Standard callbacks for complex bytecodes
-	//=====================================================================
+	// Callback for running host functions. Since host functions can trap, throw exceptions, and
+	// tail-call other functions, this routine must handle all these cases. Trapping/throwing
+	// is handled by returning a non-null {Throwable} and tail-calling a {WasmFunction} is handled
+	// by returning that function to the (Wasm) caller, with the stack already containing its arguments.
 	def runtime_callHost(hf: HostFunction) -> (Throwable, WasmFunction) {
-		var stack = curStack; // XXX: accept as parameter?
+		var stack = curStack.setRsp(CiRuntime.callerSp()); // XXX: accept as parameter?
 		var args: Range<Value> = stack.popN(hf.sig.params);
 		while (hf != null) {
 			if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 			var result = hf.invoke(args);
 			match (result) {
 				Throw(thrown) => {
-					if (FeatureDisable.separateStacks) stack.prependFrames0(thrown, hf, CiRuntime.callerSp());
-					else stack.prependFrames(thrown, hf);
+					stack.prependFrames(thrown, hf);
 					return (thrown, null);
 				}
 				Value0 => {
@@ -146,116 +49,67 @@ component X86_64Runtime {
 		}
 		return (null, null);
 	}
-	def runtime_MEMORY_GROW(instance: Instance, index: u32) {
-		var memory = instance.memories[index];
-		var pages = curStack.popu();
-		var result = memory.grow(pages);
-		curStack.push(Values.i_v(result));
+	//=====================================================================
+	// Callbacks for complex bytecodes
+	//=====================================================================
+	def runtime_MEMORY_GROW(instance: Instance, mem_index: u31) {
+		return Runtime.MEMORY_GROW(curStack, instance, mem_index);
 	}
-	def runtime_MEMORY_INIT(instance: Instance, dindex: u32, mindex: u32) -> Throwable {
-		var memory = instance.memories[mindex];
-		var ddecl = if(!instance.dropped_data[dindex], instance.module.data[int.!(dindex)]);
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var dst_offset = curStack.popu();
-		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_MEMORY_INIT(instance: Instance, data_index: u31, mem_index: u31) -> Throwable {
+		return Runtime.MEMORY_INIT(curStack.setRsp(CiRuntime.callerSp()), instance, data_index, mem_index);
 	}
-	def runtime_MEMORY_COPY(instance: Instance, mindex1: u32, mindex2: u32) -> Throwable { // XXX: inline
-		var dst = instance.memories[mindex1];
-		var src = instance.memories[mindex2];
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var dst_offset = curStack.popu();
-		var t = dst.copyM(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_MEMORY_COPY(instance: Instance, mem_index1: u31, mem_index2: u31) -> Throwable {
+		return Runtime.MEMORY_COPY(curStack.setRsp(CiRuntime.callerSp()), instance, mem_index1, mem_index2);
 	}
-	def runtime_MEMORY_FILL(instance: Instance, mindex: u32) -> Throwable {
-		var memory = instance.memories[mindex];
-		var size = curStack.popu();
-		var val = curStack.popu();
-		var dest = curStack.popu();
-		var t = memory.fill(dest, u8.view(val), size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_MEMORY_FILL(instance: Instance, mem_index: u31) -> Throwable {
+		return Runtime.MEMORY_FILL(curStack.setRsp(CiRuntime.callerSp()), instance, mem_index);
 	}
-	def runtime_GLOBAL_GET(instance: Instance, index: u32) { // XXX: inline when Value rep known
-		var val = instance.globals[index].value;
-		curStack.push(val);
+	def runtime_GLOBAL_GET(instance: Instance, global_index: u31) {
+		return Runtime.GLOBAL_GET(curStack, instance, global_index);
 	}
-	def runtime_GLOBAL_SET(instance: Instance, index: u32) { // XXX: inline when Value rep known
-		var g = instance.globals[index];
-		var val = curStack.pop(g.valtype);
-		g.value = val;
+	def runtime_GLOBAL_SET(instance: Instance, global_index: u31) {
+		return Runtime.GLOBAL_SET(curStack, instance, global_index);
 	}
-	def runtime_TABLE_GET(instance: Instance, index: u32) -> Throwable { // XXX: inline when Value rep known
-		var table = instance.tables[index];
-		var elem = curStack.popu();
-		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
-		var val = table.elems[elem];
-		curStack.push(val);
-		return FINISHED;
+	def runtime_TABLE_GET(instance: Instance, table_index: u31) -> Throwable {
+		return Runtime.TABLE_GET(curStack.setRsp(CiRuntime.callerSp()), instance, table_index);
 	}
-	def runtime_TABLE_SET(instance: Instance, index: u32) -> Throwable {
-		var table = instance.tables[index];
-		var val = curStack.pop(table.elemtype);
-		var elem = curStack.popu();
-		if (elem >= table.elems.length) return doTrap(TrapReason.TABLE_OUT_OF_BOUNDS, CiRuntime.callerSp());
-		table[int.view(elem)] = val;
-		return FINISHED;
+	def runtime_TABLE_SET(instance: Instance, table_index: u31) -> Throwable {
+		return Runtime.TABLE_SET(curStack.setRsp(CiRuntime.callerSp()), instance, table_index);
 	}
-	def runtime_TABLE_INIT(instance: Instance, eindex: u32, tindex: u32) -> Throwable {
-		var elem = if (!instance.dropped_elems[eindex], instance.module.elems[int.!(eindex)]);
-		var table = instance.tables[tindex];
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var dst_offset = curStack.popu();
-		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_TABLE_INIT(instance: Instance, elem_index: u31, table_index: u31) -> Throwable {
+		return Runtime.TABLE_INIT(curStack.setRsp(CiRuntime.callerSp()), instance, elem_index, table_index);
 	}
-	def runtime_TABLE_COPY(instance: Instance, t1: u32, t2: u32) -> Throwable {
-		var dst = instance.tables[t1];
-		var src = instance.tables[t2];
-		var size = curStack.popu(), src_offset = curStack.popu(), dst_offset = curStack.popu();
-		var t = dst.copyT(dst_offset, src, src_offset, size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_TABLE_COPY(instance: Instance, table_index1: u31, table_index2: u31) -> Throwable {
+		return Runtime.TABLE_COPY(curStack.setRsp(CiRuntime.callerSp()), instance, table_index1, table_index2);
 	}
-	def runtime_TABLE_GROW(instance: Instance, tindex: u32) {
-		var table = instance.tables[tindex];
-		var size = curStack.popu();
-		var val = curStack.pop(table.elemtype);
-		var r = table.grow(size, val);
-		curStack.push(Values.i_v(r));
+	def runtime_TABLE_GROW(instance: Instance, table_index: u31) {
+		return Runtime.TABLE_GROW(curStack, instance, table_index);
 	}
-	def runtime_TABLE_FILL(instance: Instance, tindex: u32) -> Throwable { // XXX: inline when Value rep known
-		var table = instance.tables[tindex];
-		var size = curStack.popu();
-		var val = curStack.pop(table.elemtype);
-		var dest = curStack.popu();
-		var t = table.fill(dest, val, size);
-		if (t != TrapReason.NONE) return doTrap(t, CiRuntime.callerSp());
-		return FINISHED;
+	def runtime_TABLE_FILL(instance: Instance, table_index: u31) -> Throwable { // XXX: inline when Value rep known
+		return Runtime.TABLE_FILL(curStack.setRsp(CiRuntime.callerSp()), instance, table_index);
 	}
+
 	def runtime_PROBE_loop(func: WasmFunction, pc: int) -> Throwable {
-		var frame = TargetFrame(CiRuntime.callerSp());
+		var rsp = CiRuntime.callerSp();
+		var stack = curStack.setRsp(rsp);
+		var frame = TargetFrame(rsp);
 		var ret = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, frame));
-		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		if (ret != null) return stack.throw(ret);
 		return ret;
 	}
 	def runtime_PROBE_instr(func: WasmFunction, pc: int) -> Throwable {
-		var frame = TargetFrame(CiRuntime.callerSp());
+		var rsp = CiRuntime.callerSp();
+		var stack = curStack.setRsp(rsp);
+		var frame = TargetFrame(rsp);
 		var ret = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, frame));
-		if (Trap.?(ret)) return prependFrames(Trap.!(ret), null, CiRuntime.callerSp());
+		if (ret != null) return stack.throw(ret);
 		return ret;
 	}
 	def runtime_TRAP(func: WasmFunction, pc: int, reason: TrapReason) -> Throwable {
+		var rsp = CiRuntime.callerSp();
+		var stack = curStack.setRsp(rsp);
 		if (Debug.runtime) Trace.OUT.put3("runtime_TRAP(%q, @+%d, %s)", func.render, pc, reason.name).outln();
-		var trap = Trap.new(reason, null, null);
-		return prependFrames(trap, null, CiRuntime.callerSp());
+		return stack.trap(reason);
 	}
 	def runtime_TIERUP(func: WasmFunction, pc: int) {
 		if (Debug.runtime) Trace.OUT.put3("tierup(wf=0x%x, func=#%d, pc=%d)",
@@ -271,204 +125,83 @@ component X86_64Runtime {
 			}
 		}
 	}
-	def prependFrames(thrown: Throwable, hf: HostFunction, sp: Pointer) -> Throwable {
-		var frame = TargetFrame(sp);
-		var trace = Vector<(WasmFunction, int)>.new();
-		var accessor = frame.getFrameAccessor();
-		while (accessor != null) {
-			trace.put(accessor.func(), accessor.pc());
-			var c = accessor.caller();
-			match (c) {
-				Wasm(func, pc, frame) => {
-					accessor = frame.getFrameAccessor(); // XXX: get frame without inflating accessor
-				}
-				_ => break;
-			}
-		}
-		var result = Array<(WasmFunction, int)>.new(trace.length); // reverse frames
-		for (i < result.length) {
-			result[i] = trace[result.length - i - 1];
-		}
-		thrown.prepend(result, hf);
-		return thrown;
+	def runtime_THROW(instance: Instance, tag_index: u31) -> Throwable {
+		var rsp = CiRuntime.callerSp();
+		var stack = curStack.setRsp(rsp);
+		var tag = instance.tags[tag_index];
+		var args = stack.popN(tag.sig.params);
+		var ex = Exception.new(tag, args, null);
+		return stack.throw(ex);
 	}
-	def doTrap(reason: TrapReason, sp: Pointer) -> Throwable {
-		var trap = Trap.new(reason, null, null);
-		return prependFrames(trap, null, sp);
+	def runtime_THROW_REF(thrown: Throwable) -> Throwable {
+		var rsp = CiRuntime.callerSp();
+		var stack = curStack.setRsp(rsp);
+		return stack.throw(thrown);
 	}
 
 	//=====================================================================
 	// GC proposal callbacks
 	//=====================================================================
-	def runtime_STRUCT_NEW(instance: Instance, index: u32) { // XXX: unify with V3Interpreter
-		var decl = StructDecl.!(instance.heaptypes[index]);
-		var fields = Array<Value>.new(decl.field_types.length);
-		for (i = fields.length - 1; i >= 0; i--) {
-			fields[i] = curStack.pop(decl.field_types[i].valtype);
-		}
-		curStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	def runtime_STRUCT_NEW(instance: Instance, struct_index: u31) {
+		return Runtime.STRUCT_NEW(curStack, instance, struct_index);
 	}
-	def runtime_STRUCT_NEW_DEFAULT(instance: Instance, index: u32) { // XXX: unify with V3Interpreter
-		var decl = StructDecl.!(instance.heaptypes[index]);
-		var fields = Array<Value>.new(decl.field_types.length);
-		for (i < fields.length) {
-			fields[i] = Values.default(decl.field_types[i].valtype);
-		}
-		curStack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	def runtime_STRUCT_NEW_DEFAULT(instance: Instance, struct_index: u31) {
+		return Runtime.STRUCT_NEW_DEFAULT(curStack, instance, struct_index);
 	}
-	def runtime_STRUCT_GET(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		curStack.push(obj.vals[findex]);
-		return null;
+	def runtime_STRUCT_GET(instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		return Runtime.STRUCT_GET(curStack.setRsp(CiRuntime.callerSp()), instance, struct_index, field_index);
 	}
-	def runtime_STRUCT_GET_S(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(curStack.popObject());
-		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		curStack.push(V3Eval.signExtend(decl.field_types[findex], obj.vals[findex]));
-		return null;
+	def runtime_STRUCT_GET_S(instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		return Runtime.STRUCT_GET_S(curStack.setRsp(CiRuntime.callerSp()), instance, struct_index, field_index);
 	}
-	def runtime_STRUCT_GET_U(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var obj = HeapStruct.!(curStack.popObject());
-		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		curStack.push(V3Eval.zeroExtend(decl.field_types[findex], obj.vals[findex]));
-		return null;
+	def runtime_STRUCT_GET_U(instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		return Runtime.STRUCT_GET_U(curStack.setRsp(CiRuntime.callerSp()), instance, struct_index, field_index);
 	}
-	def runtime_STRUCT_SET(instance: Instance, sindex: u32, findex: u32) -> Throwable { // XXX: unify with V3Interpreter
-		var decl = StructDecl.!(instance.heaptypes[int.view(sindex)]);
-		var val = curStack.pop(decl.field_types[findex].valtype);
-		var obj = HeapStruct.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		obj.vals[findex] = val;
-		return null;
+	def runtime_STRUCT_SET(instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		return Runtime.STRUCT_SET(curStack.setRsp(CiRuntime.callerSp()), instance, struct_index, field_index);
 	}
-	def runtime_ARRAY_NEW(instance: Instance, index: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[index]);
-		var len = curStack.popu();
-		var elem = curStack.pop(decl.elem_types[0].valtype);
-		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
-		var length = int.view(len);
-		var vals = Array<Value>.new(length);
-		for (i < vals.length) vals[i] = elem;
-		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
-		return null;
+	def runtime_ARRAY_NEW(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_NEW(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_NEW_DEFAULT(instance: Instance, index: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[index]);
-		var len = curStack.popu();
-		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
-		var length = int.view(len);
-		var vals = Array<Value>.new(length);
-		var elem = Values.default(decl.elem_types[0].valtype);
-		for (i < vals.length) vals[i] = elem;
-		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
-		return null;
+	def runtime_ARRAY_NEW_DEFAULT(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_NEW_DEFAULT(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_GET(instance: Instance, ignore: u32) -> Throwable {
-		var index = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		curStack.push(obj.vals[index]);
-		return null;
+	def runtime_ARRAY_GET(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_GET(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_GET_S(instance: Instance, aindex: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var index = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		curStack.push(V3Eval.signExtend(decl.elem_types[0], obj.vals[index]));
-		return null;
+	def runtime_ARRAY_GET_S(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_GET_S(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_GET_U(instance: Instance, aindex: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var index = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		curStack.push(V3Eval.zeroExtend(decl.elem_types[0], obj.vals[index]));
-		return null;
+	def runtime_ARRAY_GET_U(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_GET_U(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_SET(instance: Instance, aindex: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[aindex]);
-		var val = curStack.pop(decl.elem_types[0].valtype);
-		var index = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		if (obj == null) return doTrap(TrapReason.NULL_DEREF, CiRuntime.callerSp());
-		if (index >= u32.view(obj.vals.length)) return doTrap(TrapReason.ARRAY_INDEX_OOB, CiRuntime.callerSp());
-		obj.vals[index] = val;
-		return null;
+	def runtime_ARRAY_SET(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_SET(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_NEW_FIXED(instance: Instance, index: u32, len: u32) -> Throwable {
-		var decl = ArrayDecl.!(instance.heaptypes[index]);
-		if (len > Execute.limits.max_array_length) return doTrap(TrapReason.OOM, CiRuntime.callerSp());
-		var length = int.view(len);
-		var vals = Array<Value>.new(length);
-		var t = decl.elem_types[0].valtype;
-		for (i = vals.length - 1; i >= 0; i--) vals[i] = curStack.pop(t);
-		curStack.push(Value.Ref(HeapArray.new(decl, vals)));
-		return null;
+	def runtime_ARRAY_NEW_FIXED(instance: Instance, array_index: u31, length: u31) -> Throwable {
+		return Runtime.ARRAY_NEW_FIXED(curStack.setRsp(CiRuntime.callerSp()), instance, array_index, length);
 	}
-	def runtime_ARRAY_NEW_DATA(instance: Instance, index: u32, dindex: u32) -> Throwable {
-		var len = curStack.popu();
-		var offset = curStack.popu();
-		var result = Runtime.ARRAY_NEW_DATA(instance, index, dindex, offset, len);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		curStack.push(Value.Ref(result.result));
-		return null;
+	def runtime_ARRAY_NEW_DATA(instance: Instance, array_index: u31, data_index: u31) -> Throwable {
+		return Runtime.ARRAY_NEW_DATA(curStack.setRsp(CiRuntime.callerSp()), instance, array_index, data_index);
 	}
-	def runtime_ARRAY_NEW_ELEM(instance: Instance, index: u32, eindex: u32) -> Throwable {
-		var len = curStack.popu();
-		var offset = curStack.popu();
-		var result = Runtime.ARRAY_NEW_ELEM(instance, index, eindex, offset, len);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		curStack.push(Value.Ref(result.result));
-		return null;
+	def runtime_ARRAY_NEW_ELEM(instance: Instance, array_index: u31, elem_index: u31) -> Throwable {
+		return Runtime.ARRAY_NEW_ELEM(curStack.setRsp(CiRuntime.callerSp()), instance, array_index, elem_index);
 	}
-	def runtime_ARRAY_FILL(instance: Instance, index: u32) -> Throwable {
-		var rtt = ArrayDecl.!(instance.heaptypes[index]);
-		var size = curStack.popu();
-		var val = curStack.pop(rtt.elem_types[0].valtype); // XXX: polymorphic pop
-		var offset = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		var result = Runtime.ARRAY_FILL(obj, offset, val, size);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		return null;
+	def runtime_ARRAY_FILL(instance: Instance, array_index: u31) -> Throwable {
+		return Runtime.ARRAY_FILL(curStack.setRsp(CiRuntime.callerSp()), instance, array_index);
 	}
-	def runtime_ARRAY_COPY(instance: Instance, unused1: u32, unused2: u32) -> Throwable {
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var src = HeapArray.!(curStack.popObject());
-		var dst_offset = curStack.popu();
-		var dst = HeapArray.!(curStack.popObject());
-		var result = Runtime.ARRAY_COPY(dst, dst_offset, src, src_offset, size);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		return null;
+	def runtime_ARRAY_COPY(instance: Instance, array_index1: u31, array_index2: u31) -> Throwable {
+		return Runtime.ARRAY_COPY(curStack.setRsp(CiRuntime.callerSp()), instance, array_index1, array_index2);
 	}
-	def runtime_ARRAY_INIT_DATA(instance: Instance, index: u32, dindex: u32) -> Throwable {
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var dst_offset = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		var result = Runtime.ARRAY_INIT_DATA(instance, index, dindex, obj, dst_offset, src_offset, size);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		return null;
+	def runtime_ARRAY_INIT_DATA(instance: Instance, array_index: u31, data_index: u31) -> Throwable {
+		return Runtime.ARRAY_INIT_DATA(curStack.setRsp(CiRuntime.callerSp()), instance, array_index, data_index);
 	}
-	def runtime_ARRAY_INIT_ELEM(instance: Instance, index: u32, eindex: u32) -> Throwable {
-		var size = curStack.popu();
-		var src_offset = curStack.popu();
-		var dst_offset = curStack.popu();
-		var obj = HeapArray.!(curStack.popObject());
-		var result = Runtime.ARRAY_INIT_ELEM(instance, index, eindex, obj, dst_offset, src_offset, size);
-		if (!result.ok()) return doTrap(result.reason, CiRuntime.callerSp());
-		return null;
+	def runtime_ARRAY_INIT_ELEM(instance: Instance, array_index: u31, elem_index: u31) -> Throwable {
+		return Runtime.ARRAY_INIT_ELEM(curStack.setRsp(CiRuntime.callerSp()), instance, array_index, elem_index);
 	}
 	def runtime_doCast(instance: Instance, nullable: byte, htcode: int) -> bool {
 		var val = curStack.peekRef();
-		return Execute.doCast(instance, (nullable & 2) != 0, htcode, val);
+		return Runtime.cast(instance, (nullable & 2) != 0, htcode, val);
 	}
 }
 

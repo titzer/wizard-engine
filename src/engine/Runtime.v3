@@ -4,70 +4,338 @@
 // Shared runtime routines that are called by different execution tiers, both the
 // pure-Virgil (V3) implementation, and any native implementations.
 component Runtime {
-	def ARRAY_NEW_DATA(i: Instance, index: u32, dindex: u32, offset: u32, len: u32) -> MaybeTrap<HeapArray> {
-		if (!i.dropped_data[dindex]) {
-			var rtt = ArrayDecl.!(i.heaptypes[index]);
-			var ddecl = i.module.data[int.!(dindex)];
-			if (len <= Execute.limits.max_array_length) {
-				var t = bytesToVals(rtt.elem_types[0], ddecl.data, offset, len);
-				if (t.0) return ok(HeapArray.new(rtt, t.1));
-				else return trap(TrapReason.MEM_OUT_OF_BOUNDS);
-			} else {
-				return trap(TrapReason.OOM);
-			}
-		} else {
-			return trap(TrapReason.MEM_OUT_OF_BOUNDS);
-		}
+/*
+	def RT_(stack: ExecStack, instance: Instance, index: u31) -> Throwable {
+		return null;
 	}
-	def ARRAY_NEW_ELEM(i: Instance, index: u32, eindex: u32, offset: u32, len: u32) -> MaybeTrap<HeapArray>  {
-		if (!i.dropped_elems[eindex]) {
-			var rtt = ArrayDecl.!(i.heaptypes[index]);
-			var edecl = i.module.elems[int.!(eindex)];
-			if (len <= Execute.limits.max_array_length) {
-				var vals = Array<Value>.new(int.!(len));
-				var r = Execute.copyElemsInto(vals, i, 0, edecl, offset, len);
-				if (r) return ok(HeapArray.new(rtt, vals));
-				else return trap(TrapReason.TABLE_OUT_OF_BOUNDS); // TODO: elem out of bounds
-			} else {
-				return trap(TrapReason.OOM);
-			}
-		} else {
-			return trap(TrapReason.MEM_OUT_OF_BOUNDS);
-		}
+*/
+	def GLOBAL_GET(stack: ExecStack, instance: Instance, global_index: u31) {
+		var val = instance.globals[global_index].value;
+		stack.push(val);
 	}
-	def ARRAY_FILL(obj: HeapArray, offset: u32, val: Value, size: u32) -> MaybeTrap<void> {
-		if (obj == null) return trap(TrapReason.NULL_DEREF);
+	def GLOBAL_SET(stack: ExecStack, instance: Instance, global_index: u31) {
+		var g = instance.globals[global_index];
+		var val = stack.popV(g.valtype);
+		g.value = val;
+	}
+	def TABLE_GET(stack: ExecStack, instance: Instance, table_index: u31) -> Throwable {
+		var elems = instance.tables[table_index].elems;
+		var elem = stack.popu();
+		if (elem >= elems.length) return stack.trap(TrapReason.TABLE_OUT_OF_BOUNDS);
+		stack.push(elems[elem]);
+		return null;
+	}
+	def TABLE_SET(stack: ExecStack, instance: Instance, table_index: u31) -> Throwable {
+		var table = instance.tables[table_index], elems = table.elems;
+		var val = stack.popV(table.elemtype);
+		var elem = stack.popu();
+		if (elem >= elems.length) return stack.trap(TrapReason.TABLE_OUT_OF_BOUNDS);
+		table[int.!(elem)] = val;
+		return null;
+	}
+	def MEMORY_GROW(stack: ExecStack, instance: Instance, mem_index: u31) {
+		var memory = instance.memories[mem_index];
+		var pages = stack.popu();
+		var result = memory.grow(pages);
+		stack.pushi(result);
+	}
+	// --- GC operations -----------------------------------------------------------------------------------------
+	def STRUCT_NEW(stack: ExecStack, instance: Instance, struct_index: u31) {
+		var decl = StructDecl.!(instance.heaptypes[struct_index]);
+		var fields = Array<Value>.new(decl.field_types.length);
+		for (i = fields.length - 1; i >= 0; i--) {
+			fields[i] = stack.popV(decl.field_types[i].valtype);
+		}
+		stack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	}
+	def STRUCT_NEW_DEFAULT(stack: ExecStack, instance: Instance, struct_index: u31) {
+		var decl = StructDecl.!(instance.heaptypes[struct_index]);
+		var fields = Array<Value>.new(decl.field_types.length);
+		for (i < fields.length) {
+			fields[i] = Values.default(decl.field_types[i].valtype);
+		}
+		stack.push(Value.Ref(HeapStruct.new(decl, fields)));
+	}
+	def STRUCT_GET(stack: ExecStack, instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		var obj = stack.popStruct();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		stack.push(obj.vals[field_index]);
+		return null;
+	}
+	def STRUCT_GET_S(stack: ExecStack, instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		var obj = stack.popStruct();
+		var decl = StructDecl.!(instance.heaptypes[struct_index]);
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		stack.push(V3Eval.signExtend(decl.field_types[field_index], obj.vals[field_index])); // XXX: pushi
+		return null;
+	}
+	def STRUCT_GET_U(stack: ExecStack, instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		var obj = stack.popStruct();
+		var decl = StructDecl.!(instance.heaptypes[struct_index]);
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		stack.push(V3Eval.zeroExtend(decl.field_types[field_index], obj.vals[field_index])); // XXX: pushi
+		return null;
+	}
+	def STRUCT_SET(stack: ExecStack, instance: Instance, struct_index: u31, field_index: u31) -> Throwable {
+		var decl = StructDecl.!(instance.heaptypes[struct_index]);
+		var val = stack.popV(decl.field_types[field_index].valtype);
+		var obj = stack.popStruct();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		obj.vals[field_index] = val;
+		return null;
+	}
+	def ARRAY_NEW(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		var length = stack.popu();
+		var elem = stack.popV(decl.elem_types[0].valtype);
+		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
+		var vals = Array<Value>.new(u31.!(length));
+		for (i < vals.length) vals[i] = elem;
+		stack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def ARRAY_NEW_DEFAULT(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		var length = stack.popu();
+		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
+		var vals = Array<Value>.new(u31.!(length));
+		var elem = Values.default(decl.elem_types[0].valtype);
+		for (i < vals.length) vals[i] = elem;
+		stack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def ARRAY_GET(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var index = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (index >= u32.view(obj.vals.length)) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		stack.push(obj.vals[index]);
+		return null;
+	}
+	def ARRAY_GET_S(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		var index = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (index >= u32.view(obj.vals.length)) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		stack.push(V3Eval.signExtend(decl.elem_types[0], obj.vals[index])); // XXX: pushi
+		return null;
+	}
+	def ARRAY_GET_U(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		var index = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (index >= u32.view(obj.vals.length)) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		stack.push(V3Eval.zeroExtend(decl.elem_types[0], obj.vals[index])); // XXX: pushi
+		return null;
+	}
+	def ARRAY_SET(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		var val = stack.popV(decl.elem_types[0].valtype);
+		var index = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (index >= u32.view(obj.vals.length)) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		obj.vals[index] = val;
+		return null;
+	}
+	def ARRAY_NEW_FIXED(stack: ExecStack, instance: Instance, array_index: u31, length: u32) -> Throwable {
+		var decl = ArrayDecl.!(instance.heaptypes[array_index]);
+		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
+		var vals = Array<Value>.new(u31.!(length));
+		var t = decl.elem_types[0].valtype;
+		for (i = vals.length - 1; i >= 0; i--) vals[i] = stack.popV(t);
+		stack.push(Value.Ref(HeapArray.new(decl, vals)));
+		return null;
+	}
+	def ARRAY_NEW_DATA(stack: ExecStack, instance: Instance, array_index: u31, data_index: u31) -> Throwable {
+		var length = stack.popu();
+		var offset = stack.popu();
+		if (instance.dropped_data[data_index]) return stack.trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
+		var ddecl = instance.module.data[data_index];
+		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
+		var t = bytesToVals(rtt.elem_types[0], ddecl.data, offset, length);
+		if (!t.0) return stack.trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		stack.push(Value.Ref(HeapArray.new(rtt, t.1)));
+		return null;
+	}
+	def ARRAY_NEW_ELEM(stack: ExecStack, instance: Instance, array_index: u31, elem_index: u31) -> Throwable {
+		var length = stack.popu();
+		var offset = stack.popu();
+		if (instance.dropped_elems[elem_index]) return stack.trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
+		var edecl = instance.module.elems[elem_index];
+		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
+		var vals = Array<Value>.new(u31.!(length));
+		var r = copyElemsInto(vals, instance, 0, edecl, offset, length);
+		if (!r) return stack.trap(TrapReason.TABLE_OUT_OF_BOUNDS); // TODO: elem out of bounds
+		stack.push(Value.Ref(HeapArray.new(rtt, vals)));
+		return null;
+	}
+	def ARRAY_FILL(stack: ExecStack, instance: Instance, array_index: u31) -> Throwable {
+		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
+		var size = stack.popu();
+		var val = stack.popV(rtt.elem_types[0].valtype); // XXX: polymorphic pop
+		var offset = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
 		var index = ArrayUtil.boundsCheck(obj.vals, offset, 0, size);
-		if (index < 0) return trap(TrapReason.ARRAY_INDEX_OOB);
+		if (index < 0) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
 		var r = obj.vals[index ..+ size];
 		for (i < r.length) r[i] = val;
-		return OK;
+		return null;
 	}
-	def ARRAY_COPY(dst: HeapArray, dst_offset: u32, src: HeapArray, src_offset: u32, size: u32) -> MaybeTrap<void> {
-		if (src == null || dst == null) return trap(TrapReason.NULL_DEREF);
+	def ARRAY_COPY(stack: ExecStack, instance: Instance, array_index1: u31, array_index2: u31) -> Throwable {
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var src = stack.popArray();
+		var dst_offset = stack.popu();
+		var dst = stack.popArray();
+		if (src == null || dst == null) return stack.trap(TrapReason.NULL_DEREF);
 		var r = ArrayUtil.safeCopy(dst.vals, dst_offset, src.vals, src_offset, size);
-		if (!r) return trap(TrapReason.ARRAY_INDEX_OOB);
-		return OK;
+		if (!r) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		return null;
 	}
-	def ARRAY_INIT_DATA(i: Instance, index: u32, dindex: u32, obj: HeapArray, dst_offset: u32, src_offset: u32, size: u32) -> MaybeTrap<void> {
-		if (obj == null) return trap(TrapReason.NULL_DEREF);
-		var rtt = ArrayDecl.!(i.heaptypes[index]);
-		if (i.dropped_data[dindex]) return if(size > 0, trap(TrapReason.DATA_SEGMENT_DROPPED), OK);
-		var data = i.module.data[int.!(dindex)].data;
-		if (ArrayUtil.boundsCheck(obj.vals, dst_offset, 0, size) < 0) return trap(TrapReason.ARRAY_INDEX_OOB);
+	def ARRAY_INIT_DATA(stack: ExecStack, instance: Instance, array_index: u31, data_index: u31) -> Throwable {
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var obj = stack.popArray();
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
+		if (instance.dropped_data[data_index]) return if(size > 0, stack.trap(TrapReason.DATA_SEGMENT_DROPPED), null);
+		var data = instance.module.data[data_index].data;
+		if (ArrayUtil.boundsCheck(obj.vals, dst_offset, 0, size) < 0) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
 		var t = bytesToVals(rtt.elem_types[0], data, src_offset, size);
-		if (!t.0) return trap(TrapReason.MEM_OUT_OF_BOUNDS);
+		if (!t.0) return stack.trap(TrapReason.MEM_OUT_OF_BOUNDS);
 		ArrayUtil.safeCopy(obj.vals, dst_offset, t.1, 0, size);
-		return OK;
+		return null;
 	}
-	def ARRAY_INIT_ELEM(i: Instance, index: u32, eindex: u32, obj: HeapArray, dst_offset: u32, src_offset: u32, size: u32) -> MaybeTrap<void> {
-		var rtt = ArrayDecl.!(i.heaptypes[index]);
-		if (obj == null) return trap(TrapReason.NULL_DEREF);
-		if (i.dropped_elems[eindex]) return if(size > 0, trap(TrapReason.ELEM_SEGMENT_DROPPED), OK);
-		var edecl = i.module.elems[int.!(eindex)];
-		var r = Execute.copyElemsInto(obj.vals, i, dst_offset, edecl, src_offset, size);
-		if (!r) return trap(TrapReason.ARRAY_INDEX_OOB);
-		return OK;
+	def ARRAY_INIT_ELEM(stack: ExecStack, instance: Instance, array_index: u31, elem_index: u31) -> Throwable {
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var obj = stack.popArray();
+		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
+		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (instance.dropped_elems[elem_index]) return if(size > 0, stack.trap(TrapReason.ELEM_SEGMENT_DROPPED), null);
+		var edecl = instance.module.elems[elem_index];
+		var r = copyElemsInto(obj.vals, instance, dst_offset, edecl, src_offset, size);
+		if (!r) return stack.trap(TrapReason.ARRAY_INDEX_OOB);
+		return null;
+	}
+	// --- Table operations -----------------------------------------------------------------------------------------
+	def TABLE_INIT(stack: ExecStack, instance: Instance, elem_index: u31, table_index: u31) -> Throwable {
+		var elem = if (!instance.dropped_elems[elem_index], instance.module.elems[elem_index]);
+		var table = instance.tables[table_index];
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var t = table.copyE(instance, dst_offset, elem, src_offset, size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+	def TABLE_COPY(stack: ExecStack, instance: Instance, table_index1: u31, table_index2: u31) -> Throwable {
+		var dst = instance.tables[table_index1];
+		var src = instance.tables[table_index2];
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var t = dst.copyT(dst_offset, src, src_offset, size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+	def TABLE_GROW(stack: ExecStack, instance: Instance, table_index: u31) {
+		var table = instance.tables[table_index];
+		var size = stack.popu();
+		var val = stack.popV(table.elemtype);
+		var r = table.grow(size, val);
+		stack.push(Values.i_v(r));
+	}
+	def TABLE_FILL(stack: ExecStack, instance: Instance, table_index: u31) -> Throwable {
+		var table = instance.tables[table_index];
+		var size = stack.popu();
+		var val = stack.popV(table.elemtype);
+		var dest = stack.popu();
+		var t = table.fill(dest, val, size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+	def MEMORY_INIT(stack: ExecStack, instance: Instance, data_index: u31, mem_index: u31) -> Throwable {
+		var memory = instance.memories[mem_index];
+		var ddecl = if(!instance.dropped_data[data_index], instance.module.data[data_index]);
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+	def MEMORY_COPY(stack: ExecStack, instance: Instance, mem_index1: u31, mem_index2: u31) -> Throwable {
+		var dst = instance.memories[mem_index1];
+		var src = instance.memories[mem_index2];
+		var size = stack.popu();
+		var src_offset = stack.popu();
+		var dst_offset = stack.popu();
+		var t = dst.copyM(dst_offset, src, src_offset, size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+	def MEMORY_FILL(stack: ExecStack, instance: Instance, mem_index: u31) -> Throwable {
+		var memory = instance.memories[mem_index];
+		var size = stack.popu();
+		var val = stack.popu();
+		var dest = stack.popu();
+		var t = memory.fill(dest, u8.view(val), size);
+		if (t != TrapReason.NONE) return stack.trap(t);
+		return null;
+	}
+
+	def matchRtt(obj: Object, rtt: HeapTypeDecl) -> bool {
+		match (obj) {
+			x: HeapObject => return ValueTypes.isAssignableHeap(x.decl, rtt);
+			x: WasmFunction => return ValueTypes.isAssignableHeap(x.sig, rtt);
+		}
+		return false;
+	}
+	def cast(instance: Instance, nullable: bool, htcode: int, val: Value) -> bool {
+		match (htcode) {
+			BpHeapTypeCode.FUNC.val => return checkRef(nullable, Function.?, val);
+			BpHeapTypeCode.EXTERN.val => return checkI31OrRef(nullable, Object.?, val);
+			BpHeapTypeCode.ARRAY.val => return checkRef(nullable, HeapArray.?, val);
+			BpHeapTypeCode.STRUCT.val => return checkRef(nullable, HeapStruct.?, val);
+			BpHeapTypeCode.ANY.val => return checkI31OrRef(nullable, Object.?, val);
+			BpHeapTypeCode.EQ.val => return checkI31OrRef(nullable, HeapObject.?, val);
+			BpHeapTypeCode.I31.val => return checkI31OrRef(nullable, isFalse, val);
+			BpHeapTypeCode.NOFUNC.val, // fallthru
+			BpHeapTypeCode.NOEXTERN.val, // falltrhu
+			BpHeapTypeCode.NONE.val => return checkRef(nullable, isFalse, val);
+			_ => {
+				if (!Value.Ref.?(val)) return false;
+				var obj = Value.Ref.!(val).val;
+				if (obj == null) return nullable;
+				var index = u32.!(htcode); // XXX: make this a runtime error?
+				var rtt = instance.heaptypes[index];
+				return matchRtt(obj, rtt);
+			}
+		}
+	}
+	def copyElemsInto(dest: Array<Value>, instance: Instance, dst_offset: u32, elem: ElemDecl, src_offset: u32, size: u32) -> bool {
+		if (elem == null) {
+			if (ArrayUtil.boundsCheck(dest, dst_offset, 0, size) < 0) return false;
+			if (ArrayUtil.boundsCheck<byte>(null, src_offset, 0, size) < 0) return false;
+			return true;
+		}
+		match (elem.details) {
+			FuncRefs(vals) => {
+				return ArrayUtil.safeCopyF(dest, dst_offset, vals, src_offset, size, instance.getFunctionAsVal);
+			}
+			Exprs(vals) => {
+				return ArrayUtil.safeCopyF(dest, dst_offset, vals, src_offset, size, instance.evalInitExpr);
+			}
+		}
 	}
 }
 def bytesToVals(storage: StorageType, data: Array<byte>, offset: u32, length: u32) -> (bool, Array<Value>) { // TODO: MaybeTrap
@@ -114,4 +382,22 @@ def trap<T>(reason: TrapReason) -> MaybeTrap<T> {
 def ok<T>(d: T) -> MaybeTrap<T> {
 	return MaybeTrap<T>(d, TrapReason.NONE);
 }
-def OK: MaybeTrap<void>;
+def isFalse(obj: Object) -> bool {
+	return false;
+}
+def checkI31OrRef(nullable: bool, checkRef: Object -> bool, val: Value) -> bool {
+	match (val) {
+		I31 => return true;
+		Ref(obj) => {
+			if (obj == null) return nullable;
+			return checkRef(obj);
+		}
+		_ => return false;
+	}
+}
+def checkRef(nullable: bool, q: Object -> bool, val: Value) -> bool {
+	if (!Value.Ref.?(val)) return false;
+	var obj = Value.Ref.!(val).val;
+	if (obj == null) return nullable;
+	return q(obj);
+}
