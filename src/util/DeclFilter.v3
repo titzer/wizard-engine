@@ -1,9 +1,12 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Filters members based on names using a pattern list given as a string.
-// The syntax of the pattern string is: "(Glob[.Glob])*" where Glob can contain "*" and "?",
-// as implemented in {GlobMatcher}.
+// Filters members based on names and indices using a pattern list given as a string.
+// The syntax of the pattern string is:
+//   pat_list := [ match (, match)* ]
+//   match := glob [ . pat ] | seq
+//   pat := glob | seq
+//   seq := #num [ .. num ]
 class DeclFilter(pattern: string) {
 	private def list = parseDeclFilter(pattern);
 
@@ -12,48 +15,124 @@ class DeclFilter(pattern: string) {
 		var names = module.names;
 		var mname = module.name;
 		if (mname == null && names != null) mname = names.getModuleName();
-		var fname: string;
-		if (FuncDecl.?(decl) && names != null) fname = names.getFuncName(FuncDecl.!(decl).func_index);
-		return matchesStr(mname, fname);
+		var fname: string, index: int;
+		match (decl) {
+			x: SigDecl => index = x.heaptype_index;
+			x: StructDecl => index = x.heaptype_index;
+			x: ArrayDecl => index = x.heaptype_index;
+			x: AbsTypeDecl => index = x.abstype_index;
+			x: FuncDecl => {
+				index = x.func_index;
+				if (names != null) fname = names.getFuncName(x.func_index);
+			}
+			x: TableDecl => index = x.table_index;
+			x: MemoryDecl => index = x.memory_index;
+			x: GlobalDecl => index = x.global_index;
+			x: TagDecl => index = x.tag_index;
+		}
+
+		for (l = list; l != null; l = l.tail) {
+			if (l.head.0.matches(mname, -1) && l.head.1.matches(fname, index)) return true;
+		}
+		return false;
 	}
 	def matchesStr(mname: string, fname: string) -> bool {
 		if (pattern == null) return true;
 		for (l = list; l != null; l = l.tail) {
 			var mfilter = l.head.0, ffilter = l.head.1;
-			if (ffilter == null && matchOne(mname, fname, mfilter)) return true;
-			if (matchBoth(mname, fname, mfilter, ffilter)) return true;
+			if (l.head.0.matches(mname, -1) && l.head.1.matches(fname, -1)) return true;
 		}
 		return false;
 	}
-	def matchOne(mname: string, fname: string, filter: GlobMatcher) -> bool {
-		return (mname != null && filter.matches(mname)) || (fname != null && filter.matches(fname));
-	}
-	def matchBoth(mname: string, fname: string, mfilter: GlobMatcher, ffilter: GlobMatcher) -> bool {
-		return (mname != null && mfilter.matches(mname)) && (fname != null && ffilter.matches(fname));
+	def render(buf: StringBuilder) -> StringBuilder {
+		if (pattern == null) return buf.puts("(*, *)");
+		for (l = list; l != null; l = l.tail) {
+			if (l != list) buf.csp();
+			buf.put2("(%q, %q)", l.head.0.render, l.head.1.render);
+		}
+		return buf;
 	}
 }
-def parseDeclFilter(pat: string) -> List<(GlobMatcher, GlobMatcher)> {
-	var list: List<(GlobMatcher, GlobMatcher)>;
-	if (pat == null) return list;
-	var buf = StringBuilder.new();
-	var m: GlobMatcher, f: GlobMatcher;
-	var i = 0;
-	while (true) {
-		if (i == pat.length || pat[i] == ',') {
-			var matcher = GlobMatcher.new(buf.toString());
-			if (m != null) f = matcher;
-			else m = matcher;
-			list = List.new((m, f), list);
-			m = f = null;
-			buf.reset();
-			if (i == pat.length) break;
-		} else if (pat[i] == '.' && m == null) {
-			m = GlobMatcher.new(buf.toString());
-			buf.reset();
-		} else {
-			buf.putc(pat[i]);
-		}
-		i++;
+def parseDeclFilter(input: string) -> List<(Matcher, Matcher)> {
+	if (input == null) return List.new((Matcher.All, Matcher.All), null);
+	var p = TextReader.new("<option>", input);
+	var list: List<(Matcher, Matcher)>;
+	while (p.pos < p.limit) {
+		var pair = parseMatcherPair(p);
+		list = List.new(pair, list);
+		while (p.char == ',') p.advance1();
 	}
 	return list;
+}
+def parseMatcherPair(p: TextReader) -> (Matcher, Matcher) {
+	if (p.char == '#') return (Matcher.All, parseSequence(p.advance1()));
+	var m = parseGlob(p);
+	if (p.opt1('.') > 0) {
+		var f = if (p.char == '#', parseSequence(p), parseGlob(p));
+		return (m, f);
+	}
+	return (Matcher.All, m);
+}
+def parseSequence(p: TextReader) -> Matcher {
+	var t = Ints.parsePosDecimal(p.data, p.pos);
+	var min = 0u, max = 0u;
+	if (t.0 > 0) {
+		min = max = t.1;
+		p.advance(t.0);
+	} else {
+		p.fail("invalid number");
+		return Matcher.None;
+	}
+	if (p.optN("...") > 0 || p.optN("..") > 0) {
+		var t = Ints.parsePosDecimal(p.data, p.pos);
+		if (t.0 > 0) {
+			max = t.1;
+			p.advance(t.0);
+		} else {
+			p.fail("invalid number");
+		}
+	}
+	return Matcher.Sequence(min, max);
+}
+def parseGlob(p: TextReader) -> Matcher {
+	var m: Matcher;
+	var start = p.pos, pos = p.pos;
+	while (pos < p.limit) {
+		var ch = p.data[pos];
+		if (ch == ',' || ch == '.') break;
+		pos++;
+	}
+	if (pos > start) {
+		var pattern = Arrays.range(p.data, start, pos);
+		p.advance(pos - start);
+		if (Strings.equal(pattern, "*")) m = Matcher.All; // saves a glob match
+		else m = Matcher.Glob(GlobMatcher.new(pattern));
+	}
+	return m;
+}
+
+// Different kinds of matchers, e.g. by name or sequence of indices.
+type Matcher {
+	case None;
+	case All;
+	case Glob(matcher: GlobMatcher);
+	case Sequence(min: u32, max: u32);
+
+	def matches(name: string, index: int) -> bool {
+		match (this) {
+			None => return false;
+			All => return true;
+			Glob(matcher) => return name != null && matcher.matches(name);
+			Sequence(min, max) => return index >= min && index <= max;
+		}
+	}
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (this) {
+			None => ;
+			All => buf.puts("*");
+			Glob(matcher) => buf.puts(matcher.pattern);
+			Sequence(min, max) => buf.put2("#%d..%d", min, max);
+		}
+		return buf;
+	}
 }
