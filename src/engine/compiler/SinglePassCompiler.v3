@@ -81,6 +81,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def frame = xenv;
 	def resolver = SpcMoveResolver.new(masm);
 	def unrefs = Array<(Reg, int)>.new(config.regSet.regs.length);
+	def probeSpillMode = if(SpcTuning.probeCallFreesRegs, SpillMode.SAVE_AND_FREE_REGS, SpillMode.SAVE_ONLY);
+	def runtimeSpillMode = if(SpcTuning.runtimeCallFreesRegs, SpillMode.SAVE_AND_FREE_REGS, SpillMode.SAVE_ONLY);
 	var err: ErrorGen;
 	var num_unrefs = 0;
 
@@ -315,10 +317,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				return;
 			}
 			x: OperandProbe_i_v => if (SpcTuning.intrinsifyOperandProbe) {
-				state.emitKill(resolver);
-				emit_compute_vsp(regs.vsp, state.sp);
-				emit_spill_vsp(regs.vsp);
-				masm.emit_store_curstack_vsp(regs.vsp);
+				state.emitSaveAll(resolver, probeSpillMode);
+				emit_compute_vsp(regs.scratch, state.sp);
+				emit_spill_vsp(regs.scratch);
+				masm.emit_store_curstack_vsp(regs.scratch);
 				var value_reg = masm.getV3ParamReg(ValueKind.I32, 1);
 				// XXX: Factor out loading slot into specific reg
 				var sv = state.peek();
@@ -333,11 +335,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				}
 				masm.emit_call_OperandProbe_i_v_fire(x, value_reg);
 				emit_reload_regs();
+				if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 				return;
 			}
 		}
 		// spill everything
-		state.emitKill(resolver);
+		state.emitSaveAll(resolver, probeSpillMode);
 		// compute VSP for potential frame access
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(regs.vsp);
@@ -349,7 +352,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// call runtime
 		masm.emit_call_runtime_Probe_instr();
 		emit_reload_regs();
-
+		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 	def visit_CRASH_EXEC() {
 		masm.emit_intentional_crash();
@@ -476,7 +479,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Handle the current stack state.
 		if (tailCall) emitMoveTailCallArgs(func.sig); // transfer tail call args
-		else state.emitKill(resolver); // spill entire value stack
+		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
 
 		// Load the function, XXX: skip and compute function from instance + code on stack?
 		masm.emit_mov_r_m(ValueKind.REF, func_reg, MasmAddr(tmp, offsets.Instance_functions));
@@ -554,7 +557,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Handle the current stack state.
 		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
-		else state.emitKill(resolver); // spill entire value stack
+		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
 
 		emit_compute_vsp(vsp_reg, state.sp);
 
@@ -597,7 +600,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		sv = popFixedReg(regs.func_arg);
 		var func_reg = sv.reg;
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		state.emitKill(resolver);
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 
 		emit_compute_vsp(vsp_reg, state.sp);
 		// check for null
@@ -954,7 +957,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op2n(op, arg1, arg2, count, op.sig.results, canTrap);
 	}
 	def emit_call_runtime_op1n(op: Opcode, arg1: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
-		state.emitKill(resolver);
+		state.emitSaveAll(resolver, runtimeSpillMode);
 		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		emit_load_instance(regs.runtime_arg0);
@@ -964,9 +967,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(args);
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
+		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 	def emit_call_runtime_op2n(op: Opcode, arg1: u31, arg2: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
-		state.emitKill(resolver);
+		state.emitSaveAll(resolver, runtimeSpillMode);
 		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		emit_load_instance(regs.runtime_arg0);
@@ -977,6 +981,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(args);
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
+		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 	def emitBrIf(sv: SpcVal, cond: MasmBrCond, label: MasmLabel, target: SpcControl, emptyTransfer: bool, repush: BrRepush) {
 		if (sv.isConst()) {
@@ -1438,6 +1443,13 @@ enum BrRepush(taken: bool, not_taken: bool) {
 	BOTH(true, true)
 }
 
+// When spilling all registers, controls the update to the abstract state, if any.
+enum SpillMode(free_regs: bool, remember_stored: bool) {
+	SAVE_ONLY(false, false),		// save registers and constants, don't update state
+	SAVE_AND_REMEMBER_STORED(false, true),	// save registers and constants, remember slots are stored
+	SAVE_AND_FREE_REGS(true, true),		// save registers and free all registers
+}
+
 // Compiler representation of (abstract) values on the WebAssembly value stack,
 // including its {ValueKind}, whether the value is stored into the corresponding slot,
 // whether the value tag (if tags enabled) is stored into the slot, which if any
@@ -1472,6 +1484,9 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	}
 	def withoutReg() -> SpcVal {
 		return SpcVal(flags & ~IN_REG, NO_REG, const);
+	}
+	def withFlags(add: byte) -> SpcVal {
+		return SpcVal(flags | add, reg, const);
 	}
 	def notConst() -> SpcVal {
 		return SpcVal(flags & ~IS_CONST, reg, 0);
@@ -1652,18 +1667,30 @@ class SpcState(regAlloc: RegAlloc) {
 		}
 		resolver.emitMoves();
 	}
-	def emitKill(resolver: SpcMoveResolver) {
-		if (Trace.compiler) OUT.puts("    kill all").outln();
-		for (i < sp) {
-			var sv = state[i], oflags = sv.flags;
-			if ((oflags & IN_REG) != 0) regAlloc.free(sv.reg);
-			var stored = IS_STORED | TAG_STORED;
-			var nflags = (oflags & ~IN_REG) | stored;
-			var nv = SpcVal(nflags, NO_REG, sv.const);
-			state[i] = nv;
-			if (stored == (oflags & stored)) continue;
-			var slot = u32.view(i);
-			resolver.addMove((slot, nv), (slot, sv));
+	def emitSaveAll(resolver: SpcMoveResolver, spillMode: SpillMode) {
+		if (Trace.compiler) OUT.puts("    save all").outln();
+		def STORE_MASK = IS_STORED | TAG_STORED;
+		for (slot < sp) {
+			var sv = state[slot], nv = sv;
+			if (sv.inReg() && spillMode.free_regs) {
+				nv = nv.withoutReg();
+				regAlloc.free(sv.reg);
+			}
+			var stored = nv.withFlags(STORE_MASK);
+			if ((sv.flags & STORE_MASK) != STORE_MASK) resolver.addMove((slot, stored), (slot, sv));
+			if (spillMode.remember_stored) nv = stored;
+			state[slot] = nv;
+		}
+		resolver.emitMoves();
+	}
+	def emitRestoreAll(resolver: SpcMoveResolver) {
+		if (Trace.compiler) OUT.puts("    restore all").outln();
+		for (slot < sp) {
+			var sv = state[slot];
+			if (!sv.inReg()) continue;
+			var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+			var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
+			resolver.addMove((slot, tv), (slot, fv));
 		}
 		resolver.emitMoves();
 	}
