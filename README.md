@@ -1,10 +1,10 @@
-# <img src="https://github.com/titzer/wizard-engine/blob/master/logo/wizard_logo.svg?raw=true" width="32pt"> Wizard: An advanced WebAssembly Engine for Research
+# <img src="https://github.com/titzer/wizard-engine/blob/master/logo/wizard_logo.svg?raw=true" width="32pt"> The Wizard Research Engine
 
 
 
-The Wizard Engine is a lightweight WebAssembly virtual machine designed for teaching and research.
-Its implementation is designed to be flexible and easy to grasp, ideal for experimentation and modification.
-Built with the future in mind, it is written in a fast and lightweight safe, garbage-collected programming language, [Virgil](https://github.com/titzer/virgil).
+The Wizard Research Engine is a fully-featured WebAssembly engine (virtual machine) designed for teaching and research.
+Its implementation is designed to be flexible and easy to grasp, ideal for instrumentation, experimentation and modification.
+Built with the future in mind, it is written in a fast and lightweight, safe, garbage-collected programming language, [Virgil](https://github.com/titzer/virgil).
 
 ## Features ##
 
