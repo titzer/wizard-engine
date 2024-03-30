@@ -1,0 +1,178 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A flat function-based profiler.
+def E_ = MonitorRegistry.register(
+	"fprofile", "Reports execution time spent in individual functions.",
+	FuncProfileMonitor.new());
+def filter_ = E_ // TODO: return Option<DeclFilter>
+	.addOption("<filter>", "apply profiling to selected functions");
+
+var filter: DeclFilter;
+class FuncProfileMonitor extends Monitor {
+	def entries = Vector<EnterProbe>.new();
+	// format: --monitors=fprofile{<filter>}
+	def configure(args: string) -> string {
+		if (args != null) filter = DeclFilters.parseString(args);
+		return null;
+	}
+	def onParse(module: Module) {
+		var bi = BytecodeIterator.new();
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			if (f.imp != null) continue;
+			if (filter != null && !filter.matches(module, f)) continue;
+			var prev_call = false;
+			var enter = EnterProbe.new(module, f);
+			var exit = ExitProbe.new(enter);
+			var call = NestedCallProbe.new(enter);
+			var ret = NestedReturnProbe.new(enter);
+			entries.put(enter);
+			Instrumentation.insertFuncEntryProbe(module, f.func_index, enter);
+			for (bi = BytecodeIterator.new().reset(f); bi.more(); bi.next()) {
+				if (prev_call) {
+					Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, ret);
+					prev_call = false;
+				}
+				match (bi.current()) {
+					CALL, CALL_INDIRECT, CALL_REF => {
+						Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, call);
+						prev_call = true;
+					}
+					RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => {
+						Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, exit);
+					}
+					_ => ;
+				}
+			}
+			Instrumentation.insertLocalProbe(module, f.func_index, f.cur_bytecode.length - 1, exit);
+		}
+	}
+	def onExit(code: int) {
+		output(entries);
+	}
+	def onFinish(i: Instance) {
+		output(entries);
+	}
+
+	private def isFuncMonitored(module: Module, func: FuncDecl) -> bool {
+		return !MonitorUtil.isImport(module, func) && (filter == null || filter.matches(module, func));
+	}
+}
+
+def compareEntries(a: EnterProbe, b: EnterProbe) -> bool {
+	return a.cumul > b.cumul;
+}
+
+private class EnterProbe(module: Module, func: FuncDecl) extends Probe {
+	var count: u64;
+	var cumul: u64;
+	var start: u64;
+	var nested_start: u64;
+	var stack: Vector<(u64, u64)>;
+
+	def fire(loc: DynamicLoc) -> Resumption {
+		count++;
+		if (start != 0) {
+			// recursive invocation; allocate stack entry
+			if (stack == null) stack = Vector.new();
+			stack.put(start, nested_start);
+			start = Target.rdtsc();
+		} else {
+			start = Target.rdtsc();
+		}
+		return Resumption.Continue;
+	}
+}
+
+private class ExitProbe(p: EnterProbe) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var end = Target.rdtsc();
+		var diff = end - p.start;
+		p.cumul += diff;
+		p.start = 0;
+		if (p.stack != null && p.stack.length > 0) {
+			var nlength = p.stack.length - 1;
+			var t = p.stack[nlength];
+			p.start = t.0;
+			p.nested_start = t.1;
+			p.stack.resize(nlength);
+		}
+		return Resumption.Continue;
+	}
+}
+
+private class NestedCallProbe(p: EnterProbe) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var time = Target.rdtsc();
+		p.nested_start = time;
+		return Resumption.Continue;
+	}
+}
+
+private class NestedReturnProbe(p: EnterProbe) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var time = Target.rdtsc();
+		p.cumul -= (time - p.nested_start);
+		p.nested_start = 0;
+		return Resumption.Continue;
+	}
+}
+
+def output(entries: Vector<EnterProbe>) {
+	var out = Trace.OUT;
+	var maxlen = 20;
+	var total = 0uL;
+	for (i < entries.length) {
+		var e = entries[i], func = e.func, count = e.count;
+		total += e.cumul;
+		if (count == 0) continue;
+		out.reset(); // compute maximum length of function names
+		func.render(e.module.names, out);
+		if (out.length > maxlen) maxlen = out.length;
+	}
+	if (MonitorOptions.csv) {
+		// Output basic CSV data
+		out.puts("function,count,cycles,percent").outln();
+	} else {
+		// Output a nice textual table.
+		out.reset();
+		out.mark().puts(" Function ").ljustify_mark(maxlen + 5);
+		out.puts("count      cycles  percent");
+		var len = out.length;
+		out.ln();
+		for (i < len) out.putc('-');
+		out.outln();
+	}
+
+	var array = entries.copy();
+	var sorted = Arrays.sort(array, 0, array.length, compareEntries);
+	for (e in sorted) {
+		var func = e.func, count = e.count, cumul = e.cumul;
+		var color = if(count == 0, Palette.UNREACHABLE, Palette.COVERED);
+		if (MonitorOptions.csv) {
+			func.render(e.module.names, out);
+			out.putc(',').putd(count)
+			   .putc(',').putd(cumul)
+			   .outln();
+		} else {
+			out.puts(color)
+			   .mark()
+			   .put1(" %q ", func.render(e.module.names, _))
+			   .ljustify_mark(maxlen + 2)
+			   .puts(Palette.COUNT)
+			   .mark()
+			   .putd(count).sp()
+			   .rjustify_mark(9)
+			   .mark()
+			   .putd(cumul).sp()
+			   .rjustify_mark(12)
+			   .mark();
+			TraceUtil.renderPercent(out, long.view(e.cumul), long.view(total), 3);
+			out
+			   .rjustify_mark(8)
+			   .puts(Palette.DEFAULT)
+			   .outln();
+		}
+	}
+}
