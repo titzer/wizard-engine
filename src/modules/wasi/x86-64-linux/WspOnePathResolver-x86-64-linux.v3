@@ -2,9 +2,29 @@
 // See LICENSE for details of Apache 2.0 license.
 component WasiPathUtil {
 	def normalize_path = normalize_path0;
+	def resolve_path = resolve_path0;
 
 }
 
+type PathComponent {
+	case Root;
+	case Name(s: string);
+	case Prev; // ".."
+	case Curr; // "."
+}
+
+// Flag bit to indicate that symlink resolution should follow the link.
+def LOOKUP_SYMLINK_FOLLOW = 1;
+
+def SYS_readlink = 0x59;
+
+// Maximum allowed path length.
+def PATH_MAX = 4096;
+
+def EINVAL = 22;
+def ENOENT = 2;
+
+// Checks if a given path is absolute by looking for a leading slash.
 def is_absolute_path(path: Array<byte>) -> bool {
 	return (path.length > 0) && (path[0] == '/');
 }
@@ -25,7 +45,8 @@ def find_next_slash(s: Array<byte>, start_pt: i32) -> int {
 	return -1;
 }
 
-def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>, i32, wasi_errno) {
+// Internal function to normalize paths by removing redundant segments.
+def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>) {
 	var cur = 0;
 	var normalized = StringBuilder.new();
 	var nextSlash = 0;
@@ -42,9 +63,9 @@ def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>, i32, wasi_
 		} else if (curSegmentLength == 1 && path[cur] == '.') {
 			/* No-op. Just consume the '.' */
 		} else if (curSegmentLength == 2 && path[cur] == '.' && path[cur + 1] == '.') {
-		
+
 			var tmpResult = normalized.toString();
-			
+			normalized = StringBuilder.new();
 			last = tmpResult.length - 1;
 			var tmpLen = tmpResult.length;
 			while (last >= 0) {
@@ -54,12 +75,15 @@ def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>, i32, wasi_
 				}
 				last -= 1;
 			}
+			var i = 0;
+			
 			/* If the result is currently empty, or the last prior path is also '..'
 			 then output '..'. Otherwise, remove the last path segment. */
 			if (tmpLen == 0) {
 				normalized.puts("..");
 			} else if ((last == tmpLen - 3 || last == tmpLen - 4 && tmpResult[tmpLen - 3] == '/') && tmpResult[tmpLen - 2] == '.' &&
 								 tmpResult[tmpLen - 1] == '.') {
+				normalized.puts(tmpResult);
 				normalized.puts("/..");
 			} else {
 				/* Strip the last segment, but make sure not to strip the '/' if that
@@ -69,16 +93,19 @@ def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>, i32, wasi_
 				}
 				normalized = StringBuilder.new();
 				var i = 0;
-				for (i = 0; i <= last; i++) {
+				for (i = 0; i < last; i++) {
 					normalized.putc(tmpResult[i]);// not good here
 				}
 			}
 		} else {
 			if (normalized.length > 0){
 				var normalizedStr = normalized.toString();
-				if (normalizedStr[normalizedStr.length - 1] != '/'){
+				if (normalizedStr[normalizedStr.length - 1] != '/' ){
 					normalized = StringBuilder.new();
 					normalized.puts(normalizedStr);
+					normalized.putc('/');
+				}else if(normalizedStr.length == 1 && isAbsPath){
+					normalized = StringBuilder.new();
 					normalized.putc('/');
 				}
 			}
@@ -101,6 +128,107 @@ def normalize_path0(path: Array<byte>, pathLen: i32) -> (Array<byte>, i32, wasi_
 			normalized.putc('.');
 		}
 	}
+        
 	var len = normalized.length;
-	return (normalized.toString(), len, wasi_errno.SUCCESS);
+	return normalized.toString();
+}
+
+// Checks if an absolute path remains within the sandboxed environment defined by fd_path.
+def is_abspath_sandboxed(abspath: Array<byte>, fd_path: Array<byte>) -> bool {
+	var abspath_len = abspath.length;
+	var fd_path_len = fd_path.length;
+	if (is_absolute_path(fd_path)) {
+		if (abspath_len < fd_path_len) {
+			return false;
+		}
+		var i = 0;
+		for (i = 0; i < fd_path_len; i++) {
+			if (abspath[i] != fd_path[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+	/* Handle relative fds that normalized to '.' */
+	if (fd_path_len == 1 && fd_path[0] == '.') {
+		/* If the fd's path is '.', then any path does not begin with '..' is OK. */
+		if ((abspath_len == 2 && abspath[0] == '.' && abspath[1] == '.') ||
+			(abspath_len > 2 && abspath[0] == '.' && abspath[1] == '.' && abspath[2] == '/')) {
+			return false;
+			}
+		return true;
+	}
+
+	return true;
+
+}
+
+// Normalizes an absolute path and checks if it stays within the sandbox.
+def normalize_abspath(abspath: Array<byte>, fd_path: Array<byte>) -> (Array<byte>, wasi_errno) {
+	var normalized = normalize_path0(abspath, abspath.length);
+	if (!is_abspath_sandboxed(normalized, fd_path)) {
+		return (normalized, wasi_errno.NOTCAPABLE);
+	}
+	return (normalized, wasi_errno.SUCCESS);
+}
+
+// Normalizes a relative path by combining it with fd_path and checking if it stays within the sandbox.
+def normalize_relative_path(path: Array<byte>, fd_path: Array<byte>) -> (Array<byte>, wasi_errno) {
+	var combined = StringBuilder.new();
+	combined.puts(fd_path);
+	combined.putc('/');
+	combined.puts(path);
+	var combinedStr = combined.toString();
+	
+	var normalized = normalize_path0(combinedStr, combinedStr.length);
+	
+	if (!is_abspath_sandboxed(normalized, fd_path)) {
+		return (normalized, wasi_errno.NOTCAPABLE);
+	}
+	return (normalized, wasi_errno.SUCCESS);
+}
+
+// Resolves a path without following symlinks, ensuring it stays within the sandbox.
+def resolve_path_without_link(fdinfo: WasiFd, path: Array<byte>) -> (Array<byte>, wasi_errno) {
+	var fd_path = fdinfo.path;
+	var normalized : Array<byte>;
+	if (is_absolute_path(path)) {
+		var result = normalize_abspath(path, fd_path);
+		if (result.1 != wasi_errno.SUCCESS) {
+			return result;
+		}
+		normalized = result.0;
+	} else {
+		var result = normalize_relative_path(path, fd_path);
+		if (result.1 != wasi_errno.SUCCESS) {
+			return result;
+		}
+		normalized = result.0;
+	}
+	return (normalized, wasi_errno.SUCCESS);
+
+}
+
+// Main function to resolve a path with an option to follow symlinks, ensuring it stays within the sandbox.
+def resolve_path0(fdinfo: WasiFd, path: Array<byte>, flags: i32) -> (Array<byte>, int) {
+	var result = resolve_path_without_link(fdinfo, path);
+	if (result.1 != wasi_errno.SUCCESS) {
+		return (result.0, result.1.code);
+	}
+	var normalized = result.0;
+	
+	if ((flags & LOOKUP_SYMLINK_FOLLOW) == LOOKUP_SYMLINK_FOLLOW) {
+
+		var buffer = Array<byte>.new(PATH_MAX);
+		var len = PATH_MAX;
+		var t = Linux.syscall(SYS_readlink, (normalized, Pointer.atContents(buffer), len));
+		if (t.0 < 0 && t.0 != -EINVAL && t.0 != -ENOENT) {
+			return (normalized, int.!(t.0));
+		}
+		var readlink_len = t.0;
+		// If the path is a symlink, return it
+		return (buffer, 0);
+
+	}
+	return (normalized, 0);
 }
