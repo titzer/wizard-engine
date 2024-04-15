@@ -1,0 +1,237 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Models a control stack for Wasm bytecode which can be used to compute control information such
+// as a control flow graph. The type parameter <B> represents custom information for each basic
+// block.
+// Note this class doesn't iterate bytecodes directly; instead the user interacts by calling the
+// various {visit_?} methods, or using a {BytecodeIterator} to dispatch to this class.
+class ControlStack<B> extends BytecodeVisitor {
+	// Set by the user to track the current bytecode position.
+	var pc: int;
+	// Creates a new empty label which is tracked in the control stack.
+	var newLabel: (ControlStack<B>) -> B = ControlStack<B>.defaultNewLabel;
+	// Creates a new empty block which is not part of the control stack.
+	var newBlock: (ControlStack<B>) -> B = ControlStack<B>.defaultNewLabel;
+	// Splits a block into two (e.g. branch).
+	var splitBlock: (ControlStack<B>, B) -> (B, B) = ControlStack<B>.defaultSplitBlock;
+	// Splits a block and merges the first into a label.
+	var splitBlockInto: (ControlStack<B>, B, B) -> (B, B) = ControlStack<B>.defaultSplitBlockInto;
+	// Merges a block into another block.
+	var mergeBlock: (ControlStack<B>, B, B) -> B = ControlStack<B>.defaultMergeBlock;
+	// Binds a label position.
+	var bindLabel: (ControlStack<B>, int, B) -> void = ControlStack<B>.defaultBindLabel;
+	// current block
+	var block: B;
+
+	private def stack = ArrayStack<ControlStackEntry<B>>.new();
+
+	// Resets this control to the initial state for entry.
+	def reset() -> B {
+		pc = 0;
+		stack.clear();
+		block = newLabel(this);
+		bindLabel(this, 0, block);
+		push(Opcode.UNREACHABLE);
+		return block;
+	}
+	def isUnreachable() -> bool {
+		return stack.top > 0 && !stack.peek().reachable;
+	}
+	def depth() -> int {
+		return stack.top;
+	}
+	def getEntry(depth: int) -> ControlStackEntry<B> {
+		return stack.elems[stack.top - depth - 1];
+	}
+	def getTopEntry() -> ControlStackEntry<B> {
+		return stack.peek();
+	}
+	def visit_UNREACHABLE()	{
+		setUnreachable();
+	}
+	def visit_BLOCK(btc: BlockTypeCode) {
+		push(Opcode.BLOCK);
+	}
+	def visit_LOOP(btc: BlockTypeCode) {
+		var from = stack.peek();
+		var ctl = push(Opcode.LOOP);
+		bindLabel(this, pc, ctl.label);
+		block = ctl.label = mergeBlock(this, block, ctl.label);
+	}
+	def visit_IF(btc: BlockTypeCode) {
+		var from = stack.peek();
+		var t = splitBlock(this, block);
+		var ctl = push(Opcode.IF);
+		block = t.0;
+		bindLabel(this, -1, block);
+		ctl.else_block = t.1;
+	}
+	def visit_ELSE() {
+		var ctl = stack.peek();
+		ctl.label = mergeBlock(this, block, ctl.label);
+		ctl.start_pos = pc;
+		ctl.start_opcode = Opcode.ELSE;
+		ctl.reachable = true;
+		block = ctl.else_block;
+		bindLabel(this, -1, block);
+		var d: B;
+		ctl.else_block = d;
+	}
+	def visit_TRY(btc: BlockTypeCode) {
+		block = mergeBlock(this, block, newBlock(this)); // split blocks at try
+		push(Opcode.TRY);
+	}
+	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
+		block = mergeBlock(this, block, newBlock(this)); // split blocks at try
+		push(Opcode.TRY_TABLE);
+	}
+	def visit_CATCH(tag_code: u31) {
+		var ctl = stack.peek();
+		ctl.start_pos = pc;
+		ctl.start_opcode = Opcode.CATCH;
+		block = newLabel(this);
+	}
+	def visit_CATCH_ALL() {
+		var ctl = stack.peek();
+		ctl.start_pos = pc;
+		ctl.start_opcode = Opcode.CATCH_ALL;
+		block = newLabel(this);
+	}
+	def visit_THROW(tag_code: u31) {
+		setUnreachable();
+	}
+	def visit_RETHROW(depth: u31) {
+		setUnreachable();
+	}
+	def visit_THROW_REF() {
+		setUnreachable();
+	}
+	def visit_END() {
+		end(Opcode.END);
+	}
+	def visit_BR(depth: u31) {
+		br(depth);
+	}
+	def visit_BR_IF(depth: u31) {
+		brIf(depth);
+	}
+	def visit_BR_TABLE(labels: Range<u31>) {
+		for (depth in labels) brIf(depth);
+		setUnreachable();
+	}
+	def visit_RETURN() {
+		setUnreachable();
+	}
+	def visit_RETURN_CALL(func_index: u31) {
+		setUnreachable();
+	}
+	def visit_RETURN_CALL_INDIRECT(sig_index: u31, table_index: u31) {
+		setUnreachable();
+	}
+	def visit_BR_ON_NULL(label: u31) {
+		brIf(label);
+	}
+	def visit_BR_ON_NON_NULL(label: u31) {
+		brIf(label);
+	}
+	def visit_BR_ON_CAST(imm: BrOnCastImm) {
+		brIf(imm.depth);
+	}
+	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
+		brIf(imm.depth);
+	}
+	def top() -> ControlStackEntry<B> {
+		return stack.peek();
+	}
+
+	private def push(opcode: Opcode) -> ControlStackEntry<B> {
+		var ctl = stack.next();
+		if (ctl != null) { // FAST: reuse previous ControlEntry object
+			stack.top++;
+		} else { // allocate and cache new ControlStackEntry object
+			ctl = ControlStackEntry<B>.new(stack.top);
+			stack.push(ctl);
+		}
+		ctl.start_pos = this.pc;
+		ctl.start_opcode = opcode;
+		ctl.reachable = true;
+		ctl.label = newLabel(this);
+		var d: B;
+		ctl.else_block = d;
+		return ctl;
+	}
+	private def end(opcode: Opcode) {
+		var ctl = stack.peek();
+		match (ctl.start_opcode) {
+			LOOP => {
+				// loop is a fallthru, block unchanged
+			}
+			IF => {
+				// one-armed if; simulate empty else clause
+				var end = ctl.label;
+				end = mergeBlock(this, block, end); // fallthru
+				ctl.reachable = true;
+				end = mergeBlock(this, ctl.else_block, end); // else merge
+				bindLabel(this, pc, end);
+				block = end;
+			}
+			_ => {
+				var end = ctl.label;
+				end = mergeBlock(this, block, end); // fallthru
+				bindLabel(this, pc, end);
+				block = end;
+			}
+		}
+		stack.pop();
+	}
+	private def setUnreachable() {
+		var from = stack.peek();
+		from.reachable = false;
+		block = newBlock(this);
+	}
+	private def br(depth: u31) {
+		var from = stack.peek();
+		var to = stack.elems[stack.top - depth - 1];
+		to.label = mergeBlock(this, block, to.label);
+		from.reachable = false;
+		block = newBlock(this);
+	}
+	private def brIf(depth: u31) {
+		var from = stack.peek();
+		var to = stack.elems[stack.top - depth - 1];
+		var t = splitBlockInto(this, block, to.label);
+		to.label = t.0;
+		block = t.1;
+	}
+	// Default implementations of block management functions.
+	def defaultNewLabel() -> B {
+		var d: B;
+		return d;
+	}
+	def defaultSplitBlock(b: B) -> (B, B) {
+		return (newLabel(this), newLabel(this));
+	}
+	def defaultSplitBlockInto(from: B, to: B) -> (B, B) {
+		var new_from = mergeBlock(this, from, to);
+		var rem = newLabel(this);
+		bindLabel(this, -1, rem);
+		rem = mergeBlock(this, from, rem);
+		return (new_from, rem);
+	}
+	def defaultMergeBlock(from: B, to: B) -> B {
+		var d: B;
+		return d;
+	}
+	def defaultBindLabel(pc: int, b: B) {
+	}
+}
+
+// A control stack entry tracked by the control stack.
+class ControlStackEntry<B>(depth: int) {
+	def var start_pos: int;
+	def var start_opcode: Opcode;
+	def var reachable = true;
+	def var else_block: B;
+	var label: B;
+}
