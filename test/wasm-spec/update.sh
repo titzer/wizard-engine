@@ -31,7 +31,7 @@ function update {
 	mkdir -p $REPOS
 	pushd $REPOS
 	echo "##+[$b] git clone"
-	git clone https://github.com/WebAssembly/$b
+	git clone --depth 1 https://github.com/WebAssembly/$b
 	check $?
 	popd
     else
