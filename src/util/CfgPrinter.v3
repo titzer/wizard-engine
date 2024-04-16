@@ -1,23 +1,68 @@
 // Copyright 2024 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-class CfgPrinter extends BytecodeVisitor {
-	def tracer = InstrTracer.new();
-	def bi = BytecodeIterator.new();
-	def cs = ControlStack<int>.new();
-	def targets = Vector<int>.new();
-	def entries = Vector<CfgPrintEntry>.new();
-	def lbuf = Vector<CfgEdgeChar>.new();
-	def rbuf = Vector<CfgEdgeChar>.new();
-	def ibuf = StringBuilder.new();
-	def loop_stack = ArrayStack<ControlStackEntry<int>>.new();
-	var lmax = 0;
+// A {CfgPrintEntry} represents the program counter, forward control flow edges, rendered instruction,
+// and backward edges. It can be rendered and also annotated.
+type CfgPrintEntry(pc: int, fw_edges: Array<CfgEdgeChar>, instr: string, bw_edges: Array<CfgEdgeChar>) #unboxed {
+	def length() -> int {
+		return fw_edges.length + instr.length;
+	}
+	def render(lmax: int, buf: TraceBuilder) -> TraceBuilder {
+		buf.mark().put1("+%d", pc).ljustify_mark(7);
+		renderFwEdges(buf);
+		buf.puts(instr);
+		for (i < 2 + lmax - length()) buf.sp();
+		renderBwEdges(buf);
+		return buf;
+	}
+	def renderFwEdges(buf: StringBuilder) -> StringBuilder {
+		for (e in fw_edges) match (e) {
+			EMPTY		=> buf.sp();
+			BEGIN_LOOP 	=> buf.pututf8(BOX_UPPER_LEFT);
+			BEGIN_BLOCK 	=> buf.pututf8(BOX_UPPER_LEFT);
+			IN_BLOCK 	=> buf.pututf8('|');
+			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
+			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_LEFT);
+			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_LEFT);
+			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
+			END_BLOCK	=> buf.pututf8(BOX_LOWER_LEFT);
+			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
+		}
+		return buf;
+	}
+	def renderBwEdges(buf: StringBuilder) -> StringBuilder {
+		for (e in bw_edges) match (e) {
+			BEGIN_LOOP 	=> buf.pututf8(LEFT_ARROW);
+			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
+			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_RIGHT);
+			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_RIGHT);
+			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
+			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
+			EMPTY,
+			BEGIN_BLOCK,
+			IN_BLOCK,
+			END_BLOCK	=> buf.sp();
+		}
+		return buf;
+	}
+}
 
-	def print(module: Module, func: FuncDecl) {
-		Trace.OUT.puts(Palette.FUNC)
-			.put1("func %q:", func.render(module.names, _))
-			.puts(Palette.DEFAULT)
-			.outln();
+// This utility can be used to render the forward/backward edges of a control flow graph or to compute
+// a summary of these edges which can then be annotated.
+class CfgPrinter extends BytecodeVisitor {
+	private def tracer = InstrTracer.new();
+	private def bi = BytecodeIterator.new();
+	private def cs = ControlStack<int>.new();
+	private def targets = Vector<int>.new();
+	private def entries = Vector<CfgPrintEntry>.new();
+	private def lbuf = Vector<CfgEdgeChar>.new();
+	private def rbuf = Vector<CfgEdgeChar>.new();
+	private def ibuf = StringBuilder.new();
+	private def loop_stack = ArrayStack<ControlStackEntry<int>>.new();
+	private var lmax = 0;
+
+	// Compute an array of {CfgPrintEntry} which can be used to output an annotated CFG.
+	def compute(module: Module, func: FuncDecl) -> Array<CfgPrintEntry> {
 		bi.reset(func).current();
 		cs.reset();
 		entries.resize(0);
@@ -48,24 +93,30 @@ class CfgPrinter extends BytecodeVisitor {
 
 			bi.next();
 		}
+		return entries.extract();
+	}
+	// Generate and print the control flow edges.
+	def print(module: Module, func: FuncDecl) {
+		Trace.OUT.puts(Palette.FUNC)
+			.put1("func %q:", func.render(module.names, _))
+			.puts(Palette.DEFAULT)
+			.outln();
 
+		var entries = compute(module, func);
 		for (i < entries.length) {
 			var e = entries[i];
-			Trace.OUT.sp().mark().put1("+%d", e.pc).ljustify_mark(7);
-			renderFwEdges(e.fw_edges, Trace.OUT);
-			Trace.OUT.puts(e.instr);
-			for (i < 2 + lmax - e.length()) Trace.OUT.sp();
-			renderBwEdges(e.bw_edges, Trace.OUT);
+			Trace.OUT.sp();
+			e.render(lmax, Trace.OUT);
 			Trace.OUT.outln();
 		}
 	}
-	def putEntry(pc: int, instr: string) {
+	private def putEntry(pc: int, instr: string) {
 		var e = CfgPrintEntry(pc, lbuf.extract(), instr, rbuf.extract());
 		entries.put(e);
 		var len = e.length();
 		if (len > lmax) lmax = len;
 	}
-	def makeEdges(last: ControlStackEntry<int>, before: int, after: int, target: int) {
+	private def makeEdges(last: ControlStackEntry<int>, before: int, after: int, target: int) {
 		// Initialize left edges
 		lbuf.resize(0);
 		var min = if(before < after, before, after);
@@ -84,7 +135,7 @@ class CfgPrinter extends BytecodeVisitor {
 			var min = lbuf.length - 2 * target - 2;
 			if (entry.isLoop()) {
 				// backward edge to loop start
-				makeBackwardEdge(entry);
+				makeBwEdge(entry);
 			} else {
 				// forward edge to block end
 				lbuf[min] = CfgEdgeChar.CONNECT_DOWN;
@@ -103,7 +154,7 @@ class CfgPrinter extends BytecodeVisitor {
 			lbuf.put(CfgEdgeChar.BEGIN_BLOCK).put(SP);
 		}
 	}
-	def makeBackwardEdge(entry: ControlStackEntry<int>) {
+	private def makeBwEdge(entry: ControlStackEntry<int>) {
 		for (i = loop_stack.top - 1; i >= 0; i--) {
 			var lentry = loop_stack.elems[i];
 			if (lentry != entry) continue;
@@ -126,34 +177,6 @@ class CfgPrinter extends BytecodeVisitor {
 				if (up.bw_edges[pos] == CfgEdgeChar.EMPTY) up.bw_edges[pos] = CfgEdgeChar.HAS_EDGE;
 			}
 			break;
-		}
-	}
-	def renderFwEdges(edges: Array<CfgEdgeChar>, buf: StringBuilder) {
-		for (e in edges) match (e) {
-			EMPTY		=> buf.sp();
-			BEGIN_LOOP 	=> buf.pututf8(BOX_UPPER_LEFT);
-			BEGIN_BLOCK 	=> buf.pututf8(BOX_UPPER_LEFT);
-			IN_BLOCK 	=> buf.pututf8('|');
-			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
-			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_LEFT);
-			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_LEFT);
-			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
-			END_BLOCK	=> buf.pututf8(BOX_LOWER_LEFT);
-			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
-		}
-	}
-	def renderBwEdges(edges: Array<CfgEdgeChar>, buf: StringBuilder) {
-		for (e in edges) match (e) {
-			BEGIN_LOOP 	=> buf.pututf8(LEFT_ARROW);
-			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
-			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_RIGHT);
-			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_RIGHT);
-			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
-			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
-			EMPTY,
-			BEGIN_BLOCK,
-			IN_BLOCK,
-			END_BLOCK	=> buf.sp();
 		}
 	}
 	def visit_ELSE() {
@@ -206,12 +229,6 @@ enum CfgEdgeChar {
 	END_BLOCK
 }
 def SP = CfgEdgeChar.EMPTY;
-
-type CfgPrintEntry(pc: int, fw_edges: Array<CfgEdgeChar>, instr: string, bw_edges: Array<CfgEdgeChar>) #unboxed {
-	def length() -> int {
-		return fw_edges.length + instr.length;
-	}
-}
 
 def BOX_UPPER_LEFT = 0x256Du;
 def BOX_UPPER_RIGHT = 0x256Eu;
