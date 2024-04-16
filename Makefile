@@ -25,7 +25,7 @@ WASI_X86_64_LINUX=src/modules/wasi/x86-64-linux/*.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
 SPECTEST=$(ENGINE) test/wasm-spec/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
-UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3
+UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 WIZENG=$(ENGINE) $(WAVE) $(WASI) src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
