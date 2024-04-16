@@ -1,0 +1,226 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class CfgPrinter extends BytecodeVisitor {
+	def tracer = InstrTracer.new();
+	def bi = BytecodeIterator.new();
+	def cs = ControlStack<int>.new();
+	def targets = Vector<int>.new();
+	def entries = Vector<CfgPrintEntry>.new();
+	def lbuf = Vector<CfgEdgeChar>.new();
+	def rbuf = Vector<CfgEdgeChar>.new();
+	def ibuf = StringBuilder.new();
+	def loop_stack = ArrayStack<ControlStackEntry<int>>.new();
+	var lmax = 0;
+
+	def print(module: Module, func: FuncDecl) {
+		Trace.OUT.puts(Palette.FUNC)
+			.put1("func %q:", func.render(module.names, _))
+			.puts(Palette.DEFAULT)
+			.outln();
+		bi.reset(func).current();
+		cs.reset();
+		entries.resize(0);
+		lmax = 0;
+
+		while (bi.more()) {
+			targets.resize(0);
+
+			var before = cs.depth();
+			var prev = cs.getTopEntry();
+			cs.pc = bi.pc;
+			bi.dispatch(cs);
+			bi.dispatch(this);
+			var next = cs.getTopEntry();
+			var after = cs.depth();
+			if (prev.isLoop() && after < before) loop_stack.pop();
+			if (after > before && next.isLoop()) loop_stack.push(next);
+
+			var first = if(targets.length > 0, targets[0], -1);
+			makeEdges(prev, before, after, first);
+			bi.traceOrig(ibuf, module, tracer);
+			putEntry(bi.pc, ibuf.toString());
+
+			for (i = 1; i < targets.length; i++) {
+				makeEdges(prev, before, after, targets[i]);
+				putEntry(-1, "");
+			}
+
+			bi.next();
+		}
+
+		for (i < entries.length) {
+			var e = entries[i];
+			Trace.OUT.sp().mark().put1("+%d", e.pc).ljustify_mark(7);
+			renderFwEdges(e.fw_edges, Trace.OUT);
+			Trace.OUT.puts(e.instr);
+			for (i < 2 + lmax - e.length()) Trace.OUT.sp();
+			renderBwEdges(e.bw_edges, Trace.OUT);
+			Trace.OUT.outln();
+		}
+	}
+	def putEntry(pc: int, instr: string) {
+		var e = CfgPrintEntry(pc, lbuf.extract(), instr, rbuf.extract());
+		entries.put(e);
+		var len = e.length();
+		if (len > lmax) lmax = len;
+	}
+	def makeEdges(last: ControlStackEntry<int>, before: int, after: int, target: int) {
+		// Initialize left edges
+		lbuf.resize(0);
+		var min = if(before < after, before, after);
+		for (i < min) {
+			var entry = cs.getEntry(after - i - 1);
+			var ch = if(entry.label > 0, CfgEdgeChar.HAS_EDGE, CfgEdgeChar.IN_BLOCK);
+			lbuf.put(ch).put(SP);
+		}
+		// Initialize right edges
+		rbuf.resize(2 + 2 * loop_stack.top);
+		for (i < rbuf.length) rbuf[i] = CfgEdgeChar.EMPTY;
+//		Trace.OUT.put2("at +%d, rbuf.length=%d", bi.pc, rbuf.length).outln();
+
+		if (target >= 0) {
+			var entry = cs.getEntry(target);
+			var min = lbuf.length - 2 * target - 2;
+			if (entry.isLoop()) {
+				// backward edge to loop start
+				makeBackwardEdge(entry);
+			} else {
+				// forward edge to block end
+				lbuf[min] = CfgEdgeChar.CONNECT_DOWN;
+				for (i = min+1; i < lbuf.length; i++) lbuf[i] = CfgEdgeChar.CONNECT;
+				entry.label = 1;
+			}
+		}
+
+		if (after < before) {
+			// end
+			lbuf.put(CfgEdgeChar.END_BLOCK);
+			if (last.isLoop()) lbuf.put(SP);
+			else lbuf.put(CfgEdgeChar.RIGHT_ARROW);
+		} else if (after > before) {
+			// block
+			lbuf.put(CfgEdgeChar.BEGIN_BLOCK).put(SP);
+		}
+	}
+	def makeBackwardEdge(entry: ControlStackEntry<int>) {
+		for (i = loop_stack.top - 1; i >= 0; i--) {
+			var lentry = loop_stack.elems[i];
+			if (lentry != entry) continue;
+
+			var pos = 2 + 2*i;
+			for (j < pos) rbuf[j] = CfgEdgeChar.CONNECT;
+			rbuf[pos] = CfgEdgeChar.CONNECT_UP;
+//			Trace.OUT.put2("at +%d, up to=%d", bi.pc, i).outln();
+			for (j = entries.length - 1; j >= 0; j--) {
+				var up = entries[j];
+//				Trace.OUT.put2("up +%d, up to=%d", up.pc, i).outln();
+				if (up.pc == entry.start_pos) {
+					// reached the top of the loop
+					for (k < pos) up.bw_edges[1 + k] = CfgEdgeChar.CONNECT;
+					up.bw_edges[pos] = CfgEdgeChar.CONNECT_DOWN;
+					up.bw_edges[0] = CfgEdgeChar.BEGIN_LOOP;
+					up.bw_edges[1] = CfgEdgeChar.CONNECT;
+					break;
+				}
+				if (up.bw_edges[pos] == CfgEdgeChar.EMPTY) up.bw_edges[pos] = CfgEdgeChar.HAS_EDGE;
+			}
+			break;
+		}
+	}
+	def renderFwEdges(edges: Array<CfgEdgeChar>, buf: StringBuilder) {
+		for (e in edges) match (e) {
+			EMPTY		=> buf.sp();
+			BEGIN_LOOP 	=> buf.pututf8(BOX_UPPER_LEFT);
+			BEGIN_BLOCK 	=> buf.pututf8(BOX_UPPER_LEFT);
+			IN_BLOCK 	=> buf.pututf8('|');
+			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
+			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_LEFT);
+			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_LEFT);
+			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
+			END_BLOCK	=> buf.pututf8(BOX_LOWER_LEFT);
+			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
+		}
+	}
+	def renderBwEdges(edges: Array<CfgEdgeChar>, buf: StringBuilder) {
+		for (e in edges) match (e) {
+			BEGIN_LOOP 	=> buf.pututf8(LEFT_ARROW);
+			HAS_EDGE 	=> buf.pututf8(BOX_VERTICAL);
+			CONNECT_UP 	=> buf.pututf8(BOX_LOWER_RIGHT);
+			CONNECT_DOWN	=> buf.pututf8(BOX_UPPER_RIGHT);
+			CONNECT		=> buf.pututf8(BOX_HORIZONTAL);
+			RIGHT_ARROW	=> buf.pututf8(RIGHT_ARROW);
+			EMPTY,
+			BEGIN_BLOCK,
+			IN_BLOCK,
+			END_BLOCK	=> buf.sp();
+		}
+	}
+	def visit_ELSE() {
+		targets.put(0);
+	}
+	def visit_BR(depth: u31) {
+		targets.put(depth);
+	}
+	def visit_BR_IF(depth: u31) {
+		targets.put(depth);
+	}
+	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
+		targets.put(-1);
+		for (catch in catches) match (catch) {
+			Catch(tag_index, label)		=> targets.put(label);
+			CatchRef(tag_index, label)	=> targets.put(label);
+			CatchAll(label)			=> targets.put(label);
+			CatchAllRef(label)		=> targets.put(label);
+		}
+	}
+	def visit_BR_TABLE(labels: Range<u31>) {
+		targets.put(-1);
+		for (l in labels) targets.put(l);
+	}
+	def visit_BR_ON_NULL(label: u31) {
+		targets.put(label);
+	}
+	def visit_BR_ON_NON_NULL(label: u31) {
+		targets.put(label);
+	}
+	def visit_BR_ON_CAST(imm: BrOnCastImm) {
+		targets.put(imm.depth);
+	}
+	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
+		targets.put(imm.depth);
+	}
+
+}
+
+enum CfgEdgeChar {
+	EMPTY,
+	BEGIN_LOOP,
+	BEGIN_BLOCK,
+	IN_BLOCK,
+	HAS_EDGE,
+	CONNECT_UP,
+	CONNECT_DOWN,
+	CONNECT,
+	RIGHT_ARROW,
+	END_BLOCK
+}
+def SP = CfgEdgeChar.EMPTY;
+
+type CfgPrintEntry(pc: int, fw_edges: Array<CfgEdgeChar>, instr: string, bw_edges: Array<CfgEdgeChar>) #unboxed {
+	def length() -> int {
+		return fw_edges.length + instr.length;
+	}
+}
+
+def BOX_UPPER_LEFT = 0x256Du;
+def BOX_UPPER_RIGHT = 0x256Eu;
+def BOX_LOWER_LEFT = 0x2570u;
+def BOX_LOWER_RIGHT = 0x256Fu;
+def BOX_VERTICAL = 0x2502u;
+def BOX_HORIZONTAL = 0x2500u;
+def BOX_CONNECT_LEFT = 0x251Cu;
+def BOX_CONNECT_RIGHT = 0x2524u;
+def BOX_HALF_VERTICAL = 0x2575u;
+def RIGHT_ARROW = 0x2192u;
+def LEFT_ARROW = '<';
