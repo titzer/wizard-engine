@@ -1,0 +1,137 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A utility class to insert instrumentation into functions to record entry, loops, branches,
+// and merges (ends). Used by several different monitors.
+class ControlInstrumenter extends BytecodeVisitor {
+	var entry: bool;	// instrument entry to function
+	var loops: bool;	// instrument loops
+	var branches: bool;	// instrument branches
+	var ends: bool;		// instrument ends
+	private def bi = BytecodeIterator.new();
+	private var module: Module;
+	private def entries = Vector<(int, Probe)>.new();
+
+	def instrument(module: Module, func: FuncDecl) -> ControlInstrumentation {
+		entries.resize(0);
+		this.module = module;
+		bi.iterate(func, this);
+		return if(entries.length > 0, ControlInstrumentation.new(func, entries.extract()));
+	}
+
+	def visitEntry() {
+		if (entry) {
+			var probe = CountProbe.new();
+			Instrumentation.insertFuncEntryProbe(module, bi.func.func_index, probe);
+			entries.put(0, probe);
+		}
+	}
+	def visit_IF(btc: BlockTypeCode) {
+		if (branches) insertProbeHere(CiBrProbe.new());
+	}
+	def visit_LOOP(btc: BlockTypeCode) {
+		if (loops) insertProbeHere(CountProbe.new());
+	}
+	def visit_END() {
+		if (ends) insertProbeHere(CountProbe.new());
+	}
+	def visit_BR(depth: u31) {
+		if (branches) insertProbeHere(CiBrProbe.new());
+	}
+	def visit_BR_IF(depth: u31) {
+		if (branches) insertProbeHere(CiBrProbe.new());
+	}
+	def visit_BR_TABLE(labels: Range<u31>) {
+		if (branches) insertProbeHere(CiBrTableProbe.new(u31.!(labels.length)));
+	}
+	def visit_BR_ON_NULL(depth: u31) {
+		if (branches) insertProbeHere(CiBrOnNullProbe.new(true));
+	}
+	def visit_BR_ON_NON_NULL(depth: u31) {
+		if (branches) insertProbeHere(CiBrOnNullProbe.new(false));
+	}
+	def visit_BR_ON_CAST(imm: BrOnCastImm) {
+		if (branches) insertProbeHere(CiBrOnCastProbe.new(imm.null2(), imm.ht2, true));
+	}
+	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
+		if (branches) insertProbeHere(CiBrOnCastProbe.new(imm.null2(), imm.ht2, false));
+	}
+
+	private def insertProbeHere(probe: Probe) {
+		Instrumentation.insertLocalProbe(module, bi.func.func_index, bi.pc, probe);
+		entries.put(bi.pc, probe);
+	}
+}
+
+// A container for all the instrumentation inserted into a function, returned by the instrumenter.
+class ControlInstrumentation(func: FuncDecl, entries: Array<(int, Probe)>) {
+	def getEntryCount() -> CountProbe {
+		if (entries.length < 1) return null;
+		var e = entries[0];
+		return if (e.0 == 0, CountProbe.!(e.1));
+	}
+	def getCount(pc: int) -> CountProbe {
+		// TODO: binary search
+		for (i < entries.length) {
+			var e = entries[i];
+			if (e.0 == pc && CountProbe.?(e.1)) return CountProbe.!(e.1);
+		}
+		return null;
+	}
+	def getBrCounts(pc: int) -> Array<u64> {
+		// TODO: binary search
+		for (i < entries.length) {
+			var e = entries[i];
+			if (e.0 == pc) match (e.1) {
+				x: CiBrProbe => return x.taken;
+				x: CiBrOnNullProbe => return x.taken;
+				x: CiBrOnCastProbe => return x.taken;
+				x: CiBrTableProbe => return x.taken;
+			}
+		}
+		return null;
+	}
+}
+
+private class CiBrProbe extends OperandProbe_i_v {
+	def taken = Array<u64>.new(2);
+
+	def fire_i(v: u32) {
+		taken[if(v != 0, 1, 0)] += 1;
+	}
+}
+
+private class CiBrOnNullProbe(null_taken: bool) extends Probe {
+	def taken = Array<u64>.new(2);
+
+	def fire(loc: DynamicLoc) -> Resumption {
+		match (loc.frame.getFrameAccessor().getOperand(0)) {
+			Ref(obj) => taken[if(null_taken == (obj == null), 1, 0)]++;
+			_ => taken[0]++;
+		}
+		return Resumption.Continue;
+	}
+}
+
+private class CiBrOnCastProbe(nullable: bool, htcode: int, success_taken: bool) extends Probe {
+	def taken = Array<u64>.new(2);
+
+	def fire(loc: DynamicLoc) -> Resumption {
+		var accessor = loc.frame.getFrameAccessor();
+		var instance = accessor.func().instance;
+		var result = Runtime.cast(instance, nullable, htcode, accessor.getOperand(0));
+		taken[if(result == success_taken, 0, 1)]++;
+		return Resumption.Continue;
+	}
+}
+
+private class CiBrTableProbe extends OperandProbe_i_v {
+	def count: u31;
+	def taken = Array<u64>.new(count);
+	new(count) { }
+
+	def fire_i(v: u32) {
+		if (v >= taken.length) taken[taken.length - 1]++;
+		else taken[v]++;
+	}
+}
