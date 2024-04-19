@@ -12,7 +12,7 @@ def showZeroCounts_ = E // TODO: return Option<bool>
 var inCodeMode = false;
 var showZeroCounts = false;
 class BranchMonitor extends Monitor {
-	var visitor: BranchMonitorState;
+	def funcs = Vector<(Module, ControlInstrumentation)>.new();
 	def bi = BytecodeIterator.new();
 
 	def configure(args: string) -> string {
@@ -31,264 +31,171 @@ class BranchMonitor extends Monitor {
 	}
 
 	def onParse(module: Module) {
+		var i = ControlInstrumenter.new();
+		i.entry = false;
+		i.brs = false;
+		i.br_ifs = true;
+		i.loops = false;
+		i.ends = false;
+
 		var mm = ModuleMonitor.new(module);
-		visitor = BranchMonitorState.new(mm, inCodeMode);
-		visitor.bi = bi;
-
-		mm.forEachFunc(MonitorUtil.isNotImport, bi.iterate(_, visitor));
-		mm.afterFinish(visitor.onFinish);
+		mm.forEachFunc(MonitorUtil.isNotImport, instrument(module, _, i));
 	}
-}
-
-private class BmBrProbe(taken: Array<u64>) extends OperandProbe_i_v {
-	def fire_i(v: u32) {
-		taken[if(v != 0, 1, 0)] += 1;
+	def instrument(module: Module, func: FuncDecl, i: ControlInstrumenter) {
+		var ins = i.instrument(module, func);
+		if (ins != null) funcs.put(module, ins);
 	}
-}
-
-private class BmBrOnNullProbe(taken: Array<u64>, null_taken: bool) extends Probe {
-	def fire(loc: DynamicLoc) -> Resumption {
-		match (loc.frame.getFrameAccessor().getOperand(0)) {
-			Ref(obj) => taken[if(null_taken == (obj == null), 1, 0)]++;
-			_ => taken[0]++;
-		}
-		return Resumption.Continue;
-	}
-}
-
-private class BmBrOnCastProbe(taken: Array<u64>, nullable: bool, htcode: int, success_taken: bool) extends Probe {
-	def fire(loc: DynamicLoc) -> Resumption {
-		var accessor = loc.frame.getFrameAccessor();
-		var instance = accessor.func().instance;
-		var result = Runtime.cast(instance, nullable, htcode, accessor.getOperand(0));
-		taken[if(result == success_taken, 0, 1)]++;
-		return Resumption.Continue;
-	}
-}
-
-private class BmBrTableProbe(taken: Array<u64>) extends OperandProbe_i_v {
-	def fire_i(v: u32) {
-		if (v >= taken.length) taken[taken.length - 1]++;
-		else taken[v]++;
-	}
-}
-
-private class BranchMonitorState(mm: ModuleMonitor, inCodeMode: bool) extends BytecodeVisitor {
-	def entries = Vector<BmEntry>.new();
-	var bi: BytecodeIterator;
-	def tracer = InstrTracer.new();
-
-	def visit_IF(btc: BlockTypeCode) {
-		var taken = addBranchInfo(Opcode.IF, 2);
-		insertProbeHere(BmBrProbe.new(taken));
-	}
-
-	def visit_BR_IF(depth: u31) {
-		var taken = addBranchInfo(Opcode.BR_IF, 2);
-		insertProbeHere(BmBrProbe.new(taken));
-	}
-
-	def visit_BR_TABLE(labels: Range<u31>) {
-		var taken = addBranchInfo(Opcode.BR_TABLE, labels.length);
-		insertProbeHere(BmBrTableProbe.new(taken));
-	}
-
-	def visit_BR_ON_NULL(depth: u31) {
-		var taken = addBranchInfo(Opcode.BR_ON_NULL, 2);
-		insertProbeHere(BmBrOnNullProbe.new(taken, true));
-	}
-
-	def visit_BR_ON_NON_NULL(depth: u31) {
-		var taken = addBranchInfo(Opcode.BR_ON_NON_NULL, 2);
-		insertProbeHere(BmBrOnNullProbe.new(taken, false));
-	}
-
-	def visit_BR_ON_CAST(imm: BrOnCastImm) {
-		var taken = addBranchInfo(Opcode.BR_ON_CAST, 2);
-		insertProbeHere(BmBrOnCastProbe.new(taken, imm.null2(), imm.ht2, true));
-	}
-
-	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
-		var taken = addBranchInfo(Opcode.BR_ON_CAST_FAIL, 2);
-		insertProbeHere(BmBrOnCastProbe.new(taken, imm.null2(), imm.ht2, false));
-	}
-
 	def onFinish(i: Instance) {
-		if (inCodeMode) reportCode(i.module, entries, bi, tracer);
-		else report(i.module, entries);
+		print(funcs);
 	}
-
-	private def addBranchInfo(opcode: Opcode, numTargets: int) -> Array<u64> {
-		var f = bi.func;
-		var entry = BmEntry.new(f, bi.pc, opcode, numTargets);
-		entries.put(entry);
-		return entry.taken;
+	def onExit(code: int) {
+		print(funcs);
 	}
-	private def insertProbeHere(probe: Probe) {
-		Instrumentation.insertLocalProbe(mm.module, bi.func.func_index, bi.pc, probe);
-	}
-}
-private class BmEntry(func: FuncDecl, pc: int, op: Opcode, numTargets: int) {
-	// for BR_IF, [0] = not taken and [1] = taken
-	// for IF, [0] = else branch, [1] = then branch
-	def taken = Array<u64>.new(numTargets);
 }
 
 // Output report summary for a func to STDOUT
 def OUT = Trace.OUT;
-def report(module: Module, entries: Vector<BmEntry>) {
-	var prev: FuncDecl;
-	for (j < entries.length) {
-		var e = entries[j];
-		if (!showZeroCounts) {
-			var nonzero = false;
-			for (v in e.taken) nonzero |= (v != 0);
-			if (!nonzero) continue;
-		}
-		if (e.func != prev) {
-			prev = e.func;
-			OUT.puts(Palette.FUNC)
-				.put1("func %q:", prev.render(module.names, _))
-				.puts(Palette.DEFAULT)
-				.outln();
-		}
-		OUT.puts(Palette.LNO)
-			.mark()
-			.put1("+%d", e.pc)
-			.rjustify_mark(5)
+def TRACER = InstrTracer.new();
+def print(funcs: Vector<(Module, ControlInstrumentation)>) {
+	var bi = BytecodeIterator.new();
+	for (i < funcs.length) {
+		var e = funcs[i], module = e.0, ins = e.1;
+		if (!showZeroCounts && !ins.isNonZero()) continue;
+		OUT.puts(Palette.FUNC)
+			.put1("func %q:", ins.func.render(module.names, _))
 			.puts(Palette.DEFAULT)
-			.putc(' ');
-		Opcodes.render(OUT, e.op.code);
-		OUT.puts(":\t [");
-		outputEntry(e, OUT, ", ");
-		OUT.putc(']').outln();
+			.outln();
+		bi.reset(ins.func);
+		if (inCodeMode) {
+			printCode(module, bi, ins);
+			continue;
+		}
+		
+		for (e in ins.entries) {
+			OUT.puts(Palette.LNO)
+				.mark()
+				.put1("+%d", e.0)
+				.rjustify_mark(5)
+				.puts(Palette.DEFAULT)
+				.putc(' ');
+			bi.at(e.0);
+			OUT.puts(bi.current().mnemonic);
+			var taken = ins.getBrCounts(e.0);
+			OUT.puts(":\t [");
+			for (j < taken.length) {
+				if (j > 0) OUT.csp();
+				if (taken[j] > 0) OUT.puts(Palette.COUNT);
+				else OUT.puts(Palette.DEFAULT).puts(Palette.INACTIVE);
+				OUT.putd(taken[j]);
+				OUT.puts(Palette.DEFAULT);
+			}
+			OUT.putc(']').outln();
+		}
+		
 	}
 }
 
 // Output code report for a func to STDOUT
-def reportCode(module: Module, entries: Vector<BmEntry>, bi: BytecodeIterator, tracer: InstrTracer) {
-	// generate list of unique functions from entries captured
-	def funcDecls = Vector<FuncDecl>.new();
-	for (i < entries.length) {
-		if (funcDecls.length == 0 || funcDecls[funcDecls.length-1].func_index != entries[i].func.func_index) {
-			funcDecls.put(entries[i].func);
+def printCode(module: Module, bi: BytecodeIterator, ins: ControlInstrumentation) {
+	// Use sidetable to generate a control flow graph.
+	// Later used to visually depict control flow edges.
+	var func = ins.func;
+	def st = func.sidetable;
+	def stMap = SidetableMap.new(func);
+	def cfg = HashMap<int, Vector<(int, u64)>>.new(int.!<int>, int.==);
+	for (bi = bi.reset(func); bi.more(); bi.next()) {
+		def op = bi.current();
+		match(op) {
+			IF, BR_IF, BR_ON_NULL, BR_ON_NON_NULL => {
+				var taken = ins.getBrCounts(bi.pc);
+				def stp = stMap[bi.pc];
+				def stEntry = st.getBrEntry(stp);
+				def padding = if(stEntry.dpc > 0, -1, 0);
+				def target = bi.pc + stEntry.dpc + padding;
+				// add outward edges
+				if (!cfg.has(bi.pc)) cfg[bi.pc] = Vector<(int, u64)>.new();
+				cfg[bi.pc].put(target, taken[1]);
+				cfg[bi.pc].put(bi.nextPc(), taken[0]);
+
+				// add inward edges
+				if (!cfg.has(target)) cfg[target] = Vector<(int, u64)>.new();
+				cfg[target].put(bi.pc, taken[1]);
+				if (!cfg.has(bi.nextPc())) cfg[bi.nextPc()] = Vector<(int, u64)>.new();
+				cfg[bi.nextPc()].put(bi.pc, taken[0]);
+			}
+			BR_TABLE => {
+				var taken = ins.getBrCounts(bi.pc);
+				var stp = stMap[bi.pc];
+				var stEntry = st.getBrEntry(stp);
+				def noOfTargets = stEntry.dpc;
+				for (i = 1; i <= noOfTargets; i++) {
+					stp = stp + 4;
+					stEntry = st.getBrEntry(stp);
+					def target = bi.pc + stEntry.dpc + i - 1;
+					// add outward edge
+					if (!cfg.has(bi.pc)) cfg[bi.pc] = Vector<(int, u64)>.new();
+					cfg[bi.pc].put(target, taken[i - 1]);
+
+					// add inward edge
+					if (!cfg.has(target)) cfg[target] = Vector<(int, u64)>.new();
+					cfg[target].put(bi.pc, taken[i - 1]);
+				}
+			}
+			_ => ;
 		}
 	}
 
-	var entryCounter = 0;
-	for (i < funcDecls.length) {
-		def func = funcDecls[i];
-		OUT.puts(Palette.FUNC)
-			.put1("func %q:", func.render(module.names, _))
-			.puts(Palette.DEFAULT)
-			.outln();
-
-		// Use sidetable to generate a control flow graph.
-		// Later used to visually depict control flow edges.
-		def st = func.sidetable;
-		def stMap = SidetableMap.new(func);
-		def cfg = HashMap<int, Vector<(int, u64)>>.new(int.!<int>, int.==);
-		for (bi = bi.reset(func); bi.more(); bi.next()) {
-			def op = bi.current();
-			match(op) {
-				IF, BR_IF, BR_ON_NULL, BR_ON_NON_NULL => {
-					if (bi.pc == entries[entryCounter].pc) {
-						def entry = entries[entryCounter];
-						def stp = stMap[bi.pc];
-						def stEntry = st.getBrEntry(stp);
-						def padding = if(stEntry.dpc > 0, -1, 0);
-						def target = bi.pc + stEntry.dpc + padding;
-						// add outward edges
-						if (!cfg.has(bi.pc)) cfg[bi.pc] = Vector<(int, u64)>.new();
-						cfg[bi.pc].put(target, entry.taken[1]);
-						cfg[bi.pc].put(bi.nextPc(), entry.taken[0]);
-
-						// add inward edges
-						if (!cfg.has(target)) cfg[target] = Vector<(int, u64)>.new();
-						cfg[target].put(bi.pc, entry.taken[1]);
-						if (!cfg.has(bi.nextPc())) cfg[bi.nextPc()] = Vector<(int, u64)>.new();
-						cfg[bi.nextPc()].put(bi.pc, entry.taken[0]);
-						entryCounter++;
-					}
-				}
-				BR_TABLE => {
-					if (bi.pc == entries[entryCounter].pc) {
-						def entry = entries[entryCounter];
-						var stp = stMap[bi.pc];
-						var stEntry = st.getBrEntry(stp);
-						def noOfTargets = stEntry.dpc;
-						for (i = 1; i <= noOfTargets; i++) {
-							stp = stp + 4;
-							stEntry = st.getBrEntry(stp);
-							def target = bi.pc + stEntry.dpc + i - 1;
-							// add outward edge
-							if (!cfg.has(bi.pc)) cfg[bi.pc] = Vector<(int, u64)>.new();
-							cfg[bi.pc].put(target, entry.taken[i - 1]);
-
-							// add inward edge
-							if (!cfg.has(target)) cfg[target] = Vector<(int, u64)>.new();
-							cfg[target].put(bi.pc, entry.taken[i - 1]);
-						}
-						entryCounter++;
-					}
-				}
-				_ => ;
-			}
-		}
-
-		// TODO: Visually depict edges instead of just printing numbers (quite tricky)
-		for (bi = bi.reset(func); bi.more(); bi.next()) {
-			def op = bi.current();
-			// search the edges
-			match (op) {
-				IF, BR_IF, BR_TABLE => {
-					if (cfg.has(bi.pc)) {
-						outputInstr(module, true, false, bi, OUT, tracer);
+	for (bi = bi.reset(func); bi.more(); bi.next()) {
+		def op = bi.current();
+		// search the edges
+		match (op) {
+			IF, BR_IF, BR_TABLE => {
+				if (cfg.has(bi.pc)) {
+					outputInstr(module, true, false, bi, OUT);
+					OUT.puts(Palette.TARGET)
+						.puts("  --> ");
+					def edges = cfg[bi.pc];
+					for (i < edges.length) {
+						if (i > 0) OUT.csp();
 						OUT.puts(Palette.TARGET)
-							.puts("  --> ");
-						def edges = cfg[bi.pc];
-						for (i < edges.length) {
-							if (i > 0) OUT.csp();
-							OUT.puts(Palette.TARGET)
-								.put1("+%d", edges[i].0)
-								.puts(": ")
-								.puts(Palette.DEFAULT);
-							if (edges[i].1 == 0) OUT.puts(Palette.UNREACHABLE);
-							else OUT.puts(Palette.COUNT);
-							OUT.putd(edges[i].1).puts(Palette.DEFAULT);
-						}
-					} else {
-						outputInstr(module, false, false, bi, OUT, tracer);
+							.put1("+%d", edges[i].0)
+							.puts(": ")
+							.puts(Palette.DEFAULT);
+						if (edges[i].1 == 0) OUT.puts(Palette.UNREACHABLE);
+						else OUT.puts(Palette.COUNT);
+						OUT.putd(edges[i].1).puts(Palette.DEFAULT);
 					}
-				}
-				_ => {
-					if (cfg.has(bi.pc)) {
-						outputInstr(module, false, true, bi, OUT, tracer);
-						OUT.puts(Palette.SOURCE)
-							.puts("  <-- ");
-						def edges = cfg[bi.pc];
-						for (i < edges.length) {
-							if (i > 0) OUT.csp();
-							OUT.puts(Palette.SOURCE)
-								.put1("+%d", edges[i].0)
-								.puts(": ")
-								.puts(Palette.DEFAULT);
-							if (edges[i].1 == 0) OUT.puts(Palette.UNREACHABLE);
-							else OUT.puts(Palette.COUNT);
-							OUT.putd(edges[i].1).puts(Palette.DEFAULT);
-						}
-					} else {
-						outputInstr(module, false, false, bi, OUT, tracer);
-					}
+				} else {
+					outputInstr(module, false, false, bi, OUT);
 				}
 			}
-			OUT.outln();
+			_ => {
+				if (cfg.has(bi.pc)) {
+					outputInstr(module, false, true, bi, OUT);
+					OUT.puts(Palette.SOURCE)
+						.puts("  <-- ");
+					def edges = cfg[bi.pc];
+					for (i < edges.length) {
+						if (i > 0) OUT.csp();
+						OUT.puts(Palette.SOURCE)
+							.put1("+%d", edges[i].0)
+							.puts(": ")
+							.puts(Palette.DEFAULT);
+						if (edges[i].1 == 0) OUT.puts(Palette.UNREACHABLE);
+						else OUT.puts(Palette.COUNT);
+						OUT.putd(edges[i].1).puts(Palette.DEFAULT);
+					}
+				} else {
+					outputInstr(module, false, false, bi, OUT);
+				}
+			}
 		}
+		OUT.outln();
 	}
 }
 
 // output instr helper
-def outputInstr(module: Module, source: bool, target: bool, bi: BytecodeIterator, out: TraceBuilder, tracer: InstrTracer) {
+def outputInstr(module: Module, source: bool, target: bool, bi: BytecodeIterator, out: TraceBuilder) {
 	if (source) out.puts(Palette.SOURCE);
 	else if (target) out.puts(Palette.TARGET);
 	else out.puts(Palette.LNO);
@@ -300,20 +207,9 @@ def outputInstr(module: Module, source: bool, target: bool, bi: BytecodeIterator
 	if (source || target) out.puts(Palette.SEPARATOR);
 	else out.puts(Palette.DEFAULT);
 	out.puts("    ").mark();
-	bi.traceOrig(out, module, tracer);
+	bi.traceOrig(out, module, TRACER);
 	var width = 22;
 	if (WizengOptions.color) width += 11;
 	out.ljustify_mark(width).puts(Palette.DEFAULT);
 }
 
-// output count helper
-def outputEntry(e: BmEntry, out: StringBuilder, sep: string) {
-	var taken = e.taken;
-	for (j < taken.length) {
-		if (j > 0) OUT.puts(sep);
-		if (taken[j] > 0) out.puts(Palette.COUNT);
-		else out.puts(Palette.DEFAULT).puts(Palette.INACTIVE);
-		out.putd(taken[j]);
-	}
-	out.puts(Palette.DEFAULT);
-}
