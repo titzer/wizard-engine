@@ -24,7 +24,8 @@ else
         "branches" "branches{c}" 
         "hotness" "hotness{c}"
         "globals" 
-        "memory")
+        "memory"
+        "memstats")
 fi
 
 # generate output files from all .wasm in a folder

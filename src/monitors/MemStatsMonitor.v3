@@ -1,0 +1,221 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a simple monitor that prints all memory reads/writes.
+def E = MonitorRegistry.add(
+	"memstats", "Tallies stats on memory accesses.",
+	MemStatsMonitor.new());
+
+class MemStatsMonitor extends Monitor {
+	def onParse(module: Module) {
+		var mi = MemStatsInstrumenter.new(module);
+		mi.run();
+		for (s in mi.stats) MonitorRegistry.addReport(print(s, _));
+	}
+}
+
+class MemStatsInstrumenter extends BytecodeInstrumenter {
+	var stats: Array<MemStats>;
+
+	new(module: Module) super(module) {
+		stats = Array.new(module.memories.length);
+		for (i < module.memories.length) stats[i] = MemStats.new(module, module.memories[i], log2_WASM_PAGE_SIZE);
+	}
+
+	def visitLoad(op: Opcode, imm: MemArg, size: u8) {
+		var stats = stats[imm.memory_index];
+		var probe = if(stats.decl.indexType == ValueType.I32,
+			LoadProbe32.new(stats, u32.!(imm.offset), size),
+			LoadProbe.new(stats, imm.offset, size));
+		insertProbeHere(probe);
+	}
+	def visitStore(op: Opcode, imm: MemArg, size: u8) {
+		insertProbeHere(StoreProbe.new(stats[imm.memory_index], imm.offset, size));
+	}
+	def visit_MEMORY_GROW(memory_index: u31) {
+		insertProbeHere(GrowProbe.new(stats[memory_index]));
+	}
+	def visit_MEMORY_INIT(data_index: u31, memory_index: u31) {
+		insertProbeHere(InitProbe.new(stats[memory_index]));
+	}
+	def visit_MEMORY_COPY(dst_memory_index: u31, src_memory_index: u31) {
+		insertProbeHere(CopyProbe.new(stats[dst_memory_index], stats[src_memory_index]));
+	}
+	def visit_MEMORY_FILL(memory_index: u31) {
+		insertProbeHere(FillProbe.new(stats[memory_index]));
+	}
+}
+
+// Specialized probe reduces monitor overhead by ~2x.
+class LoadProbe32(stats: MemStats, offset: u32, size: u8) extends OperandProbe_i_v {
+	def fire_i(addr: u32) {
+		stats.record_read(addr + offset, size);
+	}
+}
+
+class LoadProbe(stats: MemStats, offset: u64, size: u8) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var addr = getU64Operand(accessor, 0);
+		stats.record_read(addr + offset, size);
+		return Resumption.Continue;
+	}
+}
+
+class StoreProbe(stats: MemStats, offset: u64, size: u8) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var addr = getU64Operand(accessor, -1);
+		stats.record_write(addr + offset, size);
+		return Resumption.Continue;
+	}
+}
+
+class CopyProbe(dst_stats: MemStats, src_stats: MemStats) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var size	= getU64Operand(accessor, 0);
+		var src_offset	= getU64Operand(accessor, -1);
+		var dst_offset	= getU64Operand(accessor, -2);
+		src_stats.record_read(src_offset, size);
+		dst_stats.record_write(dst_offset, size);
+		dst_stats.record_copy(size);
+		return Resumption.Continue;
+	}
+}
+
+class InitProbe(stats: MemStats) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var size	= getU64Operand(accessor, 0);
+//		var src_offset	= getU64Operand(accessor, -1);
+		var dst_offset	= getU64Operand(accessor, -2);
+		stats.record_write(dst_offset, size);
+		stats.record_init(size);
+		return Resumption.Continue;
+	}
+}
+
+class FillProbe(stats: MemStats) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var size	= getU64Operand(accessor, 0);
+//		var value	= getU64Operand(accessor, -1);
+		var dst_offset	= getU64Operand(accessor, -2);
+		stats.record_write(dst_offset, size);
+		stats.record_fill(size);
+		return Resumption.Continue;
+	}
+}
+
+class GrowProbe(stats: MemStats) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var pages = getU64Operand(accessor, 0);
+		stats.num_grows++;
+		var cur = dynamicLoc.func.instance.memories[stats.decl.memory_index].size();
+		var total = cur + pages;
+		if (total > stats.max_pages) stats.max_pages = total;
+		return Resumption.Continue;
+	}
+}
+
+def WASM_PAGE_SIZE = 65536u;
+def log2_WASM_PAGE_SIZE = 16u6;
+
+def getU64Operand(accessor: FrameAccessor, index: int) -> u64 {
+	match (accessor.getOperand(index)) {
+		I32(val) => return val;
+		I64(val) => return val;
+		_ => return 0; // should never happen
+	}
+}
+
+class MemStats {
+	def module: Module;
+	def decl: MemoryDecl;
+	def log2_chunk_size: u6;
+	var read_counts = Array<u64>.new(int.!((decl.initial * WASM_PAGE_SIZE + (1uL << log2_chunk_size) - 1) >> log2_chunk_size));
+	var write_counts = Array<u64>.new(read_counts.length);
+	var num_grow: u64;
+	var num_copy: u64;
+	var bytes_copy: u64;
+	var num_init: u64;
+	var bytes_init: u64;
+	var num_fill: u64;
+	var bytes_fill: u64;
+	var max_pages: u64;
+	var num_grows: u64;
+
+	new(module: Module, decl, log2_chunk_size) { }
+
+	def record_read(address: u64, size: u64) {
+		var chunk = address >> log2_chunk_size;
+		if (chunk >= read_counts.length) read_counts = Arrays.grow(read_counts, int.!(chunk + 1));
+		read_counts[chunk]++;
+	}
+	def record_write(address: u64, size: u64) {
+		var chunk = address >> log2_chunk_size;
+		if (chunk >= write_counts.length) write_counts = Arrays.grow(write_counts, int.!(chunk + 1));
+		write_counts[chunk]++;
+	}
+	def record_copy(size: u64) {
+		num_copy++;
+		bytes_copy += size;
+	}
+	def record_init(size: u64) {
+		num_init++;
+		bytes_init += size;
+	}
+	def record_fill(size: u64) {
+		num_fill++;
+		bytes_fill += size;
+	}
+}
+
+def table = initTable();
+def initTable() -> TraceTable {
+	var t = TraceTable.new(["Addresses", "reads", "writes"]);
+	t.cells[0].set(24, Justification.LEFT, null);
+	t.cells[1].set(12, Justification.RIGHT, null);
+	t.cells[2].set(12, Justification.RIGHT, null);
+	return t;
+}
+
+
+def print(stats: MemStats, unused: void) {
+	Trace.OUT.put1("memory #%d", stats.decl.memory_index).outln(); // TODO: module name?
+
+	Trace.OUT.put2("memory.init: %d, %d bytes", stats.num_init, stats.bytes_init).outln();
+	Trace.OUT.put2("memory.copy: %d, %d bytes", stats.num_copy, stats.bytes_copy).outln();
+	Trace.OUT.put2("memory.fill: %d, %d bytes", stats.num_fill, stats.bytes_fill).outln();
+	Trace.OUT.put2("grows: %d, max pages: %d", stats.num_grows, stats.max_pages).outln();
+
+	var C = table.cells;
+	C[1].color = Palette.COUNT;
+	C[2].color = Palette.COUNT;
+	if (MonitorOptions.csv) table.putCsvHeader(Trace.OUT);
+	else table.putTableHeader(Trace.OUT);
+	Trace.OUT.flush();
+
+	var r = stats.read_counts, w = stats.write_counts;
+	var max = if(r.length > w.length, r.length, w.length);
+
+	for (i < max) {
+		var reads = if(i < r.length, r[i]);
+		var writes = if (i < w.length, w[i]);
+
+		var addr = u64.view(i) << stats.log2_chunk_size;
+		var last = (u64.view(i + 1) << stats.log2_chunk_size) - 1;
+
+		var accessed = reads != 0 || writes != 0;
+		C[0].color = if(accessed, Palette.COVERED, Palette.UNREACHABLE);
+		C[0].putx_32(u32.view(addr)).puts(" ... ").putx_32(u32.view(last));
+		C[1].putd(reads);
+		C[2].putd(writes);
+
+		if (MonitorOptions.csv) table.putCsvRow(Trace.OUT);
+		else table.putTableRow(Trace.OUT);
+		Trace.OUT.flush();
+	}
+}
