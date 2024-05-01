@@ -12,6 +12,7 @@ Clone the repo and put its `bin` directory in your `$PATH`.
 ```
 % git clone git@github.com:titzer/virgil.git
 % cd virgil
+% make
 % export PATH=$PATH:`pwd`/bin
 ```
 
