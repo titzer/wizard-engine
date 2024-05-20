@@ -1087,6 +1087,91 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				I64_ATOMIC_RMW_CMPXCHG	=> check_MEMARG(opcode, 8);
 				I32_ATOMIC_RMW8_CMPXCHG_U	=> check_MEMARG(opcode, 1);
 				I32_ATOMIC_RMW16_CMPXCHG_U	=> check_MEMARG(opcode, 2);
+				CONT_NEW => {
+					var cont_decl = parser.readCont();
+					if (cont_decl == null) return;
+					popE(ValueTypes.Ref(true, cont_decl.sig));
+					val_stack.push(ValueTypes.Ref(false, cont_decl));
+				}
+				CONT_BIND => {
+					var input_cont = parser.readCont();
+					if (input_cont == null) return;
+					var output_cont = parser.readCont();
+					if (output_cont == null) return;
+
+					popE(ValueTypes.Ref(true, input_cont));
+
+					var input_sig = input_cont.sig;
+					var output_sig = output_cont.sig;
+
+					var source_length = input_sig.params.length;
+					var target_length = output_sig.params.length;
+					if (source_length < target_length) {
+						err_atpc().IllegalContinuationBind(input_cont, output_cont);
+						return;
+					}
+
+					var n_binds = source_length - target_length;
+					var applied_args = Arrays.range(input_sig.params, 0, n_binds);
+					var remain_args = Arrays.range(input_sig.params, n_binds, source_length);
+
+					if (
+						!Arrays.allTrue(remain_args, output_sig.params, ValueTypes.isCompatibleParamType) ||
+						!Arrays.allTrue(input_sig.results, output_sig.results, ValueTypes.isCompatibleReturnType)
+					) {
+						err_atpc().IllegalContinuationBind(input_cont, output_cont);
+						return;
+					}
+
+					// Values on the stack matches the consumed arguments `applied_args`.
+					checkAndPopArgs(applied_args);
+					val_stack.push(ValueTypes.Ref(false, output_cont));
+				}
+				SUSPEND => {
+					var tag = parser.readTagRef();
+					if (tag == null) return;
+					var tag_sig = module.heaptypes[tag.sig_index];
+					if (!SigDecl.?(tag_sig)) {
+						err_atpc().ExpectedSignature(tag_sig);
+						return;
+					}
+
+					checkSignature(SigDecl.!(tag_sig));
+				}
+				RESUME => {
+					var ct = parser.readCont();
+					if (ct == null) return;
+					popE(ValueTypes.Ref(true, ct));
+					checkSignature(ct.sig);
+
+					var handlers = parser.readContHandlers();
+					for (i < handlers.length) {
+						var handler = handlers[i];
+						var target = getControl(handler.depth);
+						if (target == null) return;
+						checkContHandle(i, handler.tag, target);
+						ctlxfer.refC(target, handler.tag, false);
+					}
+				}
+				RESUME_THROW => {
+					var ct = parser.readCont();
+					if (ct == null) return;
+					popE(ValueTypes.Ref(true, ct));
+
+					var thrown_tag = parser.readTagRef();
+					if (thrown_tag == null) return;
+					checkAndPopArgs(thrown_tag.fields);
+
+					var handlers = parser.readContHandlers();
+					for (i < handlers.length) {
+						var handler = handlers[i];
+						var target = getControl(handler.depth);
+						if (target == null) return;
+						checkContHandle(i, handler.tag, target);
+						ctlxfer.refC(target, handler.tag, false);
+					}
+				}
+
 				INVALID => {
 					codeptr.at(opcode_pos);
 					err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
@@ -1261,9 +1346,18 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		if (p == null) return;
 		var ct = if(c.tag == null, SigCache.arr_v, c.tag.fields);
 		if (c.exnref) ct = Arrays.append(ValueTypes.EXNREF, ct); // XXX: avoid array copy
-		if (ct.length != p.length) return err_atpc().ArityMismatchInCatch(i, p.length, ct.length);
+		if (ct.length != p.length) return err_atpc().ArityMismatchInHandler("catch", i, p.length, ct.length);
 		for (j < p.length) {
-			if (!ValueTypes.isAssignable(ct[j], p[j])) err_atpc().TypeMismatchInCatch(i, p[i], ct[i]);
+			if (!ValueTypes.isAssignable(ct[j], p[j])) err_atpc().TypeMismatchInHandler("catch", i, p[i], ct[i]);
+		}
+	}
+	def checkContHandle(i: int, tag: TagDecl, target: ControlEntry) {
+		var p = labelArgs(target);
+		if (p == null) return;
+		var ct = Arrays.append(ValueType.Ref(true, HeapType.Cont(null)), tag.fields);
+		if (ct.length != p.length) return err_atpc().ArityMismatchInHandler("resume", i, p.length, ct.length);
+		for (j < p.length) {
+			if (!ValueTypes.isAssignable(p[j], ct[j])) err_atpc().TypeMismatchInHandler("resume", i, ct[i], p[i]);
 		}
 	}
 	def checkAndPopArgs(p: Array<ValueType>) {
