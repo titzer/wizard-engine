@@ -41,8 +41,10 @@ SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
-MODULES="src/modules/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
+WALI="src/modules/wali/*.v3"
+WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3"
+MODULES="src/modules/*.v3"
 
 PROGRAM=$1
 TARGET=$2
@@ -68,9 +70,9 @@ function make_build_file() {
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WIZENG $WAVE $WASI $MONITORS"
+    SOURCES="$ENGINE $WIZENG $WAVE $WASI $WALI $MONITORS"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-        SOURCES="$SOURCES $WASI_X86_64_LINUX"
+        SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
