@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wave
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -11,7 +11,7 @@ x86-64-linux: bin/spectest.x86-64-linux bin/wizeng.x86-64-linux bin/unittest.x86
 
 jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
 
-wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
+wasm-wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
 v3i: bin/spectest.v3i bin/wizeng.v3i bin/unittest.v3i bin/objdump.v3i
 
@@ -48,16 +48,16 @@ bin/objdump.jvm: $(OBJDUMP) build.sh
 
 # WAVE targets
 bin/unittest.wasm: $(UNITTEST) build.sh
-	./build.sh unittest wave
+	./build.sh unittest wasm-wave
 
 bin/spectest.wasm: $(SPECTEST) build.sh
-	./build.sh spectest wave
+	./build.sh spectest wasm-wave
 
 bin/wizeng.wasm: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng wave
+	./build.sh wizeng wasm-wave
 
 bin/objdump.wasm: $(OBJDUMP) build.sh
-	./build.sh objdump wave
+	./build.sh objdump wasm-wave
 
 # x86-linux targets
 bin/unittest.x86-linux: $(UNITTEST) build.sh

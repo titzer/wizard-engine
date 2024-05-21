@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wave>"
+    echo "Usage: build.sh <wizeng|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -116,16 +116,16 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     fi
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
-elif [ "$TARGET" = "wave" ]; then
-    # TODO: v3c-wave is not stable yet; compute its path from v3c
+elif [ "$TARGET" = "wasm-wave" ]; then
+    # TODO: v3c-wasm-wave is not stable yet; compute its path from v3c
     V3C_PATH=$(which v3c)
-    V3C_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wave}
-    $V3C_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
-elif [ "$TARGET" = "wali" ]; then
-    # TODO: v3c-wave is not stable yet; compute its path from v3c
+    V3C_WASM_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-wave}
+    $V3C_WASM_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+elif [ "$TARGET" = "wasm-linux" ]; then
+    # TODO: v3c-wasm-linux is not stable yet; compute its path from v3c
     V3C_PATH=$(which v3c)
-    V3C_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wali}
-    $V3C_WAVE -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    V3C_WASM_LINUX=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-linux}
+    $V3C_WASM_LINUX -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
