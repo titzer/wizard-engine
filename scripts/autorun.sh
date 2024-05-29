@@ -3,12 +3,14 @@
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   BIN="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  echo "Bin:" $BIN
   SOURCE="$(readlink "$SOURCE")"
+  echo "Source:" $SOURCE
   [[ $SOURCE != /* ]] && SOURCE="$BIN/$SOURCE"
 done
 BIN="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-
 PROGRAM=$1
+#$2 is now $1 and so on
 shift
 export targets=$($BIN/sense_host.sh)
 
@@ -53,6 +55,11 @@ search_and_exe $@
 
 # not found, try building all targets
 (do_make)
+
+#not found again, search in bin instead - go to parent of current folder (likely scripts) and go to bin instead
+BIN=$(dirname "$BIN")
+BIN=($BIN/bin)
+
 
 # try searching again after building
 search_and_exe $@
