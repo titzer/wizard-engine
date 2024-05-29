@@ -3,9 +3,7 @@
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   BIN="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  echo "Bin:" $BIN
   SOURCE="$(readlink "$SOURCE")"
-  echo "Source:" $SOURCE
   [[ $SOURCE != /* ]] && SOURCE="$BIN/$SOURCE"
 done
 BIN="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
