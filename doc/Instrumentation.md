@@ -23,15 +23,15 @@ wizeng --monitors=loops,coverage{code=instr} test.wasm
 
 ## Options
 
-When no optional arguments are provided, most monitors display only summaries. The `code` argument will print out instrumentation infromation alongside bytecode, where possible. The `csv` argument outputs the monitor data in a csv format to the terminal. The available monitors and their options are as follows:
+When no optional arguments are provided, most monitors display only summaries. The `code` argument will print out instrumentation infromation alongside bytecode, where possible. The `csv` argument outputs the monitor data in a csv format to standard out. The available monitors and their options are as follows:
 
 | Monitor    | Options                                    | Description                                                                                         |
 |------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `loops`    | `{c\|code}` `{csv}`                        | Analyzes loop blocks and their execution behaviour.                                                 |
+| `loops`    | `{c\|code}`                                | Analyzes loop blocks and their execution behaviour.                                                 |
 | `coverage` | `{c\|code[=i\|instr]}`                     | Tracks code coverage, optionally at block or instruction level.                                     |
 | `calls`    | `{c\|code[=<function pattern*>]}`          | Captures function call information and call stack, optionally filtered by a function pattern.       |
-| `branches` | `{c\|code}` `{csv}`                        | Tracks branch instructions to analyze control flow, depicting inward or outward control flow edges. |
-| `hotness`  | `{c\|code}` `{csv}`                        | Identifies hot code regions with high execution frequency.                                          |
+| `branches` | `{c\|code}`                                | Tracks branch instructions to analyze control flow, depicting inward or outward control flow edges. |
+| `hotness`  | `{c\|code}`                                | Identifies hot code regions with high execution frequency.                                          |
 | `profile`  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
 | `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
 | `globals`  |                                            | Provides information on the usage of global variables.                                              |
