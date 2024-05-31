@@ -23,7 +23,7 @@ wizeng --monitors=loops,coverage{code=instr} test.wasm
 
 ## Options
 
-When no optional arguments are provided, most monitors display only summaries. The `code` argument will print out instrumentation infromation alongside bytecode, where possible. The available monitors and their options are as follows:
+When no optional arguments are provided, most monitors display only summaries. The `code` argument will print out instrumentation infromation alongside bytecode, where possible. The `csv` argument outputs the monitor data in a csv format to standard out. The available monitors and their options are as follows:
 
 | Monitor    | Options                                    | Description                                                                                         |
 |------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------|
