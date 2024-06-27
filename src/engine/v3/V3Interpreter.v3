@@ -15,6 +15,13 @@ class V3Interpreter extends WasmStack {
 	private var params_arity = -1;
 	private var return_arity = -1;
 
+	// After `resume` is called, this stack is marked as CALL_CHILD and moves to
+	// the next instruction when resumed in the future. However at that time,
+	// the `pc` would point to the next instruction, making handler lookup
+	// impossible without somehow retrieving the `pc` at the `resume` that
+	// caused the CALL_CHILD transition. This variable is a hack for that.
+	private var prev_resume_pc = -1;
+
 	// WasmStack interface
 	// ===================================================================================
 	def state() -> StackState {
@@ -36,7 +43,11 @@ class V3Interpreter extends WasmStack {
 		params_arity -= args.length;
 		if (params_arity == 0) state_ = StackState.RESUMABLE;
 	}
+	def getMissingBinds() -> int {
+		return params_arity;
+	}
 	def resume() -> Result {
+		// TODO: handle more states
 		checkState("resume()", StackState.RESUMABLE);
 		thrown = null;
 
@@ -48,6 +59,7 @@ class V3Interpreter extends WasmStack {
 			// Run host calls until they either trap, return, or tail-call Wasm.
 			runHostCall();
 		}
+		
 		// Return the appropriate result.
 		match (state_) {
 			THROWING => return clearAndThrow();
@@ -1142,8 +1154,10 @@ class V3Interpreter extends WasmStack {
 				if (cont.used) trap(TrapReason.USED_CONTINUATION);
 
 				cont.used = true;
-				cont.stack.bind(values.peekn(cont_type.sig.params.length));
+				cont.stack.bind(values.peekn(cont.stack.getMissingBinds()));
 				
+				prev_resume_pc = frame.pc;
+				state_ = StackState.CALL_CHILD;
 				stack_switch_info = StackSwitchInfo.RunChildStack(cont.stack);
 			}
 			RESUME_THROW => {
@@ -1164,6 +1178,8 @@ class V3Interpreter extends WasmStack {
 
 				cont.used = true;
 				var res = cont.stack.throw(throwable);
+				prev_resume_pc = frame.pc;
+				state_ = StackState.CALL_CHILD;
 				stack_switch_info = StackSwitchInfo.RunChildStack(cont.stack);
 			}
 			SUSPEND => {
@@ -1464,34 +1480,29 @@ class V3Interpreter extends WasmStack {
 	def onChildTerminate(vals: Array<Value>) {
 		values.pusha(vals);
 	}
-	def onChildSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) {
+	// Returns whether the suspend got handled.
+	def onChildSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) -> bool {
 		values.pusha(vals);
 		values.push(Value.Ref(cont));
 		if (!gotoResumeHandlerAndConsume(tag)) {
 			state_ = StackState.SUSPENDED;
 			stack_switch_info = StackSwitchInfo.Suspend(cont, tag, vals);
+			return false;
 		}
+		state_ = StackState.RESUMABLE;
+		return true;
 	}
-	// def handleResumeResult(r: Result) {
-	// 	match (r) {
-	// 		Value(vals) => values.pusha(vals);
-	// 		Throw(t) => throw(t);
-	// 		Suspend(cont, info) => {
-	// 			values.pusha(info.vals);
-	// 			values.push(Value.Ref(cont));
-	// 			if (!gotoResumeHandlerAndConsume(info.tag)) {
-	// 				state_ = StackState.SUSPENDED;
-	// 				var info = StackSwitchInfo.SuspendInfo(cont, info.tag, info.vals);
-	// 				stack_switch_info = Result.StackSwitch(parent, info);
-	// 			}
-	// 		}
-	// 	}
-	// }
+	def onChildThrow(t: Throwable) -> Throwable {
+		state_ = StackState.RESUMABLE;
+		return throw(t);
+	}
 	def throw(t: Throwable) -> Throwable {
 		if (Exception.?(t)) {
 			var ex = Exception.!(t);
 			for (f = frame; f != null && f.func != null; f = f.prev) {
-				var handler = f.func.decl.findExHandler(f.func.instance, ex.tag, f.pc);
+				var at = if(prev_resume_pc != -1, prev_resume_pc, f.pc);
+				prev_resume_pc = -1;
+				var handler = f.func.decl.findExHandler(f.func.instance, ex.tag, at);
 				if (handler.handler_pc >= 0) {
 					frame = f;
 					var code = f.func.decl.cur_bytecode;
@@ -1521,7 +1532,8 @@ class V3Interpreter extends WasmStack {
 	}
 	// ext:typed-continuation
 	def gotoResumeHandlerAndConsume(tag: Tag) -> bool {
-		var handler = frame.func.decl.findResumeHandler(frame.func.instance, tag, frame.pc);
+		var handler = frame.func.decl.findResumeHandler(frame.func.instance, tag, prev_resume_pc);
+		prev_resume_pc = -1;
 		if (handler.handler_pc >= 0) {
 			var code = frame.func.decl.cur_bytecode;
 			frame.pc = handler.handler_pc;
