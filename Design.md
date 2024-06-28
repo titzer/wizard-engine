@@ -24,7 +24,7 @@ Rather than optimize for performance for a specific set of Wasm features _now_, 
   We make nice use of Virgil's enhanced enum language mechanism here.
 * [BinParser](src/engine/BinParser.v3) - Contains the logic of parsing Wasm module bytes into the internal memory representation.
   Internally it utilizes a simple state machine to be *push-based*, i.e. it is possible to create a BinParser and then feed parts of a module incrementally as they become available, for example over a network.
-* [ValueType](src/engine/ValueType.v3) - The one place where types are represented in the engine.
+* [ValueType](src/engine/Type.v3) - The one place where types are represented in the engine.
   This makes it easy to see what kinds of types are needed, and the logic for all type relations (e.g. assignability, subtyping, least-upper-bound) are expressed here.
 * [CodeValidator](src/engine/CodeValidator.v3) - Contains all logic for validating function bodies.
   The code validator uses the standard single-pass abstract interpretation approach for checking code.

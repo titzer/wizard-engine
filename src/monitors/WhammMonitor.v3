@@ -1,0 +1,172 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// This class implements a monitor that is implemented in WebAssembly, i.e. as a Whamm
+// module. Such modules have exported functions whose names describe how to attach
+// behavior to events.
+
+// Event names supported:
+//   before:bytecode:<mnemonic>			Before matching bytecodes execute
+
+
+// TODO:
+//  - thread error reporter through monitor
+//  - report callbacks
+//  - binding callbacks
+//  - define frame accessor methods
+//  - externref in Virgil
+//   before:bytecode:call(<func pattern>)		Upon static direct calls to func
+//   before:call:<func pattern>
+//   before:enter:<func pattern>			Entry of function(s)
+//   before:return:<func pattern>
+//   before:unwind:<func pattern>
+//   before:throw
+//   before:catch
+//   before:parse					Upon module parse
+//   before:instantiate
+//   before:start
+//   before:main
+//   before:exit
+class WhammMonitor(whamm: Module) extends Monitor {
+	var onParseF: int = -1;
+	var onInstantiateF: int = -1;
+	var onStartF: int = -1;
+	var onMainF: int = -1;
+	var onInstanceF: int = -1;
+	var onExitF: int = -1;
+	var bytecodePatterns: Array<List<(WhammBytecodePattern, FuncDecl)>>;
+	var whammInstances: List<(Module, Instance, InstanceRef)>; // XXX: leaky
+
+	new() {
+		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.filename).outln();
+		for (i < whamm.exports.length) {
+			var e = whamm.exports[i], name = e.0, decl = e.1;
+			if (!FuncDecl.?(decl)) continue;
+			if (Trace.whamm) Trace.OUT.put2("  export %d: \"%s\" = ", i, name);
+			var func = FuncDecl.!(decl);
+			var p = WhammEventParser.new(whamm.filename, name);
+			if (p.bytecodePattern != null) addBytecodePattern(p.bytecodePattern, func);
+			else if (Trace.whamm) Trace.OUT.puts("no events matched").outln();
+		}
+
+	}
+	def addBytecodePattern(b: WhammBytecodePattern, func: FuncDecl) {
+		if (Trace.whamm) Trace.OUT.put1("bytecode %s", b.op.mnemonic).outln();
+		if (bytecodePatterns == null) bytecodePatterns = Array.new(Opcodes.count);
+		bytecodePatterns[b.op.tag] = List.new((b, func), bytecodePatterns[b.op.tag]);
+	}
+	def onParse(module: Module) {
+		var wi = getWhammInstance(module).0;
+		if (wi == null) return;
+		if (onParseF >= 0) {
+			def moduleRef = ModuleRef.new(module);
+			Execute.call(wi.functions[onParseF], [Value.Ref(moduleRef)]); // TODO: report traps
+		}
+		if (bytecodePatterns != null) {
+			var it = BytecodeIterator.new();
+			for (i < module.functions.length) {
+				var func = module.functions[i];
+				if (func.imp != null) continue; // imported
+				for (bi = it.reset(func); bi.more(); bi.next()) {
+					var bp = bytecodePatterns[bi.current().tag];
+					for (l = bp; l != null; l = l.tail) {
+						if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), bi.pc, bi.current().mnemonic).outln();
+						var wf = WasmFunction.!(wi.functions[bp.head.1.func_index]);
+						Instrumentation.insertLocalProbe(module, func.func_index, bi.pc, WhammProbe.new(wf, []));
+					}
+				}
+			}
+		}
+	}
+	def onInstantiate(i: Instance) {
+		if (onInstanceF < 0) return;
+		var t = getWhammInstance(i.module), wi = t.0;
+		if (wi == null) return;
+		def instRef = InstanceRef.new(i);
+		Execute.call(wi.functions[onInstanceF], [Value.Ref(instRef)]); // TODO: report traps
+	}
+	private def getWhammInstance(module: Module) -> (Instance, InstanceRef) {
+		for (l = whammInstances; l != null; l = l.tail) {
+			if (l.head.0 == module) return (l.head.1, l.head.2);
+		}
+		if (Trace.whamm) Trace.OUT.put2("Instantiating whamm module %s for %s", whamm.filename, module.filename).outln();
+		var imports = Array<Exportable>.new(whamm.imports.length), err = ErrorGen.new(whamm.filename);
+		var i = Instantiator.new(Extension.set.all, whamm, imports, err);
+		i.processors.put(WizengModule.new());
+		var instance = i.run();
+		if (!err.ok()) return ErrorBuilder.new()
+			.render(err.error_code, whamm.filename, err.section, err.error_index, err.error_pos, err.error_msg)
+			.exit((null, null));
+		var instRef = InstanceRef.new(instance);
+		whammInstances = List.new((module, instance, instRef), whammInstances);
+		return (instance, instRef);
+	}
+}
+
+// A parser that extracts bytecode patterns or other patterns from the name of an exported function.
+class WhammEventParser(filename: string, expname: string) {
+	def r = TextReader.new(filename, expname);
+	var bytecodePattern: WhammBytecodePattern;
+
+	new() {
+		if (r.optN("wasm:") >= 0) {
+			if (r.optN("bytecode:") >= 0) {
+				var op = Opcodes.parseName(r.data[r.pos ...]);
+				if (op != Opcode.INVALID) {
+					r.advance(op.mnemonic.length);
+					bytecodePattern = WhammBytecodePattern.new(op);
+				}
+			}
+		}
+	}
+}
+
+// Pattern that describes which opcodes instrumentation may be applied to.
+class WhammBytecodePattern(op: Opcode) {
+}
+
+// Possible arguments that can be passed to a Whamm probe.
+type ProbeArg {
+	case DynamicLoc;
+	case FrameAccessor;
+	case FrameEditor;
+	case Pc;
+	case Function;
+	case Stack(t: ValueType, i: int);
+	case Local(t: ValueType, i: int);
+}
+
+// Various operations that a user-provided probe might attempt.
+enum ProbeCapabilities {
+	READ_PC, READ_FUNC, READ_STACK, READ_LOCALS,
+	WRITE_STACK, WRITE_LOCALS,
+	BR, TRAP, THROW, SWITCH, TAIL_CALL
+}
+
+// A probe that adapts a Wasm function to be called by the engine-internal probing mechanism.
+class WhammProbe(func: WasmFunction, sig: Array<ProbeArg>) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var args = marshallArgs(sig, loc);
+		Execute.call(func, args); // XXX: runs on a new stack
+		return Resumption.Continue;
+	}
+}
+
+// Generic argument marshalling routine.
+def marshallArgs(args: Array<ProbeArg>, loc: DynamicLoc) -> Array<Value> {
+	var result = Array<Value>.new(args.length);
+	for (i < args.length) {
+		var v: Value;
+		match (args[i]) {
+			DynamicLoc => v = Value.Ref(DynamicLocRef.new(loc));
+			FrameAccessor => ;
+			FrameEditor => ;
+			Pc => v = Value.I32(u32.!(loc.pc));
+			Function => v = Value.Ref(loc.func);
+			Stack(t, i) => v = loc.frame.getFrameAccessor().getOperand(i);
+			Local(t, i) => v = loc.frame.getFrameAccessor().getLocal(i);
+		}
+		result[i] = v;
+	}
+	return result;
+}

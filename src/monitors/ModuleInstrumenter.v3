@@ -1,14 +1,10 @@
 // Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// The ModuleMonitor interface implements an API for inserting callbacks for various events that
+// The ModuleInstrumenter interface implements an API for inserting callbacks for various events that
 // occur during execution. Events are detected and instrumented using the lower-level probe API
 // offered by the engine.
-class ModuleMonitor(module: Module) extends Monitor {
-	new() {
-		MonitorOptions.insertMonitor(this);
-	}
-
+class ModuleInstrumenter(module: Module) {
 	// Attach callback {f} to be called before {func} is executed.
 	def beforeFuncExec(func: FuncDecl, f: DynamicLoc -> Resumption) -> Probe {
 		if (func.imp != null) return null;
@@ -40,15 +36,15 @@ class ModuleMonitor(module: Module) extends Monitor {
 	}
 	// Attach callback {f} to any non-import function execution.
 	def beforeAllFuncExec(f: DynamicLoc -> Resumption) {
-		forEachFunc(MonitorUtil.isNotImport, beforeFuncExec(_, f));
+		forEachFunc(ModuleInstrumenter.beforeFuncExec(_, _, f));
 	}
 	// Attach callback {f} to any non-import function return.
 	def beforeAllFuncReturn(f: DynamicLoc -> Resumption) {
-		forEachFunc(MonitorUtil.isNotImport, beforeFuncReturn(_, f));
+		forEachFunc(ModuleInstrumenter.beforeFuncReturn(_, _, f));
 	}
 	// Attach callback {f} to any non-import function call or return.
 	def beforeAllFuncExecAndReturn(callFn: DynamicLoc -> Resumption, retFn: DynamicLoc -> Resumption) {
-		forEachFunc(MonitorUtil.isNotImport, beforeFuncExecAndReturn(_, callFn, retFn));
+		forEachFunc(ModuleInstrumenter.beforeFuncExecAndReturn(_, _, callFn, retFn));
 	}
 	// Attach callback {f} to before an instruction execution.
 	def beforeInstrExec(func: FuncDecl, pc: int, f: DynamicLoc -> Resumption) -> Probe {
@@ -74,11 +70,11 @@ class ModuleMonitor(module: Module) extends Monitor {
 	}
 	// Attach callback {f} to before a read of the global at index {global_index}.
 	def beforeGlobalRead(f: DynamicLoc -> Resumption, global_index: u31) {
-		forEachFunc(MonitorUtil.isNotImport, monitorFuncForGlobalAccess(_, global_index, false, f));
+		forEachFunc(ModuleInstrumenter.instrumentGlobalAccess(_, _, global_index, false, f));
 	}
 	// Attach callback {f} to before a write of the global at index {global_index}.
 	def beforeGlobalWrite(f: DynamicLoc -> Resumption, global_index: u31) {
-		forEachFunc(MonitorUtil.isNotImport, monitorFuncForGlobalAccess(_, global_index, true, f));
+		forEachFunc(ModuleInstrumenter.instrumentGlobalAccess(_, _, global_index, true, f));
 	}
 	// Attach callback {f} to before every memory read.
 	def beforeMemRead(f: (DynamicLoc, Memory, u64, u64) -> Resumption) {
@@ -94,16 +90,35 @@ class ModuleMonitor(module: Module) extends Monitor {
 	}
 
 	// Helpers
-	// call f(funcDecl) if filter(module, funcDecl) is true
-	def forEachFunc<T>(filter: (Module, FuncDecl) -> bool, f: FuncDecl -> T) {
+	// call f(funcDecl)
+	def forEachFunc<T>(f: (ModuleInstrumenter, FuncDecl) -> T) {
 		for (i < module.functions.length) {
 			var func = module.functions[i];
+			if (func.imp != null) continue;
+			f(this, func);
+		}
+	}
+	// call f(funcDecl) if filter(module, funcDecl) is true
+	def forEachFuncMatching<T>(filter: (Module, FuncDecl) -> bool, f: (ModuleInstrumenter, FuncDecl) -> T) {
+		for (i < module.functions.length) {
+			var func = module.functions[i];
+			if (func.imp != null) continue;
 			if (!filter(module, func)) continue;
-			f(func);
+			f(this, func);
+		}
+	}
+	// call f(funcDecl) if filter(module, funcDecl) is true
+	def forEachFuncFiltered<T>(filter: DeclFilter, f: (ModuleInstrumenter, FuncDecl) -> T) {
+		if (filter == null) return forEachFunc(f);
+		for (i < module.functions.length) {
+			var func = module.functions[i];
+			if (func.imp != null) continue;
+			if (filter != null && !filter.matches(module, func)) continue;
+			f(this, func);
 		}
 	}
 
-	private def monitorFuncForGlobalAccess(func: FuncDecl, global_index: u31, isWrite: bool, f: DynamicLoc -> Resumption) {
+	private def instrumentGlobalAccess(func: FuncDecl, global_index: u31, isWrite: bool, f: DynamicLoc -> Resumption) {
 		var bi = BytecodeIterator.new();
 		var visitor = GlobalVisitor.new(module, f, isWrite, global_index);
 		visitor.bi = bi;
@@ -121,9 +136,9 @@ class ModuleMonitor(module: Module) extends Monitor {
 		var visitor = MemoryVisitor.new(module, readFn, writeFn, growFn);
 		visitor.bi = it;
 
-		forEachFunc(MonitorUtil.isNotImport, monitorFuncForMemoryAccess(_, visitor));
+		forEachFunc(ModuleInstrumenter.instrumentMemoryAccesses(_, _, visitor));
 	}
-	private def monitorFuncForMemoryAccess(func: FuncDecl, visitor: MemoryVisitor) {
+	private def instrumentMemoryAccesses(func: FuncDecl, visitor: MemoryVisitor) {
 		for (bi = visitor.bi.reset(func); bi.more(); bi.next()) {
 			bi.dispatch(visitor);
 		}
@@ -335,7 +350,7 @@ private class MemoryVisitor(
 private class MemoryAccessProbe(imm: MemArg, operand: int, size: u64, f: (DynamicLoc, Memory, u64, u64) -> Resumption) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> Resumption {
 		var accessor = dynamicLoc.frame.getFrameAccessor();
-		var address: u64 = u64.!(Values.v_i(accessor.getOperand(operand)));
+		var address: u64 = Values.v_u(accessor.getOperand(operand));
 		address += imm.offset;
 
 		var memory = dynamicLoc.func.instance.memories[imm.memory_index];
@@ -346,7 +361,7 @@ private class MemoryAccessProbe(imm: MemArg, operand: int, size: u64, f: (Dynami
 private class MemoryGrowProbe(memory_index: u31, f: (DynamicLoc, Memory, u32) -> Resumption) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> Resumption {
 		var accessor = dynamicLoc.frame.getFrameAccessor();
-		var pages = u23.!(Values.v_i(accessor.getOperand(0)));
+		var pages = Values.v_u(accessor.getOperand(0));
 		var memory = dynamicLoc.func.instance.memories[memory_index];
 		return f(dynamicLoc, memory, pages);
 	}

@@ -27,8 +27,8 @@ Wizard fully supports these Wasm proposals:
 
 Other features under development:
 
-  * Type imports
   * Threads
+  * Stack-switching
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.
