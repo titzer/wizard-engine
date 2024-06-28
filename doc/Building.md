@@ -21,8 +21,8 @@ It's mostly ready to run right out of the box.
 
 ```
 % v3c -version
-Aeneas III-6.1418: no input files
-Build Data: x86-linux 2021-08-06 19:01:30 by titzer@magic-carpet
+Aeneas III-7.1743: no input files
+Build Data: x86-linux 2024-06-28 10:27:26 by titzer@kabal
 ```
 
 The Virgil repo has stable binary checked in. If building Wizard fails you might need to bootstrap the latest version of Virgil.
@@ -78,11 +78,13 @@ Binaries will be deposited in the `bin` directory, with each platform binary hav
 
 ## Testing Wizard
 
-Wizard has three layers of tests:
+Wizard has several batteries of tests:
 
 * internal unit tests
-* a runner for the testsuite from the Wasm [spec](http://github.com/WebAssembly/spec)
+* Wasm [spec](http://github.com/WebAssembly/spec) and proposal tests
+* regression tests
 * tests for the `wizeng` command-line and monitor functionality
+* tests for WASI functionality
 
 ### Unit tests
 Internal unit tests probe the internal functionality of Wizard's implementation much deeper than tests in the specification, and they are generally faster to run.
@@ -122,25 +124,46 @@ Now you're ready to run the specification tests.
 ...
 ```
 
-### Monitor tests
+### Wizeng tests
 In `test/wizeng/` folder, to test all monitors with all the tests in this folder run:
 ```bash
-% cd test/wizeng
-% ./monitors.sh 
+% cd test/monitors
+% ./test.sh 
 ...
 ```
+
+### Monitor tests
+A battery of tests for monitor functionality are included.
+These are in the `test/monitors/` folder and can be run with:
+```bash
+% test/monitors/test.sh
+...
+```
+
 Pass monitor names as arguments to only test specific monitor arguments:
 ```bash
-% ./monitors.sh loops branches{c}
+% test/monitors/test.sh loops branches{c}
 ...
 ```
-Use the `monitors-update.sh` script to update/create test outputs, for when a monitor is updated or a new monitor is added:
+Use the `update-expected.sh` script to update/create test outputs, for when a monitor is updated or a new monitor is added:
 ```bash
-% ./monitors-update.sh <new-monitor1> <new-monitor2>
-% ls monitors
+% test/monitors/update-expected.sh <new-monitor1> <new-monitor2>
+% ls expected/
 ...
 ```
-This will generate test outputs for valid test files found in `test/wizeng` for the supplied monitors.
+This will generate test outputs for programs found in `test/monitors` for the supplied monitors.
+
+
+### Regression tests
+Regression tests are more numerous as they include results from fuzzing, past bugfixes, and various other places.
+These tests are separate from the Wizard binaries and use the `.wast` format, which allows them to also run on the reference interpreter and other engines.
+You can run the regression tests via:
+
+```
+% test/regress.sh
+```
+
+If a test fails, it be debugged in the `spectest` runner.
 
 
 ## Proposal Tests
@@ -155,4 +178,22 @@ The scripts for building and running specification tests can also handle proposa
 % cd ../..
 % test/spec.sh -ext:<proposal> <proposal>
 ...
+```
+
+## Running tests on one target
+
+Most test scripts respect the `TEST_TARGET` environment variable, which allows faster turnarounds.
+
+```
+% TEST_TARGET=x86-64-linux test/spec.sh
+Testing spec       x86-64-linux                | 147 of 147 passed                                                                         
+```
+
+## Specifying Wizard options when testing
+
+Most test scripts respect the `WIZENG_OPTS` environment variable and will pass it to Wizard when running tests.
+
+```
+% WIZENG_OPTS=-mode=jit test/spec.sh
+Testing spec       x86-64-linux                | 147 of 147 passed                                                                         
 ```

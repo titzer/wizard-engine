@@ -61,6 +61,12 @@ function run_test() {
 			continue # test was found in expected failures
 		    fi
 		fi
+		if [ -f failures.$target.$TEST_MODE ]; then
+		    grep $test failures.$target.$TEST_MODE
+		    if [ $? = 0 ]; then
+			continue # test was found in expected failures
+		    fi
+		fi
 		echo "##-fail: $P.$check.diff"
 		return 1
 	    fi
