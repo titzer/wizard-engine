@@ -108,7 +108,7 @@ for target in $TEST_TARGETS; do
 	skip monitors
         continue
     fi
-    do_script wizeng/monitors
+    do_script monitors/test
 done
 
 # Self-hosted (unit) tests
