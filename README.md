@@ -80,15 +80,16 @@ Read how to [Build and Test](doc/Building.md) Wizard.
 
 Read how to use [tracing options](doc/Tracing.md) in Wizard.
 
-Read how to use [monitor options](doc/Instrumentation.md) for instrumentation in Wizard.
+Read how to use built-in [monitors](doc/Monitors.md) for analysis in Wizard.
+
+Read how to build your own [monitors](doc/YourMonitor.md) for instrumentation in Wizard.
 
 ### Research Projects
 
 Currently, Wizard supports three closely related research projects:
 
- * Generalized import system: a Wasm extension for expressing source-level constructs in Wasm
- * Jawa: a Java virtual machine runtime system implementation using the generalized import sytsem
  * Fast-int: the fast, in-place interpreter for Wasm
+ * Stack-switching: a fast implementation of [WasmFX](https://wasmfx.dev) for Wizard
 
 ## License
 
