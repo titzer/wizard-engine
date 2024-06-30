@@ -37,7 +37,7 @@ The available monitors and their options are as follows:
 |------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | [`branches`](BranchMonitor.md) | `{c\|code}`                                | Tracks branch instructions to analyze control flow, depicting inward or outward control flow edges. |
 | `calls`    | `{c\|code[=<function pattern*>]}`          | Captures function call information and call stack, optionally filtered by a function pattern.       |
-| `control`  |                                            | Counts branches and loops and displays an annotated control flow graph.                             |
+| [`control`](ControlMonitor.md)  |                                            | Counts branches and loops and displays an annotated control flow graph.                             |
 | `coverage` | `{c\|code[=i\|instr]}`                     | Tracks code coverage, optionally at block or instruction level.                                     |
 | `debug`    |                                            | Provides ability to step through bytecode and pause execution using breakpoints.                    |
 | `fprofile` | `{<function pattern*>}`                    | Function profiler that reports time spent in individual functions                                   |
