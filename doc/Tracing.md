@@ -32,16 +32,17 @@ Production engines are often unhelpful, lacking enough detail about errors to fi
 Trace options dump their output to stdout.
 Their abbreviated forms can be combined, so `-tiv` traces both the interpreter and the code validator.
 
-# Tracing calls
+# Basic Tracing
 
-There are three important kinds of call tracing that are useful in developing and using Wizard.
+There are several basic tracing utilities built into Wizard that allow users to gain insight into the behavior of both the engine and the program it is executing.
+More advanced tracing and analysis is supported via [monitors](./Monitors.md).
 
 ### Tracing Wizard
 
-The first kind of call tracing traces *the Wizard Engine*'s implementation.
+The first kind of basic tracing traces *the Wizard Engine*'s implementation.
 This is useful if you are debugging the engine itself.
-To do this, you can run Wizard in the Virgil interpreter (i.e. not compiled to a binary) and pass the `-trace-calls=<pat>` option to the Virgil compiler.
-You first must `make` one of the interpreter "binaries" in the `bin/` directory and then pass your pattern in the `V3C_OPTS` environment variable.
+You first must build Wizard for the `v3i` target by running `make v3i` (or, e.g. `make bin/unittest.v3i), which generates a script in the `bin/` directory that runs the engine from source on the Virgil interpreter.
+Each script respects the `V3C_OPTS` environment variable, which you can then set to include `-trace-calls=<pat>`, which is an option built into the Virgil interpreter that traces calls to specified methods.
 
 ```
 % make bin/unittest.v3i
@@ -49,28 +50,29 @@ You first must `make` one of the interpreter "binaries" in the `bin/` directory 
 ...
 ```
 
-The pattern that is accepted by the `-trace-calls` option is a [glob](https://en.wikipedia.org/wiki/Glob_(programming)), i.e. it has the special `*` and `?` characters.
-Using a pattern, you can narrow down the method(s) that you want the Virgil compiler to trace within the Wizard implementation.
+The `-trace-calls` option accepts a [glob](https://en.wikipedia.org/wiki/Glob_(programming)), which is a pattern that can include literal names and the special `*` and `?` characters.
+Using a pattern, you can narrow down the method(s) that you want to trace within the Wizard implementation.
 You can pass more than one pattern, separating them by commas.
 
 ### Tracing Imports
 
-The third kind of call tracing traces calls from *the Wasm program* to its imports.
-Typically, imports come from the system, such as WASI, or another embedding.
-Tracing them is similar to tracing system calls.
-In order to trace all calls to an imported module, use `--trace-module`.
-
+The next kind of basic tracing traces calls from *the Wasm program* to its imports.
+Typically, imports come from the host environment, such as [WASI](https://wasi.dev), [WALI](https://github.com/arjunr2/WALI/blob/main/docs/wali.wit), or even from the engine itself.
+Tracing import calls is similar to tracing system calls on a native platform.
+Wizard accepts `--trace-module=<pat>` option that allows tracing calls to one or more host modules.
+       
 ```
-% bin/wizeng --expose-wizeng --trace-module=wizeng test/wizeng/hello.wasm
+% bin/wizeng --expose-wizeng --trace-module=* test/wizeng/hello.wasm
+wizeng.puts(52445, 14)
 Hello Wizeng!
 ...
 ```
 
 ### Tracing Wasm calls
 
-The third kind of call tracing traces *the Wasm program internal calls*.
+The next kind of call tracing traces *the Wasm program internal calls*.
 To do this, the `wizeng` binary supports a similar option `--trace-calls=<pat>` that also accepts a glob.
-The Wizard engine will use the names of functions in the Wasm binary from the names section.
+The Wizard engine will use the names of functions in the Wasm binary from the names section for matching.
 
 ```
 % bin/wizeng --expose-wizeng --trace-calls=*.main test/wizeng/hello.wasm
@@ -79,8 +81,27 @@ Hello Wizeng!
 ...
 ```
 
+This option can also accepts function indices, specified with `#N..M`, which is useful when modules don't have names.
+The below example prints calls to functions `#3` and `#4` as they are executed.
+```
+% bin/wizeng --expose-wizeng --trace-calls=#3..4 test/wizeng/calls1.wasm
+  <wasm func "bar">()
+    <wasm func "baz">()
+  <wasm func "baz">()
+  <wasm func "bar">()
+    <wasm func "baz">()
+  <wasm func "bar">()
+    <wasm func "baz">()
+  <wasm func "bar">()
+    <wasm func "baz">()
+  <wasm func "baz">()
+...
+```
+
+
 ### Tracing instructions
 
+Sometimes, even finer-grained tracing is necessary.
 As seen in the options, Wizard has the ability to trace the interpreter's execution via the `--trace-int` or `-ti` option.
 This is useful for example, in testing small programs, as it will print out every instruction executed.
 
@@ -125,4 +146,4 @@ We can also see the individual operands to instructions by adding the `-tio` (i.
 ## The `-fatal` option
 
 When working on the Wizard Engine itself, often it is useful to get a stacktrace of where in Wizard's implementation an error (such as a failed unit test) occurs.
-The `-fatal` option causes Wizard to intentionally exit with a stacktrace upon the first error.
+The `-fatal` option causes Wizard to intentionally exit with a stacktrace upon the first unit test error.
