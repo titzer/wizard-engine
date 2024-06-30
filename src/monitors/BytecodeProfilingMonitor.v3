@@ -1,0 +1,308 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a profiler that targets wasm modules containing a generalized interpreter
+// that evaluates compiled bytecode.
+//
+// This profiler aims to recover source level information, including hot functions, call graphs,
+// and execution costs in terms of wasm instructions.
+def E = MonitorRegistry.add(
+	"profile_bytecode", "Recovers source level information from bytecode execution",
+	BytecodeProfilingMonitor.new());
+
+def OUT = Trace.OUT;
+class BytecodeProfilingMonitor extends Monitor {
+	var dispatch_func: FuncDecl;
+	// the exact pc in the dispatch function that reads the source bytecode.
+	var bytecode_read_pc = -1;
+	var state = SourceProfileState.new();
+
+	def onParse(module: Module) {
+		var dispatch_marker_func_index = -1;
+		var mi = ModuleInstrumenter.new(module);
+
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+
+			// find the dispatch marker function.
+			if (f.imp != null) {
+				if (Strings.equal(f.imp.module_name, "profiling") &&
+					Strings.equal(f.imp.field_name, "dispatch_marker")) {
+					dispatch_marker_func_index = i;
+				}
+				continue;
+			}
+
+			// find the main dispatch function by checking for calls to the
+			// dispatch marker function.
+			var prev_byte_read_pc = -1;
+			for (bi = BytecodeIterator.new().reset(f); bi.more(); bi.next()) {
+				match (bi.current()) {
+					CALL => {
+						var immptr = bi.immptr();
+						var callee_index = immptr.read_uleb32();
+						if (callee_index == dispatch_marker_func_index) {
+							dispatch_func = f;
+						}
+					}
+					BR_TABLE => {
+						if (dispatch_func != null && bytecode_read_pc < 0 && prev_byte_read_pc >= 0) {
+							bytecode_read_pc = prev_byte_read_pc;
+						}
+					}
+					I32_LOAD8_U => {
+						if (dispatch_func != null && bytecode_read_pc < 0) {
+							prev_byte_read_pc = bi.pc;
+						}
+					}
+					_ => ;
+				}
+			}
+			if (dispatch_func != null) break;
+		}
+		// insert byte read probe only at dispatch function.
+		var memory_visitor = MemoryVisitor.new(module, beforeMemRead, null, null);
+		memory_visitor.bi = BytecodeIterator.new();
+		mi.forEachFuncMatching(isDispatchFunc, ModuleInstrumenter.instrumentMemoryAccesses(_, _, memory_visitor));
+
+		// insert entry/exit probe at dispatch function.
+		mi.beforeFuncExecAndReturn(dispatch_func, beforeDispatchRun, beforeDispatchReturn);
+
+		// enable global count probe
+		Instrumentation.insertGlobalProbe(state.count_probe);
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		state.compactTrace();
+		state.reportSourceFunctionTrace();
+		state.reportRecoveredBytecodes();
+		state.hotness.report();
+	}
+
+	private def beforeMemRead(dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
+		if (dynamicLoc.pc != bytecode_read_pc) return Resumption.Continue;
+		var b = mem.read_u8(u32.!(address), 0).result;
+		state.step(u32.!(address), b);
+		return Resumption.Continue;
+
+		// formatting
+		// for (i < dispatch_call_depth) OUT.puts("  ");
+		// OUT.put1("addr: %d bytecode: ", u32.!(address))
+		//    .putx_8(b)
+		//    .put1(" prev cost: %d", u32.!(state.count_probe.count))
+		//    .outln();
+	}
+
+	private def beforeDispatchRun(dynamicLoc: DynamicLoc) -> Resumption {
+		state.funcStart();
+		return Resumption.Continue;
+	}
+
+	private def beforeDispatchReturn(dynamicLoc: DynamicLoc) -> Resumption {
+		state.funcReturn();
+		return Resumption.Continue;
+	}
+
+	private def isDispatchFunc(module: Module, func: FuncDecl) -> bool {
+		return func.func_index == dispatch_func.func_index;
+	}
+}
+
+private class SourceProfileState {
+	var call_stack: List<u32>;
+	// complete execution trace.
+	var trace: List<TraceEntry>;
+	// the recovered bytecode for each source function.
+	var recovered_bytecodes = HashMap<u32, HashMap<u32, u8>>.new(int.!<u32>, u32.==);
+	// wasm instruction global counter, used to calculate cost.
+	def count_probe: CountProbe = CountProbe.new();
+	// total costs of each bytecode execution.
+	def hotness: BytecodeHotness = BytecodeHotness.new();
+	var last_probe_event: ProbeEvent = ProbeEvent.RETURN;
+
+	def funcStart() {
+		commonSetup();
+		trace = List.new(TraceEntry.CALL(0), trace);
+		call_stack = List<u32>.new(0, call_stack);
+		last_probe_event = ProbeEvent.CALL;
+	}
+
+	def funcReturn() {
+		commonSetup();
+		trace = List.new(TraceEntry.RETURN(call_stack.head), trace);
+		call_stack = call_stack.tail;
+		last_probe_event = ProbeEvent.RETURN;
+	}
+
+	def step(addr: u32, b: u8) {
+		def cost = u32.!(count_probe.count);
+		match (last_probe_event) {
+			CALL => { // first byte of a new function, rewrite func_id
+				trace = List.new(TraceEntry.SYSTEM(cost),
+							List.new(TraceEntry.CALL(addr), trace.tail));
+				call_stack = List.new(addr, call_stack.tail);
+			}
+			RETURN => trace = List.new(TraceEntry.SYSTEM(cost), trace);
+			BYTE_READ(bytecode) => trace = List.new(TraceEntry.STEP(bytecode, cost), trace);
+		}
+
+		// mark recovered bytecode
+		if (!recovered_bytecodes.has(call_stack.head)) {
+			recovered_bytecodes[call_stack.head] = HashMap<u32, u8>.new(int.!<u32>, u32.==);
+		}
+		recovered_bytecodes[call_stack.head][addr] = b;
+		last_probe_event = ProbeEvent.BYTE_READ(b);
+		hotness.record(b, cost);
+		count_probe.count = 0;
+	}
+
+	def compactTrace() {
+		var rev = Lists.reverse(trace);
+		var new_trace: List<TraceEntry>;
+		var valid_func_id_stack: List<u32>;
+		while (rev != null) {
+			match (rev.head) {
+				CALL(func_id) => {
+					if (func_id > 0) {
+						new_trace = List.new(TraceEntry.CALL(func_id), new_trace);
+						valid_func_id_stack = List.new(func_id, valid_func_id_stack);
+					}
+				}
+				STEP(bytecode, cost) => new_trace = List.new(rev.head, new_trace);
+				RETURN(func_id) => {
+					if (valid_func_id_stack != null && func_id == valid_func_id_stack.head) {
+						new_trace = List.new(TraceEntry.RETURN(func_id), new_trace);
+						valid_func_id_stack = valid_func_id_stack.tail;
+					}
+				}
+				SYSTEM(cost) => {
+					if (new_trace != null) {
+						match (new_trace.head) {
+							SYSTEM(c) => new_trace = List.new(TraceEntry.SYSTEM(c + cost), new_trace.tail);
+							_ => new_trace = List.new(rev.head, new_trace);
+						}
+					} else {
+						new_trace = List.new(rev.head, new_trace);
+					}
+				}
+			}
+			rev = rev.tail;
+		}
+		trace = new_trace;
+	}
+
+	def reportSourceFunctionTrace() {
+		var fd = System.fileOpen("source_trace.csv", false);
+		var rev = Lists.reverse(trace);
+		var b = StringBuilder.new();
+		b.puts("function_id,bytecode,cost\n");
+		var stack: List<u32>;
+		while (rev != null) {
+			match (rev.head) {
+				CALL(func_id) => {
+					stack = List.new(func_id, stack);
+					b.put1("%d,START,0", stack.head).ln();
+				}
+				STEP(bytecode, cost) => {
+					b.put3("%d,%x,%d", stack.head, u8.!(bytecode), cost).ln();
+				}
+				RETURN(func_id) => {
+					b.put1("%d,END,0", stack.head).ln();
+					stack = stack.tail;
+				}
+				SYSTEM(cost) => {
+					if (stack == null) {
+						b.put1("0,00,%d", cost).ln();
+					} else {
+						b.put2("%d,00,%d", stack.head, cost).ln();
+					}
+				}
+			}
+			rev = rev.tail;
+		}
+		System.write(fd, b.buf);
+	}
+
+	def reportRecoveredBytecodes() {
+		var fd = System.fileOpen("recovered_bytecodes.csv", false);
+		var function_ids = Maps.keyList(recovered_bytecodes);
+		var b = StringBuilder.new();
+		b.puts("function_id,bytecode\n"); // header
+		while (function_ids != null) {
+			var function_id = function_ids.head;
+			b.put1("%d:", function_id);
+			var bytecodes = recovered_bytecodes[function_id];
+			var bytecode_addrs = Maps.keyList(bytecodes);
+			var min_addr = u32.max;
+			var max_addr: u32 = 0;
+			while (bytecode_addrs != null) {
+				var addr = bytecode_addrs.head;
+				if (addr < min_addr) min_addr = addr;
+				if (addr > max_addr) max_addr = addr;
+				bytecode_addrs = bytecode_addrs.tail;
+			}
+
+			for (i = min_addr; i <= max_addr; i++) {
+				b.put1("/%x", bytecodes[i]);
+			}
+			b.ln();
+			function_ids = function_ids.tail;
+		}
+		System.write(fd, b.buf);
+	}
+
+	private def commonSetup() {
+		match (last_probe_event) {
+			BYTE_READ(bytecode) => {
+				trace = List.new(TraceEntry.STEP(bytecode, u32.!(count_probe.count)), trace);
+				hotness.record(bytecode, u32.!(count_probe.count));
+			}
+			_ => trace = List.new(TraceEntry.SYSTEM(u32.!(count_probe.count)), trace);
+		}
+		count_probe.count = 0;
+	}
+}
+
+private class BytecodeHotness {
+	var bytecode_hotness: Array<HashMap<u32, u32>> = Array.new(256);
+
+	def record(b: u8, cost: u32) {
+		if (bytecode_hotness[b] == null) {
+			bytecode_hotness[b] = HashMap<u32, u32>.new(int.!<u32>, u32.==);
+		}
+		if (!bytecode_hotness[b].has(cost)) {
+			bytecode_hotness[b][cost] = 0;
+		}
+		bytecode_hotness[b][cost]++;
+	}
+
+	def report() {
+		var fd = System.fileOpen("global_hotness.csv", false);
+		var b = StringBuilder.new();
+		b.puts("bytecode,cost,count\n"); // header
+		for (i = 0; i < bytecode_hotness.length; i++) {
+			if (bytecode_hotness[i] != null) {
+				var costs = Maps.keyList(bytecode_hotness[i]);
+				while (costs != null) {
+					var j = costs.head;
+					b.put3("%x,%d,%d", i, j, bytecode_hotness[i][j]).ln();
+					costs = costs.tail;
+				}
+			}
+		}
+		System.write(fd, b.buf);
+	}
+}
+
+private type TraceEntry {
+	case CALL(func_id: u32);
+	case STEP(bytecode: u8, cost: u32);
+	case RETURN(func_id: u32);
+	case SYSTEM(cost: u32);
+}
+
+private type ProbeEvent {
+	case BYTE_READ(bytecode: u8);
+	case CALL;
+	case RETURN;
+}
