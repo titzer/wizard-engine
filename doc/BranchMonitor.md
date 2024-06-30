@@ -1,6 +1,6 @@
-# The `branch` Monitor
+# The `branches` Monitor
 
-Wizard's built-in `branch` monitor analyzes the dynamic control flow behavior of a program by instrumenting all branches and reporting a summary.
+Wizard's built-in `branches` monitor analyzes the dynamic control flow behavior of a program by instrumenting all branches and reporting a summary.
 It is enabled with the `--monitors=branches` flag and accepts a small number of flags.
 
 ## Basic usage
