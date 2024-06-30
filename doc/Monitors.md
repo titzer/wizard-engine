@@ -7,18 +7,18 @@ These monitors utilize Wizard's efficient *probe* mechanism that allows extensib
 
 Monitors are enabled using the `--monitor` flag, which accepts multiple monitors with options.
 
-```bash
+```
 wizeng --monitors=<monitor>{<opts>}[,<monitor>{<opts>}] <wasm files>
 ```
 
 Each monitor supports its own optional arguments and modifiers:
 
-```bash
+```
 <monitor>{<opt>=<modifier>[,<opt>=<modifier>]}
 ```
 
 Here's an example usage:
-```bash
+```
 % bin/wizeng --monitors=loops test/monitors/loop_monitor0.wasm
 func #1:
    +8 ... +39 loop:   133
@@ -48,7 +48,7 @@ The available monitors and their options are as follows:
 | `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
 | `memstats` |                                            | Monitors memory accesses and reports statistics per page of memory.                                 |
 | `opcodes`  |                                            | Reports the static and dynamic count of instructions, broken down by opcode.                        |
-| `profile`  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
+| [`profile`](ProfileMonitor.md)  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
 | `timeout`  | `{<num>}`                                  | Terminates program execution after a given number of instructions.                                  |
 | `tracepoints` | `{<func-filter>:min_pc..max_pc}`        | Traces a function's value stack at given locations.                                                 |
 
