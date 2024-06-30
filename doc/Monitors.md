@@ -35,15 +35,22 @@ The available monitors and their options are as follows:
 
 | Monitor    | Options                                    | Description                                                                                         |
 |------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `loops`    | `{c\|code}`                                | Analyzes loop blocks and their execution behaviour.                                                 |
-| `coverage` | `{c\|code[=i\|instr]}`                     | Tracks code coverage, optionally at block or instruction level.                                     |
-| `calls`    | `{c\|code[=<function pattern*>]}`          | Captures function call information and call stack, optionally filtered by a function pattern.       |
 | `branches` | `{c\|code}`                                | Tracks branch instructions to analyze control flow, depicting inward or outward control flow edges. |
-| `hotness`  | `{c\|code}`                                | Identifies hot code regions with high execution frequency.                                          |
-| `profile`  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
-| `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
-| `globals`  |                                            | Provides information on the usage of global variables.                                              |
+| `calls`    | `{c\|code[=<function pattern*>]}`          | Captures function call information and call stack, optionally filtered by a function pattern.       |
+| `control`  |                                            | Counts branches and loops and displays an annotated control flow graph.                             |
+| `coverage` | `{c\|code[=i\|instr]}`                     | Tracks code coverage, optionally at block or instruction level.                                     |
 | `debug`    |                                            | Provides ability to step through bytecode and pause execution using breakpoints.                    |
+| `fprofile` | `{<function pattern*>}`                    | Function profiler that reports time spent in individual functions                                   |
+| `globals`  |                                            | Provides information on the usage of global variables.                                              |
+| `hotness`  | `{c\|code}`                                | Identifies hot code regions with high execution frequency.                                          |
+| `icount`   |                                            | Reports instruction count within functions.                                                         |
+| `loops`    | `{c\|code}`                                | Analyzes loop blocks and their execution behaviour.                                                 |
+| `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
+| `memstats` |                                            | Monitors memory accesses and reports statistics per page of memory.                                 |
+| `opcodes`  |                                            | Reports the static and dynamic count of instructions, broken down by opcode.                        |
+| `profile`  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
+| `timeout`  | `{<num>}`                                  | Terminates program execution after a given number of instructions.                                  |
+| `tracepoints` | `{<func-filter>:min_pc..max_pc}`        | Traces a function's value stack at given locations.                                                 |
 
 ## Debugger
 
