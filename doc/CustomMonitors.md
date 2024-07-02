@@ -77,7 +77,7 @@ If we look into the source of this monitor in [Demo32Monitor.v3](./Demo42Monitor
 
 ```
 // 1. Register our simple monitor so it is accessible with  --monitors=demo42
-def E = MonitorRegistry.add(
+def monitor_ = MonitorRegistry.add(
 	"demo42", "Reports occurrences of the number 42 after an integer addition.",
 	Demo42Monitor.new());
 
