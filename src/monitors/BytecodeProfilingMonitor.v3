@@ -11,100 +11,112 @@ def E = MonitorRegistry.add(
 	BytecodeProfilingMonitor.new());
 
 def OUT = Trace.OUT;
+
+def MIN_DISPATCH_CASE_COUNT = 50;
+def MAX_OPERAND_LEN = 4;
+
 class BytecodeProfilingMonitor extends Monitor {
-	var dispatch_func: FuncDecl;
-	// the exact pc in the dispatch function that reads the source bytecode.
-	var bytecode_read_pc = -1;
-	var state = SourceProfileState.new();
+	// all functions that could be the dispatch function.
+	// kvp of function index to the (FuncDecl, bytecode_read_pc, profile_state) pair.
+	var potential_dispatch_functions = HashMap<int, (FuncDecl, int, SourceProfileState)>.new(int.!<int>, int.==);
+	var all_counters: List<DynamicLoc -> Resumption>;
 
 	def onParse(module: Module) {
-		var dispatch_marker_func_index = -1;
 		var mi = ModuleInstrumenter.new(module);
 
+		var bi = BytecodeIterator.new();
 		for (i < module.functions.length) {
 			var f = module.functions[i];
-
-			// find the dispatch marker function.
-			if (f.imp != null) {
-				if (Strings.equal(f.imp.module_name, "profiling") &&
-					Strings.equal(f.imp.field_name, "dispatch_marker")) {
-					dispatch_marker_func_index = i;
-				}
-				continue;
-			}
+			if (f.imp != null) continue;
+			bi = bi.reset(f);
 
 			// find the main dispatch function by checking for calls to the
 			// dispatch marker function.
-			var prev_byte_read_pc = -1;
-			for (bi = BytecodeIterator.new().reset(f); bi.more(); bi.next()) {
+			var prev_byte_read_pc = -1, bytecode_read_pc = -1;
+			var last_block_chain = 0;
+			var is_last_instr_block = false;
+			while (bi.more()) {
 				match (bi.current()) {
-					CALL => {
-						var immptr = bi.immptr();
-						var callee_index = immptr.read_uleb32();
-						if (callee_index == dispatch_marker_func_index) {
-							dispatch_func = f;
-						}
-					}
 					BR_TABLE => {
-						if (dispatch_func != null && bytecode_read_pc < 0 && prev_byte_read_pc >= 0) {
-							bytecode_read_pc = prev_byte_read_pc;
+						is_last_instr_block = false;
+						if (prev_byte_read_pc >= 0 && last_block_chain > MIN_DISPATCH_CASE_COUNT) {
+							var state = SourceProfileState.new();
+							all_counters = List.new(state.count_probe.fire, all_counters);
+							potential_dispatch_functions[f.func_index] = (f, prev_byte_read_pc, state);
+							break;
 						}
 					}
 					I32_LOAD8_U => {
-						if (dispatch_func != null && bytecode_read_pc < 0) {
-							prev_byte_read_pc = bi.pc;
+						prev_byte_read_pc = bi.pc;
+						is_last_instr_block = false;
+					}
+					BLOCK => {
+						if (is_last_instr_block) {
+							last_block_chain++;
+						} else {
+							last_block_chain = 0;
+							is_last_instr_block = true;
 						}
 					}
-					_ => ;
+					_ => is_last_instr_block = false;
 				}
+				bi.next();
 			}
-			if (dispatch_func != null) break;
 		}
 		// insert byte read probe only at dispatch function.
 		var memory_visitor = MemoryVisitor.new(module, beforeMemRead, null, null);
 		memory_visitor.bi = BytecodeIterator.new();
-		mi.forEachFuncMatching(isDispatchFunc, ModuleInstrumenter.instrumentMemoryAccesses(_, _, memory_visitor));
+		mi.forEachFuncMatching(isPossibleDispatch, ModuleInstrumenter.instrumentMemoryAccesses(_, _, memory_visitor));
 
 		// insert entry/exit probe at dispatch function.
-		mi.beforeFuncExecAndReturn(dispatch_func, beforeDispatchRun, beforeDispatchReturn);
+		mi.beforeAllFuncExecAndReturn(beforeDispatchRun, beforeDispatchReturn);
 
 		// enable global count probe
-		Instrumentation.insertGlobalProbe(state.count_probe);
+		Instrumentation.insertGlobalProbe(CombinedCountProbe.new(all_counters));
 	}
 
 	def onFinish(i: Instance, r: Result) {
-		state.compactTrace();
-		state.reportSourceFunctionTrace();
-		state.reportRecoveredBytecodes();
-		state.hotness.report();
+		var states = Maps.valueList(potential_dispatch_functions);
+		while (states != null) {
+			states.head.2.compactTrace();
+			states.head.2.reportSourceFunctionTrace();
+			states.head.2.reportRecoveredBytecodes();
+			states.head.2.hotness.report();
+			states = states.tail;
+		}
 	}
 
 	private def beforeMemRead(dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
-		if (dynamicLoc.pc != bytecode_read_pc) return Resumption.Continue;
-		var b = mem.read_u8(u32.!(address), 0).result;
-		state.step(u32.!(address), b);
+		var func_id = dynamicLoc.func.decl.func_index;
+		if (!potential_dispatch_functions.has(func_id)) return Resumption.Continue;
+		if (dynamicLoc.pc != potential_dispatch_functions[func_id].1) {
+			for (i: u32 = 0; i < size; i++) {
+				var b = mem.read_u8(u32.!(address + i), 0).result;
+				potential_dispatch_functions[func_id].2.try_record_operand(u32.!(address + i), b);
+			}
+		} else {
+			var b = mem.read_u8(u32.!(address), 0).result;
+			potential_dispatch_functions[func_id].2.step(u32.!(address), b);
+		}
 		return Resumption.Continue;
-
-		// formatting
-		// for (i < dispatch_call_depth) OUT.puts("  ");
-		// OUT.put1("addr: %d bytecode: ", u32.!(address))
-		//    .putx_8(b)
-		//    .put1(" prev cost: %d", u32.!(state.count_probe.count))
-		//    .outln();
 	}
 
 	private def beforeDispatchRun(dynamicLoc: DynamicLoc) -> Resumption {
-		state.funcStart();
+		var func_id = dynamicLoc.func.decl.func_index;
+		if (!potential_dispatch_functions.has(func_id)) return Resumption.Continue;
+		potential_dispatch_functions[func_id].2.funcStart();
 		return Resumption.Continue;
 	}
 
 	private def beforeDispatchReturn(dynamicLoc: DynamicLoc) -> Resumption {
-		state.funcReturn();
+		var func_id = dynamicLoc.func.decl.func_index;
+		if (!potential_dispatch_functions.has(func_id)) return Resumption.Continue;
+		potential_dispatch_functions[func_id].2.funcReturn();
 		return Resumption.Continue;
 	}
 
-	private def isDispatchFunc(module: Module, func: FuncDecl) -> bool {
-		return func.func_index == dispatch_func.func_index;
+	private def isPossibleDispatch(module: Module, func: FuncDecl) -> bool {
+		return potential_dispatch_functions.has(func.func_index);
 	}
 }
 
@@ -114,8 +126,10 @@ private class SourceProfileState {
 	var trace: List<TraceEntry>;
 	// the recovered bytecode for each source function.
 	var recovered_bytecodes = HashMap<u32, HashMap<u32, u8>>.new(int.!<u32>, u32.==);
+	// address of the last read bytecode.
+	var last_opcode_addr: u32;
 	// wasm instruction global counter, used to calculate cost.
-	def count_probe: CountProbe = CountProbe.new();
+	def count_probe: FuelCountProbe = FuelCountProbe.new();
 	// total costs of each bytecode execution.
 	def hotness: BytecodeHotness = BytecodeHotness.new();
 	var last_probe_event: ProbeEvent = ProbeEvent.RETURN;
@@ -136,6 +150,7 @@ private class SourceProfileState {
 
 	def step(addr: u32, b: u8) {
 		def cost = u32.!(count_probe.count);
+		last_opcode_addr = addr;
 		match (last_probe_event) {
 			CALL => { // first byte of a new function, rewrite func_id
 				trace = List.new(TraceEntry.SYSTEM(cost),
@@ -154,6 +169,13 @@ private class SourceProfileState {
 		last_probe_event = ProbeEvent.BYTE_READ(b);
 		hotness.record(b, cost);
 		count_probe.count = 0;
+	}
+
+	def try_record_operand(addr: u32, b: u8) {
+		if (addr - last_opcode_addr <= MAX_OPERAND_LEN) {
+			System.puts("try_record_operand\n");
+			recovered_bytecodes[call_stack.head][addr] = b;
+		}
 	}
 
 	def compactTrace() {
@@ -291,6 +313,29 @@ private class BytecodeHotness {
 			}
 		}
 		System.write(fd, b.buf);
+	}
+}
+
+private class CombinedCountProbe(all_counters: List<DynamicLoc -> Resumption>) extends CountProbe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var counters = all_counters;
+		while (counters != null) {
+			counters.head(dynamicLoc);
+			counters = counters.tail;
+		}
+		return Resumption.Continue;
+	}
+}
+
+private class FuelCountProbe extends CountProbe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var opcode_byte = dynamicLoc.func.decl.orig_bytecode[dynamicLoc.pc];
+		var opcode = Opcodes.opcodes[opcode_byte];
+		match (opcode) {
+			BLOCK, LOOP, UNREACHABLE, RETURN, ELSE, END => count += 0;
+			_ => count += 1;
+		}
+		return Resumption.Continue;
 	}
 }
 
