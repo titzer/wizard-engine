@@ -12,9 +12,10 @@ class X86_64Stack extends WasmStack {
 	var rsp: Pointer;
 	var func: Function;
 	var parent_rsp_ptr: Pointer;
+	var curr_resume_handler: Pointer; // pointer to sidetable entry for resume
 	private var params_arity = -1;
-	private var return_results: Array<ValueType>;
-	private var state_: StackState;
+	var return_results: Array<ValueType>;
+	var state_: StackState;
 
 	new(size) {
 		if (mapping == null) fatal("out of memory allocating value stack");
@@ -243,7 +244,7 @@ class X86_64Stack extends WasmStack {
 	def pushi(v: int) {
 		pushPair(BpTypeCode.I32.code, u64.view(v));
 	}
-	def popN(t: Array<ValueType>) -> Array<Value> {
+	def popN(t: Range<ValueType>) -> Array<Value> {
 		var r = Array<Value>.new(t.length);
 		for (j = t.length - 1; j >= 0; j--) r[j] = pop(t[j]);
 		return r;
@@ -333,6 +334,31 @@ class X86_64Stack extends WasmStack {
 		}
 		vsp += -(valuerep.slot_size);
 		return (vsp + valuerep.tag_size).load<Object>();
+	}
+	def moveToStack(stack: ExecStack, n_vals: int) {
+		// This method assumes `stack` is `X86_64Stack` and performs a memory
+		// copy.
+		var s = X86_64Stack.!(stack);
+		vsp += -(valuerep.slot_size * n_vals);
+
+		Trace.OUT.put1("Moving %d elems", n_vals).outln();
+		Trace.OUT.put1("From: %q", this.func.render).outln();
+		Trace.OUT.put1("To: %q", s.func.render).outln();
+
+		// Size of `u64`. The memory is copied in chunks of `sizeof(u64)`.
+		var chunk_size = 8;
+		for (i < n_vals) {
+			for (slot_id < valuerep.slot_size / chunk_size) {
+				var slot_offset = slot_id * chunk_size;
+
+				var to = s.vsp + slot_offset;
+				var from = vsp + (i * valuerep.slot_size) + slot_offset;
+				// TODO: fix this
+				var val = from.load<u64>();
+				to.store(val);
+			}
+			s.vsp += valuerep.slot_size;
+		}
 	}
 	def checkTopTag(tag: byte) -> byte {
 		if (!valuerep.tagged) return tag;
@@ -434,6 +460,8 @@ class X86_64Stack extends WasmStack {
 def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
 
 component X86_64Stacks {
+	var RESUME_STUB_POINTER: Pointer;
+
 	def getFrameAccessor(sp: Pointer) -> X86_64FrameAccessor {
 		var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 		var code = RiRuntime.findUserCode(retip);
@@ -467,6 +495,7 @@ component X86_64Stacks {
 	}
 }
 
+// TODO: clean this up
 def NOP_ENTRY = 1;
 def RETADDR_SIZE = Pointer.SIZE;
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
@@ -567,6 +596,8 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
 	var r_stack = xenv.tmp0;
 	var r_parent = xenv.tmp1;
+	var r_return_arity = xenv.tmp3;
+	var r_parent_vsp = xenv.tmp4;
 
 	// Nothing calls this stub; it is only returned to. A nop serves as a placeholder for a non-existent
 	// call instruction so that stackwalking logic works properly.
@@ -580,11 +611,22 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	// if %parent == 0 goto l_return ; don't copy values onto parent stack
 	var l_return = masm.newLabel(-1);
 	masm.emit_br_r(r_parent, MasmBrCond.REF_NULL, l_return);
-	// TODO: mov %vsp, [%parent.vsp]
-	// TODO: do_value_copy(%parent.vsp, %vsp, %stack.return_arity)
-	// mov [%stack.parent], nullptr ; XXX: redundant?
+
+	// set %return_arity
+	masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(r_stack, masm.offsets.X86_64Stack_return_results));
+	masm.emit_mov_r_m(ValueKind.I32, r_return_arity, MasmAddr(xenv.scratch, masm.offsets.Array_length));
+	// [%parent.vsp] += slot_size * %return_arity
+	masm.emit_mov_r_r(ValueKind.I32, xenv.scratch, r_return_arity);
+	asm.q.imul_r_i(G(xenv.scratch), Target.tagging.slot_size);
+	asm.q.add_m_r(G(r_parent).plus(masm.offsets.X86_64Stack_vsp), G(xenv.scratch));
+	// mov %parent_vsp, [%parent.vsp]
+	masm.emit_mov_r_m(ValueKind.REF, r_parent_vsp, MasmAddr(r_parent, masm.offsets.X86_64Stack_vsp));
+	// emit_value_copy(%parent.vsp, %stack.vsp, %return_arity, r_xmm0);
+	masm.emit_value_copy(G(r_parent_vsp), G(xenv.vsp), G(r_return_arity), X(xenv.xmm0));
+
+	// mov [%stack.parent], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
-	// mov [%stack.parent_rsp_ptr], nullptr ; XXX: redundant?
+	// mov [%stack.parent_rsp_ptr], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp_ptr), 0);
 	// l_return:
 	masm.bindLabel(l_return);
