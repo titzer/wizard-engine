@@ -144,6 +144,70 @@ component X86_64Runtime {
 		var stack = curStack.setRsp(rsp);
 		return stack.throw(thrown);
 	}
+	def runtime_CONT_NEW(instance: Instance, cont_index: u32) -> Throwable {
+		return Runtime.CONT_NEW(curStack.setRsp(CiRuntime.callerSp()), instance, cont_index, make_new_x86_stack);
+	}
+	def runtime_CONT_BIND(instance: Instance, in_cont_index: u32, out_cont_index: u32) -> Throwable {
+		return Runtime.CONT_BIND(curStack.setRsp(CiRuntime.callerSp()), instance, in_cont_index, out_cont_index);
+	}
+	// Handles all the necessary higher-level stack transfer operations.
+	// Returns the top of the continuation.
+	def runtime_process_resume(instance: Instance, cont_index: u32) -> Throwable {
+		var stack = X86_64Stack.!(curStack.setRsp(CiRuntime.callerSp()));
+		var cont_decl = ContDecl.!(instance.heaptypes[cont_index]);
+		var cont_ref = stack.popV(ValueType.Ref(true, HeapType.Cont(cont_decl)));
+		var cont = Continuation.!(Value.Ref.!(cont_ref).val);
+		
+		if (cont == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (cont.used) return stack.trap(TrapReason.USED_CONTINUATION);
+		cont.used = true;
+
+		var vals = stack.popN(cont_decl.sig.params);
+		cont.top.pushN(vals);
+
+		cont.bottom.parent = stack;
+		X86_64Stack.!(cont.top).state_ = StackState.RUNNING;
+		stack.state_ = StackState.CALL_CHILD;
+
+		// XXX: use a better way to return values back on stack
+		stack.push(Value.Ref(cont));
+		return null;
+	}
+	// Unwinds the stack chain and sets {curStack} to the stack that can handle
+	// the suspension (or throw an error on the top-most stack if no sush handler
+	// is found). Then, the tag parameters and the continuation is pushed onto
+	// the handler stack.
+	// This function returns the order/index of the found handler (-1 if none).
+	def runtime_handle_suspend(instance: Instance, tag_index: int) -> int {
+		var stack = curStack;
+		var tag = instance.tags[tag_index];
+		var prev = stack;
+		var vals = stack.popN(tag.sig.params);
+		while (prev.parent != null) {
+			Trace.OUT.put1("SEARCHING for tag %d", tag_index).ln();
+			var parent = X86_64Stack.!(prev.parent);
+			var frame = TargetFrame(parent.rsp + Pointer.SIZE);
+			var result = parent.findSuspendHandler(frame, tag);
+			if (result.0 >= 0) { // handler found
+				var cont = Continuation.new(stack, prev);
+				// set stack params arity
+				stack.params_arity = tag.sig.results.length;
+				stack.state_ = StackState.SUSPENDED;
+				// dummy bind with 0 values to update stack state
+				stack.bind([]);
+				
+				prev.parent = null;
+				curStack = parent;
+				curStack.state_ = StackState.RUNNING;
+				curStack.pushN(vals);
+				curStack.push(Value.Ref(cont));
+				curStack.rsp += Pointer.SIZE; // pop ret addr
+				return result.1;
+			}
+			prev = parent;
+		}
+		return -1;
+	}
 
 	//=====================================================================
 	// GC proposal callbacks
@@ -217,6 +281,9 @@ component X86_64Runtime {
 	def runtime_doCast(instance: Instance, nullable: byte, htcode: int) -> bool {
 		var val = curStack.peekRef();
 		return Runtime.cast(instance, (nullable & 2) != 0, htcode, val);
+	}
+	private def make_new_x86_stack() -> X86_64Stack {
+		return X86_64Stack.new(EngineOptions.STACK_SIZE.get());
 	}
 }
 
