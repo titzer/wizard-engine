@@ -240,15 +240,44 @@ private class EventHandler {
 	}
 
 	def memoryRead(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
+		var addr = u32.view(addr);
+		var size = u32.view(size);
 		var mem_index = mem.decl.memory_index;
 		var shadow_mem = shadowMems[mem_index];
-		for (i = u32.view(addr); i < addr + size; i++) {
-			var data = mem.read_u8(i, 0).result;
-			var shadow_data = shadow_mem.read_u8(i, 0).result;
-			if (data != shadow_data) {
-				trace.put(WasmEvent.Load(mem_index, i, data));
-				shadow_mem.write_u8(i, 0, data);
+		var mem_ptr = mem.range_oil_32(addr, 0, size);
+		var shadow_ptr = shadow_mem.range_oil_32(addr, 0, size);
+		var data_lo: u64, data_hi: u64;
+		var shadow_data_lo: u64, shadow_data_hi: u64;
+		match (size) {
+			1 => {
+				data_lo = DataReaders.read_range_u8(mem_ptr.result);
+				shadow_data_lo = DataReaders.read_range_u8(shadow_ptr.result);
 			}
+			2 => {
+				data_lo = DataReaders.read_range_u16(mem_ptr.result);
+				shadow_data_lo = DataReaders.read_range_u16(shadow_ptr.result);
+			}
+			4 => {
+				data_lo = DataReaders.read_range_u32(mem_ptr.result);
+				shadow_data_lo = DataReaders.read_range_u32(shadow_ptr.result);
+			}
+			8 => {
+				data_lo = DataReaders.read_range_u64(mem_ptr.result);
+				shadow_data_lo = DataReaders.read_range_u64(shadow_ptr.result);
+			}
+			16 => {
+				var data_result = DataReaders.read_range_u128(mem_ptr.result);
+				var shadow_result = DataReaders.read_range_u128(shadow_ptr.result);
+				data_lo = data_result.0;
+				data_hi = data_result.1;
+				shadow_data_lo = shadow_result.0;
+				shadow_data_hi = shadow_result.1;
+			}
+			_ => ;
+		}
+		if (shadow_data_lo != data_lo || (size == 16 && (shadow_data_hi != data_hi))) {
+			trace.put(WasmEvent.Load(mem_index, addr, Ranges.dup(mem_ptr.result)));
+			shadow_mem.copyM(addr, mem, addr, size);
 		}
 		return Resumption.Continue;
 	}
@@ -256,12 +285,20 @@ private class EventHandler {
 	def memoryWrite(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
 		var mem_index = mem.decl.memory_index;
 		var shadow_mem = shadowMems[mem_index];
-		var new_val = loc.frame.getFrameAccessor().getTopOfStack();
-		match (new_val) {
-			I32(v) => shadow_mem.write_u32(u32.view(addr), 0, v);
-			I64(v) => shadow_mem.write_u64(u32.view(addr), 0, v);
-			F32(v) => shadow_mem.write_u32(u32.view(addr), 0, v);
-			F64(v) => shadow_mem.write_u64(u32.view(addr), 0, v);
+		var new_val: u64;
+		var dst = shadow_mem.range_oil_32(u32.view(addr), 0, u32.view(size));
+		match (loc.frame.getFrameAccessor().getTopOfStack()) {
+			I32(v) => new_val = v;
+			I64(v) => new_val = v;
+			F32(v) => new_val = v;
+			F64(v) => new_val = v;
+			_ => ;
+		}
+		match (size) {
+			1 => DataWriters.write_range_u8(dst.result, u8.view(new_val));
+			2 => DataWriters.write_range_u16(dst.result, u16.view(new_val));
+			4 => DataWriters.write_range_u32(dst.result, u32.view(new_val));
+			8 => DataWriters.write_range_u64(dst.result, new_val);
 			_ => ;
 		}
 		return Resumption.Continue;
@@ -443,7 +480,7 @@ type WasmEvent {
 	case FuncEntryTable(idx: int, table_idx: int, params: Array<Value>);
 
 	// observed memory updates made by the host
-	case Load(idx: int, offset: u64, data: u8);
+	case Load(idx: int, offset: u64, data: Array<u8>);
 	case MemGrow(idx: int, amount: int);
 
 	// observed table updates made by the host
@@ -471,7 +508,8 @@ type WasmEvent {
 				renderParams(sb, params);
 			}
 			Load(idx, offset, data) => {
-				sb.put3("L;%d;;%d;%d", idx, offset, data);
+				sb.put2("L;%d;;%d;", idx, offset);
+				renderBytes(sb, data);
 			}
 			MemGrow(idx, amount) => {
 				sb.put2("MG;%d;;%d", idx, amount);
@@ -503,7 +541,7 @@ type WasmEvent {
 	def renderValue(val: Value, sb: StringBuilder) {
 		match (val) {
 			I32(val) => sb.put1("%d;i32", val);
-			I64(val) => sb.put1("%duL;i64", val);
+			I64(val) => sb.put1("%d;i64", val);
 			F32(val) => sb.put1("%x;f32", val);
 			F64(val) => sb.put1("%x;f64", val);
 			_ => ;
@@ -514,6 +552,13 @@ type WasmEvent {
 		for (i < params.length) {
 			Values.render(params[i], sb);
 			if (i < params.length - 1) sb.puts(",");
+		}
+	}
+
+	def renderBytes(sb: StringBuilder, data: Array<u8>) {
+		for (i < data.length) {
+			sb.put1("%d", data[i]);
+			if (i < data.length - 1) sb.puts(",");
 		}
 	}
 }
