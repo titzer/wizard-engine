@@ -82,7 +82,7 @@ Read how to use [tracing options](doc/Tracing.md) in Wizard.
 
 Read how to use built-in [monitors](doc/Monitors.md) for analysis in Wizard.
 
-Read how to build your own [monitors](doc/YourMonitor.md) for instrumentation in Wizard.
+Read how to build your own custom [monitors](doc/CustomMonitors.md) for instrumentation in Wizard.
 
 ### Research Projects
 
