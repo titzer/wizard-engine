@@ -1,4 +1,4 @@
-// Copyright 2023 Wizard Authors. All rights reserved.
+// Copyright 2024 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
 // Implements a profiler that targets wasm modules containing a generalized interpreter
@@ -23,9 +23,8 @@ var MAX_OPERAND_LEN = 6;
 class BytecodeProfilingMonitor extends Monitor {
 	def visitor = DispatchFunctionBytecodeVisitor.new(BytecodeIterator.new());
 	def fuel_count_probe = FuelCountProbe.new();
-	// the SourceProfileState of all functions that could be the dispatch function.
-	var potential_dispatch_functions: List<SourceProfileState>;
-	var all_counters: List<DynamicLoc -> Resumption>;
+	// the GuestProfileState of all functions that could be the dispatch function.
+	var potential_dispatch_functions: List<GuestProfileState>;
 
 	def configure(args: string) -> string {
 		def argMap = MonitorUtil.argMapFrom(args);
@@ -59,7 +58,7 @@ class BytecodeProfilingMonitor extends Monitor {
 	def onFinish(i: Instance, r: Result) {
 		for (states = potential_dispatch_functions; states != null; states = states.tail) {
 			states.head.compactTrace();
-			states.head.reportSourceFunctionTrace();
+			states.head.reportGuestFunctionTrace();
 			states.head.reportRecoveredBytecodes();
 			states.head.hotness.report();
 		}
@@ -69,28 +68,38 @@ class BytecodeProfilingMonitor extends Monitor {
 		visitor.reset();
 		visitor.bi.reset(func).dispatchAll(visitor);
 		if (visitor.is_dispatch_func) { // save the profile state and insert memory probes 
-			var state = SourceProfileState.new(fuel_count_probe, func.func_index,
-				StringBuilder.new().put1("func_%d", func.func_index).toString());
-			
+			var state = GuestProfileState.new(fuel_count_probe, func.func_index,
+				func.render(mi.module.names, StringBuilder.new()).toString());
 			potential_dispatch_functions = List.new(state, potential_dispatch_functions);
-			var memory_visitor = MemoryVisitor.new(mi.module,
-				beforeMemRead(state, visitor.opcode_read_pc, _, _, _, _), null, null);
-			memory_visitor.bi = visitor.bi.reset(func);
-			memory_visitor.bi.dispatchAll(memory_visitor);
+			var guest_bytecode_read_visitor = MemoryVisitor.new(mi.module,
+				beforeGuestBytecodeRead(state, _, _, _, _), null, null);
+			var guest_bytecode_imm_read_visitor = MemoryVisitor.new(mi.module,
+				beforeGuestBytecodeImmRead(state, _, _, _, _), null, null);
+			guest_bytecode_read_visitor.bi = visitor.bi.reset(func);
+			guest_bytecode_imm_read_visitor.bi = guest_bytecode_read_visitor.bi;
+			for (bi = guest_bytecode_read_visitor.bi; bi.more(); bi.next()) {
+				if (bi.pc == visitor.opcode_read_pc) {
+					bi.dispatch(guest_bytecode_read_visitor);
+				} else {
+					bi.dispatch(guest_bytecode_imm_read_visitor);
+				}
+
+			}
 		}
 	}
 
-	private def beforeMemRead(profile_state: SourceProfileState, opcode_read_pc: int,
+	private def beforeGuestBytecodeRead(profile_state: GuestProfileState,
 							  dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
-		if (dynamicLoc.pc != opcode_read_pc) {
-			// check for opcode operand read.
-			for (i: u32 = 0; i < size; i++) {
-				var b = mem.read_u8(u32.!(address + i), 0).result;
-				profile_state.try_record_operand(u32.!(address + i), b);
-			}
-		} else { // opcode read
-			var b = mem.read_u8(u32.!(address), 0).result;
-			profile_state.step(u32.!(address), b);
+		var b = mem.read_u8(u32.!(address), 0).result;
+		profile_state.step(u32.!(address), b);
+		return Resumption.Continue;
+	}
+
+	private def beforeGuestBytecodeImmRead(profile_state: GuestProfileState,
+							  dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
+		for (i: u32 = 0; i < size; i++) {
+			var b = mem.read_u8(u32.!(address + i), 0).result;
+			profile_state.try_record_operand(u32.!(address + i), b);
 		}
 		return Resumption.Continue;
 	}
@@ -101,9 +110,9 @@ class BytecodeProfilingMonitor extends Monitor {
 			var state = dispatches.head;
 			if (state.dispatch_func_id == func_id) {
 				if (is_enter) {
-					state.sourceFuncStart();
+					state.guestFuncStart();
 				} else {
-					state.sourceFuncReturn();
+					state.guestFuncReturn();
 				}
 			} else {
 				state.wasmFuncEvent(func_id, is_enter);
@@ -135,7 +144,7 @@ private class DispatchFunctionBytecodeVisitor(bi: BytecodeIterator) extends Byte
 	}
 }
 
-private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: int, output_prefix: string) {
+private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: int, output_prefix: string) {
 	var call_stack = ListStack<u32>.new();
 	// complete execution trace.
 	var trace: List<TraceEntry>;
@@ -151,15 +160,15 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 	var cur_wasm_func_trace: List<WasmFuncTrace>;
 
 	// updates profiler state upon wasm function invocation/return, during the execution of a
-	// valid source opcode. This is used to understand which wasm functions are associated to
+	// valid guest opcode. This is used to understand which wasm functions are associated to
 	// particular opcodes.
 	def wasmFuncEvent(wasm_func_id: int, is_start: bool) {
 		var wasm_trace = WasmFuncTrace(wasm_func_id, u32.!(count_probe.count) - last_step_count, is_start);
 		cur_wasm_func_trace = List.new(wasm_trace, cur_wasm_func_trace);
 	}
 
-	// updates the profiler state upon source function invocation.
-	def sourceFuncStart() {
+	// updates the profiler state upon guest (js) function invocation.
+	def guestFuncStart() {
 		commonSetup();
 		wasmFuncEvent(dispatch_func_id, true);
 		trace = List.new(TraceEntry.CALL(0), trace);
@@ -167,8 +176,8 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 		last_probe_event = ProbeEvent.CALL;
 	}
 
-	// updates the profiler state upon source function return.
-	def sourceFuncReturn() {
+	// updates the profiler state upon guest (js) function return.
+	def guestFuncReturn() {
 		commonSetup();
 		wasmFuncEvent(dispatch_func_id, false);
 		trace = List.new(TraceEntry.RETURN(call_stack.peek()), trace);
@@ -188,7 +197,7 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 				call_stack.push(addr);
 			}
 			RETURN => trace = List.new(TraceEntry.SYSTEM(cost, cur_wasm_func_trace), trace);
-			OPCODE_READ(bytecode, offset) => 
+			GUEST_OPCODE_READ(bytecode, offset) => 
 				trace = List.new(TraceEntry.STEP(bytecode, offset, cost, cur_wasm_func_trace), trace);
 		}
 
@@ -197,7 +206,7 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 			recovered_bytecodes[call_stack.peek()] = HashMap<u32, u8>.new(int.!<u32>, u32.==);
 		}
 		recovered_bytecodes[call_stack.peek()][addr] = b;
-		last_probe_event = ProbeEvent.OPCODE_READ(b, addr - call_stack.peek());
+		last_probe_event = ProbeEvent.GUEST_OPCODE_READ(b, addr - call_stack.peek());
 		hotness.record(b, cost);
 		last_step_count = u32.!(count_probe.count);
 		last_probe_event_count = u32.!(count_probe.count);
@@ -254,7 +263,7 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 		trace = new_trace;
 	}
 
-	def reportSourceFunctionTrace() {
+	def reportGuestFunctionTrace() {
 		if (trace == null) return;
 		var rev = Lists.reverse(trace);
 		var b = StringBuilder.new();
@@ -329,7 +338,7 @@ private class SourceProfileState(count_probe: FuelCountProbe, dispatch_func_id: 
 	private def commonSetup() {
 		def cost = get_cost();
 		match (last_probe_event) {
-			OPCODE_READ(bytecode, offset) => {
+			GUEST_OPCODE_READ(bytecode, offset) => {
 				trace = 
 					List.new(TraceEntry.STEP(bytecode, offset, cost, cur_wasm_func_trace), trace);
 				hotness.record(bytecode, cost);
@@ -389,7 +398,7 @@ private class BytecodeHotness(output_prefix: string) {
 	}
 }
 
-// custom counter that ignores certain instructions.
+// custom fuel counter that ignores certain instructions.
 private class FuelCountProbe extends CountProbe {
 	def fire(dynamicLoc: DynamicLoc) -> Resumption {
 		var opcode_byte = dynamicLoc.func.decl.orig_bytecode[dynamicLoc.pc];
@@ -409,7 +418,7 @@ private type TraceEntry {
 	case SYSTEM(cost: u32, wasm_func_trace: List<WasmFuncTrace>);
 }
 
-// wasm function call/return events when the dispatch function is executing a valid source opcode.
+// wasm function call/return events when the dispatch function is executing a valid guest opcode.
 private type WasmFuncTrace(func_id: int, instr_count: u32, is_start: bool) {
 	def toString() -> string {
 		return Strings.format3("%d:%s:%d", func_id, if (is_start, "S", "E"), instr_count);
@@ -417,7 +426,7 @@ private type WasmFuncTrace(func_id: int, instr_count: u32, is_start: bool) {
 }
 
 private type ProbeEvent {
-	case OPCODE_READ(bytecode: u8, offset: u32);
+	case GUEST_OPCODE_READ(bytecode: u8, offset: u32);
 	case CALL;
 	case RETURN;
 }
