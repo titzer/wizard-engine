@@ -14,11 +14,11 @@ class R3Monitor extends Monitor {
 		handler = EventHandler.new(module);
 		Instrumentation.insertGlobalProbe(ReturnProbe.new(handler));
 		var mm = ModuleInstrumenter.new(module);
-		var visitor = R3MonitorBytecodeVisitor.new(handler, module, BytecodeIterator.new());
-		mm.forEachFunc(instrumentFunc(visitor, _, _));
-		mm.beforeMemRead(handler.memoryRead);
-		mm.beforeMemWrite(handler.memoryWrite);
-		mm.beforeMemGrow(handler.memoryGrow);
+		R3MonitorBytecodeInstrumenter.new(handler, module).run();
+		mm.forEachFunc(instrumentFunctionEnter);
+		mm.beforeMemRead(handler.onMemoryRead);
+		mm.beforeMemWrite(handler.onMemoryWrite);
+		mm.beforeMemGrow(handler.onMemoryGrow);
 	}
 
 	def onInstantiate(instance: Instance) {
@@ -31,55 +31,69 @@ class R3Monitor extends Monitor {
 		System.puts(sb.toString());
 	}
 
-	private def instrumentFunc(visitor: R3MonitorBytecodeVisitor, mm: ModuleInstrumenter, func: FuncDecl) {
+	private def instrumentFunctionEnter(mm: ModuleInstrumenter, func: FuncDecl) {
 		Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, EnterProbe.new(handler, func));
-		visitor.bi.reset(func).dispatchAll(visitor);
 	}
 }
 
-private class R3MonitorBytecodeVisitor(handler: EventHandler, module: Module, bi: BytecodeIterator) extends BytecodeVisitor {
+private class R3MonitorBytecodeInstrumenter extends BytecodeInstrumenter {
+	def handler: EventHandler;
+
+	new(handler: EventHandler, module: Module) super(module) {
+		handler = handler;
+	}
+
 	def visit_CALL(func_index: u31)	{
-		insert(CallProbe.new(func_index, handler));
+		insertProbeHere(CallProbe.new(func_index, handler));
 	}
 
 	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
 		// in case of consecutive CALL instructions, the correct behavior relies on probe fires in the insertion order.
 		var sig_decl = SigDecl.!(module.heaptypes[sig_index]);
-		insert(CallIndirectProbe.new(sig_decl, table_index, handler));
+		insertProbeHere(CallIndirectProbe.new(sig_decl, table_index, handler));
 	}
 
 	def visit_GLOBAL_GET(global_index: u31) {
-		insert(GlobalGetProbe.new(handler, global_index));
+		insertProbeHere(GlobalGetProbe.new(handler, global_index));
 	}
 
 	def visit_GLOBAL_SET(global_index: u31) {
-		insert(GlobalSetProbe.new(handler, global_index));
+		insertProbeHere(GlobalSetProbe.new(handler, global_index));
 	}
 
 	def visit_TABLE_GET(table_index: u31) {
-		insert(TableGetProbe.new(handler, table_index));
+		insertProbeHere(TableGetProbe.new(handler, table_index));
 	}
 
 	def visit_TABLE_SET(table_index: u31) {
-		insert(TableSetProbe.new(handler, table_index));
+		insertProbeHere(TableSetProbe.new(handler, table_index));
 	}
 
 	def visit_TABLE_GROW(table_index: u31) {
-		insert(TableGrowProbe.new(handler, table_index));
+		insertProbeHere(TableGrowProbe.new(handler, table_index));
+	}
+
+	def visit_MEMORY_COPY(dst_index: u31, src_index: u31) {
+		insertProbeHere(MemoryCopyProbe.new(handler, dst_index, src_index));
+	}
+
+	def visit_MEMORY_INIT(data_index: u31, mem_index: u31) {
+		var data_decl = module.data[data_index];
+		insertProbeHere(MemoryInitProbe.new(handler, mem_index, data_decl.data));
+	}
+
+	def visit_MEMORY_FILL(mem_index: u31) {
+		insertProbeHere(MemoryFillProbe.new(handler, mem_index));
 	}
 
 	def visit_RETURN() {
-		insert(ExitProbe.new(handler, bi.func.func_index));
+		insertProbeHere(ExitProbe.new(handler, bi.func.func_index));
 	}
 
 	def visit_END() {
 		if (bi.pc + 1 == bi.func.cur_bytecode.length) {
-			insert(ExitProbe.new(handler, bi.func.func_index));
+			insertProbeHere(ExitProbe.new(handler, bi.func.func_index));
 		}
-	}
-
-	private def insert(probe: Probe) {
-		Instrumentation.insertLocalProbe(module, bi.func.func_index, bi.pc, probe);
 	}
 }
 
@@ -127,6 +141,7 @@ private class EventHandler {
 		for (i < shadowMems.length) {
 			var shadow_mem = shadowMems[i];
 			var instance_mem = instance.memories[i];
+			// initialize shadow memory after active data segments are loaded.
 			if (shadow_mem.copyM(0, instance_mem, 0, u32.view(instance_mem.length())) != TrapReason.NONE) {
 				System.error("R3MonitorError", "failed to instantiate shadow memory");
 			}
@@ -240,13 +255,108 @@ private class EventHandler {
 		shadowTables[table_idx].grow(growth, Values.FUNCREF_NULL);
 	}
 
-	def memoryRead(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
-		var addr = u32.view(addr);
+	def onMemoryRead(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
+		alignShadowMemFixedRange(mem, addr, size);
+		return Resumption.Continue;
+	}
+
+	def onMemoryWrite(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
+		var mem_index = mem.decl.memory_index;
+		var shadow_mem = shadowMems[mem_index];
+		var new_val: u64;
+		var new_val_high: u64;
+		var dst = shadow_mem.range_ol_64(addr, u32.view(size));
+		match (loc.frame.getFrameAccessor().getTopOfStack()) {
+			I32(v) => new_val = v;
+			I64(v) => new_val = v;
+			F32(v) => new_val = v;
+			F64(v) => new_val = v;
+			V128(low, high) => {
+				new_val = low;
+				new_val_high = high;
+			}
+			_ => ;
+		}
+		match (size) {
+			1 => DataWriters.write_range_u8(dst.result, u8.view(new_val));
+			2 => DataWriters.write_range_u16(dst.result, u16.view(new_val));
+			4 => DataWriters.write_range_u32(dst.result, u32.view(new_val));
+			8 => DataWriters.write_range_u64(dst.result, new_val);
+			16 => DataWriters.write_range_u128(dst.result, (new_val, new_val_high));
+		}
+		return Resumption.Continue;
+	}
+
+	def onMemoryGrow(loc: DynamicLoc, mem: Memory, pages: u32) -> Resumption {
+		if (pages > 0) {
+			growShadowMem(mem.decl.memory_index, pages);
+		}
+		return Resumption.Continue;
+	}
+
+	def onMemoryInit(loc: DynamicLoc, mem_index: int, data: Array<u8>) {
+		var dst_offset = Values.v_u(loc.frame.getFrameAccessor().getOperand(-2));
+		var src_offset =Values.v_u(loc.frame.getFrameAccessor().getOperand(-1));
+		var copy_size = Values.v_u(loc.frame.getFrameAccessor().getTopOfStack());
+		shadowMems[mem_index].copyIn(dst_offset, data, src_offset, copy_size);
+	}
+
+	def onMemoryCopy(loc: DynamicLoc, dst_index: u32, src_mem: Memory) {
+		var src_index = src_mem.decl.memory_index;
+		var dst_offset = Values.v_u(loc.frame.getFrameAccessor().getOperand(-2));
+		var src_offset =Values.v_u(loc.frame.getFrameAccessor().getOperand(-1));
+		var copy_size = Values.v_u(loc.frame.getFrameAccessor().getTopOfStack());
+
+		// check if the copy range matches with shadow memory
+		alignShadowMemRange(src_mem, src_offset, copy_size);
+		shadowMems[dst_index].copyM(dst_offset, src_mem, src_offset, copy_size);
+	}
+
+	def onMemoryFill(mem_index: u32, dst_offset: u32, val: u8, size: u32) {
+		shadowMems[mem_index].fill(dst_offset, val, size);
+	}
+
+	def renderTrace(sb: StringBuilder) {
+		for (i < trace.length) {
+			trace[i].render(sb);
+		}
+	}
+
+	private def growShadowMem(mem_index: int, growth: u32) {
+		var shadow_mem = shadowMems[mem_index];
+		trace.put(WasmEvent.MemGrow(mem_index, int.view(growth)));
+		shadow_mem.grow(growth);
+	}
+
+	private def alignShadowMemRange(mem: Memory, addr: u64, size: u64) {
+		var scanned_size: u64 = 0;
+		while (scanned_size <= size - 16) {
+			alignShadowMemFixedRange(mem, addr, 16);
+			scanned_size += 16;
+			addr += 16;
+		}
+		if (scanned_size <= size - 8) {
+			alignShadowMemFixedRange(mem, addr, 8);
+			scanned_size += 8;
+			addr += 8;
+		}
+		if (scanned_size <= size - 4) {
+			alignShadowMemFixedRange(mem, addr, 4);
+			scanned_size += 4;
+			addr += 4;
+		}
+		for (i < size - scanned_size) {
+			alignShadowMemFixedRange(mem, addr, 1);
+			addr++;
+		}
+	}
+
+	private def alignShadowMemFixedRange(mem: Memory, addr: u64, size: u64) {
 		var size = u32.view(size);
 		var mem_index = mem.decl.memory_index;
 		var shadow_mem = shadowMems[mem_index];
-		var mem_ptr = mem.range_oil_32(addr, 0, size).result;
-		var shadow_ptr = shadow_mem.range_oil_32(addr, 0, size).result;
+		var mem_ptr = mem.range_ol_64(addr, size).result;
+		var shadow_ptr = shadow_mem.range_ol_64(addr, size).result;
 		var data_lo: u64, data_hi: u64;
 		var shadow_data_lo: u64, shadow_data_hi: u64;
 		match (size) {
@@ -278,55 +388,8 @@ private class EventHandler {
 		}
 		if (shadow_data_lo != data_lo || (size == 16 && (shadow_data_hi != data_hi))) {
 			trace.put(WasmEvent.Load(mem_index, addr, Ranges.dup(mem_ptr)));
-			shadow_mem.copyM(addr, mem, addr, size);
+			shadow_mem.copyM(u32.view(addr), mem, u32.view(addr), size);
 		}
-		return Resumption.Continue;
-	}
-
-	def memoryWrite(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
-		var mem_index = mem.decl.memory_index;
-		var shadow_mem = shadowMems[mem_index];
-		var new_val: u64;
-		var new_val_high: u64;
-		var dst = shadow_mem.range_oil_32(u32.view(addr), 0, u32.view(size));
-		match (loc.frame.getFrameAccessor().getTopOfStack()) {
-			I32(v) => new_val = v;
-			I64(v) => new_val = v;
-			F32(v) => new_val = v;
-			F64(v) => new_val = v;
-			V128(low, high) => {
-				new_val = low;
-				new_val_high = high;
-			}
-			_ => ;
-		}
-		match (size) {
-			1 => DataWriters.write_range_u8(dst.result, u8.view(new_val));
-			2 => DataWriters.write_range_u16(dst.result, u16.view(new_val));
-			4 => DataWriters.write_range_u32(dst.result, u32.view(new_val));
-			8 => DataWriters.write_range_u64(dst.result, new_val);
-			16 => DataWriters.write_range_u128(dst.result, (new_val, new_val_high));
-		}
-		return Resumption.Continue;
-	}
-
-	def memoryGrow(loc: DynamicLoc, mem: Memory, pages: u32) -> Resumption {
-		if (pages > 0) {
-			growShadowMem(mem.decl.memory_index, pages);
-		}
-		return Resumption.Continue;
-	}
-
-	def renderTrace(sb: StringBuilder) {
-		for (i < trace.length) {
-			trace[i].render(sb);
-		}
-	}
-
-	private def growShadowMem(mem_index: int, growth: u32) {
-		var shadow_mem = shadowMems[mem_index];
-		trace.put(WasmEvent.MemGrow(mem_index, int.view(growth)));
-		shadow_mem.grow(growth);
 	}
 
 	private def checkMemGrow(instance: Instance) {
@@ -474,6 +537,32 @@ private class TableGrowProbe(handler: EventHandler, table_index: u31) extends Pr
 		var frame_accessor = loc.frame.getFrameAccessor();
 		var growth = Values.v_u(frame_accessor.getTopOfStack());
 		handler.onTableGrow(table_index, growth);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryInitProbe(handler: EventHandler, mem_index: u31, data: Array<u8>) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		handler.onMemoryInit(loc, mem_index, data);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryCopyProbe(handler: EventHandler, dst_index: u31, src_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var src_mem = loc.func.instance.memories[src_index];
+		handler.onMemoryCopy(loc, dst_index, src_mem);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryFillProbe(handler: EventHandler, mem_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var dst_offset = Values.v_u(frame_accessor.getOperand(-2));
+		var val = Values.v_u(frame_accessor.getOperand(-1));
+		var size = Values.v_u(frame_accessor.getTopOfStack());
+		handler.onMemoryFill(mem_index, dst_offset, u8.view(val), size);
 		return Resumption.Continue;
 	}
 }
