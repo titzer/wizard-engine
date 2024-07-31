@@ -21,8 +21,8 @@ var MIN_DISPATCH_CASE_COUNT = 150;
 var MAX_OPERAND_LEN = 6;
 
 class BytecodeProfilingMonitor extends Monitor {
-	def visitor = DispatchFunctionBytecodeVisitor.new(BytecodeIterator.new());
-	def fuel_count_probe = FuelCountProbe.new();
+	var visitor: DispatchFunctionBytecodeVisitor;
+	def fuel_counter = FuelCounter.new();
 	// the GuestProfileState of all functions that could be the dispatch function.
 	var potential_dispatch_functions: List<GuestProfileState>;
 	var terminal_out = false; // if true, output all traces to terminal, otherwise to default trace files.
@@ -49,9 +49,7 @@ class BytecodeProfilingMonitor extends Monitor {
 	}
 
 	def onParse(module: Module) {
-		// enable global count probe.
-		Instrumentation.insertGlobalProbe(fuel_count_probe);
-
+		visitor = DispatchFunctionBytecodeVisitor.new(module, BytecodeIterator.new(), fuel_counter);
 		// detect possible dispatch functions and insert memory probes.
 		var mi = ModuleInstrumenter.new(module);
 		mi.forEachFunc(instrumentFunc);
@@ -73,7 +71,7 @@ class BytecodeProfilingMonitor extends Monitor {
 		visitor.reset();
 		visitor.bi.reset(func).dispatchAll(visitor);
 		if (visitor.is_dispatch_func) { // save the profile state and insert memory probes 
-			var state = GuestProfileState.new(fuel_count_probe, func.func_index,
+			var state = GuestProfileState.new(fuel_counter, func.func_index,
 				func.render(mi.module.names, StringBuilder.new()).toString());
 			potential_dispatch_functions = List.new(state, potential_dispatch_functions);
 			var guest_bytecode_read_visitor = MemoryVisitor.new(mi.module,
@@ -104,7 +102,7 @@ class BytecodeProfilingMonitor extends Monitor {
 							  dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
 		for (i: u32 = 0; i < size; i++) {
 			var b = mem.read_u8(u32.!(address + i), 0).result;
-			profile_state.try_record_operand(u32.!(address + i), b);
+			profile_state.tryRecordOperand(u32.!(address + i), b);
 		}
 		return Resumption.Continue;
 	}
@@ -127,29 +125,62 @@ class BytecodeProfilingMonitor extends Monitor {
 	}
 }
 
-// iterates over all wasm functions to detect possible dispatch functions using simple heuristics.
-private class DispatchFunctionBytecodeVisitor(bi: BytecodeIterator) extends BytecodeVisitor {
+// iterates over all wasm functions to detect possible dispatch functions using simple heuristics, and to
+// calculate size of basic blocks.
+private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterator, counter: FuelCounter) extends BytecodeVisitor {
 	var opcode_read_pc = -1;
+
+	var basic_block_start_pc = 0;
+	var basic_block_size: u32 = 0;
+	var is_prev_op_basic_block_end = true;
+
 	var is_dispatch_func = false;
 
 	def visit_BR_TABLE(labels: Range<u31>) {
+		visitOp(Opcode.BR_TABLE);
 		if (!is_dispatch_func && labels.length >= MIN_DISPATCH_CASE_COUNT && opcode_read_pc >= 0) {
 			is_dispatch_func = true;
 		}
 	}
+
 	def visit_I32_LOAD8_U(imm: MemArg) {
+		visitOp(Opcode.I32_LOAD8_U);
 		if (!is_dispatch_func) {
 			opcode_read_pc = bi.pc;
+		}
+	}
+
+	def visitOp(op: Opcode) {
+		if (is_prev_op_basic_block_end && basic_block_size > 0) {
+			basic_block_start_pc = bi.pc;
+			basic_block_size = 0;
+		}
+		match (op) {
+			BLOCK, LOOP, UNREACHABLE, RETURN, ELSE, END => ;
+			_ => basic_block_size++;
+		}
+		match (op) {
+			BLOCK, LOOP, IF, ELSE, END, BR, BR_IF, 
+			BR_TABLE, CALL_INDIRECT, CALL, RETURN, CALL_REF, 
+			RETURN_CALL_REF, RETURN_CALL_INDIRECT => { // end of basic block
+				var basic_block_probe = BasicBlockProbe.new(basic_block_size, counter);
+				Instrumentation.insertLocalProbe(module, bi.func.func_index, basic_block_start_pc, basic_block_probe);
+				is_prev_op_basic_block_end = true;
+			}
+			_ => is_prev_op_basic_block_end = false;
 		}
 	}
 
 	def reset() {
 		opcode_read_pc = -1;
 		is_dispatch_func = false;
+		basic_block_start_pc = 0;
+	    basic_block_size = 0;
+	    is_prev_op_basic_block_end = true;
 	}
 }
 
-private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: int, output_prefix: string) {
+private class GuestProfileState(counter: FuelCounter, dispatch_func_id: int, output_prefix: string) {
 	var call_stack = ListStack<u32>.new();
 	// complete execution trace.
 	var trace: List<TraceEntry>;
@@ -157,6 +188,7 @@ private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: i
 	var recovered_bytecodes = HashMap<u32, HashMap<u32, u8>>.new(int.!<u32>, u32.==);
 	// address of the last read bytecode.
 	var last_opcode_addr: u32;
+	var fuel_count: u32 = 0;
 	// total costs of each bytecode execution.
 	def hotness: BytecodeHotness = BytecodeHotness.new(output_prefix);
 	var last_probe_event: ProbeEvent = ProbeEvent.RETURN;
@@ -168,7 +200,7 @@ private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: i
 	// valid guest opcode. This is used to understand which wasm functions are associated to
 	// particular opcodes.
 	def wasmFuncEvent(wasm_func_id: int, is_start: bool) {
-		var wasm_trace = WasmFuncTrace(wasm_func_id, u32.!(count_probe.count) - last_step_count, is_start);
+		var wasm_trace = WasmFuncTrace(wasm_func_id, counter.count - last_step_count, is_start);
 		cur_wasm_func_trace = List.new(wasm_trace, cur_wasm_func_trace);
 	}
 
@@ -213,17 +245,21 @@ private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: i
 		recovered_bytecodes[call_stack.peek()][addr] = b;
 		last_probe_event = ProbeEvent.GUEST_OPCODE_READ(b, addr - call_stack.peek());
 		hotness.record(b, cost);
-		last_step_count = u32.!(count_probe.count);
-		last_probe_event_count = u32.!(count_probe.count);
+		last_step_count = counter.count;
+		last_probe_event_count = counter.count;
 		cur_wasm_func_trace = null;
 	}
 
 	// process memory read adjacent to the last opcode read, in order to recover possible operands
 	// associated with the last read opcode.
-	def try_record_operand(addr: u32, b: u8) {
+	def tryRecordOperand(addr: u32, b: u8) {
 		if (addr - last_opcode_addr <= MAX_OPERAND_LEN && recovered_bytecodes.has(call_stack.peek())) {
 			recovered_bytecodes[call_stack.peek()][addr] = b;
 		}
+	}
+
+	def incrementFuel(amount: u32) {
+		fuel_count += amount;
 	}
 
 	// compact the trace by coalescing consecutive system events.
@@ -357,11 +393,11 @@ private class GuestProfileState(count_probe: FuelCountProbe, dispatch_func_id: i
 			}
 			_ => trace = List.new(TraceEntry.SYSTEM(cost, cur_wasm_func_trace), trace);
 		}
-		last_probe_event_count = u32.!(count_probe.count);
+		last_probe_event_count = counter.count;
 	}
 
 	private def get_cost() -> u32 {
-		return u32.!(count_probe.count) - last_probe_event_count;
+		return counter.count - last_probe_event_count;
 	}
 }
 
@@ -414,16 +450,20 @@ private class BytecodeHotness(output_prefix: string) {
 	}
 }
 
-// custom fuel counter that ignores certain instructions.
-private class FuelCountProbe extends CountProbe {
+// inserted at the start of every basic block, makes fuel calculation faster by avoiding a global probe.
+private class BasicBlockProbe(size: u32, counter: FuelCounter) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> Resumption {
-		var opcode_byte = dynamicLoc.func.decl.orig_bytecode[dynamicLoc.pc];
-		match (opcode_byte) {
-			// BLOCK, LOOP, UNREACHABLE, RETURN, ELSE, END
-			0x02, 0x03, 0x00, 0x0F, 0x05, 0x0B => count += 0;
-			_ => count += 1;
-		}
+		counter.incrementFuel(size);
 		return Resumption.Continue;
+	}
+}
+
+// custom fuel counter that aggregates all the BasicBlockProbe counts.
+private class FuelCounter {
+	var count: u32 = 0;
+
+	def incrementFuel(size: u32) {
+		count += size;
 	}
 }
 
