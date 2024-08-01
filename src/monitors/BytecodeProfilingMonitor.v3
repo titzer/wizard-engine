@@ -25,12 +25,12 @@ class BytecodeProfilingMonitor extends Monitor {
 	def fuel_counter = FuelCounter.new();
 	// the GuestProfileState of all functions that could be the dispatch function.
 	var potential_dispatch_functions: List<GuestProfileState>;
-	var terminal_out = false; // if true, output all traces to terminal, otherwise to default trace files.
+	var output_folder: string; // output folder for the profiling results, if unset, print to terminal.
 
 	def configure(args: string) -> string {
 		def argMap = MonitorUtil.argMapFrom(args);
-		if (argMap.has("terminal")) {
-			terminal_out = true;
+		if (argMap.has("output_folder")) {
+			output_folder = argMap["output_folder"];
 			return null;
 		}
 		if (argMap.has("switch_size")) {
@@ -61,9 +61,9 @@ class BytecodeProfilingMonitor extends Monitor {
 	def onFinish(i: Instance, r: Result) {
 		for (states = potential_dispatch_functions; states != null; states = states.tail) {
 			states.head.compactTrace();
-			states.head.reportGuestFunctionTrace(terminal_out);
-			states.head.reportRecoveredBytecodes(terminal_out);
-			states.head.hotness.report(terminal_out);
+			states.head.reportGuestFunctionTrace(output_folder);
+			states.head.reportRecoveredBytecodes(output_folder);
+			states.head.hotness.report(output_folder);
 		}
 	}
 
@@ -132,7 +132,6 @@ private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterat
 
 	var basic_block_start_pc = 0;
 	var basic_block_size: u32 = 0;
-	var is_prev_op_basic_block_end = true;
 
 	var is_dispatch_func = false;
 
@@ -151,23 +150,23 @@ private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterat
 	}
 
 	def visitOp(op: Opcode) {
-		if (is_prev_op_basic_block_end && basic_block_size > 0) {
-			basic_block_start_pc = bi.pc;
-			basic_block_size = 0;
-		}
 		match (op) {
 			BLOCK, LOOP, UNREACHABLE, RETURN, ELSE, END => ;
 			_ => basic_block_size++;
 		}
 		match (op) {
-			BLOCK, LOOP, IF, ELSE, END, BR, BR_IF, 
+			LOOP, END, IF, ELSE, BR, BR_IF, 
 			BR_TABLE, CALL_INDIRECT, CALL, RETURN, CALL_REF, 
+			BR_ON_CAST, BR_ON_CAST_FAIL, BR_ON_NULL, BR_ON_NON_NULL,
 			RETURN_CALL_REF, RETURN_CALL_INDIRECT => { // end of basic block
-				var basic_block_probe = BasicBlockProbe.new(basic_block_size, counter);
-				Instrumentation.insertLocalProbe(module, bi.func.func_index, basic_block_start_pc, basic_block_probe);
-				is_prev_op_basic_block_end = true;
+				if (basic_block_size > 0) {
+					var basic_block_probe = BasicBlockProbe.new(basic_block_size, counter);
+					Instrumentation.insertLocalProbe(module, bi.func.func_index, basic_block_start_pc, basic_block_probe);
+					basic_block_start_pc = bi.nextPc();
+					basic_block_size = 0;
+				}
 			}
-			_ => is_prev_op_basic_block_end = false;
+			_ => ;
 		}
 	}
 
@@ -176,7 +175,6 @@ private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterat
 		is_dispatch_func = false;
 		basic_block_start_pc = 0;
 	    basic_block_size = 0;
-	    is_prev_op_basic_block_end = true;
 	}
 }
 
@@ -304,7 +302,7 @@ private class GuestProfileState(counter: FuelCounter, dispatch_func_id: int, out
 		trace = new_trace;
 	}
 
-	def reportGuestFunctionTrace(terminal_out: bool) {
+	def reportGuestFunctionTrace(output_folder: string) {
 		if (trace == null) return;
 		var rev = Lists.reverse(trace);
 		var b = StringBuilder.new();
@@ -343,15 +341,15 @@ private class GuestProfileState(counter: FuelCounter, dispatch_func_id: int, out
 			}
 			rev = rev.tail;
 		}
-		if (terminal_out) {
-			Trace.OUT.puts(b.toString());
+		if (output_folder == null) {
+			System.puts(b.toString());
 		} else {
-			var fd = System.fileOpen(Strings.format1("%s_guest_trace.csv", output_prefix), false);
+			var fd = System.fileOpen(Strings.format2("%s/%s_guest_trace.csv", output_folder, output_prefix), false);
 			System.write(fd, b.toString());
 		}
 	}
 
-	def reportRecoveredBytecodes(terminal_out: bool) {
+	def reportRecoveredBytecodes(output_folder: string) {
 		var function_ids = Maps.keyList(recovered_bytecodes);
 		if (function_ids == null) return;
 		var b = StringBuilder.new();
@@ -375,10 +373,10 @@ private class GuestProfileState(counter: FuelCounter, dispatch_func_id: int, out
 			b.ln();
 			function_ids = function_ids.tail;
 		}
-		if (terminal_out) {
-			Trace.OUT.puts(b.toString());
+		if (output_folder == null) {
+			System.puts(b.toString());
 		} else {
-			var fd = System.fileOpen(Strings.format1("%s_recovered_bytecodes.csv", output_prefix), false);
+			var fd = System.fileOpen(Strings.format2("%s/%s_recovered_bytecodes.csv", output_folder, output_prefix), false);
 			System.write(fd, b.toString());
 		}
 	}
@@ -422,7 +420,7 @@ private class BytecodeHotness(output_prefix: string) {
 		bytecode_hotness[b][new_cost] = bytecode_hotness[b][new_cost] + 1;
 	}
 
-	def report(terminal_out: bool) {
+	def report(output_folder: string) {
 		var b = StringBuilder.new();
 		var is_empty = true;
 		b.puts("bytecode,cost,count\n"); // header
@@ -440,10 +438,10 @@ private class BytecodeHotness(output_prefix: string) {
 			}
 		}
 		if (!is_empty) {
-			if (terminal_out) {
-				Trace.OUT.puts(b.toString());
+			if (output_folder == null) {
+				System.puts(b.toString());
 			} else {
-				var fd = System.fileOpen(Strings.format1("%s_global_hotness.csv", output_prefix), false);
+				var fd = System.fileOpen(Strings.format2("%s/%s_global_hotness.csv", output_folder, output_prefix), false);
 				System.write(fd, b.toString());
 			}
 		}
