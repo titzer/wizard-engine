@@ -12,9 +12,9 @@ class R3Monitor extends Monitor {
 
 	def onParse(module: Module) {
 		handler = EventHandler.new(module);
-		Instrumentation.insertGlobalProbe(ReturnProbe.new(handler));
-		var mm = ModuleInstrumenter.new(module);
 		R3MonitorBytecodeInstrumenter.new(handler, module).run();
+
+		var mm = ModuleInstrumenter.new(module);
 		mm.forEachFunc(instrumentFunctionEnter);
 		mm.beforeMemRead(handler.onMemoryRead);
 		mm.beforeMemWrite(handler.onMemoryWrite);
@@ -38,62 +38,74 @@ class R3Monitor extends Monitor {
 
 private class R3MonitorBytecodeInstrumenter extends BytecodeInstrumenter {
 	def handler: EventHandler;
+	var last_op_is_call = false;
 
 	new(handler: EventHandler, module: Module) super(module) {
 		handler = handler;
 	}
 
 	def visit_CALL(func_index: u31)	{
-		insertProbeHere(CallProbe.new(func_index, handler));
+		checkCallReturnAndInsertProbe(CallProbe.new(func_index, handler));
+		last_op_is_call = true;
 	}
 
 	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
-		// in case of consecutive CALL instructions, the correct behavior relies on probe fires in the insertion order.
 		var sig_decl = SigDecl.!(module.heaptypes[sig_index]);
-		insertProbeHere(CallIndirectProbe.new(sig_decl, table_index, handler));
+		checkCallReturnAndInsertProbe(CallIndirectProbe.new(sig_decl, table_index, handler));
+		last_op_is_call = true;
 	}
 
 	def visit_GLOBAL_GET(global_index: u31) {
-		insertProbeHere(GlobalGetProbe.new(handler, global_index));
+		checkCallReturnAndInsertProbe(GlobalGetProbe.new(handler, global_index));
 	}
 
 	def visit_GLOBAL_SET(global_index: u31) {
-		insertProbeHere(GlobalSetProbe.new(handler, global_index));
+		checkCallReturnAndInsertProbe(GlobalSetProbe.new(handler, global_index));
 	}
 
 	def visit_TABLE_GET(table_index: u31) {
-		insertProbeHere(TableGetProbe.new(handler, table_index));
+		checkCallReturnAndInsertProbe(TableGetProbe.new(handler, table_index));
 	}
 
 	def visit_TABLE_SET(table_index: u31) {
-		insertProbeHere(TableSetProbe.new(handler, table_index));
+		checkCallReturnAndInsertProbe(TableSetProbe.new(handler, table_index));
 	}
 
 	def visit_TABLE_GROW(table_index: u31) {
-		insertProbeHere(TableGrowProbe.new(handler, table_index));
+		checkCallReturnAndInsertProbe(TableGrowProbe.new(handler, table_index));
 	}
 
 	def visit_MEMORY_COPY(dst_index: u31, src_index: u31) {
-		insertProbeHere(MemoryCopyProbe.new(handler, dst_index, src_index));
+		checkCallReturnAndInsertProbe(MemoryCopyProbe.new(handler, dst_index, src_index));
 	}
 
 	def visit_MEMORY_INIT(data_index: u31, mem_index: u31) {
 		var data_decl = module.data[data_index];
-		insertProbeHere(MemoryInitProbe.new(handler, mem_index, data_decl.data));
+		checkCallReturnAndInsertProbe(MemoryInitProbe.new(handler, mem_index, data_decl.data));
 	}
 
 	def visit_MEMORY_FILL(mem_index: u31) {
-		insertProbeHere(MemoryFillProbe.new(handler, mem_index));
+		checkCallReturnAndInsertProbe(MemoryFillProbe.new(handler, mem_index));
 	}
 
 	def visit_RETURN() {
-		insertProbeHere(ExitProbe.new(handler, bi.func.func_index));
+		checkCallReturnAndInsertProbe(ExitProbe.new(handler, bi.func.func_index));
 	}
 
 	def visit_END() {
+		if (last_op_is_call) {
+			insertProbeHere(ReturnProbe.new(handler));
+		}
 		if (bi.pc + 1 == bi.func.cur_bytecode.length) {
 			insertProbeHere(ExitProbe.new(handler, bi.func.func_index));
 		}
+	}
+
+	def checkCallReturnAndInsertProbe(new_probe: Probe) {
+		if (last_op_is_call) {
+			insertProbeHere(ReturnProbe.new(handler));
+		}
+		insertProbeHere(new_probe);
 	}
 }
 
@@ -154,9 +166,12 @@ private class EventHandler {
 			}
 		}
 		for (i < shadowGlobals.length) {
-			shadowGlobals[i] = instance.globals[i].value;
+			var global_val = instance.globals[i].value;
+			shadowGlobals[i] = global_val;
+			if (module.globals[i].imported()) {
+				trace.put(WasmEvent.ImportGlobal(i, global_val));
+			}
 		}
-		var temp = shadowMems[0].read_u8(1294673,0).result;
 	}
 
 	def onFuncEntry(index: int, params: Array<Value>, instance: Instance) {
@@ -427,8 +442,7 @@ private class EventHandler {
 				if (func_id_from_imp_name.has(name)) {
 					return func_id_from_imp_name[name];
 				}
-			}
-				
+			}	
 		}
 		return -1;
 	}
@@ -489,10 +503,7 @@ private class CallIndirectProbe(sig: SigDecl, table_index: u31, handler: EventHa
 
 private class ReturnProbe(handler: EventHandler) extends Probe {
 	def fire(loc: DynamicLoc) -> Resumption {
-		if (handler.last_instr_is_call && loc.pc > 0) {
-			handler.onCallReturn(loc);
-		}
-		handler.last_instr_is_call = false;
+		handler.onCallReturn(loc);
         return Resumption.Continue;
 	}
 }
@@ -620,13 +631,16 @@ type WasmEvent {
 				renderValue(value, sb);
 			}
 			ImportCall(idx) => {
-				sb.put1("IC;%d", idx);
+				sb.put1("IC;%d;", idx);
 			}
 			ImportReturn(results) => {
-				sb.puts("IR;;;");
+				sb.puts("IR;0;;");
 				renderParams(sb, results);
 			}
 			ImportGlobal(idx, initial) => {
+				sb.put1("IG;%d;;;;", idx);
+				renderValue(initial, sb);
+				sb.puts(";");
 			}
 		}
 		sb.puts("\n");
@@ -645,7 +659,14 @@ type WasmEvent {
 
 	def renderParams(sb: StringBuilder, params: Array<Value>) {
 		for (i < params.length) {
-			Values.render(params[i], sb);
+			match (params[i]) {
+				I31(val) => sb.put1("%d", u32.view(val));
+				I32(val) => sb.put1("%d", val);
+				I64(val) => sb.put1("%d", val);
+				F32(val) => sb.put1("f32:%x", val);
+				F64(val) => sb.put1("f64:%x", val);
+				_ => ;
+			}
 			if (i < params.length - 1) sb.puts(",");
 		}
 	}
