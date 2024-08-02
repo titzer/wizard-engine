@@ -1,0 +1,486 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Implements a profiler that targets wasm modules containing a generalized interpreter
+// that evaluates compiled bytecode.
+//
+// This profiler aims to recover source level information, including hot functions, call graphs,
+// and execution costs in terms of wasm instructions.
+def E = MonitorRegistry.add(
+	"profile_bytecode", "Recovers source level information from bytecode execution",
+	BytecodeProfilingMonitor.new());
+
+def OUT = Trace.OUT;
+
+// the minimum number of cases contained in the "switch" statement of the dispatch
+// function. This is used during static analysis to identify the most likely wasm function
+// as dispatch.
+var MIN_DISPATCH_CASE_COUNT = 150;
+
+// the maximum size in bytes that separates 2 consecutive opcodes.
+var MAX_OPERAND_LEN = 6;
+
+class BytecodeProfilingMonitor extends Monitor {
+	var visitor: DispatchFunctionBytecodeVisitor;
+	def fuel_counter = FuelCounter.new();
+	// the GuestProfileState of all functions that could be the dispatch function.
+	var potential_dispatch_functions: List<GuestProfileState>;
+	var output_folder: string; // output folder for the profiling results, if unset, print to terminal.
+
+	def configure(args: string) -> string {
+		def argMap = MonitorUtil.argMapFrom(args);
+		if (argMap.has("output_folder")) {
+			output_folder = argMap["output_folder"];
+			return null;
+		}
+		if (argMap.has("switch_size")) {
+			var parse_result = Ints.parseDecimal(argMap["switch_size"], 0);
+			if (parse_result.0 > 0) MIN_DISPATCH_CASE_COUNT = parse_result.1;
+			return null;
+		}
+		if (argMap.has("operand_len")) {
+			var parse_result = Ints.parseDecimal(argMap["operand_len"], 0);
+			if (parse_result.0 > 0) MAX_OPERAND_LEN = parse_result.1;
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
+	}
+
+	def onParse(module: Module) {
+		visitor = DispatchFunctionBytecodeVisitor.new(module, BytecodeIterator.new(), fuel_counter);
+		// detect possible dispatch functions and insert memory probes.
+		var mi = ModuleInstrumenter.new(module);
+		mi.forEachFunc(instrumentFunc);
+
+		// insert entry/exit probe at all functions.
+		mi.beforeAllFuncExecAndReturn(beforeFuncExecOrReturn(_, true), beforeFuncExecOrReturn(_, false));
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		for (states = potential_dispatch_functions; states != null; states = states.tail) {
+			states.head.compactTrace();
+			states.head.reportGuestFunctionTrace(output_folder);
+			states.head.reportRecoveredBytecodes(output_folder);
+			states.head.hotness.report(output_folder);
+		}
+	}
+
+	private def instrumentFunc(mi: ModuleInstrumenter, func: FuncDecl) {
+		visitor.reset();
+		visitor.bi.reset(func).dispatchAll(visitor);
+		if (visitor.is_dispatch_func) { // save the profile state and insert memory probes 
+			var state = GuestProfileState.new(fuel_counter, func.func_index,
+				func.render(mi.module.names, StringBuilder.new()).toString());
+			potential_dispatch_functions = List.new(state, potential_dispatch_functions);
+			var guest_bytecode_read_visitor = MemoryVisitor.new(mi.module,
+				beforeGuestBytecodeRead(state, _, _, _, _), null, null);
+			var guest_bytecode_imm_read_visitor = MemoryVisitor.new(mi.module,
+				beforeGuestBytecodeImmRead(state, _, _, _, _), null, null);
+			guest_bytecode_read_visitor.bi = visitor.bi.reset(func);
+			guest_bytecode_imm_read_visitor.bi = guest_bytecode_read_visitor.bi;
+			for (bi = guest_bytecode_read_visitor.bi; bi.more(); bi.next()) {
+				if (bi.pc == visitor.opcode_read_pc) {
+					bi.dispatch(guest_bytecode_read_visitor);
+				} else {
+					bi.dispatch(guest_bytecode_imm_read_visitor);
+				}
+
+			}
+		}
+	}
+
+	private def beforeGuestBytecodeRead(profile_state: GuestProfileState,
+							  dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
+		var b = mem.read_u8(u32.!(address), 0).result;
+		profile_state.step(u32.!(address), b);
+		return Resumption.Continue;
+	}
+
+	private def beforeGuestBytecodeImmRead(profile_state: GuestProfileState,
+							  dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
+		for (i: u32 = 0; i < size; i++) {
+			var b = mem.read_u8(u32.!(address + i), 0).result;
+			profile_state.tryRecordOperand(u32.!(address + i), b);
+		}
+		return Resumption.Continue;
+	}
+
+	private def beforeFuncExecOrReturn(dynamicLoc: DynamicLoc, is_enter: bool) -> Resumption {
+		var func_id = dynamicLoc.func.decl.func_index;
+		for (dispatches = potential_dispatch_functions; dispatches != null; dispatches = dispatches.tail) {
+			var state = dispatches.head;
+			if (state.dispatch_func_id == func_id) {
+				if (is_enter) {
+					state.guestFuncStart();
+				} else {
+					state.guestFuncReturn();
+				}
+			} else {
+				state.wasmFuncEvent(func_id, is_enter);
+			}
+		}
+		return Resumption.Continue;
+	}
+}
+
+// iterates over all wasm functions to detect possible dispatch functions using simple heuristics, and to
+// calculate size of basic blocks.
+private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterator, counter: FuelCounter) extends BytecodeVisitor {
+	var opcode_read_pc = -1;
+
+	var basic_block_start_pc = 0;
+	var basic_block_size: u32 = 0;
+
+	var is_dispatch_func = false;
+
+	def visit_BR_TABLE(labels: Range<u31>) {
+		visitOp(Opcode.BR_TABLE);
+		if (!is_dispatch_func && labels.length >= MIN_DISPATCH_CASE_COUNT && opcode_read_pc >= 0) {
+			is_dispatch_func = true;
+		}
+	}
+
+	def visit_I32_LOAD8_U(imm: MemArg) {
+		visitOp(Opcode.I32_LOAD8_U);
+		if (!is_dispatch_func) {
+			opcode_read_pc = bi.pc;
+		}
+	}
+
+	def visitOp(op: Opcode) {
+		match (op) {
+			BLOCK, LOOP, UNREACHABLE, RETURN, ELSE, END => ;
+			_ => basic_block_size++;
+		}
+		match (op) {
+			LOOP, END, IF, ELSE, BR, BR_IF, 
+			BR_TABLE, CALL_INDIRECT, CALL, RETURN, CALL_REF, 
+			BR_ON_CAST, BR_ON_CAST_FAIL, BR_ON_NULL, BR_ON_NON_NULL,
+			RETURN_CALL_REF, RETURN_CALL_INDIRECT => { // end of basic block
+				if (basic_block_size > 0) {
+					var basic_block_probe = BasicBlockProbe.new(basic_block_size, counter);
+					Instrumentation.insertLocalProbe(module, bi.func.func_index, basic_block_start_pc, basic_block_probe);
+					basic_block_start_pc = bi.nextPc();
+					basic_block_size = 0;
+				}
+			}
+			_ => ;
+		}
+	}
+
+	def reset() {
+		opcode_read_pc = -1;
+		is_dispatch_func = false;
+		basic_block_start_pc = 0;
+	    basic_block_size = 0;
+	}
+}
+
+private class GuestProfileState(counter: FuelCounter, dispatch_func_id: int, output_prefix: string) {
+	var call_stack = ListStack<u32>.new();
+	// complete execution trace.
+	var trace: List<TraceEntry>;
+	// the recovered bytecode for each source function.
+	var recovered_bytecodes = HashMap<u32, HashMap<u32, u8>>.new(int.!<u32>, u32.==);
+	// address of the last read bytecode.
+	var last_opcode_addr: u32;
+	var fuel_count: u32 = 0;
+	// total costs of each bytecode execution.
+	def hotness: BytecodeHotness = BytecodeHotness.new(output_prefix);
+	var last_probe_event: ProbeEvent = ProbeEvent.RETURN;
+	var last_step_count: u32;
+	var last_probe_event_count: u32;
+	var cur_wasm_func_trace: List<WasmFuncTrace>;
+
+	// updates profiler state upon wasm function invocation/return, during the execution of a
+	// valid guest opcode. This is used to understand which wasm functions are associated to
+	// particular opcodes.
+	def wasmFuncEvent(wasm_func_id: int, is_start: bool) {
+		var wasm_trace = WasmFuncTrace(wasm_func_id, counter.count - last_step_count, is_start);
+		cur_wasm_func_trace = List.new(wasm_trace, cur_wasm_func_trace);
+	}
+
+	// updates the profiler state upon guest (js) function invocation.
+	def guestFuncStart() {
+		commonSetup();
+		wasmFuncEvent(dispatch_func_id, true);
+		trace = List.new(TraceEntry.CALL(0), trace);
+		call_stack.push(0);
+		last_probe_event = ProbeEvent.CALL;
+	}
+
+	// updates the profiler state upon guest (js) function return.
+	def guestFuncReturn() {
+		commonSetup();
+		wasmFuncEvent(dispatch_func_id, false);
+		trace = List.new(TraceEntry.RETURN(call_stack.peek()), trace);
+		call_stack.pop();
+		last_probe_event = ProbeEvent.RETURN;
+	}
+
+	// records the profiling information for a single opcode execution
+	def step(addr: u32, b: u8) {
+		def cost = get_cost();
+		last_opcode_addr = addr;
+		match (last_probe_event) {
+			CALL => { // first byte of a new function, rewrite func_id
+				trace = List.new(TraceEntry.SYSTEM(cost, cur_wasm_func_trace),
+							List.new(TraceEntry.CALL(addr), trace.tail));
+				call_stack.pop();
+				call_stack.push(addr);
+			}
+			RETURN => trace = List.new(TraceEntry.SYSTEM(cost, cur_wasm_func_trace), trace);
+			GUEST_OPCODE_READ(bytecode, offset) => 
+				trace = List.new(TraceEntry.STEP(bytecode, offset, cost, cur_wasm_func_trace), trace);
+		}
+
+		// mark recovered bytecode
+		if (!recovered_bytecodes.has(call_stack.peek())) {
+			recovered_bytecodes[call_stack.peek()] = HashMap<u32, u8>.new(int.!<u32>, u32.==);
+		}
+		recovered_bytecodes[call_stack.peek()][addr] = b;
+		last_probe_event = ProbeEvent.GUEST_OPCODE_READ(b, addr - call_stack.peek());
+		hotness.record(b, cost);
+		last_step_count = counter.count;
+		last_probe_event_count = counter.count;
+		cur_wasm_func_trace = null;
+	}
+
+	// process memory read adjacent to the last opcode read, in order to recover possible operands
+	// associated with the last read opcode.
+	def tryRecordOperand(addr: u32, b: u8) {
+		if (addr - last_opcode_addr <= MAX_OPERAND_LEN && recovered_bytecodes.has(call_stack.peek())) {
+			recovered_bytecodes[call_stack.peek()][addr] = b;
+		}
+	}
+
+	def incrementFuel(amount: u32) {
+		fuel_count += amount;
+	}
+
+	// compact the trace by coalescing consecutive system events.
+	def compactTrace() {
+		var rev = Lists.reverse(trace);
+		var new_trace: List<TraceEntry>;
+		var valid_func_id_stack: List<u32>;
+		while (rev != null) {
+			match (rev.head) {
+				CALL(func_id) => {
+					if (func_id > 0) {
+						new_trace = List.new(TraceEntry.CALL(func_id), new_trace);
+						valid_func_id_stack = List.new(func_id, valid_func_id_stack);
+					}
+				}
+				STEP => new_trace = List.new(rev.head, new_trace);
+				RETURN(func_id) => {
+					if (valid_func_id_stack != null && func_id == valid_func_id_stack.head) {
+						new_trace = List.new(TraceEntry.RETURN(func_id), new_trace);
+						valid_func_id_stack = valid_func_id_stack.tail;
+					}
+				}
+				SYSTEM(cost, wasm_func_trace) => {
+					if (new_trace != null) {
+						match (new_trace.head) {
+							SYSTEM(c, prev_wasm_trace) => {
+								new_trace = List.new(TraceEntry.SYSTEM(c + cost, wasm_func_trace), new_trace.tail);
+							}
+							STEP(bytecode, offset, c, old_func_trace) => {
+								hotness.update(bytecode, c, c + cost);
+								new_trace = List.new(TraceEntry.STEP(bytecode, offset, c + cost, wasm_func_trace), new_trace.tail);
+							}
+							_ => new_trace = List.new(rev.head, new_trace);
+						}
+					} else {
+						new_trace = List.new(rev.head, new_trace);
+					}
+				}
+			}
+			rev = rev.tail;
+		}
+		trace = new_trace;
+	}
+
+	def reportGuestFunctionTrace(output_folder: string) {
+		if (trace == null) return;
+		var rev = Lists.reverse(trace);
+		var b = StringBuilder.new();
+		b.puts("function_id,pc_offset,opcode,cost,wasm_func_trace\n");
+		var stack = ListStack<u32>.new();
+		while (rev != null) {
+			match (rev.head) {
+				CALL(func_id) => {
+					stack.push(func_id);
+					b.put1("%d,0,START,0,", stack.peek()).ln();
+				}
+				STEP(bytecode, offset, cost, wasm_func_trace) => {
+					b.put3("%d,%d,%x,", stack.peek(), offset, u8.!(bytecode))
+					.put1("%d,", cost);
+					if (wasm_func_trace != null) {
+						var wasm_trace = Lists.reverse(wasm_func_trace);
+						while (wasm_trace != null) {
+							b.puts(wasm_trace.head.toString());
+							wasm_trace = wasm_trace.tail;
+							if (wasm_trace != null) b.puts("|");
+						}
+					}
+					b.ln();
+				}
+				RETURN(func_id) => {
+					b.put1("%d,0,END,0,", stack.peek()).ln();
+					stack.pop();
+				}
+				SYSTEM(cost, wasm_func_trace) => {
+					if (stack.empty()) {
+						b.put1("0,0,00,%d,", cost).ln();
+					} else {
+						b.put2("%d,0,00,%d,", stack.peek(), cost).ln();
+					}
+				}
+			}
+			rev = rev.tail;
+		}
+		if (output_folder == null) {
+			System.puts(b.toString());
+		} else {
+			var fd = System.fileOpen(Strings.format2("%s/%s_guest_trace.csv", output_folder, output_prefix), false);
+			System.write(fd, b.toString());
+		}
+	}
+
+	def reportRecoveredBytecodes(output_folder: string) {
+		var function_ids = Maps.keyList(recovered_bytecodes);
+		if (function_ids == null) return;
+		var b = StringBuilder.new();
+		b.puts("function_id,bytecode\n"); // header
+		while (function_ids != null) {
+			var function_id = function_ids.head;
+			b.put1("%d,", function_id);
+			var bytecodes = recovered_bytecodes[function_id];
+			var bytecode_addrs = Maps.keyList(bytecodes);
+			var min_addr = u32.max;
+			var max_addr: u32 = 0;
+			while (bytecode_addrs != null) {
+				var addr = bytecode_addrs.head;
+				if (addr < min_addr && addr >= function_id) min_addr = addr;
+				if (addr > max_addr) max_addr = addr;
+				bytecode_addrs = bytecode_addrs.tail;
+			}
+			for (i = min_addr; i <= max_addr; i++) {
+				b.put1("/%x", bytecodes[i]);
+			}
+			b.ln();
+			function_ids = function_ids.tail;
+		}
+		if (output_folder == null) {
+			System.puts(b.toString());
+		} else {
+			var fd = System.fileOpen(Strings.format2("%s/%s_recovered_bytecodes.csv", output_folder, output_prefix), false);
+			System.write(fd, b.toString());
+		}
+	}
+
+	private def commonSetup() {
+		def cost = get_cost();
+		match (last_probe_event) {
+			GUEST_OPCODE_READ(bytecode, offset) => {
+				trace = 
+					List.new(TraceEntry.STEP(bytecode, offset, cost, cur_wasm_func_trace), trace);
+				hotness.record(bytecode, cost);
+			}
+			_ => trace = List.new(TraceEntry.SYSTEM(cost, cur_wasm_func_trace), trace);
+		}
+		last_probe_event_count = counter.count;
+	}
+
+	private def get_cost() -> u32 {
+		return counter.count - last_probe_event_count;
+	}
+}
+
+private class BytecodeHotness(output_prefix: string) {
+	var bytecode_hotness: Array<HashMap<u32, u32>> = Array.new(256);
+
+	def record(b: u8, cost: u32) {
+		if (bytecode_hotness[b] == null) {
+			bytecode_hotness[b] = HashMap<u32, u32>.new(int.!<u32>, u32.==);
+		}
+		if (!bytecode_hotness[b].has(cost)) {
+			bytecode_hotness[b][cost] = 0;
+		}
+		bytecode_hotness[b][cost]++;
+	}
+
+	def update(b: u8, old_cost: u32, new_cost: u32) {
+		if (bytecode_hotness[b] == null || !bytecode_hotness[b].has(old_cost)) {
+			return;
+		}
+		bytecode_hotness[b][old_cost]--;
+		bytecode_hotness[b][new_cost] = bytecode_hotness[b][new_cost] + 1;
+	}
+
+	def report(output_folder: string) {
+		var b = StringBuilder.new();
+		var is_empty = true;
+		b.puts("bytecode,cost,count\n"); // header
+		for (i = 0; i < bytecode_hotness.length; i++) {
+			if (bytecode_hotness[i] != null) {
+				var costs = Maps.keyList(bytecode_hotness[i]);
+				while (costs != null) {
+					var j = costs.head;
+					if (bytecode_hotness[i][j] > 0) {
+						is_empty = false;
+						b.put3("%x,%d,%d", i, j, bytecode_hotness[i][j]).ln();
+					}
+					costs = costs.tail;
+				}
+			}
+		}
+		if (!is_empty) {
+			if (output_folder == null) {
+				System.puts(b.toString());
+			} else {
+				var fd = System.fileOpen(Strings.format2("%s/%s_global_hotness.csv", output_folder, output_prefix), false);
+				System.write(fd, b.toString());
+			}
+		}
+	}
+}
+
+// inserted at the start of every basic block, makes fuel calculation faster by avoiding a global probe.
+private class BasicBlockProbe(size: u32, counter: FuelCounter) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		counter.incrementFuel(size);
+		return Resumption.Continue;
+	}
+}
+
+// custom fuel counter that aggregates all the BasicBlockProbe counts.
+private class FuelCounter {
+	var count: u32 = 0;
+
+	def incrementFuel(size: u32) {
+		count += size;
+	}
+}
+
+private type TraceEntry {
+	case CALL(func_id: u32);
+	case STEP(bytecode: u8, offset: u32, cost: u32, wasm_func_trace: List<WasmFuncTrace>);
+	case RETURN(func_id: u32);
+	case SYSTEM(cost: u32, wasm_func_trace: List<WasmFuncTrace>);
+}
+
+// wasm function call/return events when the dispatch function is executing a valid guest opcode.
+private type WasmFuncTrace(func_id: int, instr_count: u32, is_start: bool) {
+	def toString() -> string {
+		return Strings.format3("%d:%s:%d", func_id, if (is_start, "S", "E"), instr_count);
+	}
+}
+
+private type ProbeEvent {
+	case GUEST_OPCODE_READ(bytecode: u8, offset: u32);
+	case CALL;
+	case RETURN;
+}
