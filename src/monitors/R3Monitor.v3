@@ -7,16 +7,38 @@ def E_ = MonitorRegistry.add(
 
 class R3Monitor extends Monitor {
 	def var handler: EventHandler;
+	// if certain wasm FuncDecl has this prefix, we treat it as a host function, and 
+	// won't instrument it at all.
+	def var host_prefix: string;
+
+	def configure(args: string) -> string {
+		def argMap = MonitorUtil.argMapFrom(args);
+		if (argMap.has("host_prefix")) {
+			host_prefix = argMap["host_prefix"];
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
+	}
 
 	def onParse(module: Module) {
-		handler = EventHandler.new(module);
-		R3MonitorBytecodeInstrumenter.new(handler, module).run();
+		handler = EventHandler.new(module, host_prefix);
 
 		var mm = ModuleInstrumenter.new(module);
-		mm.forEachFunc(instrumentFunctionEnter);
-		mm.beforeMemRead(handler.onMemoryRead);
-		mm.beforeMemWrite(handler.onMemoryWrite);
-		mm.beforeMemGrow(handler.onMemoryGrow);
+		if (host_prefix != null) {
+			R3MonitorBytecodeInstrumenter.new(handler, module).runMatching(filterReplayFunctions);
+			mm.forEachFuncMatching(filterReplayFunctions, instrumentFunctionEnter);
+			mm.beforeMemReadMatching(handler.onMemoryRead, filterReplayFunctions);
+			mm.beforeMemWriteMatching(handler.onMemoryWrite, filterReplayFunctions);
+			mm.beforeMemGrowMatching(handler.onMemoryGrow, filterReplayFunctions);
+		} else {
+			R3MonitorBytecodeInstrumenter.new(handler, module).run();
+			mm.forEachFunc(instrumentFunctionEnter);
+			mm.beforeMemRead(handler.onMemoryRead);
+			mm.beforeMemWrite(handler.onMemoryWrite);
+			mm.beforeMemGrow(handler.onMemoryGrow);
+		}
 	}
 
 	def onInstantiate(instance: Instance) {
@@ -31,6 +53,13 @@ class R3Monitor extends Monitor {
 
 	private def instrumentFunctionEnter(mm: ModuleInstrumenter, func: FuncDecl) {
 		Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, EnterProbe.new(handler, func));
+	}
+
+	// if the function name starts with a "r3", return false, we treat them as host functions.
+	private def filterReplayFunctions(module: Module, decl: FuncDecl) -> bool {
+		var name = handler.getFuncName(decl.func_index);
+		if (host_prefix != null && Strings.startsWith(name, host_prefix)) return false;
+		return true;
 	}
 }
 
@@ -122,17 +151,22 @@ private class EventHandler {
 	def var shadowTables: Array<Table>;
 
 	def var module: Module;
+
 	def exported_func_names = HashMap<int, string>.new(int.!<int>, int.==);
+	def exported_table_names = HashMap<int, string>.new(int.!<int>, int.==);
+
 	def func_id_from_imp_name = Strings.newMap<int>();
 
-	var last_instr_is_call = false;
+	def var host_prefix: string;
 
-	new(module: Module) {
+	new(module: Module, host_prefix: string) {
+		host_prefix = host_prefix;
 		call_kind_stack.push((CallKind.EXT, -1));
 		module = module;
 		for (i < module.exports.length) {
 			var e = module.exports[i];
 			if (FuncDecl.?(e.1)) exported_func_names[FuncDecl.!(e.1).func_index] = e.0;
+			if (TableDecl.?(e.1)) exported_table_names[TableDecl.!(e.1).table_index] = e.0;
 		}
 		for (i < module.imports.length) {
 			var i = module.imports[i];
@@ -188,14 +222,16 @@ private class EventHandler {
 				for (table in instance.tables) {
 					for (table_idx < table.elems.length) {
 						if (index == resolveFuncIdx(table, table_idx)) {
-							trace.put(WasmEvent.FuncEntryTable(index, table_idx, params));
+							var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+							trace.put(WasmEvent.FuncEntryTable(index, table_idx, table_name, params));
 							index_match_found = true;
 							break;
 						}
 					}
 					if (index_match_found) break;
 				}
-				System.error("R3MonitorError", "external call with table_get failed");
+				if (!index_match_found)
+					System.error("R3MonitorError", "external call with table_get failed");
 			}
 			checkMemGrow(instance);
 			checkTableGrow(instance);
@@ -209,8 +245,8 @@ private class EventHandler {
 
 	def onCall(func_id: int) {
 		var func_decl = module.functions[func_id];
-		if (func_decl.imp != null) {
-			last_instr_is_call = true;
+		var name = getFuncName(func_id);
+		if (func_decl.imp != null || (host_prefix != null && Strings.startsWith(name, "r3"))) {
 			call_kind_stack.push((CallKind.EXT, func_id));
 			trace.put(WasmEvent.ImportCall(func_id));
 		}
@@ -232,7 +268,6 @@ private class EventHandler {
 		var func = module.functions[func_id];
 		var results_len = func.sig.results.length;
 		var results = Array<Value>.new(results_len);
-		var func_name = getFuncName(func.func_index);
 		for (i < results_len) {
 			results[i] = frame_accessor.getOperand(-1 * (results_len - i - 1));
 		}
@@ -256,9 +291,10 @@ private class EventHandler {
 	def onTableGet(table_idx: int, entry_idx: int, table: Table) -> int {
 		var func_idx = resolveFuncIdx(table, entry_idx);
 		if (func_idx != -1) {
-			var func_name = getFuncName(func_idx);
+			var func_name = if (exported_func_names.has(func_idx), exported_func_names[func_idx], getFuncName(func_idx));
 			if (table.elems[entry_idx] != shadowTables[table_idx].elems[entry_idx]) {
-				trace.put(WasmEvent.TableGet(table_idx, entry_idx, func_idx, func_name));
+				var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+				trace.put(WasmEvent.TableGet(table_idx, table_name, entry_idx, func_idx, func_name));
 				shadowTables[table_idx][entry_idx] = table.elems[entry_idx];
 			}
 		}
@@ -270,7 +306,8 @@ private class EventHandler {
 	}
 
 	def onTableGrow(table_idx: int, growth: u32) {
-		trace.put(WasmEvent.TableGrow(table_idx, growth));
+		var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+		trace.put(WasmEvent.TableGrow(table_idx, table_name, growth));
 		shadowTables[table_idx].grow(growth, Values.FUNCREF_NULL);
 	}
 
@@ -343,8 +380,12 @@ private class EventHandler {
 
 	private def growShadowMem(mem_index: int, growth: u32) {
 		var shadow_mem = shadowMems[mem_index];
-		trace.put(WasmEvent.MemGrow(mem_index, int.view(growth)));
 		shadow_mem.grow(growth);
+	}
+
+	private def growShadowMemWithTrace(mem_index: int, growth: u32) {
+		growShadowMem(mem_index, growth);
+		trace.put(WasmEvent.MemGrow(mem_index, int.view(growth)));
 	}
 
 	private def alignShadowMemRange(mem: Memory, addr: u64, size: u64) {
@@ -419,7 +460,7 @@ private class EventHandler {
 			var instance_mem_pages = instance_mem.size();
 			if (shadow_mem_pages < instance_mem_pages) {
 				var growth = instance_mem_pages - shadow_mem_pages;
-				growShadowMem(i, growth);
+				growShadowMemWithTrace(i, growth);
 			}
 		}
 	}
@@ -439,11 +480,11 @@ private class EventHandler {
 
 	private def resolveFuncIdx(table: Table, entry_idx: int) -> int {
 		if (table.funcs != null) {
-			if (WasmFunction.?(table.funcs[entry_idx])) 
+			if (WasmFunction.?(table.funcs[entry_idx]))
 				return WasmFunction.!(table.funcs[entry_idx]).decl.func_index;
 			if (HostFunction.?(table.funcs[entry_idx])) {
 				var name = HostFunction.!(table.funcs[entry_idx]).name;
-				if (func_id_from_imp_name.has(name)) {
+				if (func_id_from_imp_name.has(name)) {					
 					return func_id_from_imp_name[name];
 				}
 			}	
@@ -455,10 +496,10 @@ private class EventHandler {
 		return module.functions[func_index].imported();
 	}
 
-	private def getFuncName(index: int) -> string {
-		var name = if (module.names != null, module.names.getFuncName(index));
+	private def getFuncName(func_index: int) -> string {
+		var name = if (module.names != null, module.names.getFuncName(func_index));
 		if (name != null) return name;
-		else return StringBuilder.new().put1("#%d", index).toString();
+		else return StringBuilder.new().put1("#%d", func_index).toString();
 	}
 }
 
@@ -477,7 +518,7 @@ private class EnterProbe(handler: EventHandler, func: FuncDecl) extends Probe {
 		for (i < params_len) {
 			params_list[i] = frame_accessor.getLocal(i);
 		}
-		handler.onFuncEntry(func.func_index, params_list, loc.func.instance);
+		handler.onFuncEntry(func.func_index, Arrays.dup(params_list), loc.func.instance);
         return Resumption.Continue;
 	}
 }
@@ -587,15 +628,15 @@ private type CallStackEntry(func_id: int, kind: CallKind);
 type WasmEvent {
 	// function calls by the host
 	case FuncEntry(idx: int, func_name: string, params: Array<Value>);
-	case FuncEntryTable(idx: int, table_idx: int, params: Array<Value>);
+	case FuncEntryTable(idx: int, table_idx: int, table_name: string, params: Array<Value>);
 
 	// observed memory updates made by the host
 	case Load(idx: int, offset: u64, data: Array<u8>);
 	case MemGrow(idx: int, amount: int);
 
 	// observed table updates made by the host
-	case TableGet(table_idx: int, entry_idx: int, func_idx: int, func_name: string);
-	case TableGrow(table_idx: int, amount: u32);
+	case TableGet(table_idx: int, table_name: string, entry_idx: int, func_idx: int, func_name: string);
+	case TableGrow(table_idx: int, table_name: string, amount: u32);
 
 	// observed global updates made by the host
 	case GlobalGet(idx: int, value: Value);
@@ -613,38 +654,38 @@ type WasmEvent {
 				sb.put2("EC;%d;%s;", idx, func_name);
 				renderParams(sb, params);
 			}
-			FuncEntryTable(idx, table_idx, params) => {
-				sb.put2("TC;%d;%d;", idx, table_idx);
+			FuncEntryTable(idx, table_idx, table_name, params) => {
+				sb.put3("TC;%d;%s;%d;", idx, table_name, table_idx);
 				renderParams(sb, params);
 			}
 			Load(idx, offset, data) => {
-				sb.put2("L;%d;;%d;", idx, offset);
+				sb.put2("L;%d;%d;", idx, offset);
 				renderBytes(sb, data);
 			}
 			MemGrow(idx, amount) => {
-				sb.put2("MG;%d;;%d", idx, amount);
+				sb.put2("MG;%d;%d", idx, amount);
 			}
-			TableGet(table_idx, idx, func_idx, func_name) => {
-				sb.put2("T;%d;;%d;", table_idx, idx);
+			TableGet(table_idx, table_name, idx, func_idx, func_name) => {
+				sb.put3("T;%d;%s;%d;", table_idx, table_name, idx);
 				sb.put2("%d;%s", func_idx, func_name);
 			}
-			TableGrow(table_idx, amount) => {
+			TableGrow(table_idx, table_name, amount) => {
+				sb.put3("TG;%d;%s;%d", table_idx, table_name, amount);
 			}
 			GlobalGet(idx, value) => {
-				sb.put1("G;%d;;", idx);
+				sb.put1("G;%d;", idx);
 				renderValue(value, sb);
 			}
 			ImportCall(idx) => {
-				sb.put1("IC;%d;", idx);
+				sb.put1("IC;%d", idx);
 			}
 			ImportReturn(results) => {
-				sb.puts("IR;0;;");
+				sb.puts("IR;0;");
 				renderParams(sb, results);
 			}
 			ImportGlobal(idx, initial) => {
-				sb.put1("IG;%d;;;;", idx);
+				sb.put1("IG;%d;", idx);
 				renderValue(initial, sb);
-				sb.puts(";");
 			}
 		}
 		sb.puts("\n");
@@ -652,25 +693,26 @@ type WasmEvent {
 
 	// helper method to print values for globals related events
 	def renderValue(val: Value, sb: StringBuilder) {
-		match (val) {
-			I32(val) => sb.put1("%d;i32", val);
-			I64(val) => sb.put1("%d;i64", val);
-			F32(val) => sb.put1("%x;f32", val);
-			F64(val) => sb.put1("%x;f64", val);
-			_ => ;
+		if (val == Values.F32_nan || val == Values.F64_nan) {
+			sb.puts("NaN");
+		} else if (val == Values.F32_infinity || val == Values.F64_infinity) {
+			sb.puts("Infinity");
+		} else if (val == Values.F32_minus_infinity || val == Values.F64_minus_infinity) {
+			sb.puts("-Infinity");
+		} else {
+			match (val) {
+				I32(val) => sb.put1("%d", i32.view(val));
+				I64(val) => sb.put1("%d", i64.view(val));
+				F32(val) => sb.put1("%s", Floats.displayFromBits32(val));
+				F64(val) => sb.put1("%s", Floats.displayFromBits64(val));
+				_ => ;
+			}
 		}
 	}
 
 	def renderParams(sb: StringBuilder, params: Array<Value>) {
 		for (i < params.length) {
-			match (params[i]) {
-				I31(val) => sb.put1("%d", u32.view(val));
-				I32(val) => sb.put1("%d", val);
-				I64(val) => sb.put1("%d", val);
-				F32(val) => sb.put1("f32:%x", val);
-				F64(val) => sb.put1("f64:%x", val);
-				_ => ;
-			}
+			renderValue(params[i], sb);
 			if (i < params.length - 1) sb.puts(",");
 		}
 	}
