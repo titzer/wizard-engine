@@ -13,15 +13,6 @@ import sys, struct
 """
 
 
-def hex_to_float(hex_str):
-    byte_data = bytes.fromhex(hex_str)
-    if len(byte_data) == 4:
-        return struct.unpack("!f", byte_data)[0]
-    elif len(byte_data) == 8:
-        return struct.unpack("!d", byte_data)[0]
-    return None
-
-
 def main():
     ref_trace_path = sys.argv[1]
     with open(ref_trace_path, "r") as file:
