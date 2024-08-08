@@ -109,6 +109,7 @@ for target in $TEST_TARGETS; do
         continue
     fi
     do_script monitors/test
+    do_script monitors/wasm-r3-tests/test
 done
 
 # Self-hosted (unit) tests

@@ -1,0 +1,10 @@
+EC;3;entry;
+IC;0
+IR;0;3
+IC;0
+IR;0;1
+IC;1
+IR;1;2.5
+IC;2
+IR;2;5
+ER
