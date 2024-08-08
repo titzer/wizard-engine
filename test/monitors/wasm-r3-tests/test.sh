@@ -8,12 +8,13 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../../common.sh monitors
+. $DIR/../../common.sh R3-monitor
 
 make_binary wizeng || exit $?
 
 WIZENG="../../../$BINARY $WIZENG_OPTS -nocolor"
 
+print_testing
 cd $DIR
 
 V3C=${V3C:=$(which v3c)}
@@ -32,7 +33,7 @@ function run_tests {
         testcase=$(basename "${file%.*}")
         echo "##+$testcase"
         trace_file="${file%.*}.r3"
-        $WIZENG '--monitors=r3{host_prefix=r3}' $file | v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
+        $WIZENG '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
         if [ $? -ne 0 ]; then
             echo "##-fail"
         else
