@@ -6,7 +6,7 @@
 // behavior to events.
 
 // Event names supported:
-//   before:opcode:<mnemonic>			Before matching bytecodes execute
+//   before:opcode:<mnemonic>			Before matching opcodes execute
 
 
 // TODO:
@@ -15,7 +15,7 @@
 //  - binding callbacks
 //  - define frame accessor methods
 //  - externref in Virgil
-//   before:bytecode:call(<func pattern>)		Upon static direct calls to func
+//   before:opcode:call(<func pattern>)		Upon static direct calls to func
 //   before:call:<func pattern>
 //   before:enter:<func pattern>			Entry of function(s)
 //   before:return:<func pattern>
@@ -34,7 +34,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	var onMainF: int = -1;
 	var onInstanceF: int = -1;
 	var onExitF: int = -1;
-	var bytecodePatterns: Array<List<(WhammBytecodePattern, FuncDecl)>>;
+	var opcodePatterns: Array<List<(WhammOpcodePattern, FuncDecl)>>;
 	var whammInstances: List<(Module, Instance, InstanceRef)>; // XXX: leaky
 
 	new() {
@@ -45,15 +45,25 @@ class WhammMonitor(whamm: Module) extends Monitor {
 			if (Trace.whamm) Trace.OUT.put2("  export %d: \"%s\" = ", i, name);
 			var func = FuncDecl.!(decl);
 			var p = WhammEventParser.new(whamm.filename, name);
-			if (p.bytecodePattern != null) addBytecodePattern(p.bytecodePattern, func);
+			if (p.opcodePattern != null) addOpcodePattern(p.opcodePattern, func);
 			else if (Trace.whamm) Trace.OUT.puts("no events matched").ln();
 		}
 
 	}
-	def addBytecodePattern(b: WhammBytecodePattern, func: FuncDecl) {
-		if (Trace.whamm) Trace.OUT.put1("bytecode %s", b.op.mnemonic).ln();
-		if (bytecodePatterns == null) bytecodePatterns = Array.new(Opcodes.count);
-		bytecodePatterns[b.op.tag] = List.new((b, func), bytecodePatterns[b.op.tag]);
+	def addOpcodePattern(b: WhammOpcodePattern, func: FuncDecl) {
+		if (Trace.whamm) {
+			Trace.OUT.put1("opcode %s", b.op.mnemonic);
+			if (b.params.length > 0) {
+				Trace.OUT.puts("(");
+				for (i < b.params.length) {
+					if (i > 0) Trace.OUT.csp();
+					b.params[i].render(Trace.OUT);
+				}
+				Trace.OUT.puts(")").ln();
+			}
+		}
+		if (opcodePatterns == null) opcodePatterns = Array.new(Opcodes.count);
+		opcodePatterns[b.op.tag] = List.new((b, func), opcodePatterns[b.op.tag]);
 	}
 	def onParse(module: Module) {
 		var wi = getWhammInstance(module).0;
@@ -62,21 +72,40 @@ class WhammMonitor(whamm: Module) extends Monitor {
 			def moduleRef = ModuleRef.new(module);
 			Execute.call(wi.functions[onParseF], [Value.Ref(moduleRef)]); // TODO: report traps
 		}
-		if (bytecodePatterns != null) {
+		if (opcodePatterns != null) {
 			var it = BytecodeIterator.new();
 			for (i < module.functions.length) {
 				var func = module.functions[i];
 				if (func.imp != null) continue; // imported
 				for (bi = it.reset(func); bi.more(); bi.next()) {
-					var bp = bytecodePatterns[bi.current().tag];
+					var bp = opcodePatterns[bi.current().tag];
 					for (l = bp; l != null; l = l.tail) {
 						if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), bi.pc, bi.current().mnemonic).ln();
 						var wf = WasmFunction.!(wi.functions[bp.head.1.func_index]);
-						Instrumentation.insertLocalProbe(module, func.func_index, bi.pc, WhammProbe.new(wf, []));
+						var args = bindParams(it, bp.head.0.params);
+						Instrumentation.insertLocalProbe(module, func.func_index, bi.pc, WhammProbe.new(wf, args));
 					}
 				}
 			}
 		}
+	}
+	def bindParams(it: BytecodeIterator, params: Array<WhammParam>) -> Array<WhammArg> {
+		var result = Array<WhammArg>.new(params.length);
+		for (i < result.length) {
+			var arg: WhammArg;
+			match (params[i]) {
+				DynamicLoc => ;
+				FrameAccessor => arg = WhammArg.FrameAccessor;
+				Pc => arg = WhammArg.Val(Values.i_v(it.pc));
+				Func => arg = WhammArg.Val(Values.i_v(it.func.func_index));
+				Imm(orig, i) => ; // TODO
+				Stack(orig, i) => ; // TODO
+				Local(orig, i) => ;
+				Call(target, params) => ;
+			}
+			result[i] = arg;
+		}
+		return result;
 	}
 	def onInstantiate(i: Instance) {
 		if (onInstanceF < 0) return;
@@ -103,10 +132,10 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	}
 }
 
-// A parser that extracts bytecode patterns or other patterns from the name of an exported function.
+// A parser that extracts opcode patterns or other patterns from the name of an exported function.
 class WhammEventParser(filename: string, expname: string) {
 	def r = TextReader.new(filename, expname);
-	var bytecodePattern: WhammBytecodePattern;
+	var opcodePattern: WhammOpcodePattern;
 
 	new() {
 		if (r.optN("wasm:") >= 0) {
@@ -114,15 +143,19 @@ class WhammEventParser(filename: string, expname: string) {
 				var op = Opcodes.parseName(r.data[r.pos ...]);
 				if (op != Opcode.INVALID) {
 					r.advance(op.mnemonic.length);
-					bytecodePattern = WhammBytecodePattern.new(op);
+					var params = NO_PARAMS;
+					if (r.char == '(') params = WhammUtil.parseParams(r);
+					opcodePattern = WhammOpcodePattern.new(op, params);
 				}
 			}
 		}
 	}
 }
 
+def NO_PARAMS: Array<WhammParam> = [];
+
 // Pattern that describes which opcodes instrumentation may be applied to.
-class WhammBytecodePattern(op: Opcode) {
+class WhammOpcodePattern(op: Opcode, params: Array<WhammParam>) {
 }
 
 // A probe that adapts a Wasm function to be called by the engine-internal probing mechanism.
