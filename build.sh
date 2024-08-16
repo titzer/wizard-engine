@@ -45,6 +45,7 @@ WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
 WALI="src/modules/wali/*.v3"
 WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
+RESERVED_CODE_SIZE=64K
 
 PROGRAM=$1
 TARGET=$2
@@ -99,7 +100,7 @@ if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
 elif [[ "$TARGET" = "x86-64-darwin" || "$TARGET" = "x86_64_darwin" ]]; then
     v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
+    v3c-x86-64-linux -symbols -heap-size=700m -reserved-code-size=$RESERVED_CODE_SIZE -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
 	if [ "$PREGEN" != 0 ]; then
