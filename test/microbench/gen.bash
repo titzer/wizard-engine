@@ -21,7 +21,7 @@ if [ $? = 0 ]; then
     if [ "$ITERATIONS" = "0" ]; then
 	ITERATIONS=1
     fi
-    sed -es/__INNER_ITERATIONS__/$ITERATIONS/g $input | sed -es/__REPEAT__/$repeat
+    sed -es/__INNER_ITERATIONS__/$ITERATIONS/g $input | sed -es/__REPEAT__/$repeat/g
 else
     # repeat doesn't occur, multiply number of iterations
     ITERATIONS=$(bc <<< "scale=0; $CALIBRATION * $inner_ms * $repeat / 1")

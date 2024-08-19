@@ -21,6 +21,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	var opcode_pos: int;
 	var validatingInitExpr = false;
 	var init_stack: ArrayStack<InitExpr>;
+	var probe: (CodeValidator, int, Opcode) -> void;
 
 	new() {
 		codeptr.onError = err.onDataReaderError;
@@ -38,7 +39,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	}
 	private def validateFunc0(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
 		// Reset internal state.
-		if (Trace.validation) OUT.put2("validate(func #%d: %q)", func.func_index, func.sig.render).outln();
+		if (Trace.validation) OUT.put2("==== begin validate: func %q: %q ========================", func.render(module.names, _), func.sig.render).ln();
 		this.func = func;
 		resetSig(func.sig);
 		resetCode(d);
@@ -78,7 +79,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		return reterr();
 	}
 	private def validateExpr0(sig: SigDecl, d: DataReader) -> CodeValidatorResult {
-		if (Trace.validation) OUT.put1("validate(expr: %q)", sig.render).outln();
+		if (Trace.validation) OUT.put1("validate(expr: %q)", sig.render).ln();
 		resetSig(sig);
 		resetCode(d);
 		opcode_pos = codeptr.pos;
@@ -143,7 +144,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		return CodeValidatorResult.Error(err.error_code, err.error_pos, err.error_msg);
 	}
 	def traceLocals(count: u32, ltype: ValueType) {
-		OUT.put2("  locals %d: %q", count, ltype.render).outln();
+		OUT.put2("  locals %d: %q", count, ltype.render).ln();
 	}
 	def err_atpc() -> ErrorGen {
 		return err.rel(codeptr, opcode_pos);
@@ -156,6 +157,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			var constExpr = false;
 			opcode_pos = codeptr.pos;
 			var opcode = codeptr.read_opcode();
+			if (probe != null) probe(this, opcode_pos, opcode);
 			if (Trace.validation) { traceOpcode(); traceStack(true); }
 			// FAST: Handle short operators (predictable direct branch)
 			if (Opcodes.attributes[opcode.prefix].SHORT_OP) {
@@ -278,7 +280,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
 							for (i < ctl.catches.length) {
 								var c = ctl.catches[i];
-								var sidetable_entry = sidetable_pos + (i * Sidetables.ex_entry_size);
+								var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4); // TODO: entry size
 								var info = ExHandlerInfo.Sidetable(c.exnref, sidetable_entry);
 								var tag_index = if(c.tag != null, c.tag.tag_index, Modules.EX_TAG_ALL);
 								ex_handlers.put(ExHandlerEntry(tag_index, ctl.start_pos - func_start_pos, opcode_pos - func_start_pos, info));
@@ -901,14 +903,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				ANY_CONVERT_EXTERN => {
 					if (noGC(opcode)) return;
-					if (!checkExtension(Extension.GC, opcode)) return;
 					var nullable = popRefE(ValueTypes.EXTERNREF);
 					var at = if(nullable, ValueTypes.ANYREF, ValueTypes.ANYREF_NONNULL);
 					push(at);
 				}
 				EXTERN_CONVERT_ANY => {
 					if (noGC(opcode)) return;
-					if (!checkExtension(Extension.GC, opcode)) return;
 					var nullable = popRefE(ValueTypes.ANYREF);
 					var et = if(nullable, ValueTypes.EXTERNREF, ValueTypes.EXTERNREF_NONNULL);
 					push(et);
@@ -1011,7 +1011,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				I8X16_SHUFFLE => {
 					checkLanes(31, 16);
 					checkSignature(opcode.sig);
-				} 
+				}
 				I8X16_EXTRACTLANE_S,
 				I8X16_EXTRACTLANE_U,
 				I8X16_REPLACELANE => checkLaneAndSig(opcode, 15);
@@ -1297,7 +1297,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def checkLanes(max: u32, num_lane: u32) {
 		for (i = 0; i < num_lane; i++) {
 			checkLane(max);
-		}	
+		}
 	}
 	def checkLaneAndSig(opcode: Opcode, max: u32) {
 		checkLane(max);
@@ -1314,12 +1314,9 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		checkSignature(opcode.sig);
 	}
 	def traceOpcode() {
-		OUT.put2("  %x(+%d): ", opcode_pos, opcode_pos - ctlxfer.start_pos);
-		var prev = codeptr.pos;
-		codeptr.at(opcode_pos);
-		instrTracer.putInstr(OUT, module, codeptr);
-		codeptr.at(prev);
-		OUT.outln();
+		var pc = opcode_pos - ctlxfer.start_pos;
+		instrTracer.putPcAndInstr(OUT, module, func, pc, true);
+		OUT.ln();
 	}
 	def checkTargetArgs(target: ControlEntry) {
 		var p = labelArgs(target);
@@ -1355,7 +1352,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			checkContHandle(i, handler.tag, cont, target);
 			ctlxfer.refC(target, handler.tag, false);
 
-			var sidetable_entry = sidetable_pos + (i * Sidetables.ex_entry_size);
+			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4); // TODO: entry size
 			var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
 			var tag_index = handler.tag.tag_index;
 			var resume_pos = opcode_pos - func_start_pos;
@@ -1460,22 +1457,6 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		}
 		return (val_stack.pop(), true);
 	}
-	def popAnyFunc() -> (SigDecl, bool) {
-		if (val_stack.top <= ctl_top.val_stack_top) {
-			if (ctl_top.reachable) err_atpc().EmptyValueStack();
-			return (null, false);
-		}
-		var t = val_stack.pop();
-		match (t) {
-			Ref(nullable, heap) => match (heap) {
-				Func(sig) => return (sig, true);
-				_ => ;
-			}
-			_ => ;
-		}
-		err_atpc().ExpectedFunctionTypeT(t);
-		return (null, false);
-	}
 	def popRef() -> (ValueType, bool) {
 		var t = popAny();
 		if (t.1 && !ValueTypes.isRef(t.0)) err_atpc().ExpectedRefType(t.0);
@@ -1541,7 +1522,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		}
 		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
 		if (Trace.validation) {
-			OUT.put2("    label: depth=%d @+%d", depth, result.start_pos - ctlxfer.start_pos).outln();
+			OUT.put2("    label: depth=%d @+%d", depth, result.start_pos - ctlxfer.start_pos).ln();
 		}
 		return result;
 	}
@@ -1562,7 +1543,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			e.render(OUT);
 			OUT.putc(' ');
 		}
-		OUT.outln();
+		OUT.ln();
 	}
 }
 def labelArgs(target: ControlEntry) -> Array<ValueType> {
@@ -1611,7 +1592,7 @@ class SidetableBuilder {
 		var stp = sidetable.length;
 		if (Trace.validation) {
 			OUT.put3("    refElse(@+%d (stp=%d) to +%d.else", pc, stp, rel(target.start_pos));
-			OUT.outln();
+			OUT.ln();
 		}
 		target.else_ref = stp;
 		Sidetables.putBrEntry(sidetable, pc, 0, 0, -1);
@@ -1633,7 +1614,7 @@ class SidetableBuilder {
 		if (Trace.validation) {
 			OUT.put3("    refV(@+%d (stp=%d) to +%d.label, ", pc, stp, rel(target.start_pos));
 			OUT.put2("valcount=%d, popcount=%d)",	valcount, popcount);
-			OUT.outln();
+			OUT.ln();
 		}
 		Sidetables.putBrEntry(sidetable, pc, valcount, popcount, target.first_ref);
 		target.first_ref = stp;
@@ -1649,7 +1630,7 @@ class SidetableBuilder {
 		var stp = sidetable.length;
 		if (Trace.validation) {
 			OUT.put3("    refC(@+pc tag=%d exnref=%z vsp=%d", if(tag != null, tag.tag_index, -1), exnref, target.val_stack_top);
-			OUT.outln();
+			OUT.ln();
 		}
 		Sidetables.putCatchEntry(sidetable, handler_pc, target.val_stack_top, target.first_ref);
 		target.first_ref = stp;
@@ -1664,7 +1645,7 @@ class SidetableBuilder {
 		var pc = rel(pos);
 		while (stp >= 0) {
 			var ni = sidetable[stp + Sidetables.dstp_pos];
-			if (Trace.validation) OUT.put2("    resolve(stp=%d, next=%d)", stp, ni).outln();
+			if (Trace.validation) OUT.put2("    resolve(stp=%d, next=%d)", stp, ni).ln();
 			var pos = sidetable[stp + Sidetables.dpc_pos];
 			var pc_delta = pc - pos;
 			sidetable[stp + Sidetables.dpc_pos] = pc_delta;
@@ -1672,13 +1653,13 @@ class SidetableBuilder {
 
 			if (Trace.validation) {
 				OUT.put3("    resolve(@+%d to +%d) (\xCE\x94stp=%d)", pos, pc, sidetable_pos - stp);
-				OUT.outln();
+				OUT.ln();
 			}
 			stp = ni;
 		}
 	}
 	def rethrow(ex_slot: int, popcount: int) {
-		if (Trace.validation) OUT.put2("    rethrow ex_slot=%d popcount=%d", ex_slot, popcount).outln();
+		if (Trace.validation) OUT.put2("    rethrow ex_slot=%d popcount=%d", ex_slot, popcount).ln();
 		sidetable.put(ex_slot).put(0).put(popcount).put(0); // XXX: only need 1 entry for rethrow
 	}
 	def rel(pos: int) -> int {
@@ -1686,5 +1667,169 @@ class SidetableBuilder {
 	}
 	def extract() -> Sidetable {
 		return if(sidetable.length > 0, Sidetable(sidetable.extract()), Sidetables.NO_SIDETABLE);
+	}
+}
+
+def stackDelta(func_sig: SigDecl, opcode: Opcode, parser: WasmParser) -> (int, int) {
+	var sig = opcode.sig;
+	if (sig != null) return (sig.params.length, sig.results.length);
+	def noFallThru = -1;
+	def error = (-1, -1);
+	match (opcode) {
+		INVALID, CRASH_EXEC, CRASH_COMPILER =>				return (0, noFallThru);
+		UNREACHABLE, BR, DELEGATE =>					return (0, noFallThru);
+		ELSE, CATCH, CATCH_ALL, RETHROW => 				return (0, noFallThru);
+		THROW_REF, BR_TABLE => 						return (1, noFallThru);
+		BR_ON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL =>			return (1, 1);
+		BR_IF, BR_ON_NON_NULL =>					return (1, 0);
+		END =>								return (0, 0);
+		DROP =>								return (1, 0);
+		SELECT =>							return (3, 1);
+		LOCAL_GET =>							return (0, 1);
+		LOCAL_SET =>							return (1, 0);
+		LOCAL_TEE =>							return (1, 1);
+		GLOBAL_GET =>							return (0, 1);
+		GLOBAL_SET =>							return (1, 0);
+		TABLE_GET =>							return (1, 0);
+		TABLE_SET =>							return (2, 0);
+		MEMORY_SIZE =>							return (0, 1);
+		MEMORY_GROW =>							return (1, 1);
+		I32_CONST, I64_CONST, F32_CONST, F64_CONST, REF_NULL =>		return (0, 1);
+		REF_IS_NULL =>							return (1, 1);
+		REF_FUNC =>							return (0, 1);
+		REF_AS_NON_NULL =>						return (1, 1);
+		REF_EQ =>							return (2, 1);
+		STRUCT_NEW_DEFAULT =>						return (0, 1);
+		STRUCT_GET, STRUCT_GET_S, STRUCT_GET_U =>			return (1, 1);
+		STRUCT_SET =>							return (2, 0);
+		ARRAY_NEW_DEFAULT =>						return (1, 1);
+		ARRAY_GET, ARRAY_GET_S, ARRAY_GET_U =>				return (2, 1);
+		ARRAY_SET =>							return (3, 1);
+		ARRAY_LEN =>							return (1, 1);
+		ARRAY_FILL =>							return (3, 0);
+		ARRAY_COPY =>							return (5, 0);
+		ARRAY_INIT_DATA =>						return (4, 0);
+		ARRAY_INIT_ELEM =>						return (4, 0);
+		ARRAY_NEW_DATA =>						return (3, 1);
+		ARRAY_NEW_ELEM =>						return (2, 1);
+		REF_I31 =>							return (1, 1);
+		I31_GET_S =>							return (1, 1);
+		I31_GET_U =>							return (1, 1);
+		REF_TEST, REF_TEST_NULL =>					return (1, 1);
+		REF_CAST, REF_CAST_NULL =>					return (1, 1);
+		ANY_CONVERT_EXTERN =>						return (1, 1);
+		EXTERN_CONVERT_ANY =>						return (1, 1);
+		MEMORY_INIT =>							return (3, 0);
+		MEMORY_COPY =>							return (3, 0);
+		MEMORY_FILL =>							return (3, 0);
+		TABLE_INIT =>							return (3, 0);
+		TABLE_COPY =>							return (3, 0);
+		TABLE_GROW =>							return (2, 0);
+		TABLE_SIZE =>							return (0, 1);
+		TABLE_FILL =>							return (3, 0);
+		CONT_NEW =>							return (1, 1);
+
+		BLOCK, LOOP, TRY, TRY_TABLE => {
+			var pr = parser.readBlockType();
+			return (pr.0.length, pr.0.length); // consumes and leaves params on stack
+		}
+		IF => {
+			var pr = parser.readBlockType();
+			return (1 + pr.0.length, pr.0.length);
+		}
+		THROW => {
+			var tag = parser.readTagRef();
+			if (tag == null) return error;
+			return (tag.fields.length, noFallThru);
+		}
+		RETURN => {
+			return (func_sig.results.length, noFallThru);
+		}
+		CALL => {
+			var func = parser.readFuncRef();
+			if (func == null) return error;
+			return (func.sig.params.length, func.sig.results.length);
+		}
+		CALL_INDIRECT => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			var unused_ = parser.readTableImm();
+			return (1 + sig.params.length, sig.results.length);
+		}
+		RETURN_CALL => {
+			var func = parser.readFuncRef();
+			if (func == null) return error;
+			return (func.sig.params.length, noFallThru);
+		}
+		RETURN_CALL_INDIRECT => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			var unused_ = parser.readTableImm();
+			return (1 + sig.params.length, noFallThru);
+		}
+		CALL_REF => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			return (1 + sig.params.length, sig.results.length);
+		}
+		RETURN_CALL_REF => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			return (1 + sig.params.length, noFallThru);
+		}
+		SELECT_T => {
+			var at = parser.readValueTypes("select count", parser.limits.max_num_select_results);
+			// arity == 1 + 2 * at.length
+			if (at.length == 0) return error;
+			return (1 + 2 * at.length, at.length);
+		}
+		STRUCT_NEW => {
+			var st = parser.readStructType();
+			if (st == null) return error;
+			return (st.field_types.length, 1);
+		}
+		ARRAY_NEW => {
+			var at = parser.readArrayType();
+			if (at == null) return error;
+			return (1 + at.elem_types.length, 1);
+		}
+		ARRAY_NEW_FIXED => {
+			var at = parser.readArrayType();
+			if (at == null) return error;
+			var size = parser.readU32_i("array size", parser.limits.max_array_length);
+			return (1 + size, 1);
+		}
+		CONT_BIND => {
+			var input_cont = parser.readCont();
+			if (input_cont == null) return error;
+			var output_cont = parser.readCont();
+			if (output_cont == null) return error;
+			return (1 + input_cont.sig.params.length - output_cont.sig.params.length, 1);
+		}
+		SUSPEND => {
+			var tag = parser.readTagRef();
+			if (tag == null) return error;
+			var tag_sig = parser.module.heaptypes[tag.sig_index];
+			if (!SigDecl.?(tag_sig)) return error;
+			var sig = SigDecl.!(tag_sig);
+			return (sig.params.length, sig.results.length);
+		}
+		RESUME => {
+			var ct = parser.readCont();
+			if (ct == null) return error;
+			return (1 + ct.sig.params.length, ct.sig.results.length);
+		}
+		RESUME_THROW => {
+			var ct = parser.readCont();
+			if (ct == null) return error;
+			var tag = parser.readTagRef();
+			var tag_sig = parser.module.heaptypes[tag.sig_index];
+			if (!SigDecl.?(tag_sig)) return error;
+			var sig = SigDecl.!(tag_sig);
+			return (sig.params.length, ct.sig.results.length);
+		}
+		_ => {
+			return error;
+		}
 	}
 }

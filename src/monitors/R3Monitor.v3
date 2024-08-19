@@ -1,0 +1,722 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def monitor_ = MonitorRegistry.add(
+	"r3", "Generates a reduced set of event traces for wasm r3 replay module creation.",
+	R3Monitor.new());
+def filter_ = monitor_
+	.addOption("exclude=<filter>", "treat the matched functions as host functions.");
+
+class R3Monitor extends Monitor {
+	def var handler: EventHandler;
+	// if certain wasm FuncDecl has this prefix, we treat it as a host function, and 
+	// won't instrument it at all.
+	def var host_filter: DeclFilter;
+
+	def configure(args: string) -> string {
+		def argMap = MonitorUtil.argMapFrom(args);
+		if (argMap.has("exclude")) {
+			host_filter = DeclFilters.parseString(argMap["exclude"]);
+			return null;
+		}
+		def buf = StringBuilder.new();
+		buf.put1("invalid argument(s) \"%s\"", args);
+		return buf.toString();
+	}
+
+	def onParse(module: Module) {
+		handler = EventHandler.new(module, host_filter);
+
+		var mm = ModuleInstrumenter.new(module);
+		R3MonitorBytecodeInstrumenter.new(handler, module).runMatching(filterReplayFunctions);
+		mm.forEachFuncMatching(filterReplayFunctions, instrumentFunctionEnter);
+		mm.beforeMemReadMatching(filterReplayFunctions, handler.onMemoryRead);
+		mm.beforeMemWriteMatching(filterReplayFunctions, handler.onMemoryWrite);
+		mm.beforeMemGrowMatching(filterReplayFunctions, handler.onMemoryGrow);
+	}
+
+	def onInstantiate(instance: Instance) {
+		handler.onInstantiate(instance);
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		var sb = StringBuilder.new();
+		handler.renderTrace(sb);
+		System.puts(sb.toString());
+	}
+
+	private def instrumentFunctionEnter(mm: ModuleInstrumenter, func: FuncDecl) {
+		Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, EnterProbe.new(handler, func));
+	}
+
+	// if the function name matches the given host_filter, return false, we treat them as host functions.
+	private def filterReplayFunctions(module: Module, decl: FuncDecl) -> bool {
+		if (host_filter != null) {
+			return !host_filter.matches(module, decl);
+		}
+		return true;
+	}
+}
+
+private class R3MonitorBytecodeInstrumenter extends BytecodeInstrumenter {
+	def handler: EventHandler;
+	var last_op_is_call = false;
+
+	new(handler: EventHandler, module: Module) super(module) {
+		handler = handler;
+	}
+
+	def visitOp(op: Opcode) {
+		if (last_op_is_call) {
+			insertProbeHere(ReturnProbe.new(handler));
+		}
+	}
+
+	def visit_CALL(func_index: u31)	{
+		checkCallReturnAndInsertProbe(R3CallProbe.new(func_index, handler));
+		last_op_is_call = true;
+	}
+
+	def visit_CALL_INDIRECT(sig_index: u31, table_index: u31) {
+		var sig_decl = SigDecl.!(module.heaptypes[sig_index]);
+		checkCallReturnAndInsertProbe(R3CallIndirectProbe.new(sig_decl, table_index, handler));
+		last_op_is_call = true;
+	}
+
+	def visit_GLOBAL_GET(global_index: u31) {
+		checkCallReturnAndInsertProbe(GlobalGetProbe.new(handler, global_index));
+	}
+
+	def visit_GLOBAL_SET(global_index: u31) {
+		checkCallReturnAndInsertProbe(GlobalSetProbe.new(handler, global_index));
+	}
+
+	def visit_TABLE_GET(table_index: u31) {
+		checkCallReturnAndInsertProbe(TableGetProbe.new(handler, table_index));
+	}
+
+	def visit_TABLE_SET(table_index: u31) {
+		checkCallReturnAndInsertProbe(TableSetProbe.new(handler, table_index));
+	}
+
+	def visit_TABLE_GROW(table_index: u31) {
+		checkCallReturnAndInsertProbe(TableGrowProbe.new(handler, table_index));
+	}
+
+	def visit_MEMORY_COPY(dst_index: u31, src_index: u31) {
+		checkCallReturnAndInsertProbe(MemoryCopyProbe.new(handler, dst_index, src_index));
+	}
+
+	def visit_MEMORY_INIT(data_index: u31, mem_index: u31) {
+		var data_decl = module.data[data_index];
+		checkCallReturnAndInsertProbe(MemoryInitProbe.new(handler, mem_index, data_decl.data));
+	}
+
+	def visit_MEMORY_FILL(mem_index: u31) {
+		checkCallReturnAndInsertProbe(MemoryFillProbe.new(handler, mem_index));
+	}
+
+	def visit_RETURN() {
+		checkCallReturnAndInsertProbe(ExitProbe.new(handler, bi.func.func_index));
+	}
+
+	def visit_END() {
+		if (last_op_is_call) {
+			insertProbeHere(ReturnProbe.new(handler));
+		}
+		if (bi.pc + 1 == bi.func.cur_bytecode.length) {
+			insertProbeHere(ExitProbe.new(handler, bi.func.func_index));
+		}
+	}
+
+	def checkCallReturnAndInsertProbe(new_probe: Probe) {
+		if (last_op_is_call) {
+			insertProbeHere(ReturnProbe.new(handler));
+		}
+		insertProbeHere(new_probe);
+	}
+}
+
+private class EventHandler {
+	def call_kind_stack = ListStack<(CallKind, int)>.new();
+	def trace = Vector<WasmEvent>.new();
+
+	def var shadowGlobals: Array<Value>;
+	def var shadowMems: Array<Memory>;
+	def var shadowTables: Array<Table>;
+
+	def var module: Module;
+
+	def exported_func_names = HashMap<int, string>.new(int.!<int>, int.==);
+	def exported_table_names = HashMap<int, string>.new(int.!<int>, int.==);
+
+	def func_id_from_imp_name = Strings.newMap<int>();
+
+	def var host_filter: DeclFilter;
+
+	new(module: Module, host_filter: DeclFilter) {
+		host_filter = host_filter;
+		call_kind_stack.push((CallKind.EXT, -1));
+		module = module;
+		for (i < module.exports.length) {
+			var e = module.exports[i];
+			if (FuncDecl.?(e.1)) exported_func_names[FuncDecl.!(e.1).func_index] = e.0;
+			if (TableDecl.?(e.1)) exported_table_names[TableDecl.!(e.1).table_index] = e.0;
+		}
+		for (i < module.imports.length) {
+			var i = module.imports[i];
+			if (FuncDecl.?(i)) func_id_from_imp_name[i.imp.field_name] = FuncDecl.!(i).func_index;
+		}
+
+		// allocate shadow memories, globals and tables
+		shadowMems = Array<Memory>.new(module.memories.length);
+		shadowGlobals = Array<Value>.new(module.globals.length);
+		shadowTables = Array<Table>.new(module.tables.length);
+		for (i < module.memories.length) {
+			shadowMems[i] = Target.newMemory(module.memories[i]);
+		}
+		for (i < module.tables.length) {
+			var decl = module.tables[i];
+			shadowTables[i] = Table.new(decl.elemtype, decl);
+		}
+	}
+
+	// initialize shadow memories, tables and globals with initial values after module instantiation
+	def onInstantiate(instance: Instance) {
+		for (i < shadowMems.length) {
+			var shadow_mem = shadowMems[i];
+			var instance_mem = instance.memories[i];
+			// initialize shadow memory after active data segments are loaded.
+			if (shadow_mem.copyM(0, instance_mem, 0, u32.view(instance_mem.length())) != TrapReason.NONE) {
+				System.error("R3MonitorError", "failed to instantiate shadow memory");
+			}
+		}
+		for (i < shadowTables.length) {
+			var shadowTable = shadowTables[i];
+			var instanceTable = instance.tables[i];
+			if (shadowTable.copyT(0, instanceTable, 0, u32.view(instanceTable.elems.length)) != TrapReason.NONE) {
+				System.error("R3MonitorError", "failed to instantiate shadow table");
+			}
+		}
+		for (i < shadowGlobals.length) {
+			var global_val = instance.globals[i].value;
+			shadowGlobals[i] = global_val;
+			if (module.globals[i].imported()) {
+				trace.put(WasmEvent.ImportGlobal(i, global_val));
+			}
+		}
+	}
+
+	def onFuncEntry(index: int, params: Array<Value>, instance: Instance) {
+		if (call_kind_stack.peek().0 == CallKind.EXT) {
+			if (exported_func_names.has(index)) {
+				var export_func_name = exported_func_names[index];
+				trace.put(WasmEvent.FuncEntry(index, export_func_name, params));
+			} else { // called with table_get
+				var index_match_found = false;
+				for (table in instance.tables) {
+					for (table_idx < table.elems.length) {
+						if (index == resolveFuncIdx(table, table_idx)) {
+							var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+							trace.put(WasmEvent.FuncEntryTable(index, table_idx, table_name, params));
+							index_match_found = true;
+							break;
+						}
+					}
+					if (index_match_found) break;
+				}
+				if (!index_match_found)
+					System.error("R3MonitorError", "external call with table_get failed");
+			}
+			checkMemGrow(instance);
+			checkTableGrow(instance);
+		}
+		call_kind_stack.push((CallKind.INT, index));
+	}
+
+	def onFuncExit(index: int) {
+		call_kind_stack.pop();
+	}
+
+	def onCall(func_id: int) {
+		var func_decl = module.functions[func_id];
+		if (func_decl.imp != null || (host_filter != null && host_filter.matches(module, func_decl))) {
+			call_kind_stack.push((CallKind.EXT, func_id));
+			trace.put(WasmEvent.ImportCall(func_id));
+		}
+	}
+
+	def onIndirectCall(table_index: int, entry_idx: int, table: Table) {
+		var func_id = onTableGet(table_index, entry_idx, table);
+		if (func_id != -1) {
+			onCall(func_id);
+		}
+	}
+
+	def onCallReturn(loc: DynamicLoc) {
+		if (call_kind_stack.peek().0 == CallKind.INT) {
+			return;
+		}
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var func_id = call_kind_stack.pop().1;
+		var func = module.functions[func_id];
+		var results_len = func.sig.results.length;
+		var results = Array<Value>.new(results_len);
+		for (i < results_len) {
+			results[i] = frame_accessor.getOperand(-1 * (results_len - i - 1));
+		}
+		trace.put(WasmEvent.ImportReturn(results));
+		var instance = loc.func.instance;
+		checkMemGrow(instance);
+		checkTableGrow(instance);
+	}
+
+	def onGlobalSet(id: int, new_value: Value) {
+		shadowGlobals[id] = new_value;
+	}
+
+	def onGlobalGet(id: int, value: Value) {
+		if (shadowGlobals[id] != value) {
+			trace.put(WasmEvent.GlobalGet(id, value));
+			shadowGlobals[id] = value;
+		}
+	}
+
+	def onTableGet(table_idx: int, entry_idx: int, table: Table) -> int {
+		var func_idx = resolveFuncIdx(table, entry_idx);
+		if (func_idx != -1) {
+			var func_name = if (exported_func_names.has(func_idx), exported_func_names[func_idx], getFuncName(func_idx));
+			if (table.elems[entry_idx] != shadowTables[table_idx].elems[entry_idx]) {
+				var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+				trace.put(WasmEvent.TableGet(table_idx, table_name, entry_idx, func_idx, func_name));
+				shadowTables[table_idx][entry_idx] = table.elems[entry_idx];
+			}
+		}
+		return func_idx;
+	}
+
+	def onTableSet(table_idx: int, entry_idx: int, new_val: Value) {
+		shadowTables[table_idx][entry_idx] = new_val;
+	}
+
+	def onTableGrow(table_idx: int, growth: u32) {
+		var table_name = if (exported_table_names.has(table_idx), exported_table_names[table_idx], "");
+		trace.put(WasmEvent.TableGrow(table_idx, table_name, growth));
+		shadowTables[table_idx].grow(growth, Values.FUNCREF_NULL);
+	}
+
+	def onMemoryRead(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
+		alignShadowMemFixedRange(mem, addr, size);
+		return Resumption.Continue;
+	}
+
+	def onMemoryWrite(loc: DynamicLoc, mem: Memory, addr: u64, size: u64) -> Resumption {
+		var mem_index = mem.decl.memory_index;
+		var shadow_mem = shadowMems[mem_index];
+		var new_val: u64;
+		var new_val_high: u64;
+		var dst = shadow_mem.range_ol_64(addr, u32.view(size));
+		match (loc.frame.getFrameAccessor().getTopOfStack()) {
+			I32(v) => new_val = v;
+			I64(v) => new_val = v;
+			F32(v) => new_val = v;
+			F64(v) => new_val = v;
+			V128(low, high) => {
+				new_val = low;
+				new_val_high = high;
+			}
+			_ => ;
+		}
+		match (size) {
+			1 => DataWriters.write_range_u8(dst.result, u8.view(new_val));
+			2 => DataWriters.write_range_u16(dst.result, u16.view(new_val));
+			4 => DataWriters.write_range_u32(dst.result, u32.view(new_val));
+			8 => DataWriters.write_range_u64(dst.result, new_val);
+			16 => DataWriters.write_range_u128(dst.result, (new_val, new_val_high));
+		}
+		return Resumption.Continue;
+	}
+
+	def onMemoryGrow(loc: DynamicLoc, mem: Memory, pages: u32) -> Resumption {
+		if (pages > 0) {
+			growShadowMem(mem.decl.memory_index, pages);
+		}
+		return Resumption.Continue;
+	}
+
+	def onMemoryInit(loc: DynamicLoc, mem_index: int, data: Array<u8>) {
+		var dst_offset = Values.v_u(loc.frame.getFrameAccessor().getOperand(-2));
+		var src_offset =Values.v_u(loc.frame.getFrameAccessor().getOperand(-1));
+		var copy_size = Values.v_u(loc.frame.getFrameAccessor().getTopOfStack());
+		shadowMems[mem_index].copyIn(dst_offset, data, src_offset, copy_size);
+	}
+
+	def onMemoryCopy(loc: DynamicLoc, dst_index: u32, src_mem: Memory) {
+		var src_index = src_mem.decl.memory_index;
+		var dst_offset = Values.v_u(loc.frame.getFrameAccessor().getOperand(-2));
+		var src_offset =Values.v_u(loc.frame.getFrameAccessor().getOperand(-1));
+		var copy_size = Values.v_u(loc.frame.getFrameAccessor().getTopOfStack());
+
+		// check if the copy range matches with shadow memory
+		alignShadowMemRange(src_mem, src_offset, copy_size);
+		shadowMems[dst_index].copyM(dst_offset, src_mem, src_offset, copy_size);
+	}
+
+	def onMemoryFill(mem_index: u32, dst_offset: u32, val: u8, size: u32) {
+		shadowMems[mem_index].fill(dst_offset, val, size);
+	}
+
+	def renderTrace(sb: StringBuilder) {
+		for (i < trace.length) {
+			trace[i].render(sb);
+		}
+	}
+
+	private def growShadowMem(mem_index: int, growth: u32) {
+		var shadow_mem = shadowMems[mem_index];
+		shadow_mem.grow(growth);
+	}
+
+	private def growShadowMemWithTrace(mem_index: int, growth: u32) {
+		growShadowMem(mem_index, growth);
+		trace.put(WasmEvent.MemGrow(mem_index, int.view(growth)));
+	}
+
+	private def alignShadowMemRange(mem: Memory, addr: u64, size: u64) {
+		var scanned_size: u64 = 0;
+		while (scanned_size <= size - 16) {
+			alignShadowMemFixedRange(mem, addr, 16);
+			scanned_size += 16;
+			addr += 16;
+		}
+		if (scanned_size <= size - 8) {
+			alignShadowMemFixedRange(mem, addr, 8);
+			scanned_size += 8;
+			addr += 8;
+		}
+		if (scanned_size <= size - 4) {
+			alignShadowMemFixedRange(mem, addr, 4);
+			scanned_size += 4;
+			addr += 4;
+		}
+		for (i < size - scanned_size) {
+			alignShadowMemFixedRange(mem, addr, 1);
+			addr++;
+		}
+	}
+
+	private def alignShadowMemFixedRange(mem: Memory, addr: u64, size: u64) {
+		var size = u32.view(size);
+		var mem_index = mem.decl.memory_index;
+		var shadow_mem = shadowMems[mem_index];
+		var mem_ptr = mem.range_ol_64(addr, size).result;
+		var shadow_ptr = shadow_mem.range_ol_64(addr, size).result;
+		var data_lo: u64, data_hi: u64;
+		var shadow_data_lo: u64, shadow_data_hi: u64;
+		match (size) {
+			1 => {
+				data_lo = DataReaders.read_range_u8(mem_ptr);
+				shadow_data_lo = DataReaders.read_range_u8(shadow_ptr);
+			}
+			2 => {
+				data_lo = DataReaders.read_range_u16(mem_ptr);
+				shadow_data_lo = DataReaders.read_range_u16(shadow_ptr);
+			}
+			4 => {
+				data_lo = DataReaders.read_range_u32(mem_ptr);
+				shadow_data_lo = DataReaders.read_range_u32(shadow_ptr);
+			}
+			8 => {
+				data_lo = DataReaders.read_range_u64(mem_ptr);
+				shadow_data_lo = DataReaders.read_range_u64(shadow_ptr);
+			}
+			16 => {
+				var data_result = DataReaders.read_range_u128(mem_ptr);
+				var shadow_result = DataReaders.read_range_u128(shadow_ptr);
+				data_lo = data_result.0;
+				data_hi = data_result.1;
+				shadow_data_lo = shadow_result.0;
+				shadow_data_hi = shadow_result.1;
+			}
+			_ => ;
+		}
+		if (shadow_data_lo != data_lo || (size == 16 && (shadow_data_hi != data_hi))) {
+			trace.put(WasmEvent.Load(mem_index, addr, Ranges.dup(mem_ptr)));
+			shadow_mem.copyM(u32.view(addr), mem, u32.view(addr), size);
+		}
+	}
+
+	private def checkMemGrow(instance: Instance) {
+		for (i < shadowMems.length) {
+			var shadow_mem = shadowMems[i];
+			var instance_mem = instance.memories[i];
+			var shadow_mem_pages = shadow_mem.size();
+			var instance_mem_pages = instance_mem.size();
+			if (shadow_mem_pages < instance_mem_pages) {
+				var growth = instance_mem_pages - shadow_mem_pages;
+				growShadowMemWithTrace(i, growth);
+			}
+		}
+	}
+
+	private def checkTableGrow(instance: Instance) {
+		for (i < shadowTables.length) {
+			var shadow_table = shadowTables[i];
+			var instance_table = instance.tables[i];
+			var shadow_table_size = shadow_table.elems.length;
+			var instance_table_size = instance_table.elems.length;
+			if (shadow_table_size < instance_table_size) {
+				var growth = instance_table_size - shadow_table_size;
+				onTableGrow(i, u32.view(growth));
+			}
+		}
+	}
+
+	private def resolveFuncIdx(table: Table, entry_idx: int) -> int {
+		if (table.funcs != null) {
+			if (WasmFunction.?(table.funcs[entry_idx]))
+				return WasmFunction.!(table.funcs[entry_idx]).decl.func_index;
+			if (HostFunction.?(table.funcs[entry_idx])) {
+				var name = HostFunction.!(table.funcs[entry_idx]).name;
+				if (func_id_from_imp_name.has(name)) {					
+					return func_id_from_imp_name[name];
+				}
+			}	
+		}
+		return -1;
+	}
+
+	private def funcImported(func_index: int) -> bool {
+		return module.functions[func_index].imported();
+	}
+
+	private def getFuncName(func_index: int) -> string {
+		var name = if (module.names != null, module.names.getFuncName(func_index));
+		if (name != null) return name;
+		else return StringBuilder.new().put1("#%d", func_index).toString();
+	}
+}
+
+
+private class EnterProbe(handler: EventHandler, func: FuncDecl) extends Probe {
+	def var params_len: int;
+	def var params_list: Array<Value>;
+
+	new() {
+		params_len = func.sig.params.length;
+		params_list = Array<Value>.new(params_len);
+	}
+
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		for (i < params_len) {
+			params_list[i] = frame_accessor.getLocal(i);
+		}
+		handler.onFuncEntry(func.func_index, Arrays.dup(params_list), loc.func.instance);
+        return Resumption.Continue;
+	}
+}
+
+private class ExitProbe(handler: EventHandler, func_index: int) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		handler.onFuncExit(func_index);
+		return Resumption.Continue;
+	}
+}
+
+private class R3CallProbe(callee_index: int, handler: EventHandler) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		handler.onCall(callee_index);
+        return Resumption.Continue;
+	}
+}
+
+private class R3CallIndirectProbe(sig: SigDecl, table_index: u31, handler: EventHandler) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var entry_idx = Values.v_i(frame_accessor.getTopOfStack());
+		handler.onIndirectCall(table_index, entry_idx, loc.func.instance.tables[table_index]);
+		return Resumption.Continue;
+	}
+}
+
+private class ReturnProbe(handler: EventHandler) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		handler.onCallReturn(loc);
+        return Resumption.Continue;
+	}
+}
+
+private class GlobalSetProbe(handler: EventHandler, global_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var new_val = loc.frame.getFrameAccessor().getTopOfStack();
+		handler.onGlobalSet(global_index, new_val);
+		return Resumption.Continue;
+	}
+}
+
+private class GlobalGetProbe(handler: EventHandler, global_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var val = loc.func.instance.globals[global_index].value;
+		handler.onGlobalGet(global_index, val);
+		return Resumption.Continue;
+	}
+}
+
+private class TableGetProbe(handler: EventHandler, table_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var entry_idx = Values.v_i(frame_accessor.getTopOfStack());
+		handler.onTableGet(table_index, entry_idx, loc.func.instance.tables[table_index]);
+		return Resumption.Continue;
+	}
+}
+
+private class TableSetProbe(handler: EventHandler, table_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var entry_idx = Values.v_i(frame_accessor.getOperand(-1));
+		var new_val = frame_accessor.getTopOfStack();
+		handler.onTableSet(table_index, entry_idx, new_val);
+		return Resumption.Continue;
+	}
+}
+
+private class TableGrowProbe(handler: EventHandler, table_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var growth = Values.v_u(frame_accessor.getTopOfStack());
+		handler.onTableGrow(table_index, growth);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryInitProbe(handler: EventHandler, mem_index: u31, data: Array<u8>) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		handler.onMemoryInit(loc, mem_index, data);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryCopyProbe(handler: EventHandler, dst_index: u31, src_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var src_mem = loc.func.instance.memories[src_index];
+		handler.onMemoryCopy(loc, dst_index, src_mem);
+		return Resumption.Continue;
+	}
+}
+
+private class MemoryFillProbe(handler: EventHandler, mem_index: u31) extends Probe {
+	def fire(loc: DynamicLoc) -> Resumption {
+		var frame_accessor = loc.frame.getFrameAccessor();
+		var dst_offset = Values.v_u(frame_accessor.getOperand(-2));
+		var val = Values.v_u(frame_accessor.getOperand(-1));
+		var size = Values.v_u(frame_accessor.getTopOfStack());
+		handler.onMemoryFill(mem_index, dst_offset, u8.view(val), size);
+		return Resumption.Continue;
+	}
+}
+
+private type CallStackEntry(func_id: int, kind: CallKind);
+
+type WasmEvent {
+	// function calls by the host
+	case FuncEntry(idx: int, func_name: string, params: Array<Value>);
+	case FuncEntryTable(idx: int, table_idx: int, table_name: string, params: Array<Value>);
+
+	// observed memory updates made by the host
+	case Load(idx: int, offset: u64, data: Array<u8>);
+	case MemGrow(idx: int, amount: int);
+
+	// observed table updates made by the host
+	case TableGet(table_idx: int, table_name: string, entry_idx: int, func_idx: int, func_name: string);
+	case TableGrow(table_idx: int, table_name: string, amount: u32);
+
+	// observed global updates made by the host
+	case GlobalGet(idx: int, value: Value);
+
+	// imported function call/returns made by the module
+	case ImportCall(idx: int);
+	case ImportReturn(results: Array<Value>);
+
+	// initial value of imported globals
+	case ImportGlobal(idx: int, initial: Value);
+
+	def render(sb: StringBuilder) {
+		match (this) {
+			FuncEntry(idx, func_name, params) => {
+				sb.put2("EC;%d;%s;", idx, func_name);
+				renderParams(sb, params);
+			}
+			FuncEntryTable(idx, table_idx, table_name, params) => {
+				sb.put3("TC;%d;%s;%d;", idx, table_name, table_idx);
+				renderParams(sb, params);
+			}
+			Load(idx, offset, data) => {
+				sb.put2("L;%d;%d;", idx, offset);
+				renderBytes(sb, data);
+			}
+			MemGrow(idx, amount) => {
+				sb.put2("MG;%d;%d", idx, amount);
+			}
+			TableGet(table_idx, table_name, idx, func_idx, func_name) => {
+				sb.put3("T;%d;%s;%d;", table_idx, table_name, idx);
+				sb.put2("%d;%s", func_idx, func_name);
+			}
+			TableGrow(table_idx, table_name, amount) => {
+				sb.put3("TG;%d;%s;%d", table_idx, table_name, amount);
+			}
+			GlobalGet(idx, value) => {
+				sb.put1("G;%d;", idx);
+				renderValue(value, sb);
+			}
+			ImportCall(idx) => {
+				sb.put1("IC;%d", idx);
+			}
+			ImportReturn(results) => {
+				sb.puts("IR;0;");
+				renderParams(sb, results);
+			}
+			ImportGlobal(idx, initial) => {
+				sb.put1("IG;%d;", idx);
+				renderValue(initial, sb);
+			}
+		}
+		sb.puts("\n");
+	}
+
+	// helper method to print values for globals related events
+	def renderValue(val: Value, sb: StringBuilder) {
+		if (val == Values.F32_nan || val == Values.F64_nan) {
+			sb.puts("NaN");
+		} else if (val == Values.F32_infinity || val == Values.F64_infinity) {
+			sb.puts("Infinity");
+		} else if (val == Values.F32_minus_infinity || val == Values.F64_minus_infinity) {
+			sb.puts("-Infinity");
+		} else {
+			match (val) {
+				I32(val) => sb.put1("%d", i32.view(val));
+				I64(val) => sb.put1("%d", i64.view(val));
+				F32(val) => sb.put1("0x%x", val);
+				F64(val) => sb.put1("0x%x", val);
+				_ => ;
+			}
+		}
+	}
+
+	def renderParams(sb: StringBuilder, params: Array<Value>) {
+		for (i < params.length) {
+			renderValue(params[i], sb);
+			if (i < params.length - 1) sb.puts(",");
+		}
+	}
+
+	def renderBytes(sb: StringBuilder, data: Array<u8>) {
+		for (i < data.length) {
+			sb.put1("%d", data[i]);
+			if (i < data.length - 1) sb.puts(",");
+		}
+	}
+}
+
+private enum CallKind {INT, EXT}

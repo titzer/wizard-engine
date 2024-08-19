@@ -8,7 +8,7 @@ fi
 input=$1
 shift
 
-WAT2WASM=${WAT2WASM:=$(which wat2wasm)}
+WAT2WASM=${WAT2WASM:="$(which wat2wasm) --enable-all"}
 
 CALIBRATION=$(grep INNER_CALIBRATION $input | cut -d= -f2)
 
@@ -26,5 +26,5 @@ for i in 1 10 100 1000; do
 	exit 1
     fi
 
-    btime -i 10 $* /tmp/test.wasm
+    btime -i 10 "$@" /tmp/test.wasm
 done

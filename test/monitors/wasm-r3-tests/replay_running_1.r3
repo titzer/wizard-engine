@@ -1,0 +1,10 @@
+EC;2;entry;
+IC;0
+IR;0;
+IC;0
+IR;0;
+IC;0
+IR;0;
+ER
+EC;1;changeMemWasm;0,0
+ER

@@ -16,6 +16,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 	private var parser: WasmParser;
 	private var decoder: DataReader;
 	private var fsm: BpFsm;
+	private var seen_section = -1;
 	private var seen_sections = Array<bool>.new(BpSection.count);
 	private var declared_func_count: u32;
 	private var func_body_cursor: int;
@@ -59,13 +60,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		var start = d.pos;
 		decoder = parser.decoder = d;
 //		parser.debugBuffer();
-		if (kind != BpSection.Unknown) {
-			if (seen_sections[kind.code]) {
-				if (!extensions.REPEAT_SECTIONS) return err.rel(d, d.pos-1).DuplicateSection(kind);
-			} else {
-				seen_sections[kind.code] = true;
-			}
-		}
+		enforceSectionOrder(kind, d.abs_of(d.pos-1));
 		err.section = kind;
 		match (kind) {
 			Unknown => readCustomSection(size);
@@ -121,7 +116,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 			_ => return err.at(d).InvalidSectionCode(kind.code);
 		}
 		if (Trace.binparse) {
-			Trace.OUT.put2("======== end section code %d (%s) ========", kind.code, kind.name).outln();
+			Trace.OUT.put2("======== end section code %d (%s) ========", kind.code, kind.name).ln();
 		}
 
 		err.section = BpSection.Unknown;
@@ -130,16 +125,22 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 			err.at(d).IncompleteSection(kind.code, read, size);
 		}
 	}
+	def enforceSectionOrder(kind: BpSection, abspos: int) {
+		if (kind == BpSection.Unknown) return;
+		if (!extensions.REPEAT_SECTIONS) {
+			// enforce section ordering and uniqueness
+			if (seen_sections[kind.code]) return err.abs(abspos).DuplicateSection(kind);
+			else if (kind.tag < seen_section) return err.abs(abspos).OutOfOrderSection(kind);
+		}
+		seen_sections[kind.code] = true;
+		seen_section = kind.tag;
+	}
 	def beginCodeSection(abspos: int, count: u32) {
 		var kind = BpSection.Code;
-		if (seen_sections[kind.code]) {
-			if (!extensions.REPEAT_SECTIONS) return err.abs(abspos - 1).DuplicateSection(kind);
-		} else {
-			seen_sections[kind.code] = true;
-			if (count != declared_func_count) {
-				// TODO: count >= remaining_func_count ?
-				err.abs(abspos).FuncCountMismatch(declared_func_count, count);
-			}
+		enforceSectionOrder(kind, abspos);
+		if (count != declared_func_count) {
+			// TODO: count >= remaining_func_count ?
+			err.abs(abspos).FuncCountMismatch(declared_func_count, count);
 		}
 		if (tiering != null) tiering.onCodeSectionStart(module, count, 0); // TODO: size
 	}
@@ -158,7 +159,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		for (i < count) {
 			if (err.error()) break;
 			err.index = i;
-			if (Trace.binparse) Trace.OUT.put2("-->%s #%d", thing_name, i).outln();
+			if (Trace.binparse) Trace.OUT.put2("-->%s #%d", thing_name, i).ln();
 			read(i);
 		}
 	}
@@ -179,7 +180,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		module.explicit_data_count = count;
 	}
 	def decodeFunctionBody(index: u32, size: u32, decoder: DataReader) {
-		if (Trace.binparse) Trace.OUT.put1("-->body #%d", index).outln();
+		if (Trace.binparse) Trace.OUT.put1("-->body #%d", index).ln();
 		parser.decoder = decoder;
 		var start = decoder.pos;
 		var f: FuncDecl, i = func_body_cursor;
@@ -307,7 +308,14 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		var shared = (flags & BpMemoryFlag.Shared.mask) != 0;
 		if (shared && !has_max) err.rel(decoder, pt).ExpectedSharedMemoryMaximum();
 		var indexType = if((flags & BpMemoryFlag.Is64.mask) != 0, ValueType.I64, ValueType.I32);
-		return MemLimits(initial, max, shared, indexType);
+
+		var log2_pageSize: u5 = BpConstants.log2_WASM_PAGE_SIZE;
+		var has_page_size = (flags & BpMemoryFlag.HasPageSize.mask) != 0;
+		if (has_page_size) {
+			log2_pageSize = u5.!(parser.readU32("pagesize (log2)", limits.max_log2_page_size));
+		}
+
+		return MemLimits(initial, max, shared, indexType, log2_pageSize);
 	}
 	def readElemType() -> ValueType.Ref {
 		return parser.readRefType(true);
@@ -464,7 +472,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 			BpImportExportKind.Memory.code => {
 				reserveOne(pt, "memories", module.memories, limits.max_num_memories);
 				var l = readMemLimits();
-				decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
+				decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType, l.log2_pageSize);
 			}
 			BpImportExportKind.Global.code => {
 				reserveOne(pt, "globals", module.globals, limits.max_num_globals);
@@ -490,7 +498,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 	}
 	def readMemoryDecl(index: int) {
 		var l = readMemLimits();
-		var decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType);
+		var decl = MemoryDecl.new(l.initial, l.max, l.shared, l.indexType, l.log2_pageSize);
 		module.addDecl(decl);
 	}
 	def readTagDecl(index: int) {
@@ -749,11 +757,11 @@ class BpFsm extends WasmParser {
 		if (Trace.binparse) {
 // TODO: this is debug code, not tracing code
 //			Trace.OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.abspos(),
-//				decoder.available(), state.name).outln();
+//				decoder.available(), state.name).ln();
 		}
 		match (state) {
 			MAGIC => {
-				if (Trace.binparse) Trace.OUT.puts("======== begin module ========").outln();
+				if (Trace.binparse) Trace.OUT.puts("======== begin module ========").ln();
 				var pt = decoder.pos;
 				var magic = decoder.read_u32();
 				if (eof) return if(!retry(), err.at(decoder).EOFMagicWord());
@@ -775,7 +783,7 @@ class BpFsm extends WasmParser {
 				}
 				current_section = checkSectionCode(b);
 				if (Trace.binparse) {
-					Trace.OUT.put2("======== begin section code %d (%s) ========", current_section.code, current_section.name).outln();
+					Trace.OUT.put2("======== begin section code %d (%s) ========", current_section.code, current_section.name).ln();
 				}
 				state = BpFsmState.SECTION;
 			}
@@ -994,7 +1002,7 @@ type BrOnCastImm(flags: u8, depth: u31, ht1: int, ht2: int) #unboxed {
 	def null1() -> bool { return (flags & 1) != 0; }
 	def null2() -> bool { return (flags & 2) != 0; }
 }
-type MemLimits(initial: u64, max: Max, shared: bool, indexType: ValueType) #unboxed { }
+type MemLimits(initial: u64, max: Max, shared: bool, indexType: ValueType, log2_pageSize: u5) #unboxed { }
 type TableLimits() #unboxed { }
 
 type BlockTypeCode(code: int, index: int) #unboxed {

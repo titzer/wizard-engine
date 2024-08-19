@@ -43,7 +43,7 @@ WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
 WALI="src/modules/wali/*.v3"
-WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3"
+WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
 
 PROGRAM=$1
