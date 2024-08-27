@@ -13,7 +13,7 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 make_binary wizeng || exit $?
 
 cd $DIR
-WIZENG="../../$BINARY -nocolor"
+WIZENG="../../$BINARY -colors=false"
 
 if [ $# -gt 0 ]; then
     MONITORS=($@)

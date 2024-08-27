@@ -70,7 +70,7 @@ function make_build_file() {
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WIZENG $WAVE $WASI $WALI $MONITORS"
+    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $WIZENG"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
