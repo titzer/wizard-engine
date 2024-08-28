@@ -20,7 +20,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 	private var seen_sections = Array<bool>.new(BpSection.count);
 	private var declared_func_count: u32;
 	private var func_body_cursor: int;
-	private var subtype_list: Vector<(int, int)>;
+	private var subtype_list: Vector<(u64, int)>;
 
 	new() super(Module.new(filename)) {
 		fsm = BpFsm.new(extensions, limits, err, this);
@@ -60,7 +60,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		var start = d.pos;
 		decoder = parser.decoder = d;
 //		parser.debugBuffer();
-		enforceSectionOrder(kind, d.abs_of(d.pos-1));
+		enforceSectionOrder(kind, d.addr_of(d.pos-1));
 		err.section = kind;
 		match (kind) {
 			Unknown => readCustomSection(size);
@@ -120,27 +120,27 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 		}
 
 		err.section = BpSection.Unknown;
-		var read = d.pos - start;
+		var read = u64.!(d.pos - start);
 		if (read < size) {
 			err.at(d).IncompleteSection(kind.code, read, size);
 		}
 	}
-	def enforceSectionOrder(kind: BpSection, abspos: int) {
+	def enforceSectionOrder(kind: BpSection, addr: u64) {
 		if (kind == BpSection.Unknown) return;
 		if (!extensions.REPEAT_SECTIONS) {
 			// enforce section ordering and uniqueness
-			if (seen_sections[kind.code]) return err.abs(abspos).DuplicateSection(kind);
-			else if (kind.tag < seen_section) return err.abs(abspos).OutOfOrderSection(kind);
+			if (seen_sections[kind.code]) return err.abs(addr).DuplicateSection(kind);
+			else if (kind.tag < seen_section) return err.abs(addr).OutOfOrderSection(kind);
 		}
 		seen_sections[kind.code] = true;
 		seen_section = kind.tag;
 	}
-	def beginCodeSection(abspos: int, count: u32) {
+	def beginCodeSection(addr: u64, count: u32) {
 		var kind = BpSection.Code;
-		enforceSectionOrder(kind, abspos);
+		enforceSectionOrder(kind, addr);
 		if (count != declared_func_count) {
 			// TODO: count >= remaining_func_count ?
-			err.abs(abspos).FuncCountMismatch(declared_func_count, count);
+			err.abs(addr).FuncCountMismatch(declared_func_count, count);
 		}
 		if (tiering != null) tiering.onCodeSectionStart(module, count, 0); // TODO: size
 	}
@@ -383,7 +383,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 				code = readDefTypeCode();
 
 				if (subtype_list == null) subtype_list = Vector.new();
-				subtype_list.put(pt, module.heaptypes.length);
+				subtype_list.put(decoder.addr_of(pt), module.heaptypes.length);
 			}
 		}
 
@@ -686,7 +686,7 @@ class BinParser(extensions: Extension.set, limits: Limits, filename: string) ext
 
 type BinParserResult {
 	case Ok(module: Module) { }
-	case Error(code: WasmError, filename: string, section: BpSection, error_index: int, error_pos: int, error_msg: string) { }
+	case Error(code: WasmError, filename: string, section: BpSection, error_index: int, error_pos: u64, error_msg: string) { }
 }
 
 // A finite state machine that implements a push-based parser for binary
@@ -704,11 +704,11 @@ class BpFsm extends WasmParser {
 	var more = true;
 	var accept = false;
 	var current_section: BpSection;
-	var section_start: int;
+	var section_start: u64;
 	var section_size: u32;
 	var function_body_count: u32;
 	var current_function_body: u32;
-	var function_body_start: int;
+	var function_body_start: u64;
 	var function_body_size: u32;
 	private var total_bytes: u32;
 
@@ -756,7 +756,7 @@ class BpFsm extends WasmParser {
 		current_pos = decoder.pos;
 		if (Trace.binparse) {
 // TODO: this is debug code, not tracing code
-//			Trace.OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.abspos(),
+//			Trace.OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.addr(),
 //				decoder.available(), state.name).ln();
 		}
 		match (state) {
@@ -790,8 +790,8 @@ class BpFsm extends WasmParser {
 			SECTION => {
 				var pt = decoder.pos;
 				section_size = readU32("section size", limits.max_module_size);
-				if (eof) return if(!retry(), err_incomplete_section(decoder.abs_of(pt), 0));
-				section_start = decoder.abspos();
+				if (eof) return if(!retry(), err_incomplete_section(decoder.addr_of(pt), 0));
+				section_start = decoder.addr();
 				state = BpFsmState.SECTION_WITH_SIZE;
 			}
 			SECTION_WITH_SIZE => {
@@ -799,7 +799,7 @@ class BpFsm extends WasmParser {
 					Code => {  // code section handled specially, one function body at a time
 						function_body_count = readU32("function body count", limits.max_num_functions);
 						if (eof) return if(!retry(), err_incomplete_section(section_start, section_size));
-						function_body_start = decoder.abspos();
+						function_body_start = decoder.addr();
 						current_function_body = 0;
 						state = BpFsmState.BODY;
 						callback.beginCodeSection(function_body_start, function_body_count);
@@ -814,7 +814,7 @@ class BpFsm extends WasmParser {
 			}
 			BODY => {
 				if (current_function_body == function_body_count) { // already read N bodies
-					var read = decoder.abspos() - section_start;
+					var read = decoder.addr() - section_start;
 					if (read < section_size) err.at(decoder).IncompleteSection(BpSection.Code.code, read, section_size);
 					if (read > section_size) err.at(decoder).OverflowSection(BpSection.Code.code, read, section_size);
 					state = BpFsmState.SECTION_START;
@@ -826,7 +826,7 @@ class BpFsm extends WasmParser {
 			}
 			BODY_WITH_SIZE => {
 				decoder.sub_bytes(function_decoder, int.!(function_body_size));
-				var next_start = decoder.abspos();
+				var next_start = decoder.addr();
 				if (eof) return if(!retry(), err_incomplete_function(current_function_body, function_body_size));
 				callback.decodeFunctionBody(current_function_body, function_body_size, function_decoder);
 				function_body_start = next_start;
@@ -850,29 +850,29 @@ class BpFsm extends WasmParser {
 	}
 	def eof_is_section_overflow(d: DataReader, pos: int, size: int, msg: string) {
 		var kind = current_section.code;
-		var read = d.abs_of(pos) - section_start;
+		var read = d.addr_of(pos) - section_start;
 		var size = section_size;
 		err.rel(d, pos).OverflowSection(kind, read, size);
 	}
 	def eof_is_function_overflow(d: DataReader, pos: int, size: int, msg: string) {
-		var read = d.abs_of(pos) - function_body_start;
+		var read = d.addr_of(pos) - function_body_start;
 		var size = function_body_size;
 		err.rel(d, pos).OverflowFunctionBody(read, size);
 	}
-	def err_incomplete_section(abs: int, size: u32) {
+	def err_incomplete_section(addr: u64, size: u32) {
 		var kind = current_section;
-		var read = decoder.abspos() - abs;
+		var read = decoder.addr() - addr;
 		err.at(decoder).IncompleteSection(kind.code, read, size);
 	}
 	def err_incomplete_function(index: u32, size: u32) {
-		var read = decoder.abspos() - function_body_start;
+		var read = decoder.addr() - function_body_start;
 		err.at(decoder).IncompleteFunctionBody(read, size);
 	}
 }
 // The callbacks for sections, function bodies, and finishing a module.
 class BpFsmCallback(module: Module) {
 	def decodeSection(kind: BpSection, size: u32, d: DataReader);
-	def beginCodeSection(abspos: int, count: u32) {}
+	def beginCodeSection(addr: u64, count: u32) {}
 	def decodeFunctionBody(index: u32, size: u32, d: DataReader);
 }
 // The states for the module parser finite state machine.
