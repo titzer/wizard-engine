@@ -86,6 +86,10 @@ function run_tests {
     done
 }
 
+if [ "$PROGRESS_PIPE" != "1" ]; then
+    RAW=1
+fi
+
 if [ "$RAW" = 0 ]; then
     run_tests $TESTS | $PROGRESS
 else
