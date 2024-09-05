@@ -1,0 +1,461 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// wasm r3 record trace event types
+type WasmEvent {
+	// function calls by the host
+	case FuncEntry(idx: int, func_name: string, params: Array<Value>);
+	case FuncEntryTable(idx: int, table_idx: int, table_name: string, params: Array<Value>);
+
+	// observed memory updates made by the host
+	case Load(idx: int, offset: u64, data: Array<u8>);
+	case MemGrow(idx: int, amount: int);
+
+	// observed table updates made by the host
+	case TableGet(table_idx: int, table_name: string, entry_idx: int, func_idx: int, func_name: string);
+	case TableGrow(table_idx: int, table_name: string, amount: u32);
+
+	// observed global updates made by the host
+	case GlobalGet(idx: int, value: Value);
+
+	// imported function call/returns made by the module
+	case ImportCall(idx: int);
+	case ImportReturn(results: Array<Value>);
+
+	// initial value of imported globals
+	case ImportGlobal(idx: int, initial: Value);
+
+	def render(sb: StringBuilder) {
+		match (this) {
+			FuncEntry(idx, func_name, params) => {
+				sb.put2("EC;%d;%s;", idx, func_name);
+				renderParams(sb, params);
+			}
+			FuncEntryTable(idx, table_idx, table_name, params) => {
+				sb.put3("TC;%d;%s;%d;", idx, table_name, table_idx);
+				renderParams(sb, params);
+			}
+			Load(idx, offset, data) => {
+				sb.put2("L;%d;%d;", idx, offset);
+				renderBytes(sb, data);
+			}
+			MemGrow(idx, amount) => {
+				sb.put2("MG;%d;%d", idx, amount);
+			}
+			TableGet(table_idx, table_name, idx, func_idx, func_name) => {
+				sb.put3("T;%d;%s;%d;", table_idx, table_name, idx);
+				sb.put2("%d;%s", func_idx, func_name);
+			}
+			TableGrow(table_idx, table_name, amount) => {
+				sb.put3("TG;%d;%s;%d", table_idx, table_name, amount);
+			}
+			GlobalGet(idx, value) => {
+				sb.put1("G;%d;", idx);
+				renderValue(value, sb);
+			}
+			ImportCall(idx) => {
+				sb.put1("IC;%d", idx);
+			}
+			ImportReturn(results) => {
+				sb.puts("IR;0;");
+				renderParams(sb, results);
+			}
+			ImportGlobal(idx, initial) => {
+				sb.put1("IG;%d;", idx);
+				renderValue(initial, sb);
+			}
+		}
+		sb.puts("\n");
+	}
+
+	// helper method to print values for globals related events
+	def renderValue(val: Value, sb: StringBuilder) {
+		match (val) {
+			I32(val) => sb.put1("%d", i32.view(val));
+			I64(val) => sb.put1("%d", i64.view(val));
+			F32(val) => sb.put1("0x%x", val);
+			F64(val) => sb.put1("0x%x", val);
+			_ => ;
+		}
+	}
+
+	def renderParams(sb: StringBuilder, params: Array<Value>) {
+		for (i < params.length) {
+			renderValue(params[i], sb);
+			if (i < params.length - 1) sb.puts(",");
+		}
+	}
+
+	def renderBytes(sb: StringBuilder, data: Array<u8>) {
+		for (i < data.length) {
+			sb.put1("%d", data[i]);
+			if (i < data.length - 1) sb.puts(",");
+		}
+	}
+}
+
+// wasm r3's replay IR
+class ReplayContext(actions: Vector<WasmEvent>, var results: Array<Value>){}
+class ReplayFunction(all_ctx: Vector<ReplayContext>){}
+
+// Parser for the wasm R3 trace string format.
+class R3TraceParser(input: Array<byte>) {
+    private var import_call_count: int;
+    private var pos: int;
+    private def default_event = WasmEvent.ImportCall(0);
+    def var events = Vector<WasmEvent>.new();
+
+    // intermediate states for replay IR generation
+    private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), null);
+    private def entry_func = ReplayFunction.new(Vectors.of1(global_ctx));
+    private var last_ctx = global_ctx;
+    private def ctx_stack = ListStack<ReplayContext>.new();
+
+    def replay_map = HashMap<int, ReplayFunction>.new(int.!<int>, int.==);
+    def imported_global_vals = HashMap<int, Value>.new(int.!<int>, int.==);
+
+    // Parse the input file and populate the complete replay IR.
+    def parse() -> bool {
+        replay_map[-1] = entry_func; // entry function always has index -1
+        ctx_stack.push(global_ctx);
+        while (pos < input.length) {
+            if (matchStr("ER\n") || matchStr("ER")) {
+                continue;
+            }
+            var event = parseLine();
+            if (!event.1 || (pos < input.length && next() != '\n')) {
+                return false;
+            }
+            events.put(event.0);
+            processEvent(event.0);
+        }
+        return true;
+    }
+
+    // Updates the replay IR state with the newly parsed event.
+    private def processEvent(event: WasmEvent) {
+        match (event) {
+            ImportCall(idx) => {
+                var new_ctx = ReplayContext.new(Vector<WasmEvent>.new(), null);
+                if (!replay_map.has(idx)) {
+                    replay_map[idx] = ReplayFunction.new(Vector<ReplayContext>.new());
+                }
+                replay_map[idx].all_ctx.put(new_ctx);
+                ctx_stack.push(last_ctx);
+                last_ctx = new_ctx;
+            }
+            ImportReturn(results) => {
+                last_ctx.results = results;
+                last_ctx = ctx_stack.pop();
+            }
+            FuncEntry, FuncEntryTable => ctx_stack.peek().actions.put(event);
+            ImportGlobal(idx, initial) => imported_global_vals[idx] = initial;
+            _ => {
+                var last_action_idx = last_ctx.actions.length - 1;
+                var last_action = last_ctx.actions[last_action_idx];
+                if (WasmEvent.FuncEntry.?(last_action) || WasmEvent.FuncEntryTable.?(last_action)) {
+                    last_ctx.actions[last_action_idx] = event;
+                    last_ctx.actions.put(last_action);
+                } else {
+                    last_ctx.actions.put(event);
+                }
+            }
+        }
+    }
+
+    // Parse a single line of the input string into a WasmEvent.
+    private def parseLine() -> (WasmEvent, bool) {
+        if (matchStr("EC;")) {
+            return parseEC();
+        } else if (matchStr("TC;")) {
+            return parseTC();
+        } else if (matchStr("L;")) {
+            return parseL();
+        } else if (matchStr("MG;")) {
+            return parseMG();
+        } else if (matchStr("T;")) {
+            return parseT();
+        } else if (matchStr("TG;")) {
+            return parseTG();
+        } else if (matchStr("G;")) {
+            return parseG();
+        } else if (matchStr("IC;")) {
+            import_call_count++;
+            return parseIC();
+        } else if (matchStr("IR;")) {
+            return parseIR();
+        } else if (matchStr("IG;")) {
+            return parseIG();
+        }
+        return (default_event, false);
+    }
+
+    private def parseEC() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var name = parseStr(';', true);
+        var params = parseParams();
+        if (!params.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.FuncEntry(
+            int.view(Values.v_w_32(idx.0)),
+            name, params.0), true);
+    }
+
+    private def parseTC() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var name = parseStr(';', true);
+        var table_idx = parseIntDec();
+        if (!table_idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var params = parseParams();
+        if (!params.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.FuncEntryTable(
+            int.view(Values.v_w_32(idx.0)),
+            int.view(Values.v_w_32(table_idx.0)), name, params.0),
+            true);
+    }
+
+    private def parseL() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var offset = parseIntDec();
+        if (!offset.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var data = parseBytes();
+        if (!data.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.Load(
+            int.view(Values.v_w_32(idx.0)),
+            Values.v_w(offset.0), data.0),
+            true);
+    }
+
+    private def parseMG() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var amount = parseIntDec();
+        if (!amount.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.MemGrow(
+            int.view(Values.v_w_32(idx.0)),
+            int.view(Values.v_w_32(amount.0))),
+            true);
+    }
+
+    private def parseT() -> (WasmEvent, bool) {
+        var table_idx = parseIntDec();
+        if (!table_idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var table_name = parseStr(';', true);
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var fuc_idx = parseIntDec();
+        if (!fuc_idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var func_name = parseStr('\n', false);
+        return (WasmEvent.TableGet(
+            int.view(Values.v_w_32(table_idx.0)),
+            table_name,
+            int.view(Values.v_w_32(idx.0)),
+            int.view(Values.v_w_32(fuc_idx.0)),
+            func_name), true);
+    }
+
+    private def parseTG() -> (WasmEvent, bool) {
+        var table_idx = parseIntDec();
+        if (!table_idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var table_name = parseStr(';', true);
+        var amt = parseIntDec();
+        if (!amt.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.TableGrow(
+            int.view(Values.v_w_32(table_idx.0)),
+            table_name,
+            Values.v_w_32(amt.0)),
+            true);
+    }
+
+    private def parseIC() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.ImportCall(
+            int.view(Values.v_w_32(idx.0))), true);
+    }
+
+    private def parseIR() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var results = parseParams();
+        if (!results.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.ImportReturn(results.0), true);
+    }
+
+    private def parseG() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var val = parseValue();
+        if (!val.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.GlobalGet(
+            int.view(Values.v_w_32(idx.0)), val.0), true);
+    }
+
+    private def parseIG() -> (WasmEvent, bool) {
+        var idx = parseIntDec();
+        if (!idx.1 || !matchStr(";")) {
+            return (default_event, false);
+        }
+        var val = parseValue();
+        if (!val.1) {
+            return (default_event, false);
+        }
+        return (WasmEvent.ImportGlobal(
+            int.view(Values.v_w_32(idx.0)), val.0), true);
+    }
+
+    private def parseStr(until: byte, consume_until: bool) -> string {
+        var start = pos;
+        var sb = StringBuilder.new();
+        while (pos < input.length && input[pos] != until) {
+            sb.putc(input[pos++]);
+        }
+        if (consume_until && input[pos] == until) {
+            pos++;
+        }
+        return sb.toString();
+    }
+
+    private def byteView(val: Value) -> byte {
+        return Values.v_w_8(val);
+    }
+
+    private def parseBytes() -> (Array<byte>, bool) {
+        var result = parseParams();
+        if (!result.1) {
+            return (null, false);
+        }
+        return (Arrays.map(result.0, byteView), true);
+    }
+
+    private def parseParams() -> (Array<Value>, bool) {
+        var vec = Vector<Value>.new();
+        if (peekNext() == '\n') { // empty params list
+            return (vec.extract(), true);
+        }
+        var more_params = true;
+        while (more_params) {
+            var value = parseValue();
+            if (!value.1) {
+                return (null, false);
+            }
+            vec.put(value.0);
+            more_params = peekNext() == ','; // params are comma-separated
+            if (more_params) {
+                pos++;
+            }
+        }
+        return (vec.extract(), true);
+    }
+
+    private def parseValue() -> (Value, bool) {
+        if (matchStr("0x")) {
+            return parseFloatHex();
+        }
+        return parseIntDec();
+    }
+
+    // Parse a decimal integer, possibly negative.
+    private def parseIntDec() -> (Value, bool) {
+        var sign = 1ul;
+        if (input[pos] == '-' || input[pos] == '+') {
+            sign = if (input[pos] == '-', u64.max, sign);
+            pos++;
+        }
+		var a = input, i = pos, v1 = a[i++];
+		if (v1 < '0' || v1 > '9') { // not decimal digit
+			return (Values.I64_0, false);
+		}
+		var max = a.length, accum = v1 - u64.!('0');
+		while (i < max) {
+			var c = a[i];
+			var d = c - '0';
+			if (d < 0 || d > 9) break;
+			accum = accum * 10 + d;
+			i++;
+		}
+		pos = i;
+		return (Value.I64(accum * sign), true);
+	}
+    // Parses a hex number starting with 0x, returns the parsed value
+    // and whether the parse was successful.
+    private def parseFloatHex() -> (Value, bool) {
+		var a = input, i = pos, max = a.length;
+		var accum = 0ul;;
+        var count = 0;
+		while (i < max) {
+			var c = a[i];
+			var v = Chars.hexValue(c);
+			if (v < 0 || v > 15) break;
+			accum = (accum << 4) + u64.!(v);
+			i++;
+            count++;
+		}
+		pos = i;
+        var output = if (count <= 4, Value.F32(u32.view(accum)), Value.F64(accum));
+		return (output, true);
+	}
+    // Eat the string {s} if it is next in the input, returning {true} if so.
+	private def matchStr(s: string) -> bool {
+		if (!more(s.length)) return false;
+        var num = pos;
+		for (c in s) {
+            if (input[num++] != c) return false;
+        }
+        pos = num;
+		return true;
+	}
+    private def peekNext() -> byte {
+        if (pos >= input.length) return 0;
+        return input[pos];
+    }
+    private def next() -> byte {
+        if (pos >= input.length) return 0;
+        return input[pos++];
+    }
+    private def more(num: int) -> bool {
+		return input.length - pos >= num;
+	}
+}
