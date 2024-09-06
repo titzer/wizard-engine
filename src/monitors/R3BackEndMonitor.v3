@@ -2,11 +2,15 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def E_ = MonitorRegistry.add(
-	"r3-be", "TBD",
+	"r3-replay", "Replays a module from an R3 trace file.",
 	R3BackEndMonitor.new());
 
 class R3BackEndMonitor extends Monitor {
-    def var replay: HashMap<int, ReplayFunction>;
+    private var replay: HashMap<int, ReplayFunction>;
+    private var is_replay_valid = true;
+    private var mod: Module;
+    private var ins: Instance;
+    private var next_replay_context: Array<int>;
 
     def configure(args: string) -> string {
 		def argMap = MonitorUtil.argMapFrom(args);
@@ -22,68 +26,123 @@ class R3BackEndMonitor extends Monitor {
             }
             replay = parser.replay_map;
 			return null;
-		}
-		def buf = StringBuilder.new();
-		buf.put1("invalid argument(s) \"%s\"", args);
-		return buf.toString();
+		} else {
+            return "Missing trace_file";
+        }
 	}
 
 	def onParse(module: Module) {
-        replay.apply(debugPrint);
-        //var imported_module_builders = Strings.newMap<HostModuleBuilder>();
-		//for (j < module.imports.length) {
-        //    if (FuncDecl.?(module.imports[j])) {
-        //        var decl = FuncDecl.!(module.imports[j]);
-	    //	    var name = decl.imp.module_name;
-        //        if (ModuleRegistry.get(name) == null) {
-        //            var field_name = decl.imp.field_name;
-        //            var sig = decl.sig;
-        //            if (!imported_module_builders.has(name)) {
-        //                imported_module_builders[name] = HostModuleBuilder.new(name);
-        //            }
-        //            var module_builder = imported_module_builders[name];
-        //            module_builder.func(field_name, sig, customImportedFunction(_, sig.results));
-        //        }
-        //    }
-	    //}
-        //for (l = Maps.keyList(imported_module_builders); l != null; l = l.tail) {
-        //    imported_module_builders[l.head].register(true);
-        //}
+        mod = module;
+        // validate and update replay IR with correct values before instantiation
+        replay.apply(R3Utils.validateReplayFunction(_, _, mod, validationPrecheck, validationFail));
+        if (is_replay_valid) {
+            mod.start_function = -1;
+            var imported_module_builders = Strings.newMap<HostModuleBuilder>();
+            var func_import_count: int;
+		    for (j < mod.imports.length) {
+                if (FuncDecl.?(mod.imports[j])) {
+                    // create custom host modules for all imported functions, overwriting 
+                    // existing host modules if possible.
+                    var decl = FuncDecl.!(mod.imports[j]);
+	        	    var module_name = decl.imp.module_name;
+                    var field_name = decl.imp.field_name;
+                    var sig = decl.sig;
+                    if (!imported_module_builders.has(module_name)) {
+                        imported_module_builders[module_name] = HostModuleBuilder.new(module_name);
+                    }
+                    var module_builder = imported_module_builders[module_name];
+                    var hostFuncImpl = if (replay[decl.func_index] == null,
+                                           noOpHostFunc(_, sig.results),
+                                           emulatedHostFunc(_, sig.results, decl.func_index));
+                    module_builder.func(field_name, sig, hostFuncImpl).getMain(newMainFunc);
+                    func_import_count++;
+                }
+	        }
+            for (l = Maps.keyList(imported_module_builders); l != null; l = l.tail) {
+                imported_module_builders[l.head].register(true);
+            }
+            next_replay_context = Array<int>.new(func_import_count);
+        }
 	}
 
-    def debugPrint(func_id: int, replay_func: ReplayFunction) {
-        var sb = StringBuilder.new();
-        sb.put2("Function %d has %d calls\n", func_id, replay_func.all_ctx.length);
-        for (i < replay_func.all_ctx.length) {
-            var ctx = replay_func.all_ctx[i];
-            sb.put1("call %d\n", i);
-            for (j < ctx.actions.length) {
-                ctx.actions[j].render(sb);
-            }
-            var result_len = if (ctx.results == null, 0, ctx.results.length);
-            sb.put1("return value count: %d\n", result_len);
-        }
-        System.puts(sb.toString());
-    }
-}
+    def onInstantiate(instance: Instance) {
+        ins = instance;
+        if (is_replay_valid) {
 
-def customImportedFunction(params: Range<Value>, result_types: Array<ValueType>) -> HostResult {
-    var result_values = Array<Value>.new(result_types.length);
-    for (i < result_types.length) {
-        var t = result_types[i];
-        match (t) {
-            I32 => result_values[i] = Values.I32_0;
-            I64 => result_values[i] = Values.I64_0;
-            F32 => result_values[i] = Values.F32_0;
-            F64 => result_values[i] = Values.F64_0;
-            V128 => result_values[i] = Values.V128_0;
-            _ => result_values[i] = Values.FUNCREF_NULL;
+        }
+	}
+
+    // Wrapper for the emulated host module's main function. This replaces the original main function
+    // in the wasm module with the replay entry function.
+    private def newMainFunc(ins: Instance) -> (Function, Array<Value>) {
+        var func = HostFunction.new("main", SigCache.v_v, emulatedHostFunc(_, Array<ValueType>.new(0), -1));
+        return (func, Array<Value>.new(0));
+    }
+
+    // Implementation of the imported function that execute the observed state changes.
+    private def emulatedHostFunc(params: Range<Value>, result_types: Array<ValueType>, func_index: int) -> HostResult {
+        var replay_context_id: int;
+        if (func_index != -1) {
+            replay_context_id = next_replay_context[func_index]++;
+        }
+        var replay_context = replay[func_index].all_ctx[replay_context_id];
+        applyActions(replay_context.actions);
+        var result_values = replay_context.results;
+        match (result_types.length) {
+            0 => return HostResult.Value0;
+            1 => return HostResult.Value1(result_values[0]);
+            _ => return HostResult.ValueN(result_values);
         }
     }
-    System.puts("This works\n");
-    match (result_types.length) {
-        0 => return HostResult.Value0;
-        1 => return HostResult.Value1(result_values[0]);
-        _ => return HostResult.ValueN(result_values);
+
+    // Placeholder host function for imported, but not used functions in the reocrded trace.
+    private def noOpHostFunc(params: Range<Value>, result_types: Array<ValueType>) -> HostResult {
+        var result_values = Array<Value>.new(result_types.length);
+        for (i < result_types.length) {
+            var t = result_types[i];
+            match (t) {
+                I32 => result_values[i] = Values.I32_0;
+                I64 => result_values[i] = Values.I64_0;
+                F32 => result_values[i] = Values.F32_0;
+                F64 => result_values[i] = Values.F64_0;
+                V128 => result_values[i] = Values.V128_0;
+                _ => result_values[i] = Values.FUNCREF_NULL;
+            }
+        }
+        match (result_types.length) {
+            0 => return HostResult.Value0;
+            1 => return HostResult.Value1(result_values[0]);
+            _ => return HostResult.ValueN(result_values);
+        }
+    }
+
+    private def applyActions(actions: Vector<WasmEvent>) {
+        for (i < actions.length) {
+            var action = actions[i];
+            match (action) {
+                ImportGlobal(id, value) => ins.globals[id].value = value;
+                GlobalGet(id, value) => ins.globals[id].value = value;
+                FuncEntry, FuncEntryTable => {
+                    var id: int, params: Array<Value>;
+                    if (WasmEvent.FuncEntry.?(action)) {
+                        id = WasmEvent.FuncEntry.!(action).idx;
+                        params = WasmEvent.FuncEntry.!(action).params;
+                    } else {
+                        id = WasmEvent.FuncEntryTable.!(action).idx;
+                        params = WasmEvent.FuncEntryTable.!(action).params;
+                    }
+                    Execute.call(ins.functions[id], params);
+                }
+                Load(id, offset, data) => ins.memories[id].copyIn(u32.view(offset), data, 0, u32.view(data.length));
+                _ => ;
+            }
+        }
+    }
+
+    private def validationPrecheck() -> bool {
+        return is_replay_valid;
+    }
+    private def validationFail() {
+        is_replay_valid = false;
     }
 }

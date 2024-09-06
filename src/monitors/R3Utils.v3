@@ -98,7 +98,10 @@ type WasmEvent {
 class ReplayContext(actions: Vector<WasmEvent>, var results: Array<Value>){}
 class ReplayFunction(all_ctx: Vector<ReplayContext>){}
 
-// Parser for the wasm R3 trace string format.
+/// Parser for the wasm R3 trace string format.
+///
+/// Note: since wasm R3 trace doesn't specify int type, all decimal values will be parsed as i64,
+/// and will be converted to the expected type during replay IR validation.
 class R3TraceParser(input: Array<byte>) {
     private var import_call_count: int;
     private var pos: int;
@@ -106,7 +109,7 @@ class R3TraceParser(input: Array<byte>) {
     def var events = Vector<WasmEvent>.new();
 
     // intermediate states for replay IR generation
-    private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), null);
+    private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
     private def entry_func = ReplayFunction.new(Vectors.of1(global_ctx));
     private var last_ctx = global_ctx;
     private def ctx_stack = ListStack<ReplayContext>.new();
@@ -136,7 +139,7 @@ class R3TraceParser(input: Array<byte>) {
     private def processEvent(event: WasmEvent) {
         match (event) {
             ImportCall(idx) => {
-                var new_ctx = ReplayContext.new(Vector<WasmEvent>.new(), null);
+                var new_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
                 if (!replay_map.has(idx)) {
                     replay_map[idx] = ReplayFunction.new(Vector<ReplayContext>.new());
                 }
@@ -458,4 +461,103 @@ class R3TraceParser(input: Array<byte>) {
     private def more(num: int) -> bool {
 		return input.length - pos >= num;
 	}
+}
+
+component R3Utils {
+    // Ensures that all contexts of the function replay are consistent with the function signature,
+    // and updates certain value types in `replay_func` to match the expected signature.
+    def validateReplayFunction(
+        func_id: int,
+        replay_func: ReplayFunction,
+        mod: Module,
+        precheck: () -> bool,
+        fail_callback: () -> ()) {
+        //System.puts("Validating replay function: ");
+        //System.puti(func_id);
+        //System.puts("\n");
+        if (!precheck()) return;
+            //System.puts("Precheck failed\n");
+        if (func_id != -1) {
+            if (mod.functions.length <= func_id || mod.functions[func_id].imp == null) {
+                return fail_callback();
+            }
+            var result_types = mod.functions[func_id].sig.results;
+            for (i < replay_func.all_ctx.length) {
+                var ctx = replay_func.all_ctx[i];
+                if (!validateValues(ctx.results, result_types)) {
+                    return fail_callback();
+                }
+            }
+        } else { // special check for the default entry function
+            if (replay_func.all_ctx.length != 1 || replay_func.all_ctx[0].results.length != 0)
+                return fail_callback();
+        }
+        for (i < replay_func.all_ctx.length) {
+            var ctx = replay_func.all_ctx[i];
+            if (!validateCtxActions(ctx.actions, mod)) return fail_callback();
+        }
+    }
+
+    // Ensures that the sequence of events in the replay context is valid wrt. to the module,
+    // optionally updating the value types in the actions (e.g. params of FuncEntry/FuncTableEntry).
+    def validateCtxActions(actions: Vector<WasmEvent>, mod: Module) -> bool {
+        for (i < actions.length) {
+            var action = actions[i];
+            match (action) {
+                FuncEntry(idx, _, params) => {
+                    if (mod.functions.length <= idx 
+                        || !validateValues(params, mod.functions[idx].sig.params)) return false;
+                }
+                FuncEntryTable(idx, _, _, params) => {
+                    if (mod.functions.length <= idx 
+                        || !validateValues(params, mod.functions[idx].sig.params)) return false;
+                }
+                Load(idx, offset, data) => {
+                    var page = (offset + u64.view(data.length)) / BpConstants.WASM_PAGE_SIZE;
+                    if (!mod.memories[idx].maximum.check(page)) return false;
+                }
+                MemGrow(idx, amount) => {
+                    if (!mod.memories[idx].maximum.check(u64.view(amount))) return false;
+                }
+                TableGet(table_idx, _, entry_idx, _, _) => {
+                    if (!mod.tables[table_idx].maximum.check(u64.view(entry_idx))) return false;
+                }
+                TableGrow(table_idx, _, amount) => {
+                    if (!mod.tables[table_idx].maximum.check(amount)) return false;
+                }
+                GlobalGet(idx, value) => {
+                    if (idx >= mod.globals.length) return false;
+                    var kind = Values.kind(value);
+                    var expected_kind = ValueTypes.kind(mod.globals[idx].valtype);
+                    if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
+                        actions[i] = WasmEvent.GlobalGet(idx, Value.I32(Values.v_w_32(value)));
+                    } else if (kind != expected_kind) {
+                        return false;
+                    }
+                }
+                _ => ;
+            }
+        }
+        return true;
+    }
+
+    // Ensures that the values in `vals` are consistent with the types in `types`, updating
+    // the values in `vals` fro i64 to i32 if necessary.
+    def validateValues(vals: Array<Value>, types: Array<ValueType>) -> bool {
+        if (vals.length != types.length) {
+            return false;
+        }
+        for (i < types.length) {
+            var value = vals[i];
+            var kind = Values.kind(value);
+            var expected_kind = ValueTypes.kind(types[i]);
+            if (kind == expected_kind) continue;
+            if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
+                vals[i] = Value.I32(Values.v_w_32(value));
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
 }
