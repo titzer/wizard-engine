@@ -7,47 +7,17 @@ Use the steps below to build and test the Wizard engine.
 ## Get Virgil
 
 You'll first need to get a copy of the Virgil compiler installed and running on your system.
-Clone the repo and put its `bin` directory in your `$PATH`.
+Clone the repo, put its `bin` directory in your `$PATH`, and build it with `make`.
 
 ```
 % git clone git@github.com:titzer/virgil.git
 % cd virgil
-% make
 % export PATH=$PATH:`pwd`/bin
+% make
 ```
 
 The Virgil repository has compiler binaries directly checked in, as well as scripts that should detect your host platform and link up the right binary.
-It's mostly ready to run right out of the box.
-
-```
-% v3c -version
-Aeneas III-7.1743: no input files
-Build Data: x86-linux 2024-06-28 10:27:26 by titzer@kabal
-```
-
-The Virgil repo has stable binary checked in. If building Wizard fails you might need to bootstrap the latest version of Virgil.
-To do so change to the `virgil` directory and run `make` after adding `bin/dev` to your PATH.
-
-```
-% export PATH=$PATH:`pwd`/bin/dev
-% make
-```
-
-## Stay up-to-date with Virgil
-
-The Wizard engine unabashedly uses all of the most cutting-edge Virgil language features.
-In fact, it's almost a showcase for the language.
-Some new features and optimizations required by Wizard might not be fully supported in the stable compiler in the Virgil repo.
-Make sure to pull to stay up-to-date, and *bootstrap* the Virgil compiler to make sure it's running the latest version.
-If you are having weird build errors or bugs, try this step.
-
-```
-% cd virgil
-% git pull
-Already up to date.
-% bin/dev/aeneas clean
-% bin/dev/aeneas bootstrap
-```
+It's ready to run out-of-the-box, but Wizard often uses cutting-edge features that require the `make` step above.
 
 ## Build Wizard with `make`
 
@@ -196,4 +166,20 @@ Most test scripts respect the `WIZENG_OPTS` environment variable and will pass i
 ```
 % WIZENG_OPTS=-mode=jit test/spec.sh
 Testing spec       x86-64-linux                | 147 of 147 passed                                                                         
+```
+
+## Periodically stay up-to-date with Virgil
+
+The Wizard engine uses all of the most cutting-edge Virgil language features.
+In fact, it's almost a showcase for the language.
+Some new features and optimizations required by Wizard might not be fully supported in the stable compiler in the Virgil repo.
+Make sure to pull periodically to stay up-to-date, and *bootstrap* the Virgil compiler to make sure it's running the latest version.
+If you are having weird build errors or bugs in Wizard, try this step.
+
+```
+% cd virgil
+% git pull
+ ...
+% make clean
+% make
 ```
