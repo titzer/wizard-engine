@@ -295,6 +295,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def r_runtime_arg0	= G(xenv.runtime_arg0);
 	def r_runtime_arg1	= G(xenv.runtime_arg1);
 	def r_runtime_arg2	= G(xenv.runtime_arg2);
+	def r_runtime_ret0	= G(xenv.runtime_ret0);
+	def r_runtime_ret1	= G(xenv.runtime_ret1);
 	def r_dispatch		= G(xenv.dispatch);
 	def r_ret_throw		= G(xenv.ret_throw);
 	def r_scratch		= G(xenv.scratch);
@@ -521,6 +523,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		// mov %stack, [cur_stack]    ; reload stack object from (thread-local) curStack
 		asm.movq_r_m(r_currStack, m_curStack);
+
 		// mov %scratch, [%cont_ref.bottom]
 		asm.movq_r_m(r_scratch, r_cont_ref.plus(offsets.Continuation_bottom));
 		// mov [(%scratch == %cont_ref.bottom).parent], r_currStack
@@ -2008,6 +2011,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.RESUME); {
+			var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
 			var cont_ref = r_tmp0, handler_length = r_tmp1;
 
 			genSkipLeb(); // skip signature index
@@ -2048,18 +2052,19 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var n_args = r_tmp3;
 			asm.movd_r_m(n_args, r_stp.plus(offsets.STP_resume_nargs));
 
+			// set curr_resume_handler
+			var r_currStack = r_tmp4;
+			asm.movq_r_m(r_currStack, m_curStack);
+			asm.q.movq_m_r(r_currStack.plus(offsets.X86_64Stack_curr_resume_handler), r_stp);
+
 			// extract top stack from continuation
 			var stack_ref = r_tmp4;
 			asm.q.movq_r_m(stack_ref, cont_ref.plus(offsets.Continuation_top));
 
-			// set curr_resume_handler
-			asm.q.movq_m_r(stack_ref.plus(offsets.X86_64Stack_parent_resume_handler), r_stp);
-
 			// increment sidetable
 			asm.q.add_r_i(r_stp, Sidetables.resume_entry_size);
 			// calculate length of handler entries in sidetable
-			// TODO[ss]: maybe separate `ex_entry` and `resume_handler_entry`?
-			asm.q.imul_r_i(handler_length, Sidetables.ex_entry_size);
+			asm.q.imul_r_i(handler_length, offsets.STP_entry_size);
 			asm.q.add_r_r(r_stp, handler_length);
 
 			// mov values to new stack
@@ -2085,11 +2090,58 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			endHandler();
 		}
-		// bindHandler(Opcode.SUSPEND); {
-		// 	var cont_ref = r_tmp0, parent = r_tmp1, tag_index = r_tmp3;
+		bindHandler(Opcode.SUSPEND); {
+			var prev = r_tmp0;
+			var parent = r_tmp1;
+			var tag_index = r_tmp2;
+			var handlers = r_tmp3;
+			var hentry = r_tmp4;
 
-		// 	endHandler();
-		// }
+			genReadUleb32(tag_index); // read tag index
+
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+
+			// mov %prev, [m_curStack]
+			asm.movq_r_m(prev, masm.absPointer(offsets.X86_64Runtime_curStack));
+			// mov %parent, [%prev.parent]
+			asm.movq_r_m(parent, prev.plus(offsets.X86_64Stack_parent));
+			// null check
+			asm.q.cmp_r_i(parent, 0);
+			asm.jc_rel_far(X86_64Conds.Z, newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+			var lookup_start = X86_64Label.new(), lookup_end = X86_64Label.new();
+			// label: start
+			asm.bind(lookup_start);
+			// mov %handlers, [%parent.curr_resume_handler]
+			asm.movq_r_m(handlers, parent.plus(offsets.X86_64Stack_curr_resume_handler));
+
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_find_suspend_handler), [r_instance, tag_index, handlers], false);
+			restoreCallerIVars();
+
+			// mov %hentry, %runtime_ret0
+			asm.movq_r_r(hentry, r_runtime_ret0);
+
+			// null check
+			asm.q.cmp_r_i(hentry, 0);
+			asm.jc_rel_near(X86_64Conds.NZ, lookup_end);
+
+			// mov %prev, %parent
+			asm.movq_r_r(prev, parent);
+			asm.movq_r_m(parent, parent.plus(offsets.X86_64Stack_parent));
+
+			asm.q.cmp_r_i(parent, 0);
+			asm.jc_rel_far(X86_64Conds.Z, newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+			asm.jmp_rel_near(lookup_start);
+
+			asm.bind(lookup_end);
+
+			// TODO[ss]: redo ctrl flow transfer (no stack variant)
+
+			endHandler();
+		}
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			computeCurIpFromIp(-1);
 			computePcFromCurIp();
