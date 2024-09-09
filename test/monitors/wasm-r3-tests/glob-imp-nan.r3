@@ -1,3 +1,3 @@
-IG;0;NaN
+IG;0;0x7FF8000000000000
 EC;0;entry;
 ER

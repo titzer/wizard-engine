@@ -6,6 +6,7 @@ def E_ = MonitorRegistry.add(
 	R3BackEndMonitor.new());
 
 class R3BackEndMonitor extends Monitor {
+    private var parser: R3TraceParser;
     private var replay: HashMap<int, ReplayFunction>;
     private var is_replay_valid = true;
     private var mod: Module;
@@ -20,7 +21,7 @@ class R3BackEndMonitor extends Monitor {
             if (input == null) {
 		        return "Trace file not found";
             }
-            var parser = R3TraceParser.new(input);
+            parser = R3TraceParser.new(input);
             if (!parser.parse()) {
                 return "Trace file cannot be parsed";
             }
@@ -35,28 +36,40 @@ class R3BackEndMonitor extends Monitor {
         mod = module;
         // validate and update replay IR with correct values before instantiation
         replay.apply(R3Utils.validateReplayFunction(_, _, mod, validationPrecheck, validationFail));
-        if (is_replay_valid) {
+        if (is_replay_valid && parser.updateImportedGlobals(mod)) {
             mod.start_function = -1;
             var imported_module_builders = Strings.newMap<HostModuleBuilder>();
             var func_import_count: int;
 		    for (j < mod.imports.length) {
-                if (FuncDecl.?(mod.imports[j])) {
-                    // create custom host modules for all imported functions, overwriting 
-                    // existing host modules if possible.
-                    var decl = FuncDecl.!(mod.imports[j]);
-	        	    var module_name = decl.imp.module_name;
-                    var field_name = decl.imp.field_name;
-                    var sig = decl.sig;
-                    if (!imported_module_builders.has(module_name)) {
-                        imported_module_builders[module_name] = HostModuleBuilder.new(module_name);
-                    }
-                    var module_builder = imported_module_builders[module_name];
-                    var hostFuncImpl = if (replay[decl.func_index] == null,
-                                           noOpHostFunc(_, sig.results),
-                                           emulatedHostFunc(_, sig.results, decl.func_index));
-                    module_builder.func(field_name, sig, hostFuncImpl).getMain(newMainFunc);
-                    func_import_count++;
+                var module_name = mod.imports[j].imp.module_name;
+                var field_name = mod.imports[j].imp.field_name;
+                if (!imported_module_builders.has(module_name)) {
+                    imported_module_builders[module_name] = HostModuleBuilder.new(module_name);
                 }
+                var module_builder = imported_module_builders[module_name];
+                match (mod.imports[j]) {
+                    func_decl: FuncDecl => {
+                        // create custom host modules for all imported functions, overwriting 
+                        // existing host modules if possible.
+                        var sig = func_decl.sig;
+                        var hostFuncImpl = if (replay[func_decl.func_index] == null,
+                                               defaultHostFunc(_, sig.results),
+                                               emulatedHostFunc(_, sig.results, func_decl.func_index));
+                        module_builder.func(field_name, sig, hostFuncImpl);
+                        func_import_count++;
+                    }
+                    global_decl: GlobalDecl => {
+                        var global = Global.new(global_decl.valtype, global_decl);
+                        global.value = parser.imported_global_vals[j];
+                        module_builder.global(field_name, global);
+                    }
+                    memory_decl: MemoryDecl => {
+                        var memory = Target.newMemory(memory_decl);
+                        module_builder.memory(field_name, memory);
+                    }
+                    _ => ;
+                }
+                module_builder.getMain(newMainFunc);
 	        }
             for (l = Maps.keyList(imported_module_builders); l != null; l = l.tail) {
                 imported_module_builders[l.head].register(true);
@@ -83,7 +96,8 @@ class R3BackEndMonitor extends Monitor {
     private def emulatedHostFunc(params: Range<Value>, result_types: Array<ValueType>, func_index: int) -> HostResult {
         var replay_context_id: int;
         if (func_index != -1) {
-            replay_context_id = next_replay_context[func_index]++;
+            replay_context_id = next_replay_context[func_index];
+            next_replay_context[func_index] = replay_context_id + 1;
         }
         var replay_context = replay[func_index].all_ctx[replay_context_id];
         applyActions(replay_context.actions);
@@ -96,7 +110,7 @@ class R3BackEndMonitor extends Monitor {
     }
 
     // Placeholder host function for imported, but not used functions in the reocrded trace.
-    private def noOpHostFunc(params: Range<Value>, result_types: Array<ValueType>) -> HostResult {
+    private def defaultHostFunc(params: Range<Value>, result_types: Array<ValueType>) -> HostResult {
         var result_values = Array<Value>.new(result_types.length);
         for (i < result_types.length) {
             var t = result_types[i];
@@ -116,11 +130,11 @@ class R3BackEndMonitor extends Monitor {
         }
     }
 
+    // replay the actions in a single context, called by the emulated host function.
     private def applyActions(actions: Vector<WasmEvent>) {
         for (i < actions.length) {
             var action = actions[i];
             match (action) {
-                ImportGlobal(id, value) => ins.globals[id].value = value;
                 GlobalGet(id, value) => ins.globals[id].value = value;
                 FuncEntry, FuncEntryTable => {
                     var id: int, params: Array<Value>;
@@ -134,6 +148,9 @@ class R3BackEndMonitor extends Monitor {
                     Execute.call(ins.functions[id], params);
                 }
                 Load(id, offset, data) => ins.memories[id].copyIn(u32.view(offset), data, 0, u32.view(data.length));
+                MemGrow(id, amt_pages) => ins.memories[id].grow(u32.view(amt_pages));
+                TableGet(table_id, _, entry_id, func_id, _) => ins.tables[table_id][entry_id] = Value.Ref(ins.functions[func_id]);
+                TableGrow(table_id, _, amt) => ins.tables[table_id].grow(u32.view(amt), Values.FUNCREF_NULL);
                 _ => ;
             }
         }

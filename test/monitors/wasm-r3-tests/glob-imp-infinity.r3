@@ -1,3 +1,3 @@
-IG;0;Infinity
+IG;0;0x43DFFC0000000000
 EC;0;entry;
 ER
