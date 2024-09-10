@@ -20,7 +20,7 @@ type WasmEvent {
 
 	// imported function call/returns made by the module
 	case ImportCall(idx: int);
-	case ImportReturn(results: Array<Value>);
+	case ImportReturn(idx: int, results: Array<Value>);
 
 	// initial value of imported globals
 	case ImportGlobal(idx: int, initial: Value);
@@ -56,8 +56,8 @@ type WasmEvent {
 			ImportCall(idx) => {
 				sb.put1("IC;%d", idx);
 			}
-			ImportReturn(results) => {
-				sb.puts("IR;0;");
+			ImportReturn(idx, results) => {
+				sb.put1("IR;%d;", idx);
 				renderParams(sb, results);
 			}
 			ImportGlobal(idx, initial) => {
@@ -104,9 +104,10 @@ class ReplayFunction(all_ctx: Vector<ReplayContext>){}
 /// and will be converted to the expected type during replay IR validation.
 class R3TraceParser(input: Array<byte>) {
     private var import_call_count: int;
+    private def reader: TextReader = TextReader.new("trace", input);
     private var pos: int;
     private def default_event = WasmEvent.ImportCall(0);
-    def var events = Vector<WasmEvent>.new();
+    private def events = Vector<WasmEvent>.new();
 
     // intermediate states for replay IR generation
     private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
@@ -119,16 +120,18 @@ class R3TraceParser(input: Array<byte>) {
 
     // Parse the input file and populate the complete replay IR.
     def parse() -> bool {
+        reader.skipWs = noSkipWs;
         replay_map[-1] = entry_func; // entry function always has index -1
         ctx_stack.push(global_ctx);
-        while (pos < input.length) {
-            if (matchStr("ER\n") || matchStr("ER")) {
+        while (reader.pos < reader.limit) {
+            if (reader.optN("ER\n") > -1 || reader.optN("ER") > -1) {
                 continue;
             }
             var event = parseLine();
-            if (!event.1 || (pos < input.length && next() != '\n')) {
+            if (!event.1 || reader.char != '\n') {
                 return false;
             }
+            reader.advance1();
             events.put(event.0);
             processEvent(event.0);
         }
@@ -172,14 +175,15 @@ class R3TraceParser(input: Array<byte>) {
                 ctx_stack.push(new_ctx);
                 last_ctx = new_ctx;
             }
-            ImportReturn(results) => {
+            ImportReturn(_, results) => {
                 last_ctx = ctx_stack.pop();
                 last_ctx.results = results;
             }
             FuncEntry, FuncEntryTable => ctx_stack.peek().actions.put(event);
             ImportGlobal(idx, initial) => imported_global_vals[idx] = initial;
             _ => {
-                if (last_ctx.actions.length == 0) {
+                var import_call_returned = last_ctx != ctx_stack.peek();
+                if (import_call_returned || last_ctx.actions.length == 0) {
                     last_ctx.actions.put(event);
                     return;
                 }
@@ -197,26 +201,25 @@ class R3TraceParser(input: Array<byte>) {
 
     // Parse a single line of the input string into a WasmEvent.
     private def parseLine() -> (WasmEvent, bool) {
-        if (matchStr("EC;")) {
+        if (reader.optN("EC;") > 0) {
             return parseEC();
-        } else if (matchStr("TC;")) {
+        } else if (reader.optN("TC;") > 0) {
             return parseTC();
-        } else if (matchStr("L;")) {
+        } else if (reader.optN("L;") > 0) {
             return parseL();
-        } else if (matchStr("MG;")) {
+        } else if (reader.optN("MG;") > 0) {
             return parseMG();
-        } else if (matchStr("T;")) {
+        } else if (reader.optN("T;") > 0) {
             return parseT();
-        } else if (matchStr("TG;")) {
+        } else if (reader.optN("TG;") > 0) {
             return parseTG();
-        } else if (matchStr("G;")) {
+        } else if (reader.optN("G;") > 0) {
             return parseG();
-        } else if (matchStr("IC;")) {
-            import_call_count++;
+        } else if (reader.optN("IC;") > 0) {
             return parseIC();
-        } else if (matchStr("IR;")) {
+        } else if (reader.optN("IR;") > 0) {
             return parseIR();
-        } else if (matchStr("IG;")) {
+        } else if (reader.optN("IG;") > 0) {
             return parseIG();
         }
         return (default_event, false);
@@ -224,7 +227,7 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseEC() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var name = parseStr(';', true);
@@ -239,12 +242,12 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseTC() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var name = parseStr(';', true);
         var table_idx = parseIntDec();
-        if (!table_idx.1 || !matchStr(";")) {
+        if (!table_idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var params = parseParams();
@@ -259,11 +262,11 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseL() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var offset = parseIntDec();
-        if (!offset.1 || !matchStr(";")) {
+        if (!offset.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var data = parseBytes();
@@ -278,7 +281,7 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseMG() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var amount = parseIntDec();
@@ -293,16 +296,16 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseT() -> (WasmEvent, bool) {
         var table_idx = parseIntDec();
-        if (!table_idx.1 || !matchStr(";")) {
+        if (!table_idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var table_name = parseStr(';', true);
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var fuc_idx = parseIntDec();
-        if (!fuc_idx.1 || !matchStr(";")) {
+        if (!fuc_idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var func_name = parseStr('\n', false);
@@ -316,7 +319,7 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseTG() -> (WasmEvent, bool) {
         var table_idx = parseIntDec();
-        if (!table_idx.1 || !matchStr(";")) {
+        if (!table_idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var table_name = parseStr(';', true);
@@ -332,6 +335,7 @@ class R3TraceParser(input: Array<byte>) {
     }
 
     private def parseIC() -> (WasmEvent, bool) {
+        import_call_count++;
         var idx = parseIntDec();
         if (!idx.1) {
             return (default_event, false);
@@ -342,19 +346,20 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseIR() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var results = parseParams();
         if (!results.1) {
             return (default_event, false);
         }
-        return (WasmEvent.ImportReturn(results.0), true);
+        return (WasmEvent.ImportReturn(
+            int.view(Values.v_w_32(idx.0)), results.0), true);
     }
 
     private def parseG() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var val = parseValue();
@@ -367,7 +372,7 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseIG() -> (WasmEvent, bool) {
         var idx = parseIntDec();
-        if (!idx.1 || !matchStr(";")) {
+        if (!idx.1 || reader.req1(';') == -1) {
             return (default_event, false);
         }
         var val = parseValue();
@@ -378,14 +383,14 @@ class R3TraceParser(input: Array<byte>) {
             int.view(Values.v_w_32(idx.0)), val.0), true);
     }
 
-    private def parseStr(until: byte, consume_until: bool) -> string {
-        var start = pos;
+    private def parseStr(term: byte, consume_term: bool) -> string {
         var sb = StringBuilder.new();
-        while (pos < input.length && input[pos] != until) {
-            sb.putc(input[pos++]);
+        while (reader.pos < reader.limit && reader.char != term) {
+            sb.putc(reader.char);
+            reader.advance1();
         }
-        if (consume_until && input[pos] == until) {
-            pos++;
+        if (consume_term && reader.char == term) {
+            reader.advance1();
         }
         return sb.toString();
     }
@@ -404,7 +409,7 @@ class R3TraceParser(input: Array<byte>) {
 
     private def parseParams() -> (Array<Value>, bool) {
         var vec = Vector<Value>.new();
-        if (peekNext() == '\n') { // empty params list
+        if (reader.char == '\n') { // empty params list
             return (vec.extract(), true);
         }
         var more_params = true;
@@ -414,16 +419,16 @@ class R3TraceParser(input: Array<byte>) {
                 return (null, false);
             }
             vec.put(value.0);
-            more_params = peekNext() == ','; // params are comma-separated
+            more_params = reader.char == ','; // params are comma-separated
             if (more_params) {
-                pos++;
+                reader.advance1();
             }
         }
         return (vec.extract(), true);
     }
 
     private def parseValue() -> (Value, bool) {
-        if (matchStr("0x")) {
+        if (reader.optN("0x") > -1) {
             return parseFloatHex();
         }
         return parseIntDec();
@@ -432,64 +437,42 @@ class R3TraceParser(input: Array<byte>) {
     // Parse a decimal integer, possibly negative.
     private def parseIntDec() -> (Value, bool) {
         var sign = 1ul;
-        if (input[pos] == '-' || input[pos] == '+') {
-            sign = if (input[pos] == '-', u64.max, sign);
-            pos++;
+        if (reader.char == '-' || reader.char == '+') {
+            sign = if (reader.char == '-', u64.max, sign);
+            reader.advance1();
         }
-		var a = input, i = pos, v1 = a[i++];
-		if (v1 < '0' || v1 > '9') { // not decimal digit
-			return (Values.I64_0, false);
-		}
-		var max = a.length, accum = v1 - u64.!('0');
-		while (i < max) {
-			var c = a[i];
-			var d = c - '0';
-			if (d < 0 || d > 9) break;
-			accum = accum * 10 + d;
-			i++;
-		}
-		pos = i;
-		return (Value.I64(accum * sign), true);
+	    var v1 = reader.char;
+        reader.advance1();
+	    if (v1 < '0' || v1 > '9') { // not decimal digit
+	    	return (Values.I64_0, false);
+	    }
+	    var accum = v1 - u64.!('0');
+	    while (reader.pos < reader.limit) {
+	    	var c = reader.char;
+	    	var d = c - '0';
+	    	if (d < 0 || d > 9) break;
+	    	accum = accum * 10 + d;
+	    	reader.advance1();
+	    }
+	    return (Value.I64(accum * sign), true);
 	}
     // Parses a hex number starting with 0x, returns the parsed value
     // and whether the parse was successful.
     private def parseFloatHex() -> (Value, bool) {
-		var a = input, i = pos, max = a.length;
 		var accum = 0ul;;
         var count = 0;
-		while (i < max) {
-			var c = a[i];
+		while (reader.pos < reader.limit) {
+			var c = reader.char;
 			var v = Chars.hexValue(c);
 			if (v < 0 || v > 15) break;
 			accum = (accum << 4) + u64.!(v);
-			i++;
+			reader.advance1();
             count++;
 		}
-		pos = i;
-        var output = if (count <= 4, Value.F32(u32.view(accum)), Value.F64(accum));
+        var output = if (count <= 8, Value.F32(u32.view(accum)), Value.F64(accum));
 		return (output, true);
 	}
-    // Eat the string {s} if it is next in the input, returning {true} if so.
-	private def matchStr(s: string) -> bool {
-		if (!more(s.length)) return false;
-        var num = pos;
-		for (c in s) {
-            if (input[num++] != c) return false;
-        }
-        pos = num;
-		return true;
-	}
-    private def peekNext() -> byte {
-        if (pos >= input.length) return 0;
-        return input[pos];
-    }
-    private def next() -> byte {
-        if (pos >= input.length) return 0;
-        return input[pos++];
-    }
-    private def more(num: int) -> bool {
-		return input.length - pos >= num;
-	}
+    private def noSkipWs(text_reader: TextReader) { }
 }
 
 component R3Utils {
@@ -513,13 +496,15 @@ component R3Utils {
                     return fail_callback();
                 }
             }
-        } else { // special check for the default entry function
-            if (replay_func.all_ctx.length != 1 || replay_func.all_ctx[0].results.length != 0)
-                return fail_callback();
+        } else if (replay_func.all_ctx.length != 1 || replay_func.all_ctx[0].results.length != 0) {
+            // special check for the default entry function
+            return fail_callback();
         }
         for (i < replay_func.all_ctx.length) {
             var ctx = replay_func.all_ctx[i];
-            if (!validateCtxActions(ctx.actions, mod)) return fail_callback();
+            if (!validateCtxActions(ctx.actions, mod)) {
+                return fail_callback();
+            }
         }
     }
 

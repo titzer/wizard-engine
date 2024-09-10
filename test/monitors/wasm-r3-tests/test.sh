@@ -22,16 +22,16 @@ V3C_LOC=$(dirname $(which v3c))
 VIRGIL_LOC=$(cd $V3C_LOC/../ && pwd)
 VIRGIL_LIB=${VIRGIL_LOC}/lib/
 
-TESTS=$(ls *.wasm)
-TESTS_COUNT=$(ls *.wasm | wc -l)
+R3_FE_TESTS=$(ls *.wasm | grep -v index)
+R3_BE_TESTS=$(ls *.index.wasm)
+R3_ALL_TESTS_COUNT=$(ls *.wasm | wc -l)
 
 RAW=${RAW:=0}
 
-function run_tests {
-    echo "##>$TESTS_COUNT"
-    for file in $TESTS; do
-        testcase=$(basename "${file%.*}")
-        echo "##+$testcase"
+function run_fe_tests {
+    for file in $R3_FE_TESTS; do
+        testcase=$(basename "${file%.wasm}")
+        echo "##+$testcase (frontend)"
         trace_file="${file%.*}.r3"
         $WIZENG '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
         if [ $? -ne 0 ]; then
@@ -40,6 +40,28 @@ function run_tests {
             echo "##-ok"
         fi
     done
+}
+
+function run_be_tests {
+    for file in $R3_BE_TESTS; do
+        testcase=$(basename "${file%.index.wasm}")
+        echo "##+$testcase (backend)"
+        options="--monitors=r3-replay{trace_file=${testcase}.r3},r3"
+        $WIZENG $options $file > $P.out #| v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
+        diff $P.out $testcase.r3 | tee $P.out.diff
+        DIFF=${PIPESTATUS[0]}
+        if [ "$DIFF" != 0  ]; then
+            echo "##-fail"
+        else
+            echo "##-ok"
+        fi
+    done
+}
+
+function run_tests {
+    echo "##>$R3_ALL_TESTS_COUNT"
+    run_fe_tests
+    run_be_tests
 }
 
 if [ "$RAW" = 0 ]; then
