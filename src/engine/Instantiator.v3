@@ -23,22 +23,25 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 	var trap_reason: TrapReason;
 	var import_pos: u31;
 	var import_info: ImportInfo;
+	var instantiation_started = false;
 
-	def run() -> Instance {
+	def partialRun(deferred_imports: Array<int>) {
+		instantiation_started = true;
 		if (tiering != null) tiering.onInstantiateStart(this);
 		if (module.imports.length > 0) {
 			if (imports == null) imports = Array.new(module.imports.length);
 			else if (imports.length < module.imports.length) {
-				return fail(Strings.format2("expected %d imports, got %d", module.imports.length, imports.length));
+				fail(Strings.format2("expected %d imports, got %d", module.imports.length, imports.length));
+				return;
 			}
-		}
-		for (i < processors.length) {
-			processors[i].preprocess(error, module, imports);
+			for (i < processors.length) {
+				processors[i].preprocess(error, module, imports);
+			}
 		}
 
 		var needSigIds = false;
 		for (j < module.decls.length) {
-			if (error.error()) return null;
+			if (error.error()) return;
 			match (module.decls[j]) {
 				Sig(index) => {
 					var decl = SigDecl.!(module.heaptypes[index]);
@@ -54,6 +57,7 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 				Func(index, sig_index) => {
 					var decl = module.functions[index];
 					if ((import_info = decl.imp) != null) {
+						if (Arrays.contains(deferred_imports, decl.imp.import_index)) continue;
 						var r = imports[decl.imp.import_index];
 						instance.functions[index] = importFunction(decl, r);
 					} else {
@@ -64,13 +68,14 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 				Table(index) => {
 					var decl = module.tables[index];
 					if ((import_info = decl.imp) != null) {
+						if (Arrays.contains(deferred_imports, decl.imp.import_index)) continue;
 						var r = imports[decl.imp.import_index];
 						var t =  importTable(decl, r);
 						instance.tables[index] = t;
 						if (t != null && t.funcs != null) needSigIds = true;
 					} else {
 						var t = Table.new(mapType(decl.elemtype), decl);
-						if (t.oom) return fail("out of memory allocating table");
+						if (t.oom) { fail("out of memory allocating table"); return; }
 						instance.tables[index] = t;
 						if (t.funcs != null) needSigIds = true;
 					}
@@ -78,17 +83,19 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 				Memory(index) => {
 					var decl = module.memories[index];
 					if ((import_info = decl.imp) != null) {
+						if (Arrays.contains(deferred_imports, decl.imp.import_index)) continue;
 						var r = imports[decl.imp.import_index];
 						instance.memories[index] = importMemory(decl, r);
 					} else {
 						var m = Target.newMemory(decl);
-						if (m.oom) return fail("out of memory allocating memory");
+						if (m.oom) { fail("out of memory allocating memory"); return; }
 						instance.memories[index] = m;
 					}
 				}
 				Global(index) => {
 					var decl = module.globals[index];
 					if ((import_info = decl.imp) != null) {
+						if (Arrays.contains(deferred_imports, decl.imp.import_index)) continue;
 						var r = imports[decl.imp.import_index];
 						instance.globals[index] = importGlobal(decl, r);
 					} else {
@@ -100,6 +107,7 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 				Tag(index) => {
 					var decl = module.tags[index];
 					if ((import_info = decl.imp) != null) {
+						if (Arrays.contains(deferred_imports, decl.imp.import_index)) continue;
 						var r = imports[decl.imp.import_index];
 						instance.tags[index] = importTag(decl, r);
 					} else {
@@ -111,7 +119,7 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 				}
 			}
 		}
-		if (error.error()) return null;
+		if (error.error()) return;
 		import_info = null;
 		if (needSigIds) {
 			for (i < instance.heaptypes.length) {
@@ -124,6 +132,7 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 
 		// Initialize tables that have default element values.
 		for (t in instance.tables) {
+			if (t == null) continue; // deferred import
 			if (!t.decl.has_default_elem) continue;
 			var val = instance.evalInitExpr(t.decl.default_elem);
 			t.fill(0, val, u32.view(t.elems.length));
@@ -134,9 +143,10 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 			match (e.mode) {
 				Passive => ;
 				Active(index, offset) => {
+					if (instance.tables[index] == null) continue; // deferred import
 					loadElems(index, offset, e);
 					instance.dropped_elems[i] = true;
-					if (error.error()) return null;
+					if (error.error()) return;
 				}
 				Declarative => {
 					instance.dropped_elems[i] = true;
@@ -149,9 +159,10 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 			match (d.mode) {
 				Passive => ;
 				Active(index, offset) => {
+					if (instance.memories[index] == null) continue; // deferred import
 					loadData(index, offset, d);
 					instance.dropped_data[i] = true;
-					if (error.error()) return null;
+					if (error.error()) return;
 				}
 				Declarative => {
 					instance.dropped_data[i] = true;
@@ -168,7 +179,112 @@ class Instantiator(extensions: Extension.set, module: Module, var imports: Array
 		for (i < processors.length) {
 			processors[i].postprocess(error, instance);
 		}
+	}
 
+	def completeRun() {
+		var needSigIds = false;
+		var new_table_ids = Vector<int>.new();
+		var new_memory_ids = Vector<int>.new();
+		for (j < module.imports.length) {
+			if (error.error()) return;
+			import_info = module.imports[j].imp;
+			match (module.imports[j]) {
+				decl: FuncDecl => {
+					if (instance.functions[decl.func_index] != null) continue;
+					var r = imports[decl.imp.import_index];
+					instance.functions[decl.func_index] = importFunction(decl, r);
+				}
+				decl: TableDecl => {
+					if (instance.tables[decl.table_index] != null) continue;
+					var r = imports[decl.imp.import_index];
+					var t =  importTable(decl, r);
+					instance.tables[decl.table_index] = t;
+					new_table_ids.put(decl.table_index);
+					if (t != null && t.funcs != null) needSigIds = true;
+				}
+				decl: MemoryDecl => {
+					if (instance.memories[decl.memory_index] != null) continue;
+					var r = imports[decl.imp.import_index];
+					instance.memories[decl.memory_index] = importMemory(decl, r);
+					new_memory_ids.put(decl.memory_index);
+				}
+				decl: GlobalDecl => {
+					if (instance.globals[decl.global_index] != null) continue;
+					var r = imports[decl.imp.import_index];
+					instance.globals[decl.global_index] = importGlobal(decl, r);
+				}
+				decl: TagDecl => {
+					if (instance.tags[decl.tag_index] != null) continue;
+					var r = imports[decl.imp.import_index];
+					instance.tags[decl.tag_index] = importTag(decl, r);
+				}
+			}
+		}
+		if (error.error()) return;
+		import_info = null;
+		if (needSigIds) {
+			for (i < instance.heaptypes.length) {
+				match (instance.heaptypes[i]) {
+					x: SigDecl => instance.sig_ids[i] = Canon.sigId(x);
+					_ => instance.sig_ids[i] = -1;
+				}
+			}
+		}
+		var new_table_ids_arr = new_table_ids.extract();
+		var new_memory_ids_arr = new_memory_ids.extract();
+		// Initialize newly imported tables that have default element values.
+		for (id in new_table_ids_arr) {
+			var t = instance.tables[id];
+			var val = instance.evalInitExpr(t.decl.default_elem);
+			t.fill(0, val, u32.view(t.elems.length));
+		}
+		// Load element segments to newly imported tables.
+		for (i < module.elems.length) {
+			var e = module.elems[i];
+			match (e.mode) {
+				Active(index, offset) => {
+					if (Arrays.contains(new_table_ids_arr, index)) {
+						loadElems(index, offset, e);
+						instance.dropped_elems[i] = true;
+						if (error.error()) return;
+					}
+				}
+				_ => ;
+			}
+		}
+		// Load data segments to newly imported memories.
+		for (i < module.data.length) {
+			var d = module.data[i];
+			match (d.mode) {
+				Active(index, offset) => {
+					if (Arrays.contains(new_memory_ids_arr, index)) {
+						loadData(index, offset, d);
+						instance.dropped_data[i] = true;
+						if (error.error()) return;
+					}
+				}
+				_ => ;
+			}
+		}
+
+		// Organize exports
+		var exports = instance.exports;
+		for (i < module.exports.length) {
+			if (exports[i] == null) {
+				exports[i] = getDecl(module.exports[i].1);
+			}
+		}
+
+		for (i < processors.length) {
+			processors[i].postprocess(error, instance);
+		}
+	}
+
+	def run() -> Instance {
+		if (!instantiation_started) {
+			partialRun(Array.new(0));
+		}
+		if (error.error()) return null;
 		if (tiering != null) tiering.onInstantiateFinish(this, error);
 		return instance;
 	}
