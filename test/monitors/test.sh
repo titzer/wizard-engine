@@ -23,7 +23,7 @@ if [ $# -gt 0  ]; then
     MONITORS=($@)
 else
     MONITORS=("loops" "loops{c}" 
-        "coverage" "coverage{c}" "coverage{c=i}" 
+        "coverage" "coverage{c}" "coverage{i}" 
         "calls" 
         "branches" "branches{c}" 
         "hotness" "hotness{c}"
