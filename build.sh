@@ -102,16 +102,18 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
-	if [ "$PREGEN" != 0 ]; then
+	HOSTS=$(bin/sense_host.sh)
+	if [[ "$PREGEN" != 0 && "$HOSTS" =~ "x86-64-linux" ]]; then
+	    # try running pregen if the host platform can run the pregen binary
             cp $E $E.pregen
             $E.pregen -pregen=$E > /tmp/wizeng.pregen.out 2>&1
-	    if [ $? != 0 ]; then
-		echo "warning: could not pregen code into $E, may be slower (see $E.pregen)"
+	    STATUS=$?
+	    if [ $STATUS != 0 ]; then
+		echo "error: running $E.pregen failed"
+		exit $STATUS
 	    else
 		rm $E.pregen
 	    fi
-	else
-	    echo "warning: skipped pregen of stubs in $E, may be slower"
 	fi
     fi
 elif [ "$TARGET" = "jvm" ]; then
