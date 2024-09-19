@@ -102,11 +102,11 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
-	HOSTS=$(bin/sense_host.sh)
+	HOSTS=$(scripts/sense_host.sh)
 	if [[ "$PREGEN" != 0 && "$HOSTS" =~ "x86-64-linux" ]]; then
 	    # try running pregen if the host platform can run the pregen binary
             cp $E $E.pregen
-            $E.pregen -pregen=$E > /tmp/wizeng.pregen.out 2>&1
+            $E.pregen -pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
 	    STATUS=$?
 	    if [ $STATUS != 0 ]; then
 		echo "error: running $E.pregen failed"
