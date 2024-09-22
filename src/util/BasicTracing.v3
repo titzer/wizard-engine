@@ -1,0 +1,202 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def OUT = Trace.OUT;
+// Implements basic tracing functionality such as --trace-interpreter, --trace-calls, --trace-memory.
+component BasicTracing {
+	var moduleFilter: DeclFilter;
+	var callsFilter: DeclFilter;
+	var memoryFilter: DeclFilter;
+
+	def reset() {
+		if (Trace.interpreter) Instrumentation.probes.add(TRACE_INTERP_PROBE);
+	}
+	// Special mode to enable interpreter tracing.
+	def enableTraceInt() {
+		Instrumentation.probes.add(TRACE_INTERP_PROBE);
+	}
+	def instrumentFunc(module: Module, func: FuncDecl) {
+		// Add a call and memory tracing if the global options are turned on.
+		if (callsFilter != null && callsFilter.matches(module, func)) addTraceCallsProbes(module, func);
+		if (memoryFilter != null && memoryFilter.matches(module, func)) addTraceMemoryProbes(module, func);
+	}
+	def instrumentModule(module: Module) {
+		if (callsFilter == null && memoryFilter == null) return;
+		for (i < module.functions.length) instrumentFunc(module, module.functions[i]);
+	}
+	def addTraceCallsProbes(module: Module, func: FuncDecl) {
+		Instrumentation.insertFuncEntryProbe(module, func.func_index, CALL_TRACE_PROBE);
+	}
+	def addTraceMemoryProbes(module: Module, func: FuncDecl) {
+		TraceMemoryInstrumenter.new(module).runOne(func);
+	}
+}
+
+// Basic tracing support for the interpreter.
+def TRACE_INTERP_PROBE = TraceInstrProbe.new();
+class TraceInstrProbe extends Probe {
+	def tracer = InstrTracer.new();
+	def codeptr = DataReader.new([]);
+
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var func = dynamicLoc.func;
+		var offset = dynamicLoc.pc;
+		codeptr.reset(func.decl.cur_bytecode, offset, func.decl.cur_bytecode.length);
+		var module = if(func.instance != null, func.instance.module);
+		var len = OUT.length;
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		OUT.pad(' ', len + 2 * accessor.depth());
+		OUT.mark();
+		OUT.putc('+').putd(offset).puts(": ");
+		OUT.ljustify_mark(6);
+
+		var opcode = codeptr.data[codeptr.pos];
+		OUT.mark();
+		if (opcode == InternalOpcode.PROBE.code) {
+			OUT.puts("<probe> ");
+			var prev = (codeptr.data, codeptr.pos, codeptr.limit);
+			codeptr.reset(func.decl.orig_bytecode, prev.1, prev.2);
+			tracer.putInstr(OUT, module, codeptr);
+			codeptr.reset(prev.0, prev.1, prev.2);
+		} else {
+			tracer.putInstr(OUT, module, codeptr);
+		}
+		if (Trace.operands) {
+			OUT.sp();
+			OUT.ljustify_mark(24);
+			OUT.puts("|");
+			for (i < accessor.numLocals()) {
+				OUT.sp().putv(accessor.getLocal(i));
+			}
+			var count = accessor.numOperands();
+			OUT.puts(" |");
+			for (j = 1 - count; j <= 0; j++) {
+				OUT.sp().putv(accessor.getOperand(j));
+			}
+		}
+		OUT.ln();
+		return Resumption.Continue;
+	}
+}
+
+// Basic tracing support for calls.
+def CALL_TRACE_PROBE = CallTraceProbe.new();
+class CallTraceProbe extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var func = dynamicLoc.func;
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		OUT.indent(accessor.depth());
+		func.render(OUT);
+		OUT.puts("(");
+		for (i < func.sig.params.length) {
+			var val = accessor.getLocal(i);
+			if (i > 0) OUT.csp();
+			Values.render(val, OUT);
+		}
+		OUT.puts(")").ln();
+		return Resumption.Continue;
+	}
+}
+
+// Basic tracing support for memory loads.
+class TraceMemoryInstrumenter extends BytecodeInstrumenter {
+	new(module: Module) super(module) { }
+
+	def visitLoad(op: Opcode, imm: MemArg, size: u8) {
+		insertProbeHere(MemoryTraceLoadProbe.new(op, imm, size));
+	}
+	def visitStore(op: Opcode, imm: MemArg, size: u8) {
+		insertProbeHere(MemoryTraceStoreProbe.new(op, imm, size));
+	}
+	def visit_MEMORY_SIZE(memory_index: u31) { // TODO
+	}
+	def visit_MEMORY_GROW(memory_index: u31) { // TODO
+	}
+	def visit_MEMORY_INIT(data_index: u31, memory_index: u31) { // TODO
+	}
+	def visit_MEMORY_COPY(dst_memory_index: u31, src_memory_index: u31) { // TODO
+	}
+	def visit_MEMORY_FILL(memory_index: u31) { // TODO
+	}
+	def visit_MEMORY_ATOMIC_NOTIFY(imm: MemArg) { // TODO
+	}
+	def visit_MEMORY_ATOMIC_WAIT32(imm: MemArg) { // TODO
+	}
+	def visit_MEMORY_ATOMIC_WAIT64(imm: MemArg) { // TODO
+	}
+	def visit_ATOMIC_FENCE(flags: u8) { // TODO
+	}
+}
+
+class MemoryTraceLoadProbe(op: Opcode, imm: MemArg, size: u8) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var func = dynamicLoc.func;
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		OUT.indent(accessor.depth());
+		var index = outputOpAndAddr(op, imm.memory_index, imm.offset, accessor.getOperand(0));
+		OUT.puts(" -> ");
+		var mem = func.instance.memories[imm.memory_index];
+		var t = mem.range_oil_64(imm.offset, index, size);
+		if (t.ok()) {
+			for (i < t.result.length) OUT.putx_8(t.result[i]);
+		} else {
+			OUT.puts("!out-of-bounds");
+		}
+		OUT.ln();
+		return Resumption.Continue;
+	}
+}
+
+class MemoryTraceStoreProbe(op: Opcode, imm: MemArg, size: u8) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var func = dynamicLoc.func;
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		OUT.indent(accessor.depth());
+		var index = outputOpAndAddr(op, imm.memory_index, imm.offset, accessor.getOperand(-1));
+		OUT.puts(" <- ");
+		var mem = func.instance.memories[imm.memory_index];
+		var val = accessor.getOperand(0);
+
+		match (size) {
+			1 => match (val) {
+				I32(v) => OUT.putx_8(byte.view(v));
+				I64(v) => OUT.putx_8(byte.view(v));
+				_ => ; // TODO: error
+			}
+			2 => match (val) {
+				I32(v) => OUT.putx_16(u16.view(v));
+				I64(v) => OUT.putx_16(u16.view(v));
+				_ => ; // TODO: error
+			}
+			4 => match (val) {
+				I32(v) => OUT.putx_32(u32.view(v));
+				I64(v) => OUT.putx_32(u32.view(v));
+				F32(v) => OUT.putx_32(u32.view(v));
+				_ => ; // TODO: error
+			}
+			8 =>  match (val) {
+				I64(v) => OUT.putx_64(u64.view(v));
+				F64(v) => OUT.putx_64(u64.view(v));
+				_ => ; // TODO: error
+			}
+			_ => ; // TODO: other sizes
+		}
+		OUT.ln();
+		return Resumption.Continue;
+	}
+}
+
+def outputOpAndAddr(op: Opcode, memory_index: u31, offset: u64, index: Value) -> u64 {
+	OUT.mark()
+		.puts(op.mnemonic).sp()
+		.ljustify_mark(20)
+		.put1("mem%d[", memory_index);
+	var result: u64;
+	match (index) {
+		I32(v) => OUT.putx_32(u32.view(offset + (result = v)));
+		I64(v) => OUT.putx_64(offset + (result = v));
+		_ => ; // TODO: dynamic type error
+	}
+	OUT.putc(']');
+	return result;
+}
