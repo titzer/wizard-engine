@@ -61,6 +61,7 @@ function make_build_file() {
 	fi
 
         # TODO: handle case where build is not in a git repo
+	# TODO: use -redef-field instead of generating a build file
         REVS="$(git rev-list --count HEAD)"
 	echo "var unused__ = (Version.buildData = \"$build_data\", Version.minorVersion = $REVS);" > $build_file
 
@@ -95,11 +96,15 @@ PREGEN=${PREGEN:=1}
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-darwin" || "$TARGET" = "x86_64_darwin" ]]; then
-    v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
+    STATUS=$?
+    if [ $STATUS != 0 ]; then
+	exit $STATUS
+    fi
     if [ $PROGRAM = "wizeng" ]; then
 	E=bin/${exe}
 	HOSTS=$(scripts/sense_host.sh)
@@ -122,12 +127,12 @@ elif [ "$TARGET" = "wasm-wave" ]; then
     # TODO: v3c-wasm-wave is not stable yet; compute its path from v3c
     V3C_PATH=$(which v3c)
     V3C_WASM_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-wave}
-    $V3C_WASM_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec $V3C_WASM_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "wasm-linux" ]; then
     # TODO: v3c-wasm-linux is not stable yet; compute its path from v3c
     V3C_PATH=$(which v3c)
     V3C_WASM_LINUX=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-linux}
-    $V3C_WASM_LINUX -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec $V3C_WASM_LINUX -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
@@ -147,7 +152,7 @@ elif [ "$TARGET" = "v3i" ]; then
     echo "v3i \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
     chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors
-    $V3C $LIST
+    exec $V3C $LIST
 else
     exit_usage
 fi
