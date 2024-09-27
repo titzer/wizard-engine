@@ -1,0 +1,10 @@
+(module
+  (type $f1 (func))
+  (type $f2 (func (param i32)))
+  (type $f3 (func (result i32)))
+  (type $f4 (func (param i32) (result i32)))
+  (type $c1 (cont $f1))
+  (type $c2 (cont $f2))
+  (type $c3 (cont $f3))
+  (type $c4 (cont $f4))
+)
