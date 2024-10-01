@@ -8,7 +8,7 @@
   "\91\80\80\80\00\00\20\00\20\01\20\02\20\03\d2\00"
   "\e0\01\e3\01\00\0b"
 )
-(module instance)
+
 (assert_return
   (invoke "main"
     (i32.const 0x0)

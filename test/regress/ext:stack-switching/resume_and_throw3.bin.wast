@@ -8,7 +8,7 @@
   "\00\00\1f\40\01\00\00\00\20\00\20\01\d2\00\e0\01"
   "\e3\01\00\0b\42\2a\44\00\00\00\00\00\80\47\40\0b"
 )
-(module instance)
+
 (assert_return
   (invoke "main" (i64.const 0xffff_ffff_ffff_fba9) (f64.const 0x1.a0ap+11))
   (i64.const 0xffff_ffff_ffff_fba9)

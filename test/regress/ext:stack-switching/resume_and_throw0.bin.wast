@@ -7,5 +7,5 @@
   "\80\80\00\00\41\2f\08\00\0b\92\80\80\80\00\00\1f"
   "\40\01\00\00\00\d2\00\e0\01\e3\01\00\0b\41\2a\0b"
 )
-(module instance)
+
 (assert_return (invoke "main") (i32.const 0x2f))

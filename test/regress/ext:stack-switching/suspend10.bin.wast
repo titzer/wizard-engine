@@ -9,6 +9,6 @@
   "\02\05\20\00\d2\00\e0\01\e3\01\01\00\00\00\00\0b"
   "\21\01\ac\20\01\e3\03\00\0b"
 )
-(module instance)
+
 (assert_return (invoke "main" (f32.const 0x1.6p+3)) (f64.const 0x1.6p+3))
 (assert_return (invoke "main" (f32.const -0x1.1ep+10)) (f64.const -0x1.1ep+10))

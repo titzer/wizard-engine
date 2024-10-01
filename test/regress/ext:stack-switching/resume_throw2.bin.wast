@@ -7,5 +7,5 @@
   "\80\80\00\00\0b\8e\80\80\80\00\00\41\2a\d2\00\e0"
   "\01\e4\01\00\00\41\2a\0b"
 )
-(module instance)
+
 (assert_exception (invoke "main"))

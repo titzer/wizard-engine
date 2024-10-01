@@ -9,5 +9,5 @@
   "\e0\01\e3\01\01\00\00\00\44\00\00\00\00\00\00\46"
   "\40\d0\01\0b\1a\0b"
 )
-(module instance)
+
 (assert_return (invoke "main") (f64.const -0x1.5d4p+12))

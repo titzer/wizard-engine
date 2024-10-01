@@ -6,6 +6,6 @@
   "\80\00\02\84\80\80\80\00\00\20\00\0b\8b\80\80\80"
   "\00\00\20\00\d2\00\e0\01\e3\01\00\0b"
 )
-(module instance)
+
 (assert_return (invoke "call_e_e" (ref.extern 0)) (ref.extern 0))
 (assert_return (invoke "call_e_e" (ref.extern 1)) (ref.extern 1))
