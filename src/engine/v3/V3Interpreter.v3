@@ -59,7 +59,7 @@ class V3Interpreter extends WasmStack {
 			// Run host calls until they either trap, return, or tail-call Wasm.
 			runHostCall();
 		}
-		
+
 		// Return the appropriate result.
 		match (state_) {
 			THROWING => return clearAndThrow();
@@ -68,7 +68,7 @@ class V3Interpreter extends WasmStack {
 			CALL_CHILD => return Result.StackSwitch(stack_switch_info);
 			_ => {
 				clear();
-				return Result.Throw(Trap.new(TrapReason.ERROR, null, null)); // TODO: error message for wrong state
+				return Result.Throw(Trap.new(TrapReason.ERROR, "invalid interpreter state", null)); // TODO: error message for wrong state
 			}
 		}
 	}
@@ -468,7 +468,7 @@ class V3Interpreter extends WasmStack {
 			I64_STORE8	=> doStore(1, DataWriters.write_range_u8, Values.v_w_8);
 			I64_STORE16	=> doStore(2, DataWriters.write_range_u16, Values.v_w_16);
 			I64_STORE32	=> doStore(4, DataWriters.write_range_u32, Values.v_w_32);
-			
+
 			// Atomic load and stores
 			I32_ATOMIC_LOAD	       => doAtomicLoad(4, DataReaders.read_range_u32, Value.I32);
 			I64_ATOMIC_LOAD        => doAtomicLoad(8, DataReaders.read_range_u64, Value.I64);
@@ -476,8 +476,8 @@ class V3Interpreter extends WasmStack {
             		I32_ATOMIC_LOAD16_U    => doAtomicLoad(2, DataReaders.read_range_u32_u16, Value.I32);
             		I64_ATOMIC_LOAD8_U     => doAtomicLoad(1, DataReaders.read_range_u64_u8, Value.I64);
             		I64_ATOMIC_LOAD16_U    => doAtomicLoad(2, DataReaders.read_range_u64_u16, Value.I64);
-            		I64_ATOMIC_LOAD32_U    => doAtomicLoad(4, DataReaders.read_range_u64_u32, Value.I64);	
-					
+			I64_ATOMIC_LOAD32_U    => doAtomicLoad(4, DataReaders.read_range_u64_u32, Value.I64);
+
 			MEMORY_SIZE => {
 				var index = codeptr.read_uleb32();
 				var memory = frame.func.instance.memories[index];
@@ -1141,17 +1141,18 @@ class V3Interpreter extends WasmStack {
 			RESUME => {
 				var cont_idx = codeptr.read_uleb32();
 
-				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);				
+				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
 				var cont = Continuation.!(Value.Ref.!(pop()).val);
 				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 
 				cont.used = true;
 				cont.stack.bind(values.peekn(cont.stack.getMissingBinds()));
-				
+
 				prev_resume_pc = frame.pc;
 				state_ = StackState.CALL_CHILD;
 				stack_switch_info = StackSwitchInfo.RunChildStack(cont.stack);
+				return; // skip setting frame.pc = codeptr.pos
 			}
 			RESUME_THROW => {
 				var cont_idx = codeptr.read_uleb32();
@@ -1434,6 +1435,7 @@ class V3Interpreter extends WasmStack {
 	}
 	def advanceCaller() {
 		if (Debug.interpreter) Trace.OUT.put3("advance %q pc=%d codeptr.pos=%d", frame.func.render, frame.pc, codeptr.pos).ln();
+		// XXX: use read_opcode_and_skip()
 		var opcode = codeptr.read_opcode_but_skip_probe(frame.func.decl);
 		match (opcode) {
 			CALL, CALL_REF => {
@@ -1469,7 +1471,17 @@ class V3Interpreter extends WasmStack {
 		return f;
 	}
 	def onChildTerminate(vals: Array<Value>) {
+		if (Trace.stack) Trace.OUT.put2("onChildTerminate prev_resume_pc=%d pc=%d", prev_resume_pc, frame.pc).ln();
 		values.pusha(vals);
+		state_ = StackState.RESUMABLE;
+		// advance past resume instruction
+		var code = frame.func.decl.cur_bytecode;
+		codeptr.reset(code, frame.pc, code.length);
+		var opcode = codeptr.read_opcode_and_skip(frame.func.decl);
+		match (opcode) {
+			RESUME, RESUME_THROW => ;
+			_ => fail(Strings.format1("expected resume instruction in child terminate, got %s", opcode.name));
+		}
 	}
 	// Returns whether the suspend got handled.
 	def onChildSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) -> bool {
