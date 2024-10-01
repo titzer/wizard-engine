@@ -30,7 +30,7 @@ Rather than optimize for performance for a specific set of Wasm features _now_, 
   The code validator uses the standard single-pass abstract interpretation approach for checking code.
   In addition to validating all types and control flow, it produces the *control transfer* information needed for the fast interpreter.
 * [Value](src/engine/Value.v3) - Contains all the Wasm values, including primitives, references, etc.
-* [Interpreter](src/engine/Interpreter.v3) - The low-overhead interpreter that executes Wasm binary code directly.
+* [Interpreter](src/engine/v3/V3Interpreter.v3) - The low-overhead interpreter that executes Wasm binary code directly.
   It contains a straightforward value stack and call stack and makes heavy use of Virgil's first-class primitive operators in order to be concise.
   It uses the control transfer information to execute branches and if's with low overhead.
 * [Host](src/engine/Host.v3) - Contains the base declarations for all host-provided functionality, e.g. for an embedding.
