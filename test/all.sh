@@ -68,10 +68,6 @@ function do_script() {
 # Unit tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" = jvm ]; then # TODO: out of memory
-	skip unit "initial heap too large on this target"
-        continue;
-    fi
     $SCRIPT_LOC/unit.sh || exit_if_failure $?
 done
 

@@ -21,7 +21,7 @@
   "unknown import"
 )
 (assert_trap (invoke $Mt "call" (i32.const 0x7)) "uninitialized")
-(assert_unlinkable
+(assert_trap
   (module binary
     "\00\61\73\6d\01\00\00\00\01\85\80\80\80\00\01\60"
     "\00\01\7f\02\8c\80\80\80\00\01\02\4d\74\03\74\61"
@@ -29,6 +29,5 @@
     "\80\80\00\02\00\41\07\0b\01\00\00\41\0c\0b\01\00"
     "\0a\8a\80\80\80\00\01\84\80\80\80\00\00\41\00\0b"
   )
-  "elements segment does not fit"
+  "out of bounds"
 )
-(assert_trap (invoke $Mt "call" (i32.const 0x7)) "uninitialized")

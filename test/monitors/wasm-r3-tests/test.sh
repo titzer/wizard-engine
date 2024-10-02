@@ -47,8 +47,8 @@ function run_be_tests {
         testcase=$(basename "${file%.index.wasm}")
         echo "##+$testcase (backend)"
         options="--monitors=r3-replay{trace_file=${testcase}.r3},r3"
-        $WIZENG $options $file > $P.out #| v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
-        diff $P.out $testcase.r3 | tee $P.out.diff
+        $WIZENG $options $file > $T/$file.out #| v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
+        diff $testcase.r3 $T/$file.out | tee $T/$file.out.diff
         DIFF=${PIPESTATUS[0]}
         if [ "$DIFF" != 0  ]; then
             echo "##-fail"
