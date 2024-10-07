@@ -7,7 +7,7 @@
 
   (export "$alloc_br_if" (func $alloc_br_if))
   (export "$alloc_br_table" (func $alloc_br_table))
-  (export "$on_finish" (func $print_entries))
+  (export "before:exit" (func $print_entries))
   (export "wasm:opcode:br_if($alloc_br_if(func, pc), arg0)" (func $probe_br_if))
   (export "wasm:opcode:br_table($alloc_br_table(func, pc, imm0), arg0)" (func $probe_br_table))
 
