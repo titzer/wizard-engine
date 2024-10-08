@@ -8,15 +8,15 @@
 /// as long as the import chain is acyclic.
 class ModuleLinker(engine: Engine,
 				   program_args: Array<string>,
-				   main_module_name: string,
 				   names: Array<string>,
 				   modules: Array<Module>,
 				   error: ErrorGen) {
     private def instantiators = Strings.newMap<(Instantiator, int)>();
 	private def processor_map = Strings.newMap<ImportProcessor>();
 	private def exportable_cache = Array<Array<(Exportable, Decl)>>.new(names.length);
+	private def deferred_imports = Array<Array<int>>.new(modules.length);
 
-    def link() -> Instantiator {
+    def link() -> Array<Instantiator> {
 		for (i < names.length) {
 			var instantiator = partiallyInstantiate(i);
 			if (error.error()) return null;
@@ -26,6 +26,7 @@ class ModuleLinker(engine: Engine,
 			}
 		}
 		for (i < names.length) {
+			if (deferred_imports[i].length == 0) continue;
 			var instantiator = instantiators[names[i]].0;
 			var module = modules[i];
 			var imports = instantiator.imports;
@@ -43,10 +44,12 @@ class ModuleLinker(engine: Engine,
 					if (error.error()) return null;
 				}
 			}
-			instantiator.completeRun();
+			instantiator.runPartial(deferred_imports[i]);
 			if (error.error()) return null;
 		}
-		return instantiators[main_module_name].0;
+		var all_instantiators = Array<Instantiator>.new(names.length);
+		for (i < names.length) all_instantiators[i] = instantiators[names[i]].0;
+		return all_instantiators;
     }
 
     private def partiallyInstantiate(module_id: int) -> Instantiator {
@@ -66,7 +69,8 @@ class ModuleLinker(engine: Engine,
 			addHostModuleProcessors(name, imp_mod_name, i.processors);
 			if (error.error()) return null;
 	    }
-		i.partialRun(deferred_imports.extract());
+		this.deferred_imports[module_id] = deferred_imports.extract();
+		i.runPartial(this.deferred_imports[module_id]);
 		return i;
     }
 
@@ -94,7 +98,7 @@ class ModuleLinker(engine: Engine,
 							exp.1
 						);
 					} else if (max_steps <= 0) {
-						error.set(StringBuilder.new()
+						error.setc(WasmError.IMPORT_CYCLE_DETECTED, StringBuilder.new()
 							.put3("%s.wasm: cyclical import detected for %s.%s\n",
 									importer_mod_name, requested_module, field_name)
 							.toString());
@@ -103,22 +107,30 @@ class ModuleLinker(engine: Engine,
 						var new_mod_name = exp.1.imp.module_name;
 						var new_field_name = exp.1.imp.field_name;
 						exportable = resolveImport(exp.1, req_mod_id, new_mod_name, new_field_name, max_steps - 1);
+						if (error.error()) return (null, null);
 					}
 				}
 				// cache result along the chain of "exported imports".
 				exportable_cache[req_mod_id][exp_id] = exportable;
-				if (validateDecl(imp_decl, exportable.1)) {
-					return exportable;
-				} else {
-					error.set(StringBuilder.new()
+				var decl_match = validateDecl(imp_decl, exportable.1);
+				if (!decl_match.0) {
+					error.setc(WasmError.IMPORT_KIND_MISMATCH, StringBuilder.new()
+						.put3("%s.wasm: kind mismatch for import %s.%s\n",
+								importer_mod_name, requested_module, field_name)
+						.toString());
+					return (null, null);
+				}
+				if (!decl_match.1) {
+					error.setc(WasmError.IMPORT_TYPE_MISMATCH, StringBuilder.new()
 						.put3("%s.wasm: type mismatch for import %s.%s\n",
 								importer_mod_name, requested_module, field_name)
 						.toString());
 					return (null, null);
 				}
+				return exportable;
 			}
 		}
-		error.set(StringBuilder.new()
+		error.setc(WasmError.IMPORT_COUNT_MISMATCH, StringBuilder.new()
 			.put3("%s.wasm: field \"%s\" from module \"%s\" not found\n",
 					importer_mod_name, field_name, requested_module)
 			.toString());
@@ -135,44 +147,45 @@ class ModuleLinker(engine: Engine,
 	}
 
 	// ensures the import and export declarations match.
-	private def validateDecl(imp_decl: Decl, exp_decl: Decl) -> bool {
+	// returns (kind match, type match)
+	private def validateDecl(imp_decl: Decl, exp_decl: Decl) -> (bool, bool) {
 		if (FuncDecl.?(imp_decl) && FuncDecl.?(exp_decl)) {
 			var sig1 = FuncDecl.!(imp_decl).sig, sig2 = FuncDecl.!(exp_decl).sig;
 			if (sig1.params.length != sig2.params.length || sig1.results.length != sig2.results.length) {
-				return false;
+				return (true, false);
 			}
 			for (i < sig1.params.length) {
-				if (sig1.params[i] != sig2.params[i]) return false;
+				if (sig1.params[i] != sig2.params[i]) return (true, false);
 			}
 			for (i < sig1.results.length) {
-				if (sig1.results[i] != sig2.results[i]) return false;
+				if (sig1.results[i] != sig2.results[i]) return (true, false);
 			}
-			return true;
+			return (true, true);
 		}
 		if (GlobalDecl.?(imp_decl) && GlobalDecl.?(exp_decl)) {
 			var global1 = GlobalDecl.!(imp_decl), global2 = GlobalDecl.!(exp_decl);
-			return global1.valtype == global2.valtype && (global1.mutable || !global2.mutable);
+			return (true, global1.valtype == global2.valtype && (global1.mutable || !global2.mutable));
 		}
 		if (MemoryDecl.?(imp_decl) && MemoryDecl.?(exp_decl)) {
 			var mem1 = MemoryDecl.!(imp_decl), mem2 = MemoryDecl.!(exp_decl);
-			return mem1.maximum == mem2.maximum && mem1.initial == mem2.initial
-					&& mem1.log2_pageSize == mem2.log2_pageSize;
+			return (true, mem1.maximum == mem2.maximum && mem1.initial == mem2.initial
+					&& mem1.log2_pageSize == mem2.log2_pageSize);
 		}
 		if (TableDecl.?(imp_decl) && TableDecl.?(exp_decl)) {
 			var table1 = TableDecl.!(imp_decl), table2 = TableDecl.!(exp_decl);
-			return table1.elemtype == table2.elemtype
+			return (true, table1.elemtype == table2.elemtype
 					&& table1.maximum == table2.maximum
-					&& table1.initial == table2.initial;
+					&& table1.initial == table2.initial);
 		}
 		if (TagDecl.?(imp_decl) && TagDecl.?(exp_decl)) {
 			var tag1 = TagDecl.!(imp_decl), tag2 = TagDecl.!(exp_decl);
-			if (tag1.fields.length != tag2.fields.length) return false;
+			if (tag1.fields.length != tag2.fields.length) return (true, false);
 			for (i < tag1.fields.length) {
-				if (tag1.fields[i] != tag2.fields[i]) return false;
+				if (tag1.fields[i] != tag2.fields[i]) return (true, false);
 			}
-			return true;
+			return (true, true);
 		}
-		return false;
+		return (false, false);
 	}
 
 	// to be partially applied to build the HostFunction wrapper for imported wasm functions.
@@ -194,7 +207,7 @@ class ModuleLinker(engine: Engine,
 		if (processor_map[imp_mod_name] == null) {
 	    	var p = ModuleRegistry.get(imp_mod_name);
 	    	if (p == null) {
-				error.set(StringBuilder.new()
+				error.setc(WasmError.IMPORT_COUNT_MISMATCH, StringBuilder.new()
 	    			.put2("%s.wasm: import from unknown module \"%s\"\n", mod_name, imp_mod_name).toString());
 				return;
 			}
