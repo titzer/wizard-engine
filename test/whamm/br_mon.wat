@@ -2,7 +2,7 @@
   (import "wizeng" "puti" (func $puti (param i32)))
   (import "wizeng" "puts" (func $puts (param i32 i32)))
 
-  (memory (export "mem") 44)
+  (memory (export "mem") 2)   ;; no expansion checks
   (global $last_entry (mut i32) (i32.const 0))
 
   (export "$alloc_br_if" (func $alloc_br_if))
@@ -47,6 +47,10 @@
     local.get $entry
   )
 
+  ;; Table entry
+  ;; n is the number of entries in the table including the default target
+  ;; 0      4      8      12
+  ;; | func |  pc  |   n  |  0 taken |   ...  | n taken |
   (func $alloc_br_table (param $func i32) (param $pc i32) (param $count i32) (result i32)
     (local $entry i32)
     local.get $count
@@ -54,31 +58,31 @@
     i32.add
     local.set $count
 
-    global.get $last_entry  ;; 0 | 0
-    local.set $entry        ;; 0 |
+    global.get $last_entry
+    local.set $entry
 
-    local.get $entry        ;; 0 | 0
-    local.get $func         ;; 0 | 0 0
-    i32.store               ;; 0 |        0000
+    local.get $entry
+    local.get $func
+    i32.store
 
-    local.get $entry        ;; 0 | 0
-    local.get $pc           ;; 0 | 26
-    i32.store offset=4      ;; 0 |        0000 0026
+    local.get $entry
+    local.get $pc
+    i32.store offset=4
 
-    local.get $entry        ;; 0 | 0
-    local.get $count        ;; 0 | 4
-    i32.store offset=8      ;; 0 |        0000 0004 0004
+    local.get $entry
+    local.get $count
+    i32.store offset=8
 
-    i32.const 12            ;; 0 | 12
-    i32.const 8             ;; 0 | 12 8
-    local.get $count        ;; 0 | 12 8 4
-    i32.mul                 ;; 0 | 12 32
-    i32.add                 ;; 0 | 44
-    local.get $entry        ;; 0 | 44 0
-    i32.add                 ;; 0 | 44
-    global.set $last_entry  ;; 0 |        g <- 44
+    i32.const 12
+    i32.const 8
+    local.get $count
+    i32.mul
+    i32.add
+    local.get $entry
+    i32.add
+    global.set $last_entry
 
-    local.get $entry        ;; 0 | 0
+    local.get $entry
   )
 
   (func $probe_br_if (param $entry i32) (param $arg0 i32)
