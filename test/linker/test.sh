@@ -43,7 +43,7 @@ function run_tests {
                 fi
             fi
         done
-        options="--expose=wizeng -ti --link=${combined_files}"
+        options="--expose=wizeng --link=${combined_files}"
         $WIZENG $options main.wasm > $T/$testcase.out
         diff ../$testcase.out $T/$testcase.out | tee $T/$testcase.out.diff
         DIFF=${PIPESTATUS[0]}

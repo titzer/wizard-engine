@@ -3,6 +3,7 @@ module
 (import "alloc" "allocate" (func $__15411_allocate (param i32) (result i32)))
 (import "alloc" "memory" (memory 1))
 (import "func" "func" (func $func (param i32) (param i32) (result i32)))
+(import "wizeng" "puti" (func $puti (param i32)))
 
 (func $15411abort (i32.const 1) (i32.const 0) (i32.div_u) (drop))
 (func $15411memerror (i32.const -1) (i32.load) (drop))
@@ -196,14 +197,10 @@ module
 (unreachable)
 )
 
-(func $exp
-i32.const 1
-i32.const 3
+(func $out
 call $main
-i32.eq
-i32.div_s
-drop
+call $puti
 )
-(export "main" (func $exp))
+(export "main" (func $out))
 
 )

@@ -1,5 +1,6 @@
 (module
 (import "table" "table" (table 2 2 funcref))
+(import "wizeng" "puti" (func $puti (param i32)))
 
 (func $func 
     (i32.const 0)
@@ -19,7 +20,7 @@
     (i32.load)
     (i32.eq)
     (i32.div_u)
-    (drop)
+    call $puti
 )
 (export "main" (func $main))
 (memory (export "memory") 1)

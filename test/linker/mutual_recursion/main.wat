@@ -1,6 +1,7 @@
 
 (module
 (import "func" "func" (func $f2 (param $1 i32)))
+(import "wizeng" "puti" (func $puti (param i32)))
 
 (func $f1 (param $1 i32)
     i32.const 0
@@ -30,7 +31,7 @@
     i32.load
     i32.eq
     i32.div_u
-    drop
+    call $puti
 )
 
 (export "func" (func $f1))

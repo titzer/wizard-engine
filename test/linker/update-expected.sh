@@ -16,7 +16,7 @@ function run_tests {
                 fi
             fi
         done
-        options="--expose=wizeng -ti --link=${combined_files}"
+        options="--expose=wizeng --link=${combined_files}"
         wizeng $options main.wasm > ../$testcase.out
         cd ..
     done
