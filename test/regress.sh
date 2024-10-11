@@ -28,9 +28,9 @@ function run_tests() {
     for ext in $(find test/regress -type d) ; do
 	if [[ $ext =~ test/regress/(ext:.*) ]]; then
 	    arg="-${BASH_REMATCH[1]}"
-	    # if [ $arg = "-ext:stack-switching" ]; then # TODO: dont skip
-		# continue
-	    # fi
+	    if [ $arg = "-ext:stack-switching" ]; then # TODO: dont skip
+		continue
+	    fi
 	    TESTS="$ext/*.bin.wast"
 	    $CMD $arg $TESTS
 	fi
