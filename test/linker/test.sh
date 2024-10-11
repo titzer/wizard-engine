@@ -8,7 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh R3-monitor
+. $DIR/../common.sh Linker
 
 make_binary wizeng || exit $?
 
@@ -37,14 +37,14 @@ function run_tests {
         for file in *.wasm; do
             if [ "$file" != "main.wasm" ]; then
                 if [ -n "$combined_files" ]; then
-                    combined_files="$combined_files,$file"
+                    combined_files="$combined_files $file"
                 else
                     combined_files="$file"
                 fi
             fi
         done
-        options="--expose=wizeng --link=${combined_files}"
-        $WIZENG $options main.wasm > $T/$testcase.out
+        options="--expose=wizeng"
+        $WIZENG $options $combined_files main.wasm > $T/$testcase.out
         diff ../$testcase.out $T/$testcase.out | tee $T/$testcase.out.diff
         DIFF=${PIPESTATUS[0]}
         if [ "$DIFF" != 0  ]; then

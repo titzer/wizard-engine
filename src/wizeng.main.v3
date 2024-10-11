@@ -6,11 +6,12 @@ var print_result = false;
 def main(args: Array<string>) -> int {
 	var engine = Engine.new();
 	var programArgs: Array<string>;
-	var path: string;
+	var all_paths = Vector<string>.new();
+	var parse_options_done = false;
 	// Parse option and extract module and module arguments
 	for (i < args.length) {
 		var a = args[i];
-		if (a.length > 0 && a[0] == '-') {
+		if (a.length > 0 && a[0] == '-' && !parse_options_done) {
 			var ok = OptionsRegistry.parse(a);
 			if (!ok) return ErrorBuilder.new()
 				.puts("wizeng: unrecognized option ")
@@ -19,33 +20,29 @@ def main(args: Array<string>) -> int {
 				.exit(1);
 			engine.extensions = EngineOptions.extensions;
 		} else {
-			path = a;
-			programArgs = Arrays.range(args, i, args.length);
-			break;
+			parse_options_done = true;
+			all_paths.put(a);
 		}
 	}
 
 	if (WizengOptions.PREGEN_FILE.val != null) {
 		var err = Target.pregenIntoFile(WizengOptions.PREGEN_FILE.val);
 		if (err != null) return err.exit(2);
-		if (path == null) return 0; // all done
+		if (all_paths.length == 0) return 0; // all done
 	}
 
 	if (WizengOptions.helped) {
 		return 0;
 	}
 
-	if (path == null) return ErrorBuilder.new()
+	if (all_paths.length == 0) return ErrorBuilder.new()
 		.puts("wizeng: no input files\n")
 		.exit(3);
 
-	var all_paths = Vector<string>.new();
-	if (WizengOptions.LINK_MODULES.val != null) {
-		all_paths = WizengOptions.LINK_MODULES.val;
+	if (WizengOptions.PROG_ARGS.val != null) {
+		programArgs = WizengOptions.PROG_ARGS.val.extract();
 	}
-	all_paths.put(path);
-	var modules = Array<Module>.new(all_paths.length);
-	var names = Array<string>.new(all_paths.length);
+	var named_modules = Array<(string, Module)>.new(all_paths.length);
 	for (i < all_paths.length) {
 		var path = all_paths[i];
 		if (!Strings.endsWith(path, ".wasm")) return ErrorBuilder.new()
@@ -53,7 +50,7 @@ def main(args: Array<string>) -> int {
 			.puts(": unknown file format, expected .wasm\n")
 			.exit(4);
 	}
-	var monitors = MonitorOptions.getMonitors();
+	var monitors = MonitorOptions.getMonitors().extract();
 	if (monitors.length > 0) Execute.tiering.onMonitorsStart();
 	for (i < all_paths.length) {
 		var path = all_paths[i];
@@ -74,112 +71,121 @@ def main(args: Array<string>) -> int {
 				.render(code, path, section, error_index, error_pos, error_msg)
 				.exit(3);
 		}
-		modules[i] = module;
-		names[i] = extractName(path);
+		named_modules[i] = (extractName(path), module);
 	}
 	var err = ErrorGen.new(all_paths[all_paths.length - 1]);
 	// Call monitors for all modules
-	for (i < modules.length) {
-		for (j < monitors.length) monitors[j].onParse(modules[i]);
-		if (monitors.length > 0) Execute.tiering.onMonitorsFinish(modules[i], err);
+	for (named_module in named_modules) {
+		for (monitor in monitors) monitor.onParse(named_module.1);
+		if (monitors.length > 0) Execute.tiering.onMonitorsFinish(named_module.1, err);
 	}
 
 	var binder: (Decl, Exportable) -> Exportable;
 	if (BasicTracing.moduleFilter != null) binder = ImportTracer.new(BasicTracing.moduleFilter).wrap;
-	var linker = ModuleLinker.new(engine, programArgs, names, modules, binder, err);
+	var linker = ModuleLinker.new(engine, programArgs, named_modules, binder, err);
 	var all_instantiators = linker.link();
-	var main_module = modules[modules.length - 1];
 	if (!err.ok()) return ErrorBuilder.new()
-		.render(err.error_code, path, err.section, err.error_index, err.error_pos, err.error_msg)
+		.render(err.error_code,
+			    if(u32.view(err.index) < all_paths.length, all_paths[err.index], all_paths[all_paths.length - 1]),
+				err.section,
+				err.error_index,
+				err.error_pos,
+				err.error_msg)
 		.exit(6);
 
 	// Call monitors for all instances on instantiate
-	for (instantiator in all_instantiators) for (i < monitors.length) monitors[i].onInstantiate(instantiator.instance);
+	for (instantiator in all_instantiators) for (monitor in monitors) monitor.onInstantiate(instantiator.instance);
 
-	// Try to find the main entrypoint.
-	var main_instantiator = all_instantiators[all_instantiators.length - 1];
-	var main_instance = main_instantiator.instance;
-	var entry: (Function, Array<Value>);
-	for (j < main_instantiator.processors.length) {
-		var p = main_instantiator.processors[j];
-		if (HostModule.?(p)) {
-			entry = HostModule.!(p).getMain(main_instance);
-			if (entry.0 != null) break;
-		}
-	}
-
-	if (entry.0 == null) {
-		entry = findDefaultMain(main_instance);
-	}
-
-	if (entry.0 == null) return ErrorBuilder.new()
-		.puts(path)
-		.puts(": no main export from module\n")
-		.exit(7);
-
-	// Execute the start function, if any.
-	if (main_module.start_function >= 0) {
-		var start = main_instance.functions[main_module.start_function];
-		for (i < monitors.length) monitors[i].onStart(start);
-		var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
-		match (r) {
-			Throw(thrown) => {
-				// Start function trapped or exited, return
-				printThrowable(thrown);
-				MonitorRegistry.runReports();
-				Metrics.report();
-				return -1;
-			}
-			_ => ; // ignore return value and break
-		}
-	}
-
-	// Execute the main entrypoint.
-	for (i < monitors.length) monitors[i].onMain(entry.0, entry.1);
-	var before_us = Metrics.main_time_us.ticks();
-	var before_cycles = Metrics.main_time_cycles.ticks();
-	var r = Execute.call(entry.0, entry.1);
-	Metrics.main_time_cycles.updateDiff(before_cycles);
-	Metrics.main_time_us.updateDiff(before_us);
-
+	// Try to find the main entrypoint for all modules.
 	var exit_code = 0;
-	match (r) {
-		Value(vals) => {
-			if (vals.length == 1) {
-				match (vals[0]) {
-					I32(val) => exit_code = int.view(val);
-					I64(val) => exit_code = int.view(val);
-					_ => ;
-				}
-			}
-			if (print_result) {
-				for (i < vals.length) {
-					if (i > 0) Trace.OUT.sp();
-					Trace.OUT.putv(vals[i]);
-				}
-				Trace.OUT.ln();
+	for (i < all_instantiators.length) {
+		var path = all_paths[i];
+		var instantiator = all_instantiators[i];
+		var ins = instantiator.instance;
+		var module = ins.module;
+		var entry: (Function, Array<Value>);
+		for (j < instantiator.processors.length) {
+			var p = instantiator.processors[j];
+			if (HostModule.?(p)) {
+				entry = HostModule.!(p).getMain(ins);
+				if (entry.0 != null) break;
 			}
 		}
-		Throw(thrown) => match (thrown) {
-			x: Exit => {
-				exit_code = int.view(x.code);
-			}
-			_ => {
-				printThrowable(thrown);
-				exit_code = -1;
+
+		if (entry.0 == null) {
+			entry = findDefaultMain(ins);
+		}
+
+		if (i == all_instantiators.length - 1 && entry.0 == null) return ErrorBuilder.new()
+			.puts(path)
+			.puts(": no main export from module\n")
+			.exit(7);
+
+		// Execute the start function, if any.
+		if (module.start_function >= 0) {
+			var start = ins.functions[module.start_function];
+			for (monitor in monitors) monitor.onStart(start);
+			var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
+			match (r) {
+				Throw(thrown) => {
+					// Start function trapped or exited, return
+					printThrowable(thrown);
+					MonitorRegistry.runReports();
+					Metrics.report();
+					return -1;
+				}
+				_ => ; // ignore return value and break
 			}
 		}
-		StackSwitch(info) => {
-			// printThrowable(info.parent.trap(TrapReason.INVALID_SUSPEND));
-			// UNREACHABLE as far as V3Interpreter is concerned.
-			// TODO[ss]: check how to make this better
-			exit_code = -1;
+
+		// Execute the main entrypoint.
+		if (entry.0 != null) {
+			for (monitor in monitors) monitor.onMain(entry.0, entry.1);
+			var before_us = Metrics.main_time_us.ticks();
+			var before_cycles = Metrics.main_time_cycles.ticks();
+			var r = Execute.call(entry.0, entry.1);
+			Metrics.main_time_cycles.updateDiff(before_cycles);
+			Metrics.main_time_us.updateDiff(before_us);
+
+			match (r) {
+				Value(vals) => {
+					if (vals.length == 1) {
+						match (vals[0]) {
+							I32(val) => exit_code = int.view(val);
+							I64(val) => exit_code = int.view(val);
+							_ => ;
+						}
+					}
+					if (print_result) {
+						for (i < vals.length) {
+							if (i > 0) Trace.OUT.sp();
+							Trace.OUT.putv(vals[i]);
+						}
+						Trace.OUT.ln();
+					}
+				}
+				Throw(thrown) => match (thrown) {
+					x: Exit => {
+						exit_code = int.view(x.code);
+					}
+					_ => {
+						printThrowable(thrown);
+						exit_code = -1;
+					}
+				}
+				StackSwitch(info) => {
+					// printThrowable(info.parent.trap(TrapReason.INVALID_SUSPEND));
+					// UNREACHABLE as far as V3Interpreter is concerned.
+					// TODO[ss]: check how to make this better
+					exit_code = -1;
+				}
+			}
+			// Call monitors on finish
+			for (monitor in monitors) monitor.onFinish(ins, r);
+			MonitorRegistry.runReports();
+			Metrics.report();
 		}
 	}
-	// Call monitors on finish
-	for (i < monitors.length) monitors[i].onFinish(main_instance, r);
-	MonitorRegistry.runReports();
-	Metrics.report();
 	return exit_code;
 }
 def printThrowable(thrown: Throwable) {
@@ -278,7 +284,7 @@ component WizengOptions {
 	def group = OptionsRegistry.newGroup("WIZENG", null);
 	def HELP = group.newFlag("help", printHelp, "Print command-line help.");
 	def HELP2 = group.newFlag("-help", printHelp, "Print command-line help.");
-	def LINK_MODULES = group.newOption("-link", null, "=<path_1, ... ,path_n>", parsePaths, "Provide a list of paths to modules for dynamic linking.");
+	def PROG_ARGS = group.newOption("-args", null, "=<arg_1, ... ,arg_n>", parseArgs, "Provide a list of program args for certain host module initialization.");
 	def VERSION = group.newFlag("-version", printVersion, "Print build version.");
 	def PREGEN_FILE = group.newPathOption("pregen", null, "Pre-generate assembly interpreter and stubs into the given file.");
 	def EXPOSE = group.newStringOption("-expose", null, "Expose the given host module's functionality to programs.")
@@ -312,18 +318,18 @@ def findDefaultMain(instance: Instance) -> (Function, Array<Value>) {
 	}
 	return (null, null);
 }
-def parsePaths(input: string) -> Vector<string> {
-	var paths = Vector<string>.new();
+def parseArgs(input: string) -> Vector<string> {
+	var args = Vector<string>.new();
 	var sb = StringBuilder.new();
 	for (c in input) {
 		if (c == ',') {
-			paths.put(sb.toString());
+			args.put(sb.toString());
 		} else {
 			sb.putc(c);
 		}
 	}
-	paths.put(sb.toString());
-	return paths;
+	args.put(sb.toString());
+	return args;
 }
 def extractName(path: string) -> string {
 	var sb = StringBuilder.new();

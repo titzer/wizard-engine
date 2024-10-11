@@ -10,14 +10,14 @@ function run_tests {
         for file in *.wasm; do
             if [ "$file" != "main.wasm" ]; then
                 if [ -n "$combined_files" ]; then
-                    combined_files="$combined_files,$file"
+                    combined_files="$combined_files $file"
                 else
                     combined_files="$file"
                 fi
             fi
         done
-        options="--expose=wizeng --link=${combined_files}"
-        wizeng $options main.wasm > ../$testcase.out
+        options="--expose=wizeng"
+        wizeng $options $combined_files main.wasm  > ../$testcase.out
         cd ..
     done
 }
