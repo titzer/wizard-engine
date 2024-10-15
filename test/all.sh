@@ -134,4 +134,10 @@ for target in $TEST_TARGETS; do
     do_script wasi/test
 done
 
+# linker tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    do_script linker/test
+done
+
 exit 0
