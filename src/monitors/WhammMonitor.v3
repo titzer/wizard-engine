@@ -38,6 +38,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	var onExitF: int = -1;
 	var opcodePatterns: Array<List<(Opcode, Array<WhammParam>, FuncDecl)>>;
 	var whammInstances: List<(Module, Instance, InstanceRef)>; // XXX: leaky
+  var err: ErrorGen;
 
 	new() {
 		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.filename).ln();
@@ -71,6 +72,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	}
   // monitors called on parsed modules
 	def onParse(module: Module, err: ErrorGen) {
+	  this.err = err;
 	    // What extensions?
 		var wi = getWhammInstance(module).0;
 		if (wi == null) return;
@@ -98,7 +100,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
   		if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), opcode_pos, opcode.mnemonic).ln();
 			var wf   = WasmFunction.!(wi.functions[bp.head.2.func_index]);
 			var args = bindParams(cv, wf, wi, bp.head.1, opcode, false);
-			Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, WhammProbe.new(wf, args));
+			if (args != null) Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, WhammProbe.new(wf, args));
 		}
 	}
 
@@ -108,7 +110,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	  def expParams = wf.sig.params;  // expected params of WasmFunction
 
 	  if (expParams.length != args.length) {
-      System.error("Whamm probe error", "arity mismatch");	    // TODO this is a true error
+      err.at(cv.parser.decoder).WhammProbeError("whamm probe", "arity mismatch between wasm function params and whamm exported name");
 	  }
 
 		for (i < args.length) {
@@ -118,19 +120,19 @@ class WhammMonitor(whamm: Module) extends Monitor {
 				FrameAccessor  => {
 				  arg = WhammArg.FrameAccessor; // type externref
 				  if (expParams[i] != ValueTypes.EXTERNREF) {
-            System.error("Whamm probe error", "type mismatch"); // TODO true error
+            err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on frame accessor argument");
 				  }
 			  }
 				Pc             => {
           arg = WhammArg.Val(Values.i_v(cv.opcode_pos));
 				  if (expParams[i] != ValueType.I32) {
-            System.error("Whamm probe error", "type mismatch"); // TODO true error
+            err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on pc argument");
 				  }
 				}
 				Func           => {
           arg = WhammArg.Val(Values.i_v(cv.func.func_index));
           if (expParams[i] != ValueType.I32) {
-            System.error("Whamm probe error", "type mismatch"); // TODO true error
+            err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on function index argument");
 				  }
 				}
 				Imm(orig, j)   => {
@@ -184,8 +186,12 @@ class WhammMonitor(whamm: Module) extends Monitor {
             }
           }
 
-          // TODO this is a true error on most opcodes, but an unmatch upcode on some (which ones? e.g. br_table)
-          if (j >= vals.length) System.error("Whamm probe error", "immN out of bounds");
+          if (j >= vals.length) {
+            match (op) {
+              BR_TABLE, TRY_TABLE => return null;
+              _ => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "immediate argument out of bounds");
+            }
+          }
 
           arg = WhammArg.Val(vals[j]);
           var t: ValueType;
@@ -199,44 +205,46 @@ class WhammMonitor(whamm: Module) extends Monitor {
             V128(_, _) => t = ValueType.V128;
           }
           if (expParams[i] != t) {
-            System.error("Whamm probe error", "type mismatch"); // TODO true error
+            err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on immediate return type");
           }
 				}
 				Arg(orig, i)   => {  // arg0 = first arg to bytecode
 				  def io = Opcodes.stackDelta(cv.sig, op, dupParser(cv));
 				  def args = io.0;
 				  if (i >= args) {
-            System.error("Whamm probe error", "argN out of bounds");
+				    match (op) {
+              CALL, CALL_INDIRECT => return null; // no match
+              _ => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "instruction argument out of bounds");
+				    }
 				  }
 			    def stk = cv.val_stack.elems;
 			    def top = cv.val_stack.top; // NOTE virgil comments state it might forbid this field access later
 			    def t = stk[top - 1 - i];
 			    arg = WhammArg.Operand(t, i - args + 1);
           if (expParams[i] != t) {
-            System.error("Whamm probe error", "type mismatch");
+				    match (op) {
+              CALL, CALL_INDIRECT => return null; // no match
+              _ => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "instruction argument type mismatch");
+				    }
           }
 		    }
 		    // TODO clarify what the local means (#s, args vs. true locals)
 				Local(orig, i) => {
-				  if (i >= cv.locals.length) {
-            System.error("Whamm probe error", "localN out of bounds");
-				  }
+				  if (i >= cv.locals.length) return null; // no match error
 			    def t = cv.locals[i];
 			    arg = WhammArg.Local(t, i);
-          if (expParams[i] != t) {
-            System.error("Whamm probe error", "type mismatch");
-          }
+          if (expParams[i] != t) return null; // no match error
 		    }
 				Call(target, params) => {
-				  if (nested) System.error("Whamm probe error", "nested function calls");
+				  if (nested) err.at(cv.parser.decoder).WhammProbeError("whamm probe", "nested function calls");
 
           def exports = wi.module.exports;
           def lookupR = FuncDecl.!(Vectors.lookup(exports, target.image, Strings.equal, null));
           if (lookupR == null) {
-            System.error("Whamm probe error", "Lookup for function failed");
+            err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in the probe argument not found");
           }
-          def index = lookupR.func_index; // TODO virgil pr
-//          def index = FuncDecl.!(lookup(exports, target.image)).func_index;
+
+          def index = FuncDecl.!(lookup(exports, target.image)).func_index;
           def func = wi.functions[index];
 
           def whammArgs = bindParams(cv, WasmFunction.!(func), wi, params, op, true);
@@ -245,10 +253,10 @@ class WhammMonitor(whamm: Module) extends Monitor {
       		for (i < whammArgs.length) {
       			var v: Value;
       			match (whammArgs[i]) {
-      				FrameAccessor => System.error("Whamm probe error", "frame accessor used as param to call");
+      				FrameAccessor => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "frame accessor used as an argument to a call");
       				Val(val)      => v = val;
-      				Operand(t, i) => System.error("Whamm probe error", "arg used as param to call");
-      				Local(t, i)   => System.error("Whamm probe error", "local used as param to call");
+      				Operand(t, i) => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "arg used as an argument to a call");
+      				Local(t, i)   => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "local used as an argument to a call");
       			}
       			args[i] = v;
     			}
@@ -256,7 +264,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 			    def result = Execute.call(func, args); // XXX: runs on a new stack
 			    match (result) {
             Value(vals)       => {
-              if (vals.length == 0) System.error("Whamm probe error", "call did not return value");
+              if (vals.length == 0) err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value");
               arg = WhammArg.Val(vals[0]);
               var t: ValueType;
               match (vals[0]) {
@@ -269,11 +277,11 @@ class WhammMonitor(whamm: Module) extends Monitor {
                 V128(_, _) => t = ValueType.V128;
               }
               if (expParams[i] != t) {
-                System.error("Whamm probe error", "type mismatch");
+                err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on call return type");
               }
             }
-            Throw(throw)      => System.error("Whamm probe error", "call did not return value");
-            StackSwitch(info) => System.error("Whamm probe error", "call did not return value");
+            Throw(throw)      => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value");
+            StackSwitch(info) => err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value");
 			    }
 				}
 			}
