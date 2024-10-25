@@ -6,5 +6,5 @@
   "\80\00\02\87\80\80\80\00\00\20\00\41\2a\6a\0b\8b"
   "\80\80\80\00\00\41\15\d2\00\e0\01\e3\01\00\0b"
 )
-
+(module instance)
 (assert_return (invoke "main") (i32.const 0x3f))

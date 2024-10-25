@@ -9,7 +9,7 @@
   "\00\d2\00\e0\03\e3\03\01\00\00\00\42\0b\d0\01\0b"
   "\1a\0b"
 )
-
+(module instance)
 (assert_return (invoke "main" (i32.const 0x17)) (i64.const 0x17))
 (assert_return
   (invoke "main" (i32.const 0xffff_ffd5))

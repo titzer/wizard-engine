@@ -5,5 +5,5 @@
   "\04\6d\61\69\6e\00\00\0a\90\80\80\80\00\01\8a\80"
   "\80\80\00\00\d0\01\e4\01\00\00\41\2a\0b"
 )
-
+(module instance)
 (assert_trap (invoke "main") "null continuation")

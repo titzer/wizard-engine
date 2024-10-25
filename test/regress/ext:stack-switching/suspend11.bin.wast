@@ -7,5 +7,5 @@
   "\0b\93\80\80\80\00\00\02\63\01\d2\00\e0\01\e3\01"
   "\01\00\00\00\d0\01\0b\1a\0b"
 )
-
+(module instance)
 (assert_suspension (invoke "main") "unhandled")

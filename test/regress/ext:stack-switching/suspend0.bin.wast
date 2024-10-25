@@ -6,5 +6,5 @@
   "\98\80\80\80\00\02\84\80\80\80\00\00\e2\00\0b\89"
   "\80\80\80\00\00\d2\00\e0\01\e3\01\00\0b"
 )
-
+(module instance)
 (assert_suspension (invoke "main") "unhandled")

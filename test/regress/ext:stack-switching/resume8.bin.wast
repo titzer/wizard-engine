@@ -9,7 +9,7 @@
   "\20\00\d2\00\e0\01\e3\01\00\0b\8b\80\80\80\00\00"
   "\20\00\d2\01\e0\03\e3\03\00\0b"
 )
-
+(module instance)
 (assert_return (invoke "call_f_f" (f32.const 0x1.6p+3)) (f32.const 0x1.6p+3))
 (assert_return
   (invoke "call_f_f" (f32.const -0x1.bcp+7))
