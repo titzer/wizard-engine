@@ -17,7 +17,7 @@ Clone the repo, put its `bin` directory in your `$PATH`, and build it with `make
 ```
 
 The Virgil repository has compiler binaries directly checked in, as well as scripts that should detect your host platform and link up the right binary.
-It's ready to run out-of-the-box, but Wizard often uses cutting-edge features that require the `make` step above.
+While Virgil is ready to run out of the box with a pre-built compiler, Wizard often uses cutting-edge Virgil features that require the `make` step above.
 
 ## Build Wizard with `make`
 
@@ -42,8 +42,8 @@ vctags -e src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3 src/wave/*.v3 src/was
 ./build.sh objdump jvm
 ```
 
-By default, this will build the unittests, the spectest runner, a command line runner, and an objdump utility, for all platforms.
-Binaries will be deposited in the `bin` directory, with each platform binary have an appropriate suffix.
+By default, this will build the unittests, the spectest runner, the main engine (wizeng), and an objdump utility, for all platforms.
+Binaries will be deposited in the `bin` directory, with each platform binary having an appropriate suffix.
 
 
 ## Testing Wizard
@@ -54,6 +54,7 @@ Wizard has several batteries of tests:
 * Wasm [spec](http://github.com/WebAssembly/spec) and proposal tests
 * regression tests
 * tests for the `wizeng` command-line and monitor functionality
+* tests for monitors
 * tests for WASI functionality
 
 ### Unit tests
