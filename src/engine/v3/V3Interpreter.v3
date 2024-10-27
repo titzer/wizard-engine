@@ -47,7 +47,6 @@ class V3Interpreter extends WasmStack {
 		return params_arity;
 	}
 	def resume() -> Result {
-		// TODO: handle more states
 		checkState("resume()", StackState.RESUMABLE);
 		thrown = null;
 
@@ -1118,8 +1117,9 @@ class V3Interpreter extends WasmStack {
 				var func = Function.!(Value.Ref.!(pop()).val);
 				if (func == null) return void(trap(TrapReason.NULL_DEREF));
 
-				var cont = Continuation.new(cont_decl, V3Interpreter.new());
-				cont.stack.reset(func);
+				var stack = V3Interpreter.new();
+				stack.reset(func);
+				var cont = Continuation.new(stack, stack);
 				push(Value.Ref(cont));
 			}
 			CONT_BIND => {
@@ -1129,12 +1129,12 @@ class V3Interpreter extends WasmStack {
 
 				var cont = Continuation.!(Value.Ref.!(pop()).val);
 				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
-				// continuation can only be resumed/bound once
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 				cont.used = true;
 
-				var new_cont = Continuation.new(cont.cont, cont.stack);
-				new_cont.stack.bind(values.peekn(n_binds));
+				var new_cont = Continuation.new(cont.top, cont.bottom);
+				Trace.OUT.put1("TEST %d", values.peekn(n_binds).length).ln();
+				new_cont.top.bind(values.peekn(n_binds));
         
 				cont.used = true;
 				values.top -= n_binds;
@@ -1147,13 +1147,15 @@ class V3Interpreter extends WasmStack {
 				var cont = Continuation.!(Value.Ref.!(pop()).val);
 				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
-
 				cont.used = true;
-				cont.stack.bind(values.peekn(cont.stack.getMissingBinds()));
+
+				// TODO[ss]: remove all {getMissingBinds}, use cont type for checking
+				var n_binds = cont_type.sig.params.length;
+				cont.top.bind(values.peekn(n_binds));
 
 				prev_resume_pc = frame.pc;
 				state_ = StackState.CALL_CHILD;
-				stack_switch_info = StackSwitchInfo.RunChildStack(cont.stack);
+				stack_switch_info = StackSwitchInfo.RunChildStack(cont);
 				return; // skip setting frame.pc = codeptr.pos
 			}
 			RESUME_THROW => {
@@ -1173,10 +1175,10 @@ class V3Interpreter extends WasmStack {
 				var throwable = Exception.new(exn_tag, vals, null);
 
 				cont.used = true;
-				var res = cont.stack.throw(throwable);
+				var res = cont.top.throw(throwable);
 				prev_resume_pc = frame.pc;
 				state_ = StackState.CALL_CHILD;
-				stack_switch_info = StackSwitchInfo.RunChildStack(cont.stack);
+				stack_switch_info = StackSwitchInfo.RunChildStack(cont);
 			}
 			SUSPEND => {
 				var tag = frame.func.instance.tags[codeptr.read_uleb32()];
@@ -1185,7 +1187,7 @@ class V3Interpreter extends WasmStack {
 				values.top -= n_vals;
 
 				state_ = StackState.SUSPENDED;
-				stack_switch_info = StackSwitchInfo.Suspend(Continuation.new(null, this), tag, range);
+				stack_switch_info = StackSwitchInfo.Suspend(this, tag, range);
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
 			_ => {
@@ -1486,14 +1488,19 @@ class V3Interpreter extends WasmStack {
 		}
 	}
 	// Returns whether the suspend got handled.
-	def onChildSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) -> bool {
+	def tryHandleSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) -> bool {
+		var handler = frame.func.decl.findResumeHandler(frame.func.instance, tag, prev_resume_pc);
+		if (handler.handler_pc < 0) return false;
+
+		prev_resume_pc = -1;
 		values.pusha(vals);
 		values.push(Value.Ref(cont));
-		if (!gotoResumeHandlerAndConsume(tag)) {
-			state_ = StackState.SUSPENDED;
-			stack_switch_info = StackSwitchInfo.Suspend(cont, tag, vals);
-			return false;
-		}
+
+		var code = frame.func.decl.cur_bytecode;
+		frame.pc = handler.handler_pc;
+		frame.stp = handler.sidetable_pos;
+		codeptr.reset(code, frame.pc, code.length);
+
 		state_ = StackState.RESUMABLE;
 		return true;
 	}
@@ -1534,21 +1541,6 @@ class V3Interpreter extends WasmStack {
 		if (segment != null) t = t.prependFrames(segment.frames).prependHostFunction(segment.host);
 		state_ = StackState.THROWING;
 		return thrown = t; // unhandled exception
-	}
-	// ext:typed-continuation
-	def gotoResumeHandlerAndConsume(tag: Tag) -> bool {
-		var handler = frame.func.decl.findResumeHandler(frame.func.instance, tag, prev_resume_pc);
-		prev_resume_pc = -1;
-		if (handler.handler_pc >= 0) {
-			var code = frame.func.decl.cur_bytecode;
-			frame.pc = handler.handler_pc;
-			// TODO[ss]: check that this is correct sidetable placement
-			frame.stp = handler.sidetable_pos;
-			codeptr.reset(code, frame.pc, code.length);
-			return true;
-		}
-
-		return false;
 	}
 	def trap(reason: TrapReason) -> Throwable {
 		var stacktrace = popAllFrames(true);
