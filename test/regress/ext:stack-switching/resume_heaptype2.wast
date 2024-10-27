@@ -56,7 +56,6 @@
   )
 )
 
-;; TODO: FIX THIS AHHHHHHHHHHH
 (assert_return (invoke "main" (i32.const 1)) (f32.const 1))
 (assert_return (invoke "main" (i32.const 2)) (f32.const 3))
 (assert_return (invoke "main" (i32.const 3)) (f32.const 6))
