@@ -3,7 +3,7 @@
 The Wizard Engine is designed to a research and experimentation vehicle.
 This page collects tips and guidance for how to get started working on Wizard's internals to extend and improve it.
 
-## Editor support for Virgil
+## Get syntax highlighting for Virgil in your IDE
 
 Wizard is written in Virgil, a lightweight systems language designed making fast and efficient low-level programs, like virtual machines.
 Virgil syntax highlighting is available for a number of editors, including:
@@ -12,7 +12,7 @@ Virgil syntax highlighting is available for a number of editors, including:
 - Emacs: via the E-lisp in [virgil/bin/virgil-mode.el](https://github.com/titzer/virgil/blob/master/bin/virgil-mode.el)
 - Vim: via the configuration in [virgil/bin/dev/virgil-vim](https://github.com/titzer/virgil/tree/master/bin/dev/virgil-vim)
 
-## Vim and Emacs CTAGS
+## Use CTAGS for faster navigation
 
 Virgil can generate [CTAGS](https://en.wikipedia.org/wiki/Ctags) files that help navigating program definitions and uses, which is a must in any unfamiliar codebase.
 A number of editors support CTAGS, including `emacs` and `vim`.
@@ -32,7 +32,7 @@ The Emacs [reference manual](https://www.gnu.org/software/emacs/manual/html_node
 - Find uses of a given identifier
 - Find/replace a given identifier (i.e. rename)
 
-## Tracing modes
+## Debug with tracing modes first (probably)
 
 Getting insight into Wizard's behavior--for example, to debug a change you've made--often starts with enabling tracing flags.
 These flags enable trace output of various phases of loading and executing a program, broken down by subsystem.
@@ -41,13 +41,13 @@ If you're adding new bytecodes or new types to Wizard as an experiment, or imple
 Other flags enable tracing the execution of the program, such as the calls it makes, both internally and to host calls, and tracing the interpreter state.
 Refer to the [documentation on tracing](Tracing.md) for explanation of the flags, or use the `-help` flag to `wizeng`.
 
-## Built-in Monitors
+## Debug with built-in Monitors
 
 Monitors offer a flexible extension mechanism to add new dynamic analyses to Wizard.
 They can also be useful for development of Wizard itself, as they offer more detailed insight into how programs executing.
 Refer to the [documentation on monitors](Monitors.md) for explanation of monitors, or use the `-help` flag to `wizeng`.
 
-### The `tracepoints` monitor
+### Deeper tracing with the `tracepoints` monitor
 
 Often, tracing modes, such as `-tio` (trace interpreter with operands) generate far too much output for a person to manually inspect.
 Wizard supports targeted tracing of specific program locations via the `tracepoints` monitor, which allows one to choose locations in the program that then print out the entire stack frame of the enclosing function each time they are executed.
@@ -55,12 +55,12 @@ This is useful to debug programs, but also to debug Wizard itself.
 For example, a bug in the code generation of the single-pass compiler might cause a program to misbehave.
 Comparing the output of the program when run under either the V3 interpreter or fast interpreter to its output when run on SPC, and then using tracepoints to target the tracing output to suspect functions has been a game changer!
 
-### The `breakpoints` monitor
+### Stop anywhere with the `breakpoints` monitor
 
 Similar to the `tracepoints` monitor, this monitor causes the single-pass compiler (and soon, the fast interpreter) to execute a machine-level `break` instruction (`int3` on `x86-64`), which can be used to stop the entire execution in `gdb` and inspect machine code and registers.
 This has been extremely useful to debug SPC wrong-code bugs!
 
-## Using Virgil's `-trace-calls`
+## Trace Wizard internal calls with `V3C_OPTS=-trace-calls=<methods>`
 
 A nice feature of Virgil is that it includes an interpreter for the full language.
 While absolutely necessary for Virgil's compile-time initializers, it is also useful as a sanity check for the Virgil compiler, as any platform-independent Virgil program can be run in the interpreter `v3i`, which includes various tracing modes, utilities, and even a debugger.
@@ -82,7 +82,7 @@ Here we pass `-trace-calls='Module.*'` which is a pattern that selects all metho
 Since the `-trace-calls` option works at the Virgil interpreter level, we can trace any function in Wizard.
 Running with two levels of interpretation (a Virgil interpreter running a Wasm interpreter) can be quite slow, so this works best with smaller programs.
 
-## Using Virgil's `-fatal-calls`
+## Stop Wizard anywhere with `V3C_OPTS=-fatal-calls=<methods>`
 
 We can make use of `V3C_OPTS` to pass essentially any options to the Virgil interpreter/compiler.
 Another useful option is `-fatal-calls` which takes a function pattern, exactly as `-trace-calls`.
@@ -111,21 +111,20 @@ This can be useful to figure out the chain of calls leading up to, e.g. an error
 
 Here, we can see exactly where the first invocation of `Module.addDecl` occurs.
 
-## Adding your own print calls
+## How to add your own print calls
 
 ## Using the Virgil debugger `vdb`
 
-## Effective use of `gdb`
+## How to use `gdb` to debug Wizard
 
-## Developing and debugging unit tests
+## Getting the most out of unit tests
 
 Debugging a virtual machine bug that occurs only on a very large program can be tedious and time-consuming.
 In developing Wizard, we do everything possible to preempt this by building effective unittests and making the unit testing edit-run-debug cycle as fast as possible.
 
-### Install `progress`
+### Install `progress` to make the output nicer
 
 The `progress` utility helps clean up the logging output that is output by Wizard's various test suites by summarizing it and presenting failed tests in a clean way.
 It is highly recommended to install this via the steps in the [documentation on building](Building.md).
 
-## Effective use of regression tests
-
+## Getting the most out of regression tests
