@@ -22,5 +22,8 @@
 )
 
 (assert_return (invoke "main" (i32.const 0)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 1)) (i32.const 1))
+(assert_return (invoke "main" (i32.const 2)) (i32.const 2))
+(assert_return (invoke "main" (i32.const 5)) (i32.const 5))
 (assert_return (invoke "main" (i32.const 42)) (i32.const 42))
 (assert_return (invoke "main" (i32.const 128)) (i32.const 128))

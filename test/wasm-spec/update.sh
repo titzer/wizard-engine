@@ -7,7 +7,6 @@ while [ -h "$SOURCE" ]; do
   [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-
 WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
 
 BRANCHES="$@"

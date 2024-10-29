@@ -9,5 +9,8 @@
 )
 (module instance)
 (assert_return (invoke "main" (i32.const 0x0)) (i32.const 0x0))
+(assert_return (invoke "main" (i32.const 0x1)) (i32.const 0x1))
+(assert_return (invoke "main" (i32.const 0x2)) (i32.const 0x2))
+(assert_return (invoke "main" (i32.const 0x5)) (i32.const 0x5))
 (assert_return (invoke "main" (i32.const 0x2a)) (i32.const 0x2a))
 (assert_return (invoke "main" (i32.const 0x80)) (i32.const 0x80))

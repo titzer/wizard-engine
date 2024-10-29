@@ -1,0 +1,28 @@
+(module
+  (type $f (func))
+  (type $c (cont $f))
+  (tag $t)
+  
+  (func $foo (suspend $t))
+  (elem declare func $foo)
+
+  (func (export "main") (result i32)
+    (i32.const 1)
+    (block (result (ref null $c))
+      (i32.const 2)
+      (i32.const 3)
+      (i32.const 4)
+      (i32.const 5)
+      (resume $c (on $t 0) (cont.new $c (ref.func $foo)))
+      (drop)
+      (drop)
+      (drop)
+      (drop)
+      (ref.null $c)
+    )
+    (drop)
+    (return)
+  )
+)
+
+(assert_return (invoke "main") (i32.const 1))
