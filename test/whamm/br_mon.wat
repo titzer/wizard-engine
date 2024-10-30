@@ -5,11 +5,13 @@
   (memory (export "mem") 2)   ;; no expansion checks
   (global $last_entry (mut i32) (i32.const 0))
 
+  (export "$alloc_br" (func $alloc_br))
   (export "$alloc_br_if" (func $alloc_br_if))
   (export "$alloc_br_table" (func $alloc_br_table))
-  (export "before:exit" (func $print_entries))
+  (export "wasm:opcode:br($alloc_br(fid, pc))" (func $probe_br))
   (export "wasm:opcode:br_if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
   (export "wasm:opcode:br_table($alloc_br_table(fid, pc, imm0), arg0)" (func $probe_br_table))
+  (export "before:exit" (func $print_entries))
 
   (data (i32.const 0xc00) "func=")
   (data (i32.const 0xd00) ", pc=")
@@ -17,6 +19,35 @@
   (data (i32.const 0xf00) ", [")
   (data (i32.const 0xf10) ",")
   (data (i32.const 0xf20) "]")
+
+  ;; Table entry
+  ;; 0      4      8      12         20
+  ;; | func |  pc  |   1  |  # taken |
+  (func $alloc_br (param $func i32) (param $pc i32) (result i32)
+    (local $entry i32)
+
+    global.get $last_entry
+    local.set $entry
+
+    local.get $entry
+    local.get $func
+    i32.store
+
+    local.get $entry
+    local.get $pc
+    i32.store offset=4
+
+    local.get $entry
+    i32.const 1
+    i32.store offset=8
+
+    local.get $entry
+    i32.const 20
+    i32.add
+    global.set $last_entry
+
+    local.get $entry
+  )
 
   ;; Table entry
   ;; 0      4      8      12         20         28
@@ -83,6 +114,15 @@
     global.set $last_entry
 
     local.get $entry
+  )
+
+  (func $probe_br (param $entry i32)
+    local.get $entry
+    local.get $entry
+    i64.load offset=12  ;; count of branches taken
+    i64.const 1
+    i64.add
+    i64.store offset=12
   )
 
   (func $probe_br_if (param $entry i32) (param $arg0 i32)
