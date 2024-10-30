@@ -5,7 +5,8 @@
 def OUT = Trace.OUT;
 class SpecTestInterpreter(engine: Engine, filename: string) {
 	def env = StEnv<StInstance>.new();
-	def vars = StEnv<StInstance>.new();
+	def instances = StEnv<StInstance>.new();
+	def modules = StEnv<Module>.new();
 	var last_module: StModuleResult;
 	var ok = true;
 	var loc: (int, int);
@@ -159,31 +160,53 @@ class SpecTestInterpreter(engine: Engine, filename: string) {
 			error(Strings.format2("expected %s, got %s", expected.name, got.name));
 		}
 	}
-	def doModule(module: StModule) -> StModuleResult {
-		match (module) {
-			Binary(varname, bytes) => {
+	def doModule(stm: StModule) -> StModuleResult {
+		var module: Module;
+		var bindname: string;
+		match (stm) {
+			Binary(isdef, varname, bytes) => {
+				bindname = varname;
 				var r = parseBinary(bytes);
-				if (varname != null) {
-					match (r) {
-						Ok(sti) => {
-							vars.register(varname, sti);
-						}
-						ParseError(r) => {
-							var error_msg = BinParserResult.Error.!(r).error_msg;
-							error(Strings.format1("expected valid module, got invalid: %s", error_msg));
-						}
-						LinkError(msg) => {
-							error(Strings.format1("expected valid module, got link error: %s", msg));
-						}
-						_ => ;
-					}
+				match (r) {
+					Ok(m) => module = m;
+					Error => return StModuleResult.ParseError(r);
 				}
-				return r;
+				BasicTracing.instrumentModule(module);
+				if (isdef) {
+					modules.register(varname, module);
+					return StModuleResult.Module(module);
+				}
 			}
-			Quote(varname, source) => {
+			Quote(_, varname, source) => {
 				return StModuleResult.Quote(source);
 			}
+			Instance(instname, mname) => {
+				bindname = instname;
+				if (mname != null) {
+					module = modules.lookup(mname);
+				} else {
+					if (!StModuleResult.Module.?(last_module)) return last_module;
+					module = StModuleResult.Module.!(last_module).mod;
+				}
+			}
 		}
+		var i = doInstantiate(module);
+		if (bindname != null) {
+			match (i) {
+				Instance(sti) => {
+					instances.register(bindname, sti);
+				}
+				ParseError(r) => {
+					var error_msg = BinParserResult.Error.!(r).error_msg;
+					error(Strings.format1("expected valid module, got invalid: %s", error_msg));
+				}
+				LinkError(msg) => {
+					error(Strings.format1("expected valid module, got link error: %s", msg));
+				}
+				_ => ;
+			}
+		}
+		return i;
 	}
 	def doAction(action: StAction) -> Result {
 		match (action) {
@@ -227,8 +250,13 @@ class SpecTestInterpreter(engine: Engine, filename: string) {
 	}
 	def getInstance(varname: string) -> StInstance {
 		if (varname == null) {
-			match (last_module) {
-				Ok(sti) => return sti;
+			var m = last_module;
+			if (StModuleResult.Module.?(m)) m = doInstantiate(StModuleResult.Module.!(m).mod);
+			match (m) {
+				Instance(sti) => return sti;
+				Module(m) => {
+					error("instantiation failed");
+				}
 				Quote(source) => {
 					error("expected binary module, got quoted module");
 				}
@@ -247,7 +275,7 @@ class SpecTestInterpreter(engine: Engine, filename: string) {
 			}
 			return null;
 		}
-		var i = vars.lookup(varname);
+		var i = instances.lookup(varname);
 		if (i == null) error(Strings.format1("module %s not found", varname));
 		return i;
 	}
@@ -264,20 +292,13 @@ class SpecTestInterpreter(engine: Engine, filename: string) {
 		}
 		return false;
 	}
-	def parseBinary(bytes: Array<byte>) -> StModuleResult {
+	def parseBinary(bytes: Array<byte>) -> BinParserResult {
 		var extensions = engine.extensions;
 		var limits = Limits.new().set(extensions);
 		var mp = BinParser.new(extensions, limits, "test");
 		mp.tiering = Execute.tiering;
 		mp.push(bytes, 0, bytes.length);
-		var r = mp.finish();
-		match (r) {
-			Ok(module) => {
-				BasicTracing.instrumentModule(module);
-				return doInstantiate(module);
-			}
-			Error => return StModuleResult.ParseError(r);
-		}
+		return mp.finish();
 	}
 	def doInstantiate(module: Module) -> StModuleResult {
 		var imports = Array<Exportable>.new(module.imports.length);
@@ -305,7 +326,7 @@ class SpecTestInterpreter(engine: Engine, filename: string) {
 				}
 			}
 		}
-		return StModuleResult.Ok(StInstance.new(r));
+		return StModuleResult.Instance(StInstance.new(r));
 	}
 	def print(args: Range<Value>) -> HostResult {
 		OUT.puts("called host spectest.print?");
@@ -321,7 +342,8 @@ def newGlobal(t: ValueType, i: InitExpr, v: Value) -> Global {
 	return g;
 }
 type StModuleResult {
-	case Ok(sti: StInstance);
+	case Module(mod: Module);
+	case Instance(sti: StInstance);
 	case Quote(source: string);
 	case ParseError(r: BinParserResult);
 	case CompileError(r: ErrorGen);
@@ -332,14 +354,15 @@ type StModuleResult {
 class StEnv<T> {
 	def modules = Vector<(string, T)>.new();
 	def register(name: string, t: T) {
-		modules.put(name, t);
+		if (name != null) modules.put(name, t);
 	}
 	def lookup(name: string) -> T {
+		var d: T;
+		if (name == null) return d;
 		for (i < modules.length) {
 			var m = modules[i];
 			if (Strings.equal(m.0, name)) return m.1;
 		}
-		var d: T;
 		return d;
 	}
 }

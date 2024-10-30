@@ -6,6 +6,6 @@
   "\00\02\82\80\80\80\00\00\0b\90\80\80\80\00\00\20"
   "\00\04\63\01\d2\00\e0\01\05\d0\01\0b\d1\0b"
 )
-
+(module instance)
 (assert_return (invoke "main" (i32.const 0x0)) (i32.const 0x1))
 (assert_return (invoke "main" (i32.const 0x457)) (i32.const 0x0))

@@ -1,0 +1,31 @@
+(module
+  (type $s (struct (field (mut i32)) (field i32)))
+  (type $f (func (result i32)))
+  (type $c (cont $f))
+  (tag $tag (param (ref null $s)))
+
+  (func $foo (result i32)
+    (local $struct (ref null $s))
+    (local.set $struct (struct.new $s (i32.const 42) (i32.const 24)))
+
+    (suspend $tag (local.get $struct))
+    (struct.get $s 0 (local.get $struct))
+  )
+  (elem declare func $foo)
+  (func (export "get_0") (result i32)
+    (local $temp (ref null $c))
+
+    (block $b (result (ref null $s) (ref null $c))
+      (cont.new $c (ref.func $foo))
+      (resume $c (on $tag $b))
+      (drop)
+      (ref.null $s)
+      (ref.null $c)
+    )
+    (local.set $temp)
+    (struct.set $s 0 (i32.const 2048))
+    (resume $c (local.get $temp))
+  )
+)
+
+(assert_return (invoke "get_0") (i32.const 2048))

@@ -8,5 +8,5 @@
   "\01\d2\00\e0\01\21\00\20\00\e3\01\00\23\00\20\00"
   "\e3\01\00\0b"
 )
-
+(module instance)
 (assert_trap (invoke "main") "continuation already consumed")

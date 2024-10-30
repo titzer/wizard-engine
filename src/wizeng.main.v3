@@ -6,194 +6,202 @@ var print_result = false;
 def main(args: Array<string>) -> int {
 	var engine = Engine.new();
 	var programArgs: Array<string>;
-	var path: string;
-	// Parse option and extract module and module arguments
-	for (i < args.length) {
-		var a = args[i];
-		if (a.length > 0 && a[0] == '-') {
-			var ok = OptionsRegistry.parse(a);
-			if (!ok) return ErrorBuilder.new()
-				.puts("wizeng: unrecognized option ")
-				.putsq(a)
-				.ln()
-				.exit(1);
-			engine.extensions = EngineOptions.extensions;
-		} else {
-			path = a;
-			programArgs = Arrays.range(args, i, args.length);
-			break;
-		}
+	var wasmFiles: Range<string>;
+	var pos = 0;
+	// Parse options that start with '-'
+	while (pos < args.length) {
+		var a = args[pos];
+		if (a.length == 0) break;
+		if (a[0] != '-') break;
+		var ok = OptionsRegistry.parse(a);
+		if (!ok) return ErrorBuilder.new()
+			.puts("wizeng: unrecognized option ")
+			.putsq(a)
+			.ln()
+			.exit(1);
+		engine.extensions = EngineOptions.extensions;
+		pos++;
 	}
+	// Find range of all .wasm files
+	var before = pos;
+	var skip = 0;
+	while (pos < args.length) {
+		var a = args[pos];
+		if (a.length == 0) break;
+		if (Strings.equal("--", a)) { skip = 1; break; } // skip argument separator
+		if (!Strings.endsWith(a, ".wasm")) break;
+		pos++;
+	}
+	wasmFiles = args[before ... pos];
+	// Program arguments remain after .wasm files or after "--"
+	programArgs = Ranges.dup(args[(pos + skip) ...]);
 
 	if (WizengOptions.PREGEN_FILE.val != null) {
 		var err = Target.pregenIntoFile(WizengOptions.PREGEN_FILE.val);
 		if (err != null) return err.exit(2);
-		if (path == null) return 0; // all done
+		if (wasmFiles.length == 0) return 0; // all done
 	}
 
 	if (WizengOptions.helped) {
 		return 0;
 	}
 
-	if (path == null) return ErrorBuilder.new()
+	if (wasmFiles.length == 0) return ErrorBuilder.new()
 		.puts("wizeng: no input files\n")
 		.exit(3);
 
-	if (!Strings.endsWith(path, ".wasm")) return ErrorBuilder.new()
-		.puts(path)
-		.puts(": unknown file format, expected .wasm\n")
-		.exit(4);
-
-	// Parse the binary module
-	var monitors = MonitorOptions.getMonitors();
-	if (monitors.length > 0) Execute.tiering.onMonitorsStart();
-	var result = engine.loadWasmFile(path);
-	var module: Module;
-	match (result) {
-		Ok(m) => {
-			module = m;
-			BasicTracing.instrumentModule(m);
-		}
-		FileNotFound => return ErrorBuilder.new()
-			.puts("wizeng: could not load file ")
+	var named_modules = Array<(string, Module)>.new(wasmFiles.length);
+	for (i < wasmFiles.length) {
+		var path = wasmFiles[i];
+		if (!Strings.endsWith(path, ".wasm")) return ErrorBuilder.new()
 			.puts(path)
-			.ln()
-			.exit(2);
-		ParseError(code, path, section, error_index, error_pos, error_msg) => return ErrorBuilder.new()
-			.render(code, path, section, error_index, error_pos, error_msg)
-			.exit(3);
+			.puts(": unknown file format, expected .wasm\n")
+			.exit(4);
 	}
-	// Call monitors for parsed module
-	for (i < monitors.length) {
-		def gen = ErrorGen.new("monitor");
-		monitors[i].onParse(module, gen);
-		if (gen.error()) {  // error in monitor run on parsed module
-			return ErrorBuilder.new()
-				.render(gen.error_code, gen.filename, gen.error_section, gen.error_index, gen.error_pos, gen.error_msg)
+	var monitors = MonitorOptions.getMonitors().extract();
+	if (monitors.length > 0) Execute.tiering.onMonitorsStart();
+	for (i < wasmFiles.length) {
+		var path = wasmFiles[i];
+		// Parse the binary module
+		var result = engine.loadWasmFile(path);
+		var module: Module;
+		match (result) {
+			Ok(m) => {
+				module = m;
+				BasicTracing.instrumentModule(m);
+			}
+			FileNotFound => return ErrorBuilder.new()
+				.puts("wizeng: could not load file ")
+				.puts(path)
+				.ln()
+				.exit(2);
+			ParseError(code, path, section, error_index, error_pos, error_msg) => return ErrorBuilder.new()
+				.render(code, path, section, error_index, error_pos, error_msg)
 				.exit(3);
 		}
+		named_modules[i] = (extractName(path), module);
 	}
-
-	var err = ErrorGen.new(path);
-	if (monitors.length > 0) Execute.tiering.onMonitorsFinish(module, err);
-
-	// Gather the list of import processors
-	var imports = Array<Exportable>.new(module.imports.length);
-	var i = Instantiator.new(engine.extensions, module, imports, err);
-	var map = Strings.newMap<ImportProcessor>();
-
-	for (j < module.imports.length) {
-		var name = module.imports[j].imp.module_name;
-		if (map[name] == null) {
-			var p = ModuleRegistry.get(name);
-			if (p == null) return ErrorBuilder.new()
-				.puts(path)
-				.put2(": import[%d] from unknown module \"%s\"\n", j, name)
-				.exit(7);
-			var trace = BasicTracing.moduleFilter != null && BasicTracing.moduleFilter.matchesStr(name, null);
-			p.init(programArgs, trace, err);
-			map[name] = p;
-			i.processors.put(p);
+	var err = ErrorGen.new(wasmFiles[wasmFiles.length - 1]);
+	// Call monitors for all modules
+	for (named_module in named_modules) {
+		for (i < monitors.length) {
+			def gen = ErrorGen.new("monitor");
+			monitors[i].onParse(named_module.1, gen);
+			if (gen.error()) {  // error in monitor run on parsed module
+				return ErrorBuilder.new()
+					.render(gen.error_code, gen.filename, gen.error_section, gen.error_index, gen.error_pos, gen.error_msg)
+					.exit(3);
+			}
+			if (monitors.length > 0) Execute.tiering.onMonitorsFinish(named_module.1, err);
 		}
 	}
 
-	// Call monitors on reset
-	for (i < monitors.length) monitors[i].onReset();
-
-	// Add tracing to import calls as specified by filters, if any.
-	if (BasicTracing.moduleFilter != null) i.binder = ImportTracer.new(BasicTracing.moduleFilter).wrap;
-
-	// Run the instantiatior.
-	var instance = i.run();
+	var binder: (Decl, Exportable) -> Exportable;
+	if (BasicTracing.moduleFilter != null) binder = ImportTracer.new(BasicTracing.moduleFilter).wrap;
+	var linker = ModuleLinker.new(engine, programArgs, named_modules, binder, err);
+	var all_instantiators = linker.link();
 	if (!err.ok()) return ErrorBuilder.new()
-		.render(err.error_code, path, err.section, err.error_index, err.error_pos, err.error_msg)
+		.render(err.error_code,
+			    if(u32.view(err.index) < wasmFiles.length, wasmFiles[err.index], wasmFiles[wasmFiles.length - 1]),
+				err.section,
+				err.error_index,
+				err.error_pos,
+				err.error_msg)
 		.exit(6);
 
-	// Call monitors on finish
-	for (i < monitors.length) monitors[i].onInstantiate(instance);
+	// Call monitors for all instances on instantiate
+	for (instantiator in all_instantiators) for (monitor in monitors) monitor.onInstantiate(instantiator.instance);
 
-	// Try to find the main entrypoint.
-	var entry: (Function, Array<Value>);
-	for (j < i.processors.length) {
-		var p = i.processors[j];
-		if (HostModule.?(p)) {
-			entry = HostModule.!(p).getMain(instance);
-			if (entry.0 != null) break;
-		}
-	}
-
-	if (entry.0 == null) {
-		entry = findDefaultMain(instance);
-	}
-
-	if (entry.0 == null) return ErrorBuilder.new()
-		.puts(path)
-		.puts(": no main export from module\n")
-		.exit(7);
-
-	// Execute the start function, if any.
-	if (module.start_function >= 0) {
-		var start = instance.functions[module.start_function];
-		for (i < monitors.length) monitors[i].onStart(start);
-		var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
-		match (r) {
-			Throw(thrown) => {
-				// Start function trapped or exited, return
-				printThrowable(thrown);
-				MonitorRegistry.runReports();
-				Metrics.report();
-				return -1;
-			}
-			_ => ; // ignore return value and break
-		}
-	}
-
-	// Execute the main entrypoint.
-	for (i < monitors.length) monitors[i].onMain(entry.0, entry.1);
-	var before_us = Metrics.main_time_us.ticks();
-	var before_cycles = Metrics.main_time_cycles.ticks();
-	var r = Execute.call(entry.0, entry.1);
-	Metrics.main_time_cycles.updateDiff(before_cycles);
-	Metrics.main_time_us.updateDiff(before_us);
-
+	// Try to find the main entrypoint for all modules.
 	var exit_code = 0;
-	match (r) {
-		Value(vals) => {
-			if (vals.length == 1) {
-				match (vals[0]) {
-					I32(val) => exit_code = int.view(val);
-					I64(val) => exit_code = int.view(val);
-					_ => ;
-				}
-			}
-			if (print_result) {
-				for (i < vals.length) {
-					if (i > 0) Trace.OUT.sp();
-					Trace.OUT.putv(vals[i]);
-				}
-				Trace.OUT.ln();
+	for (i < all_instantiators.length) {
+		var path = wasmFiles[i];
+		var instantiator = all_instantiators[i];
+		var ins = instantiator.instance;
+		var module = ins.module;
+		var entry: (Function, Array<Value>);
+		for (j < instantiator.processors.length) {
+			var p = instantiator.processors[j];
+			if (HostModule.?(p)) {
+				entry = HostModule.!(p).getMain(ins);
+				if (entry.0 != null) break;
 			}
 		}
-		Throw(thrown) => match (thrown) {
-			x: Exit => {
-				exit_code = int.view(x.code);
-			}
-			_ => {
-				printThrowable(thrown);
-				exit_code = -1;
+
+		if (entry.0 == null) {
+			entry = findDefaultMain(ins);
+		}
+
+		if (i == all_instantiators.length - 1 && entry.0 == null) return ErrorBuilder.new()
+			.puts(path)
+			.puts(": no main export from module\n")
+			.exit(7);
+
+		// Execute the start function, if any.
+		if (module.start_function >= 0) {
+			var start = ins.functions[module.start_function];
+			for (monitor in monitors) monitor.onStart(start);
+			var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
+			match (r) {
+				Throw(thrown) => {
+					// Start function trapped or exited, return
+					printThrowable(thrown);
+					MonitorRegistry.runReports();
+					Metrics.report();
+					return -1;
+				}
+				_ => ; // ignore return value and break
 			}
 		}
-		StackSwitch(info) => {
-			// printThrowable(info.parent.trap(TrapReason.INVALID_SUSPEND));
-			// UNREACHABLE as far as V3Interpreter is concerned.
-			// TODO[ss]: check how to make this better
-			exit_code = -1;
+
+		// Execute the main entrypoint.
+		if (entry.0 != null) {
+			for (monitor in monitors) monitor.onMain(entry.0, entry.1);
+			var before_us = Metrics.main_time_us.ticks();
+			var before_cycles = Metrics.main_time_cycles.ticks();
+			var r = Execute.call(entry.0, entry.1);
+			Metrics.main_time_cycles.updateDiff(before_cycles);
+			Metrics.main_time_us.updateDiff(before_us);
+
+			match (r) {
+				Value(vals) => {
+					if (vals.length == 1) {
+						match (vals[0]) {
+							I32(val) => exit_code = int.view(val);
+							I64(val) => exit_code = int.view(val);
+							_ => ;
+						}
+					}
+					if (print_result) {
+						for (i < vals.length) {
+							if (i > 0) Trace.OUT.sp();
+							Trace.OUT.putv(vals[i]);
+						}
+						Trace.OUT.ln();
+					}
+				}
+				Throw(thrown) => match (thrown) {
+					x: Exit => {
+						exit_code = int.view(x.code);
+					}
+					_ => {
+						printThrowable(thrown);
+						exit_code = -1;
+					}
+				}
+				StackSwitch(info) => {
+					// printThrowable(info.parent.trap(TrapReason.INVALID_SUSPEND));
+					// UNREACHABLE as far as V3Interpreter is concerned.
+					// TODO[ss]: check how to make this better
+					exit_code = -1;
+				}
+			}
+			// Call monitors on finish
+			for (monitor in monitors) monitor.onFinish(ins, r);
+			MonitorRegistry.runReports();
+			Metrics.report();
 		}
 	}
-	// Call monitors on finish
-	for (i < monitors.length) monitors[i].onFinish(instance, r);
-	MonitorRegistry.runReports();
-	Metrics.report();
 	return exit_code;
 }
 def printThrowable(thrown: Throwable) {
@@ -324,4 +332,30 @@ def findDefaultMain(instance: Instance) -> (Function, Array<Value>) {
 		}
 	}
 	return (null, null);
+}
+def parseArgs(input: string) -> Vector<string> {
+	var args = Vector<string>.new();
+	var sb = StringBuilder.new();
+	for (c in input) {
+		if (c == ',') {
+			args.put(sb.toString());
+		} else {
+			sb.putc(c);
+		}
+	}
+	args.put(sb.toString());
+	return args;
+}
+def extractName(path: string) -> string {
+	var sb = StringBuilder.new();
+	for (c in path) {
+		if (c == '/') {
+			sb.reset();
+		} else {
+			sb.putc(c);
+		}
+	}
+	var name = sb.toString();
+	name = Arrays.range(name, 0, name.length - 5);
+	return name;
 }

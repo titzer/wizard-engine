@@ -44,9 +44,9 @@ function run_test() {
     local P=$T/$test
 
     if [ -f $test.in ]; then
-	$WIZENG $flags $test $args < $test.in > $P.out 2> $P.err
+	$WIZENG $flags $test -- $args < $test.in > $P.out 2> $P.err
     else
-	$WIZENG $flags $test $args > $P.out 2> $P.err
+	$WIZENG $flags $test -- $args > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 

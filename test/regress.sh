@@ -19,32 +19,33 @@ cd $WIZENG_LOC
 TESTS="$@"
 
 function run_tests() {
-    if [ "$TESTS" =  "" ]; then
-        for dir in core gen; do
-	    TESTS=$(ls test/regress/$dir/*.bin.wast)
-	    $CMD $TESTS
-        done
+	if [ "$TESTS" =  "" ]; then
+		for dir in core gen; do
+		TESTS=$(ls test/regress/$dir/*.bin.wast)
+		$CMD $TESTS
+		done
 
-    for ext in $(find test/regress -type d) ; do
+	for ext in $(find test/regress -type d) ; do
 	if [[ $ext =~ test/regress/(ext:.*) ]]; then
-	    arg="-${BASH_REMATCH[1]}"
-	    if [ $arg = "-ext:stack-switching" ]; then # TODO: dont skip
-		continue
-	    fi
-	    TESTS="$ext/*.bin.wast"
-	    $CMD $arg $TESTS
+		arg="-${BASH_REMATCH[1]}"
+		# TODO: handle tests with multiple extensions properly
+		if [ $arg = "-ext:stack-switching" ]; then
+		arg="-ext:all"
+		fi
+		TESTS="$ext/*.bin.wast"
+		$CMD $arg $TESTS
 	fi
-    done
-    else
-        $CMD $TESTS
-    fi
+	done
+	else
+		$CMD $TESTS
+	fi
 }
 
 print_testing
 
 LOG=$T/regress.sh.log
 if [ $PROGRESS_PIPE = 1 ]; then
-    run_tests | tee $LOG | $PROGRESS
+	run_tests | tee $LOG | $PROGRESS
 else
-    run_tests | tee $LOG
+	run_tests | tee $LOG
 fi
