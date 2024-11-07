@@ -123,16 +123,16 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
     fi
 elif [ "$TARGET" = "jvm" ]; then
     v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
-elif [ "$TARGET" = "wasm-wave" ]; then
-    # TODO: v3c-wasm-wave is not stable yet; compute its path from v3c
+elif [[ "$TARGET" == wasm-* ]]; then
+    # Compile to a wasm target
     V3C_PATH=$(which v3c)
-    V3C_WASM_WAVE=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-wave}
-    exec $V3C_WASM_WAVE -symbols -heap-size=128m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
-elif [ "$TARGET" = "wasm-linux" ]; then
-    # TODO: v3c-wasm-linux is not stable yet; compute its path from v3c
-    V3C_PATH=$(which v3c)
-    V3C_WASM_LINUX=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-linux}
-    exec $V3C_WASM_LINUX -symbols -heap-size=512m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    V3C_WASM_TARGET=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-$TARGET}
+    if [ ! -x $V3C_WASM_TARGET ]; then
+	echo Unknown Wasm target \"$TARGET\". Found these:
+	ls -a ${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-*} | cat
+	exit 1
+    fi
+    exec $V3C_WASM_TARGET -symbols -heap-size=1024m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
