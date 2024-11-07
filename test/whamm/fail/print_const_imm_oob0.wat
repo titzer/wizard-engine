@@ -22,6 +22,4 @@
     (call $puti (local.get $num))
     (call $puts (i32.const 0x30) (i32.const 1))
   )
-
-  (func (export "wasm:exit"))
 )

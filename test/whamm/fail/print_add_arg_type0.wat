@@ -26,6 +26,4 @@
     (call $puts (i32.const 0x40) (i32.const 1))
     (call $puts (i32.const 0x50) (i32.const 1))
   )
-
-  (func (export "wasm:exit"))
 )
