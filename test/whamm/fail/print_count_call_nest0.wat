@@ -5,7 +5,7 @@
   (import "wizeng" "puts" (func $puts (param i32 i32)))
 
   (export "$inc_static_count" (func $inc_static_count))
-  (export "wasm:opcode:call($inc_static_count($inc_static_count()))" (func $inc_dyn_count))
+  (export "wasm:opcode:call($inc_static_count($inc_static_count(fid)))" (func $inc_dyn_count))
   (export "" (memory $mem))
 
   (memory $mem 1)
@@ -17,7 +17,7 @@
   (global $static_count (mut i32) (i32.const 0))
   (global $dyn_count (mut i32) (i32.const 0))
 
-  (func $inc_static_count (result i32)	;; return value required but unused
+  (func $inc_static_count (param i32) (result i32)	;; return value required but unused
     global.get $static_count
     i32.const 1
     i32.add

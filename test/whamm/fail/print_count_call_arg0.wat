@@ -4,6 +4,7 @@
   (import "wizeng" "puti" (func $puti (param i32)))
   (import "wizeng" "puts" (func $puts (param i32 i32)))
 
+  (export "$inc_static_count" (func $inc_static_count))
   (export "wasm:opcode:call($inc_static_count(arg0))" (func $inc_dyn_count))
   (export "" (memory $mem))
 
