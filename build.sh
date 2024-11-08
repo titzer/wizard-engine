@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|jswiz|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -54,6 +54,7 @@ UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
 WASM_MODE="src/WasmMode.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
+JSWIZ="src/jswiz.main.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3 $VIRGIL_LIB/x86-64-linux/SyscallLayouts.v3"
@@ -142,6 +143,8 @@ if [ "$PROGRAM" = "wizeng" ]; then
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
+elif [ "$PROGRAM" = "jswiz" ]; then
+    SOURCES="$ENGINE $JSWIZ"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
