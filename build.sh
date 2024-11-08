@@ -132,7 +132,7 @@ elif [[ "$TARGET" == wasm-* ]]; then
 	ls -a ${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-*} | cat
 	exit 1
     fi
-    exec $V3C_WASM_TARGET -symbols -heap-size=1024m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec $V3C_WASM_TARGET -symbols -heap-size=200m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
     $V3C $SOURCES $TARGET_V3
