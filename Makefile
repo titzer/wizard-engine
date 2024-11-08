@@ -11,6 +11,8 @@ x86-64-linux: bin/spectest.x86-64-linux bin/wizeng.x86-64-linux bin/unittest.x86
 
 jvm: bin/spectest.jvm bin/wizeng.jvm bin/unittest.jvm bin/objdump.jvm
 
+jswiz: bin/jswiz.wasm
+
 wasm-wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm bin/objdump.wasm
 
 v3i: bin/spectest.v3i bin/wizeng.v3i bin/unittest.v3i bin/objdump.v3i
@@ -29,6 +31,7 @@ SPECTEST=$(ENGINE) test/wasm-spec/*.v3 test/spectest.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
+JSWIZ=$(ENGINE) src/jswiz.main.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
 	vctags -e $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -97,3 +100,7 @@ bin/wizeng.v3i: $(WIZENG) $(MONITORS) build.sh
 
 bin/objdump.v3i: $(OBJDUMP) build.sh
 	./build.sh objdump v3i
+
+# JSWiz target
+bin/jswiz.wasm: $(JSWIZ) build.sh
+	./build.sh jswiz wasm-wave

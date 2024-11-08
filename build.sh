@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|jswiz|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -39,6 +39,7 @@ UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_L
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
+JSWIZ="src/jswiz.main.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3"
@@ -77,6 +78,8 @@ if [ "$PROGRAM" = "wizeng" ]; then
     fi
 elif [ "$PROGRAM" = "spectest" ]; then
     SOURCES="$ENGINE $SPECTEST"
+elif [ "$PROGRAM" = "jswiz" ]; then
+    SOURCES="$ENGINE $JSWIZ"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
