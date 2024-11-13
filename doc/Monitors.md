@@ -45,7 +45,6 @@ The available monitors and their options are as follows:
 | `hotness`  | `{c\|code}`                                | Identifies hot code regions with high execution frequency.                                          |
 | `icount`   |                                            | Reports instruction count within functions.                                                         |
 | [`loops`](LoopMonitor.md)    | `{c\|code}`                                | Analyzes loop blocks and their execution behaviour.                                                 |
-| `memory`   |                                            | Monitors memory operations, such as reads and writes.                                               |
 | `memstats` |                                            | Monitors memory accesses and reports statistics per page of memory.                                 |
 | `opcodes`  |                                            | Reports the static and dynamic count of instructions, broken down by opcode.                        |
 | [`profile`](ProfileMonitor.md)  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
