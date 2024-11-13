@@ -11,7 +11,7 @@
   (export "wasm:opcode:br($alloc_br(fid, pc))" (func $probe_br))
   (export "wasm:opcode:br_if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
   (export "wasm:opcode:br_table($alloc_br_table(fid, pc, imm0), arg0)" (func $probe_br_table))
-  (export "before:exit" (func $print_entries))
+  (export "wasm:exit" (func $print_entries))
 
   (data (i32.const 0xc00) "func=")
   (data (i32.const 0xd00) ", pc=")

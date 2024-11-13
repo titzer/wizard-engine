@@ -9,23 +9,10 @@
 //   wasm:opcode:<mnemonic>			Before matching opcodes execute
 
 // TODO:
-//  - thread error reporter through monitor
 //  - report callbacks
 //  - binding callbacks
 //  - define frame accessor methods
 //  - externref in Virgil
-//   before:opcode:call(<func pattern>)		Upon static direct calls to func
-//   before:call:<func pattern>
-//   before:enter:<func pattern>			Entry of function(s)
-//   before:return:<func pattern>
-//   before:unwind:<func pattern>
-//   before:throw
-//   before:catch
-//   before:parse					Upon module parse
-//   before:instantiate
-//   before:start
-//   before:main
-//   before:exit
 class WhammMonitor(whamm: Module) extends Monitor {
 	var onParseF: int = -1;
 	var onInstantiateF: int = -1;
@@ -35,6 +22,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	var onExitF: int = -1;
 	var opcodePatterns: Array<List<(Opcode, Array<WhammParam>, FuncDecl)>>;
 	var whammInstances: List<(Module, Instance, InstanceRef)>; // XXX: leaky
+	var err: ErrorGen;
 
 	new() {
 		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.filename).ln();
@@ -66,7 +54,10 @@ class WhammMonitor(whamm: Module) extends Monitor {
 			}
 		}
 	}
+	// monitors called on parsed modules
 	def onParse(module: Module, err: ErrorGen) {
+		this.err = err;
+		// What extensions?
 		var wi = getWhammInstance(module).0;
 		if (wi == null) return;
 		if (onParseF >= 0) {
@@ -74,38 +65,257 @@ class WhammMonitor(whamm: Module) extends Monitor {
 			Execute.call(wi.functions[onParseF], [Value.Ref(moduleRef)]); // TODO: report traps
 		}
 		if (opcodePatterns == null) return;
-		var it = BytecodeIterator.new();
+		// iterate over the functions in the module
 		for (i < module.functions.length) {
 			var func = module.functions[i];
 			if (func.imp != null) continue; // imported
-			for (bi = it.reset(func); bi.more(); bi.next()) {
-				var bp = opcodePatterns[bi.current().tag];
-				for (l = bp; l != null; l = l.tail) {
-					if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), bi.pc, bi.current().mnemonic).ln();
-					var wf = WasmFunction.!(wi.functions[bp.head.2.func_index]);
-					var args = bindParams(it, bp.head.1);
-					Instrumentation.insertLocalProbe(module, func.func_index, bi.pc, WhammProbe.new(wf, args));
-				}
-			}
+
+			var cv = CodeValidator.new(Extension.WIZENG, Limits.new(), module, err);
+			cv.probe = bytecodeProbe(module, wi, func, _, _, _);
+			cv.validateFunc(func);
 		}
 	}
-	def bindParams(it: BytecodeIterator, params: Array<WhammParam>) -> Array<WhammArg> {
-		var result = Array<WhammArg>.new(params.length);
-		for (i < result.length) {
+
+	def bytecodeProbe(module: Module, wi: Instance, func: FuncDecl, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
+		var bp = opcodePatterns[opcode.tag];
+
+		for (l = bp; l != null; l = l.tail) { // for every probe
+			if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), opcode_pos, opcode.mnemonic).ln();
+			def wf   = wi.functions[bp.head.2.func_index];
+			def args = bindParams(cv, wf, wi, bp.head.1, opcode, false);
+			if (args != null) Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, WhammProbe.new(wf, args));
+		}
+	}
+
+	def bindParams(cv: CodeValidator, func: Function, wi: Instance,
+			params: Array<WhammParam>, op: Opcode, nested: bool) -> Array<WhammArg> {
+		var args = Array<WhammArg>.new(params.length);
+	  	def expParams = func.sig.params;  // expected params of WasmFunction
+
+	  	if (expParams.length != args.length) {
+			err.at(cv.parser.decoder).WhammProbeError("whamm probe", "arity mismatch between wasm function params and whamm exported name");
+			return null;
+	 	}
+
+		for (i < args.length) {
 			var arg: WhammArg;
 			match (params[i]) {
-				DynamicLoc => ;
-				FrameAccessor => arg = WhammArg.FrameAccessor;
-				Pc => arg = WhammArg.Val(Values.i_v(it.pc));
-				Func => arg = WhammArg.Val(Values.i_v(it.func.func_index));
-				Imm(orig, i) => ; // TODO
-				Arg(orig, i) => ; // TODO
-				Local(orig, i) => ;
-				Call(target, params) => ;
+				DynamicLoc     => ; // TODO
+				FrameAccessor  => {
+					arg = WhammArg.FrameAccessor; // type externref
+					if (expParams[i] != ValueTypes.EXTERNREF) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on frame accessor argument");
+						return null;
+				  	}
+			  	}
+				Pc             => {
+					arg = WhammArg.Val(Values.i_v(cv.opcode_pos));
+					if (expParams[i] != ValueType.I32) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on pc argument");
+						return null;
+				  	}
+				}
+				Func           => {
+					arg = WhammArg.Val(Values.i_v(cv.func.func_index));
+					if (expParams[i] != ValueType.I32) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on function index argument");
+						return null;
+					}
+				}
+				Imm(orig, j)   => {
+					def imms = op.imms;
+					def parser = dupParser(cv);
+					def vals = Vector<Value>.new();
+
+					for (i < imms.length) {
+						match (imms[i]) {
+							ARRAY_TYPE_INDEX  => vals.put(Values.u_v(parser.readU32("array type index", u32.!(-1))));
+							BLOCK_TYPE        => vals.put(Values.i_v(parser.readTypeCode()));
+							DATA_INDEX        => vals.put(Values.u_v(parser.readU32("data index", u32.!(-1))));
+							ELEM_INDEX        => vals.put(Values.u_v(parser.readU32("elem index", u32.!(-1))));
+							TAG_INDEX         => vals.put(Values.u_v(parser.readU32("tag index", u32.!(-1))));
+							FIELD_INDEX       => vals.put(Values.u_v(parser.readU32("field index", u32.!(-1))));
+							FUNC_INDEX        => vals.put(Values.u_v(parser.readU32("func index", u32.!(-1))));
+							GLOBAL_INDEX      => vals.put(Values.u_v(parser.readU32("global index", u32.!(-1))));
+							LABEL             => vals.put(Values.u_v(parser.readLabel()));
+							LABELS            => {
+								def labels = parser.readLabels();
+								// NOTE hardcoded, because BR_TABLE is the only one that uses imm.LABELS
+								vals.put(Values.i_v(labels.length - 1));
+								vals.puta(Arrays.map(labels, Values.u_v));
+							}
+							LOCAL_INDEX       => vals.put(Values.u_v(parser.readU32("local index", u32.!(-1))));
+							MEMARG            => {
+								// TODO discuss memarg format
+								def memarg = parser.readMemoryArg();
+								vals.put(Values.u_v(memarg.flags));
+								vals.put(Values.u_v(memarg.memory_index));
+								vals.put(Values.u_v(u32.!(memarg.offset)));
+							}
+							MEMORY_INDEX      => vals.put(Values.u_v(parser.readU32("memory index", u32.!(-1))));
+							HEAP_TYPE         => vals.put(Values.i_v(parser.readTypeCode()));
+							SIG_INDEX         => vals.put(Values.u_v(parser.readU32("sig index", u32.!(-1))));
+							STRUCT_TYPE_INDEX => vals.put(Values.u_v(parser.readU32("struct type index", u32.!(-1))));
+							TABLE_INDEX       => vals.put(Values.u_v(parser.readU32("table index", u32.!(-1))));
+							VALUE_TYPES       => ;		// TODO
+							ZERO_BYTE         => vals.put(Values.u_v(parser.decoder.read1()));
+							U32               => vals.put(Values.u_v(parser.readU32("imm U32", u32.!(-1))));
+							I32               => vals.put(Values.i_v(parser.readI32()));
+							I64               => vals.put(Values.l_v(parser.readI64()));
+							F32               => vals.put(Values.f_v(parser.readF32()));
+							F64               => vals.put(Values.d_v(parser.readF64()));
+							V128              => vals.put(Values.s_v(parser.readF64(), parser.readF64()));  // TODO incorrect?
+							LANE_INDEX        => vals.put(Values.u_v(parser.decoder.read1()));
+							BR_CAST           => ;    // TODO
+							CATCHES           => ;		// TODO
+							CONT_INDEX        => ;		// TODO
+							EX_HANDLERS       => ;		// TODO
+							SUS_HANDLERS      => ;		// TODO
+						}
+					}
+
+					if (j >= vals.length) {
+						match (op) {
+							BR_TABLE, TRY_TABLE => return null;
+							_ => {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "immediate argument out of bounds");
+								return null;
+							}
+						}
+					}
+
+					arg = WhammArg.Val(vals[j]);
+					var t: ValueType;
+					match (vals[j]) {
+						Ref(_)     => ; // TODO
+						I31(_)     => ; // TODO
+						I32(_)     => t = ValueType.I32;
+						I64(_)     => t = ValueType.I64;
+						F32(_)     => t = ValueType.F32;
+						F64(_)     => t = ValueType.F64;
+						V128(_, _) => t = ValueType.V128;
+					}
+					if (expParams[i] != t) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on immediate return type");
+						return null;
+					}
+				}
+				Arg(orig, j)   => {  // arg0 = first arg to bytecode
+					if (nested) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "arg used as an argument to a call");
+						return null;
+					}
+					def io = Opcodes.stackDelta(cv.sig, op, dupParser(cv));
+					def args = io.0;
+					if (j >= args) {
+						match (op) {
+							CALL, CALL_INDIRECT => return null; // no match
+							_ => {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "instruction argument out of bounds");
+								return null;
+							}
+						}
+					}
+					def stk = cv.val_stack.peekn(args);
+					def t   = stk[args - j - 1];
+					if (expParams[i] != t) {
+						match (op) {
+							CALL, CALL_INDIRECT => return null; // no match
+							_ => {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "instruction argument type mismatch");
+								return null;
+							}
+						}
+					}
+					arg = WhammArg.Operand(t, j - args + 1);
+				}
+				Local(orig, j) => {
+					if (nested) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "local used as an argument to a call");
+						return null;
+					}
+					if (j >= cv.locals.length) return null; // no match error
+					def t = cv.locals[j];
+					arg = WhammArg.Local(t, j);
+					if (expParams[i] != t) return null; // no match error
+				}
+				Call(target, params) => {
+					if (nested) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "nested function calls");
+						return null;
+					}
+
+					def exports = wi.module.exports;
+					def lookupR = FuncDecl.!(lookup(exports, target.image, Strings.equal, null));
+					if (lookupR == null) {
+						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in the probe argument not found");
+						return null;
+					}
+
+					def index = lookupR.func_index;
+					def func = wi.functions[index];
+
+					def whammArgs = bindParams(cv, WasmFunction.!(func), wi, params, op, true);
+					if (whammArgs == null) return null;	// propagating error, not a good idea
+					def args = if(whammArgs.length == 0, Values.NONE, Array<Value>.new(whammArgs.length));
+
+					for (i < whammArgs.length) {
+						var v: Value;
+						match (whammArgs[i]) {
+							FrameAccessor => {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "frame accessor used as an argument to a call");
+								return null;
+							}
+							Val(val)      => v = val;
+							Operand(t, i) => { // this error should not happen here (captured in Arg case)
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "arg used as an argument to a call");
+								return null;
+							}
+							Local(t, i)   => { // this error should not happen here (captured in Local case)
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "local used as an argument to a call");
+								return null;
+							}
+						}
+						args[i] = v;
+					}
+					// typecheck before execute
+					def result = Execute.call(func, args); // XXX: runs on a new stack
+					match (result) {
+						Value(vals)       => {
+							if (vals.length == 0) {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value (arity 0)");
+								return null;
+							}
+							arg = WhammArg.Val(vals[0]);
+							var t: ValueType;
+							match (vals[0]) {
+								Ref(_)     => ; // TODO
+								I31(_)     => ; // TODO
+								I32(_)     => t = ValueType.I32;
+								I64(_)     => t = ValueType.I64;
+								F32(_)     => t = ValueType.F32;
+								F64(_)     => t = ValueType.F64;
+								V128(_, _) => t = ValueType.V128;
+							}
+							if (expParams[i] != t) {
+								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on call return type");
+								return null;
+							}
+						}
+						Throw(throw)      => {
+							err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value (throw)");
+							return null;
+						}
+						StackSwitch(info) => {
+							err.at(cv.parser.decoder).WhammProbeError("whamm probe", "function in call argument did not return a value (stack switch)");
+							return null;
+						}
+					}
+				}
 			}
-			result[i] = arg;
+			args[i] = arg;
 		}
-		return result;
+		return args;
 	}
 	def onInstantiate(i: Instance) {
 		if (onInstanceF < 0) return;
@@ -130,10 +340,23 @@ class WhammMonitor(whamm: Module) extends Monitor {
 		whammInstances = List.new((module, instance, instRef), whammInstances);
 		return (instance, instRef);
 	}
+
+	def onFinish(i: Instance, r: Result) {
+		def wi = getWhammInstance(i.module).0;
+		def exports = wi.module.exports;
+		// TODO allow this to fail if one does not define a wasm:exit function
+		// TODO(precludes above): actually make wasm:exit part of parsing whamm module
+		def lookupR = FuncDecl.!(lookup(exports, "wasm:exit", Strings.equal, null));
+		if (lookupR == null) return;
+		def index = lookupR.func_index;
+		def func = wi.functions[index];
+
+		Execute.call(func, Values.NONE);
+	}
 }
 
 // A probe that adapts a Wasm function to be called by the engine-internal probing mechanism.
-class WhammProbe(func: WasmFunction, sig: Array<WhammArg>) extends Probe {
+class WhammProbe(func: Function, sig: Array<WhammArg>) extends Probe {
 	private def args = if(sig.length == 0, Values.NONE, Array<Value>.new(sig.length));
 
 	def fire(loc: DynamicLoc) -> Resumption {
@@ -141,13 +364,27 @@ class WhammProbe(func: WasmFunction, sig: Array<WhammArg>) extends Probe {
 			var v: Value;
 			match (sig[i]) {
 				FrameAccessor => v = Value.Ref(loc.frame.getFrameAccessor().getMetaRef());
-				Val(val) => v = val;
+				Val(val)      => v = val;
 				Operand(t, i) => v = loc.frame.getFrameAccessor().getOperand(i);
-				Local(t, i) => v = loc.frame.getFrameAccessor().getLocal(i);
+				Local(t, i)   => v = loc.frame.getFrameAccessor().getLocal(i);
 			}
 			args[i] = v;
 		}
 		Execute.call(func, args); // XXX: runs on a new stack
 		return Resumption.Continue;
 	}
+}
+
+def lookup<K, V>(v: Vector<(K, V)>, key: K, eq: (K, K) -> bool, default: V) -> V {
+	for (i < v.length) {
+		if (eq(key, v[i].0)) return v[i].1;
+	}
+	return default;
+}
+
+def dupParser(cv: CodeValidator) -> WasmParser {
+	def decoder = cv.parser.decoder;
+	def newDecoder = CodePtr.new(null);
+	newDecoder.reset(Ranges.dup(decoder.data), decoder.pos, decoder.limit);
+	return WasmParser.new(cv.parser.extensions, cv.parser.limits, cv.parser.module, cv.parser.err, newDecoder);
 }
