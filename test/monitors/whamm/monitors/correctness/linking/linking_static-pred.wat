@@ -1,16 +1,16 @@
 ;; TO RUN:
 ;; wasm-tools parse ./test/whamm/jit/correctness/linking/linking_static-pred.wat -o ./test/whamm/jit/correctness/linking/linking_static-pred.wasm
-;; wasm-tools parse ./test/whamm/jit/correctness/linking/instr.wat -o ./test/whamm/jit/correctness/linking/instr.wasm
-;; wizard --expose=wizeng --monitors=./test/whamm/jit/correctness/linking/linking_static-pred.wasm ./test/whamm/jit/correctness/linking/instr.wasm ./test/monitors/whamm/locals_to_call.wasm
+;; wasm-tools parse ./test/whamm/jit/correctness/linking/linking_instr.wat -o ./test/whamm/jit/correctness/linking/linking_instr.wasm
+;; wizard --expose=wizeng --monitors=./test/whamm/jit/correctness/linking/linking_static-pred.wasm ./test/whamm/jit/correctness/linking/linking_instr.wasm ./test/monitors/whamm/locals_to_call.wasm
 
 ;; EXPECTED OUTPUT:
 ;; hello pred!
 ;; hello call!
 
 ;; ACTUAL OUTPUT:
-;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("instr"."call_pred"): function import not found
-;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("instr"."call_pred"): function import not found
-;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("instr"."call_pred"): function import not found
+;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("linking_instr"."call_pred"): function import not found
+;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("linking_instr"."call_pred"): function import not found
+;; ./test/whamm/jit/correctness/linking/linking_static-pred.wasm:0x1: import #1("linking_instr"."call_pred"): function import not found
 ;; Exception in thread "main" java.lang.NullPointerException: Cannot read field "module" because "V3C_WhammMonitor.getWhammInstance(V3C_Module).f0" is null
 ;; 	at V3C_WhammMonitor.onFinish(Unknown Source)
 ;; 	at V3K_wizeng$Dmain.main(Unknown Source)
@@ -31,7 +31,7 @@
 ;; - linking? true
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
-    (import "instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
+    (import "linking_instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
     (memory (export "mem") 1 1)
     (data (i32.const 0) "hello call!\n")
 

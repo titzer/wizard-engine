@@ -1,17 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/simple/simple_overlap.wat -o ./test/whamm/jit/correctness/simple/simple_overlap.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/simple/simple_overlap.wasm ./test/monitors/branch_monitor.wasm
-
-;; EXPECTED OUTPUT:
-;; call0!
-;; call1!
-;; call0!
-;; call1!
-;; call0!
-;; call1!
-;; call0!
-;; call1!
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? true
@@ -39,4 +25,10 @@
     (func $call_probe1 (export "wasm:opcode:call()")
         (call $puts (i32.const 0xFF) (i32.const 7))
     )
+
+    ;; NOTE: The behavior is that it's applying the same function multiple times...not the one that's tied to this specific probe!
+    ;;       uncomment this function below for a demonstration (will print "call*" 6 times instead of 4)
+    ;; (func $call_probe2 (export "wasm:opcode:call() ")
+    ;;     (call $puts (i32.const 0xFF) (i32.const 7))
+    ;; )
 )

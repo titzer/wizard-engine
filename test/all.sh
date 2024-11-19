@@ -108,6 +108,16 @@ for target in $TEST_TARGETS; do
     do_script monitors/wasm-r3-tests/test
 done
 
+# Whamm monitors tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = "" ]; then # for symmetry
+	skip whamm
+        continue
+    fi
+    do_script monitors/whamm/monitors/correctness/test
+done
+
 # Self-hosted (unit) tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target

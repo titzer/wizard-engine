@@ -86,6 +86,25 @@ if [[ "$1" = "-fatal" ]]; then
     let PROGRESS_PIPE=0
 fi
 
+### Utility for generating .wasm from .wat
+WAT2WASM=${WAT2WASM:="$(which wat2wasm) --enable-all"}
+function wat2wasm() {
+    WAT=$1
+    WAT_NAME_EXT=$(basename "$WAT")
+    WAT_NAME="${WAT_NAME_EXT%.*}"
+    WAT_DIR=$(dirname "$WAT")
+
+    $WAT2WASM "$WAT" -o "$WAT_DIR/$WAT_NAME.wasm"
+}
+
+function wat2wasm_dir() {
+    DIR=$1
+    WAT_FILES=$(ls $DIR/*.wat)
+    for wat in $WAT_FILES; do
+	    wat2wasm $wat
+    done
+}
+
 ### Utility for making a specific binary
 function make_binary() {
     cd $WIZENG_LOC

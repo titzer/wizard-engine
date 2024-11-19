@@ -1,11 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/simple/simple.wat -o ./test/whamm/jit/correctness/simple/simple.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/simple/simple.wasm ./test/monitors/branch_monitor.wasm
-
-;; EXPECTED OUTPUT:
-;; hello world!
-;; hello world!
-
 ;; SUMMARY
 ;; - num_match_rules: 1
 ;; - overlapping? false
@@ -25,7 +17,7 @@
     (memory (export "mem") 1 1)
     (data (i32.const 0xc00) "hello world!\n")
 
-    (func $simple_probe (export "wasm:opcode:br")
+    (func $simple_probe (export "wasm:opcode:br_if")
         (call $puts (i32.const 0xc00) (i32.const 13))
     )
 )

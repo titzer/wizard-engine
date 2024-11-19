@@ -1,11 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/simple/simple_multiple.wat -o ./test/whamm/jit/correctness/simple/simple_multiple.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/simple/simple_multiple.wasm ./test/monitors/branch_monitor.wasm
-
-;; EXPECTED OUTPUT:
-;; hello call!
-;; hello call!
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? false
@@ -23,11 +15,11 @@
     (import "wizeng" "puti" (func $puti (param i32)))
     (import "wizeng" "puts" (func $puts (param i32 i32)))
     (memory (export "mem") 1 1)
-    (data (i32.const 0x0) "hello br!\n")
+    (data (i32.const 0x0) "hello br_if!\n")
     (data (i32.const 0xFF) "hello call!\n")
 
-    (func $br_probe (export "wasm:opcode:br")
-        (call $puts (i32.const 0x0) (i32.const 10))
+    (func $br_probe (export "wasm:opcode:br_if")
+        (call $puts (i32.const 0x0) (i32.const 13))
     )
 
     (func $call_probe (export "wasm:opcode:call")
