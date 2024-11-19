@@ -2,7 +2,7 @@
 
 ## Issues: ##
 
-1. `simple/simple_overlap.wasm`: Does not apply overlapping probe matches!
+1. `simple/simple_overlap.wat`: Does not apply overlapping probe matches!
 2. `static-pred/*`: Does not correctly use predicate (no events matched if predicate is present).
 3. `req-data/immN.wat`: ClassCastException (see comments in file).
 3. `req-data/req_multiple.wat`: ClassCastException (see comments in file).
@@ -31,6 +31,13 @@
 ## Tests TODO:
 
 - Probes call out to a linked module
+    - body located in linked module
+    - body calls func in linked module
+    - predicate located in linked module
+    - predicate calls func in linked module
+    - more complex
+        - linked module calls a linked module!
+        - linked module calls func in main module!
 - multi-memory!
 
 ## Future:

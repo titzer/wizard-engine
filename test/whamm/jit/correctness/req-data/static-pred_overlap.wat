@@ -19,6 +19,7 @@
 ;; - $alloc function? false
 ;; - END? false
 ;; - multi-memory? false
+;; - linking? false
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
     (memory (export "mem") 1 1)
