@@ -8,6 +8,7 @@
 3. `req-data/req_multiple.wat`: ClassCastException (see comments in file).
 4. Match rule doesn't work if there's a space between the rule and the arguments (e.g. `wasm:opcode:call (arg0)`).
 5. `req-data/static-pred*`: Does not correctly use predicate (no events matched if predicate is present).
+6. `linking/*`: Does not correctly instantiate the linked modules for whamm monitor to import from them (see comments in the files for exceptions).
 
 ## Completed tests: ##
 
@@ -30,14 +31,6 @@
 
 ## Tests TODO:
 
-- Probes call out to a linked module
-    - body located in linked module
-    - body calls func in linked module
-    - predicate located in linked module
-    - predicate calls func in linked module
-    - more complex
-        - linked module calls a linked module!
-        - linked module calls func in main module!
 - multi-memory!
 
 ## Future:
