@@ -1,6 +1,6 @@
 ;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/req-data/localN.wat -o ./test/whamm/jit/correctness/req-data/localN.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/req-data/localN.wasm ./test/monitors/whamm/locals_to_call.wasm
+;; wasm-tools parse ./test/whamm/jit/correctness/req-data/argN.wat -o ./test/whamm/jit/correctness/req-data/argN.wasm
+;; wizard --monitors=./test/whamm/jit/correctness/req-data/argN.wasm ./test/monitors/whamm/locals_to_call.wasm
 
 ;; EXPECTED OUTPUT:
 ;; hello world!
@@ -13,7 +13,7 @@
 ;;   - dynamic: false
 ;; - requested_data:
 ;;   - predicate: N/A
-;;   - body: localN
+;;   - body: argN
 ;; - $alloc function? false
 ;; - END? false
 ;; - multi-memory? false
@@ -23,11 +23,11 @@
     (data (i32.const 0xc00) "hello world!\n")
 
     ;; out of order to test that the order is not assumed for these!
-    (func $simple_probe (export "wasm:opcode:call(local1, local0)") (param $local1 i32) (param $local0 i32)
+    (func $simple_probe (export "wasm:opcode:call(arg1, arg0)") (param $arg1 i32) (param $arg0 i32)
         (call $puts (i32.const 0xc00) (i32.const 13))
         (block $error
-            (br_if $error (i32.ne (i32.const 1) (local.get $local0)))
-            (br_if $error (i32.ne (i32.const 2) (local.get $local1)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $arg0)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $arg1)))
             return
         )
         unreachable
