@@ -9,6 +9,7 @@
 4. Match rule doesn't work if there's a space between the rule and the arguments (e.g. `wasm:opcode:call (arg0)`).
 5. `req-data/static-pred*`: Does not correctly use predicate (no events matched if predicate is present).
 6. `linking/*`: Does not correctly instantiate the linked modules for whamm monitor to import from them (see comments in the files for exceptions).
+7. `multi-memory.wat`: Activating the multi-memory extension doesn't work for the whamm monitor (see comments in file).
 
 ## Completed tests: ##
 
@@ -25,13 +26,9 @@
 1. Verify correct execution of intrinsified callbacks
 2. Composition of multiple whamm monitors
     1. multiple probes at a single location
-3. change ordering of requested operands
+3. Change ordering of requested operands
     1. (argN at the end)
     2. Request all args (in different orders, set to different values to see if things are off)
-
-## Tests TODO:
-
-- multi-memory!
 
 ## Future:
 
