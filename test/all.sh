@@ -49,7 +49,7 @@ function exit_if_failure() {
 
 if [ "$TEST_TARGETS" = "" ]; then
     if [ "$TEST_TARGET" = "" ]; then
-	TEST_TARGETS="jvm"
+	TEST_TARGETS="v3i x86-linux x86-64-linux jvm"
     else
 	TEST_TARGETS="$TEST_TARGET"
     fi
@@ -65,48 +65,48 @@ function do_script() {
     fi
 }
 
-# # Unit tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     $SCRIPT_LOC/unit.sh || exit_if_failure $?
-# done
+# Unit tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    $SCRIPT_LOC/unit.sh || exit_if_failure $?
+done
 
-# # Regression tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     do_script regress
-# done
+# Regression tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    do_script regress
+done
 
-# # Spec tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
-# 	skip spec "will run out of memory"
-#         continue
-#     fi
-#     do_script spec
-# done
+# Spec tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
+	skip spec "will run out of memory"
+        continue
+    fi
+    do_script spec
+done
 
-# # Wizeng tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     if [ "$target" = "" ]; then # for symmetry
-# 	skip wizeng
-#         continue
-#     fi
-#     do_script wizeng/test
-# done
+# Wizeng tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = "" ]; then # for symmetry
+	skip wizeng
+        continue
+    fi
+    do_script wizeng/test
+done
 
-# # Wizeng monitors tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     if [ "$target" = "" ]; then # for symmetry
-# 	skip monitors
-#         continue
-#     fi
-#     do_script monitors/test
-#     do_script monitors/wasm-r3-tests/test
-# done
+# Wizeng monitors tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = "" ]; then # for symmetry
+	skip monitors
+        continue
+    fi
+    do_script monitors/test
+    do_script monitors/wasm-r3-tests/test
+done
 
 # Whamm monitors tests
 for target in $TEST_TARGETS; do
@@ -118,36 +118,36 @@ for target in $TEST_TARGETS; do
     do_script monitors/whamm/monitors/correctness/test
 done
 
-# # Self-hosted (unit) tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
-# 	skip selfhost "will run out of memory"
-#         continue
-#     fi
-#     do_script selfhost
-# done
+# Self-hosted (unit) tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = v3i ]; then # TODO: out of memory depending on host v3c
+	skip selfhost "will run out of memory"
+        continue
+    fi
+    do_script selfhost
+done
 
-# # Virgil tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     if [ "$target" = v3i ]; then # TODO: runs really, really slow on v3i
-# 	skip virgil "runs too slowly"
-#         continue
-#     fi
-#     do_script virgil/test
-# done
+# Virgil tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = v3i ]; then # TODO: runs really, really slow on v3i
+	skip virgil "runs too slowly"
+        continue
+    fi
+    do_script virgil/test
+done
 
-# # Wasi tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     do_script wasi/test
-# done
+# Wasi tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    do_script wasi/test
+done
 
-# # linker tests
-# for target in $TEST_TARGETS; do
-#     export TEST_TARGET=$target
-#     do_script linker/test
-# done
+# linker tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    do_script linker/test
+done
 
 exit 0
