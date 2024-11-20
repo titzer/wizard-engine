@@ -2,24 +2,25 @@
 
 ## Issues: ##
 
-1. `simple/simple_overlap.wat`: Does not apply overlapping probe matches!
-2. `static-pred/*`: Does not correctly use predicate (no events matched if predicate is present).
-3. `req-data/immN.wat`: ClassCastException (see comments in file).
-3. `req-data/req_multiple.wat`: ClassCastException (see comments in file).
-4. Match rule doesn't work if there's a space between the rule and the arguments (e.g. `wasm:opcode:call (arg0)`).
-5. `req-data/static-pred*`: Does not correctly use predicate (no events matched if predicate is present).
-6. `linking/*`: Does not correctly instantiate the linked modules for whamm monitor to import from them (see comments in the files for exceptions).
-7. `multi-memory.wat`: Activating the multi-memory extension doesn't work for the whamm monitor (see comments in file).
+1. `simple_overlap.wat`: Does not apply overlapping probe matches!
+2. `*static-pred*.wat`: Does not correctly use predicate (no events matched if predicate is present).
+3. `req-data_immN.wat`: ClassCastException.
+3. `req-data_multiple.wat`: ClassCastException.
+4. `linking*.wat`: Does not correctly instantiate the linked modules for whamm monitor to import from them (see comments in the files for exceptions).
+5. `multi-memory.wat`: Activating the multi-memory extension doesn't work for the whamm monitor (see comments in file).
 
 ## Completed tests: ##
 
-- `simple/*`: Simple probes (testcases involve “1 → ∞” of these probes)
+- `simple*.wat`: Simple probes (testcases involve “1 → ∞” of these probes)
     - simple match rule, needs no application data from frameaccessor
-- `static-pred/*`: Simple probes + static predicate (testcases involve “1 → ∞” of these probes)
+- `static-pred*.wat`: Simple probes + static predicate (testcases involve “1 → ∞” of these probes)
     - only requests static data at match time for the static predicate
-- `req-data/*`: Data-requesting probes (testcases involve “1 → ∞” of these probes)
+- `req-data*.wat`: Data-requesting probes (testcases involve “1 → ∞” of these probes)
     - Match rule without predication, but requests data from the frameaccessor when on callback invocation
-    - `req-data/static-pred*`: Match rule requesting data *with* static predication
+    - `req-data*static-pred*.wat`: Match rule requesting data *with* static predication
+- `linking*.wat`: Probes utilize some linked library modules.
+- `multi-memory*.wat`: Probes are dependent on multi-memory.
+- `print*.wat`: Correct and incorrect implementations that exercise the WhammMonitor error handling.
 
 ## What tests should *do*:
 
