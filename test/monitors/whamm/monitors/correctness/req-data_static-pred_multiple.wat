@@ -1,13 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/req-data/static-pred_multiple.wat -o ./test/whamm/jit/correctness/req-data/static-pred_multiple.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/req-data/static-pred_multiple.wasm ./test/monitors/whamm/locals_to_call.wasm
-
-;; EXPECTED OUTPUT:
-;; hello pred0!
-;; hello pred1!
-;; hello call!
-;; hello call_indirect!
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? false

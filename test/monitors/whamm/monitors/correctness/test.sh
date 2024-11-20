@@ -23,6 +23,7 @@ cd $DIR
 if [ "$#" = 0 ]; then
     # Generate fresh .wasm from .wat files
     wat2wasm_dir "./"
+    wat2wasm_dir "../../apps/"
 
     TESTS=$(ls *.wasm)
 else

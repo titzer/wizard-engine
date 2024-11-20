@@ -1,10 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/req-data/argN.wat -o ./test/whamm/jit/correctness/req-data/argN.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/req-data/argN.wasm ./test/monitors/whamm/locals_to_call.wasm
-
-;; EXPECTED OUTPUT:
-;; hello world!
-
 ;; SUMMARY
 ;; - num_match_rules: 1
 ;; - overlapping? false

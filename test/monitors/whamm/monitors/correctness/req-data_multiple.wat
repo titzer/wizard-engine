@@ -1,28 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/req-data/req_multiple.wat -o ./test/whamm/jit/correctness/req-data/req_multiple.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/req-data/req_multiple.wasm ./test/monitors/whamm/locals_to_call.wasm
-
-;; EXPECTED OUTPUT:
-;; hello call!
-;; hello call_indirect!
-
-;; ACTUAL OUTPUT:
-;; Exception in thread "main" java.lang.ClassCastException
-;;	at V3C_WhammMonitor.bindParams(Unknown Source)
-;;	at V3C_WhammMonitor.bytecodeProbe(Unknown Source)
-;;	at V3D_WhammMonitor$DbytecodeProbe.invoke(Unknown Source)
-;;	at V3C_wizeng$Djvm$$closure4$L$PModule$CInstance$CFuncDecl$CCodeValidator$Cint$COpcode$Q$Avoid$CModule$CInstance$CFuncDecl$R.m123599(Unknown Source)
-;;	at V3D_wizeng$Djvm$$closure4$L$PModule$CInstance$CFuncDecl$CCodeValidator$Cint$COpcode$Q$Avoid$CModule$CInstance$CFuncDecl$R$Dm123599.invoke(Unknown Source)
-;;	at V3C_CodeValidator.validateCode(Unknown Source)
-;;	at V3C_CodeValidator.validateFunc0(Unknown Source)
-;;	at V3D_CodeValidator$DvalidateFunc0.invoke(Unknown Source)
-;;	at V3C_TimeMetric.run$L$PFuncDecl$CDataReader$Q$CCodeValidatorResult$R(Unknown Source)
-;;	at V3C_CodeValidator.validate(Unknown Source)
-;;	at V3C_CodeValidator.validateFunc(Unknown Source)
-;;	at V3C_WhammMonitor.onParse(Unknown Source)
-;;	at V3K_wizeng$Dmain.main(Unknown Source)
-;;	at V3K_wizeng$Dmain.main(Unknown Source)
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? false
