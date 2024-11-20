@@ -7,12 +7,12 @@ while [ -h "$SOURCE" ]; do
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+PROJ_BASE="$DIR/../../../../.."
 
-. $DIR/../../../../common.sh whamm
+. $PROJ_BASE/test/common.sh whamm
 
 make_binary wizeng || exit $?
-
-WIZENG="../../../../../$BINARY $WIZENG_OPTS -colors=false"
+WIZENG="$PROJ_BASE/$BINARY $WIZENG_OPTS -colors=false"
 
 target=$TEST_TARGET
 
@@ -38,8 +38,8 @@ function run_test() {
 
     echo "##+$test"
 
-    if [ -f $test.linking ]; then
-	linking=$(cat $test.linking)
+    if [ -f $test.linked ]; then
+	linked=$(cat $test.linked)
     fi
     if [ -f $test.app ]; then
 	app=$(cat $test.app)
@@ -51,9 +51,9 @@ function run_test() {
     local P=$T/$test
 
     if [ -f $test.in ]; then
-	$WIZENG $flags --monitors=$test $linking $app < $test.in > $P.out 2> $P.err
+	$WIZENG $flags --monitors=$test $linked $app < $test.in > $P.out 2> $P.err
     else
-	$WIZENG $flags --monitors=$test $linking $app > $P.out 2> $P.err
+	$WIZENG $flags --monitors=$test $linked $app > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 

@@ -1,14 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/simple_static-pred/simple_multiple.wat -o ./test/whamm/jit/correctness/simple_static-pred/simple_multiple.wasm
-;; wizard -tw --monitors=./test/whamm/jit/correctness/simple_static-pred/simple_multiple.wasm ./test/monitors/branch_monitor.wasm
-
-;; EXPECTED OUTPUT:
-;; hello br_if!
-;; hello br_if!
-;; hello br_if!
-;; hello br_if!
-;; hello call!
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? false
