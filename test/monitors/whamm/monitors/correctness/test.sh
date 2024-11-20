@@ -64,8 +64,8 @@ function run_test() {
 	unset app flags imports
 
     for check in "out" "err" "exit"; do
-	if [ -f $test.$check ]; then
-	    diff $test.$check $P.$check | tee $P.$check.diff
+	if [ -f expected/$test.$check ]; then
+	    diff expected/$test.$check $P.$check | tee $P.$check.diff
 	    DIFF=${PIPESTATUS[0]}
 	    if [ "$DIFF" != 0 ]; then
 		if [ -f failures.$target ]; then
