@@ -1,8 +1,8 @@
 ;; to be used with: ./test/monitors/whamm/locals_to_call.wasm
 
 (module
-    (import "linking_bidir" "print_pred" (func $print_pred))
-    (import "linking_bidir" "print_call" (func $print_call))
+    (import "chain-instr_print" "print_pred" (func $print_pred))
+    (import "chain-instr_print" "print_call" (func $print_call))
 
     (func $call_pred (export "call_pred") (param $fid i32) (param $pc i32) (param $local1 i32) (param $arg0 i32) (param $imm0 i32) (result i32)
         (call $print_pred)

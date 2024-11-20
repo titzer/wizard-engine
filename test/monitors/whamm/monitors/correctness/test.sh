@@ -23,6 +23,7 @@ cd $DIR
 if [ "$#" = 0 ]; then
     # Generate fresh .wasm from .wat files
     wat2wasm_dir "./"
+    wat2wasm_dir "./imports/"
     wat2wasm_dir "../../apps/"
 
     TESTS=$(ls *.wasm)
@@ -39,24 +40,28 @@ function run_test() {
 
     echo "##+$test"
 
-    if [ -f $test.linked ]; then
-	linked=$(cat $test.linked)
-    fi
     if [ -f $test.app ]; then
 	app=$(cat $test.app)
     fi
     if [ -f $test.flags ]; then
 	flags=$(cat $test.flags)
     fi
+    if [ -f $test.imports ]; then
+	imports=$(cat $test.imports)
+    fi
 
     local P=$T/$test
 
+	echo "$WIZENG $flags --monitors=$test $imports $app"
     if [ -f $test.in ]; then
-	$WIZENG $flags --monitors=$test $linked $app < $test.in > $P.out 2> $P.err
+	$WIZENG $flags --monitors=$test $imports $app < $test.in > $P.out 2> $P.err
     else
-	$WIZENG $flags --monitors=$test $linked $app > $P.out 2> $P.err
+	$WIZENG $flags --monitors=$test $imports $app > $P.out 2> $P.err
     fi
     echo $? > $P.exit
+
+	# Reset variables
+	unset app flags imports
 
     for check in "out" "err" "exit"; do
 	if [ -f $test.$check ]; then

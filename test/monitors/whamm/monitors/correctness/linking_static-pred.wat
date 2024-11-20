@@ -31,7 +31,7 @@
 ;; - linking? true
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
-    (import "linking_instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
+    (import "base-instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
     (memory (export "mem") 1 1)
     (data (i32.const 0) "hello call!\n")
 
