@@ -1,12 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/simple_static-pred/simple.wat -o ./test/whamm/jit/correctness/simple_static-pred/simple.wasm
-;; wizard -tw --monitors=./test/whamm/jit/correctness/simple_static-pred/simple.wasm ./test/monitors/profile_bytecode.wasm
-
-;; EXPECTED OUTPUT:
-;; hello world!
-;; hello world!
-;; hello world!
-
 ;; SUMMARY
 ;; - num_match_rules: 1
 ;; - overlapping? false

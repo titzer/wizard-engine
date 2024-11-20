@@ -1,17 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/req-data/req_overlap.wat -o ./test/whamm/jit/correctness/req-data/req_overlap.wasm
-;; wizard --monitors=./test/whamm/jit/correctness/req-data/req_overlap.wasm ./test/monitors/whamm/locals_to_call.wasm
-
-;; EXPECTED OUTPUT:
-;; hello call0!
-;; hello call1!
-
-;; ACTUAL OUTPUT:
-;; hello call1!
-;; hello call1!
-;; <wasm func "has_locals"> +20
-;;   !trap[FUNC_INVALID]
-
 ;; SUMMARY
 ;; - num_match_rules: 2
 ;; - overlapping? true

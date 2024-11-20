@@ -1,21 +1,3 @@
-;; TO RUN:
-;; wasm-tools parse ./test/whamm/jit/correctness/linking/linking_body-and-pred.wat -o ./test/whamm/jit/correctness/linking/linking_body-and-pred.wasm
-;; wasm-tools parse ./test/whamm/jit/correctness/linking/linking_instr.wat -o ./test/whamm/jit/correctness/linking/linking_instr.wasm
-;; wizard --expose=wizeng --monitors=./test/whamm/jit/correctness/linking/linking_body-and-pred.wasm ./test/whamm/jit/correctness/linking/linking_instr.wasm ./test/monitors/whamm/locals_to_call.wasm
-
-;; EXPECTED OUTPUT:
-;; hello pred!
-;; hello call!
-
-;; ACTUAL OUTPUT:
-;; ./test/whamm/jit/correctness/linking/linking_body-and-pred.wasm:0x0: import #0("linking_instr"."call_pred"): function import not found
-;; ./test/whamm/jit/correctness/linking/linking_body-and-pred.wasm:0x0: import #0("linking_instr"."call_pred"): function import not found
-;; ./test/whamm/jit/correctness/linking/linking_body-and-pred.wasm:0x0: import #0("linking_instr"."call_pred"): function import not found
-;; Exception in thread "main" java.lang.NullPointerException: Cannot read field "module" because "V3C_WhammMonitor.getWhammInstance(V3C_Module).f0" is null
-;; 	at V3C_WhammMonitor.onFinish(Unknown Source)
-;; 	at V3K_wizeng$Dmain.main(Unknown Source)
-;; 	at V3K_wizeng$Dmain.main(Unknown Source)
-
 ;; SUMMARY
 ;; - num_match_rules: 1
 ;; - overlapping? false
