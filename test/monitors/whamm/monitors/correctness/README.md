@@ -6,6 +6,7 @@
 2. `*static-pred*.wat`: Does not correctly use predicate (no events matched if predicate is present).
 3. `req-data_immN.wat`: ClassCastException.
 3. `req-data_multiple.wat`: ClassCastException.
+3. `req-data_with-space.wat`: Probe not applied if there's space between the match rule and the req args (seems this may only happen on Macs when using JVM??).
 4. `linking*.wat`: Does not correctly instantiate the linked modules for whamm monitor to import from them (see comments in the files for exceptions).
 5. `multi-memory.wat`: Activating the multi-memory extension doesn't work for the whamm monitor (see comments in file).
 
