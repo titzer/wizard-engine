@@ -64,8 +64,8 @@ function run_test() {
 	unset app flags imports
 
 	# Make sure expected output is available!
-	if [ ! -f expected/$test.out ]; then
-		echo "##-fail: MUST have expected output for $test"
+	if [[ ! -f expected/$test.out && ! -f expected/$test.err ]]; then
+		echo "##-fail: MUST have expected output (.out) OR error (.err) for $test"
 		return 1
 	fi
 
