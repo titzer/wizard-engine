@@ -63,6 +63,12 @@ function run_test() {
 	# Reset variables
 	unset app flags imports
 
+	# Make sure expected output is available!
+	if [ ! -f expected/$test.out ]; then
+		echo "##-fail: MUST have expected output for $test"
+		return 1
+	fi
+
     for check in "out" "err" "exit"; do
 	if [ -f expected/$test.$check ]; then
 	    diff expected/$test.$check $P.$check | tee $P.$check.diff
