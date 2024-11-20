@@ -23,7 +23,7 @@ cd $DIR
 if [ "$#" = 0 ]; then
     # Generate fresh .wasm from .wat files
     wat2wasm_dir "./"
-    wat2wasm_dir "./imports/"
+    wat2wasm_dir "./imported_modules/"
     wat2wasm_dir "../../apps/"
 
     TESTS=$(ls *.wasm)
@@ -40,14 +40,14 @@ function run_test() {
 
     echo "##+$test"
 
-    if [ -f $test.app ]; then
-	app=$(cat $test.app)
+    if [ -f app/$test.app ]; then
+	app=$(cat app/$test.app)
     fi
-    if [ -f $test.flags ]; then
-	flags=$(cat $test.flags)
+    if [ -f flags/$test.flags ]; then
+	flags=$(cat flags/$test.flags)
     fi
-    if [ -f $test.imports ]; then
-	imports=$(cat $test.imports)
+    if [ -f imports/$test.imports ]; then
+	imports=$(cat imports/$test.imports)
     fi
 
     local P=$T/$test
