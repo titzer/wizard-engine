@@ -126,33 +126,14 @@
   )
 
   (func $probe_br_if (param $entry i32) (param $arg0 i32)
-    local.get $arg0
-    (if
-      (then ;; branch taken
-        local.get $entry
-        i32.const 20
-        i32.add
-        local.get $entry
-        i32.const 20
-        i32.add
-        i64.load  ;; count of branches taken
-        i64.const 1
-        i64.add
-        i64.store
-      )
-      (else ;; branch not taken
-        local.get $entry
-        i32.const 12
-        i32.add
-        local.get $entry
-        i32.const 12
-        i32.add
-        i64.load  ;; count of branches not taken
-        i64.const 1
-        i64.add
-        i64.store
-      )
-    )
+    (local $offset i32)
+    (local.set $offset (i32.add (local.get $entry) (select (i32.const 20) (i32.const 12) (local.get $arg0))))
+    local.get $offset
+    local.get $offset
+    i64.load  ;; count of branches taken
+    i64.const 1
+    i64.add
+    i64.store
   )
 
   (func $probe_br_table (param $entry i32) (param $arg0 i32)
