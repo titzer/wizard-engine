@@ -103,475 +103,475 @@ class ReplayFunction(all_ctx: Vector<ReplayContext>){}
 /// Note: since wasm R3 trace doesn't specify int type, all decimal values will be parsed as i64,
 /// and will be converted to the expected type during replay IR validation.
 class R3TraceParser(input: Array<byte>) {
-    private var import_call_count: int;
-    private def reader: TextReader = TextReader.new("trace", input);
-    private var pos: int;
-    private def default_event = WasmEvent.ImportCall(0);
-    private def events = Vector<WasmEvent>.new();
+	private var import_call_count: int;
+	private def reader: TextReader = TextReader.new("trace", input);
+	private var pos: int;
+	private def default_event = WasmEvent.ImportCall(0);
+	private def events = Vector<WasmEvent>.new();
 
-    // intermediate states for replay IR generation
-    private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
-    private def entry_func = ReplayFunction.new(Vectors.of1(global_ctx));
-    private var last_ctx = global_ctx;
-    private def ctx_stack = ListStack<ReplayContext>.new();
+	// intermediate states for replay IR generation
+	private def global_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
+	private def entry_func = ReplayFunction.new(Vectors.of1(global_ctx));
+	private var last_ctx = global_ctx;
+	private def ctx_stack = ListStack<ReplayContext>.new();
 
-    def replay_map = HashMap<int, ReplayFunction>.new(int.!<int>, int.==);
-    def var imported_global_vals = HashMap<int, Value>.new(int.!<int>, int.==);
+	def replay_map = HashMap<int, ReplayFunction>.new(int.!<int>, int.==);
+	def var imported_global_vals = HashMap<int, Value>.new(int.!<int>, int.==);
 
-    // Parse the input file and populate the complete replay IR.
-    // returns -1 is parsing is successful, otherwise the line number of the error.
-    def parse() -> int {
-        reader.skipWs = noSkipWs;
-        replay_map[-1] = entry_func; // entry function always has index -1
-        ctx_stack.push(global_ctx);
-        while (reader.pos < reader.limit) {
-            if (reader.optN("ER\n") > -1 || reader.optN("ER") > -1) {
-                continue;
-            }
-            var event = parseLine();
-            if (!event.1 || reader.char != '\n') {
-                return reader.line - 1;
-            }
-            reader.advance1();
-            events.put(event.0);
-            processEvent(event.0);
-        }
-        return -1;
-    }
-
-    // Updates the types of imported globals based on the module, and update the key to
-    // the map from global id to import id.
-    def updateImportedGlobals(mod: Module) -> bool {
-        var updated_globals = HashMap<int, Value>.new(int.!<int>, int.==);
-        for (i < mod.globals.length) {
-            var global = mod.globals[i];
-            if (global.imp != null) {
-                var value = imported_global_vals[i];
-                var kind = Values.kind(value);
-                var expected_kind = ValueTypes.kind(global.valtype);
-                if (kind == expected_kind) {
-                    updated_globals[global.imp.import_index] = value;
-                    continue;
-                }
-                if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
-                    updated_globals[global.imp.import_index] = Value.I32(Values.v_w_32(value));
-                    continue;
-                }
-                return false;
-            }
-        }
-        imported_global_vals = updated_globals;
-        return true;
-    }
-
-    // Updates the replay IR state with the newly parsed event.
-    private def processEvent(event: WasmEvent) {
-        match (event) {
-            ImportCall(idx) => {
-                var new_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
-                if (!replay_map.has(idx)) {
-                    replay_map[idx] = ReplayFunction.new(Vector<ReplayContext>.new());
-                }
-                replay_map[idx].all_ctx.put(new_ctx);
-                ctx_stack.push(new_ctx);
-                last_ctx = new_ctx;
-            }
-            ImportReturn(_, results) => {
-                last_ctx = ctx_stack.pop();
-                last_ctx.results = results;
-            }
-            FuncEntry, FuncEntryTable => ctx_stack.peek().actions.put(event);
-            ImportGlobal(idx, initial) => imported_global_vals[idx] = initial;
-            _ => {
-                var import_call_returned = last_ctx != ctx_stack.peek();
-                if (import_call_returned || last_ctx.actions.length == 0) {
-                    last_ctx.actions.put(event);
-                    return;
-                }
-                var last_action_idx = last_ctx.actions.length - 1;
-                var last_action = last_ctx.actions[last_action_idx];
-                if (WasmEvent.FuncEntry.?(last_action) || WasmEvent.FuncEntryTable.?(last_action)) {
-                    last_ctx.actions[last_action_idx] = event;
-                    last_ctx.actions.put(last_action);
-                } else {
-                    last_ctx.actions.put(event);
-                }
-            }
-        }
-    }
-
-    // Parse a single line of the input string into a WasmEvent.
-    private def parseLine() -> (WasmEvent, bool) {
-        if (reader.optN("EC;") > 0) {
-            return parseEC();
-        } else if (reader.optN("TC;") > 0) {
-            return parseTC();
-        } else if (reader.optN("L;") > 0) {
-            return parseL();
-        } else if (reader.optN("MG;") > 0) {
-            return parseMG();
-        } else if (reader.optN("T;") > 0) {
-            return parseT();
-        } else if (reader.optN("TG;") > 0) {
-            return parseTG();
-        } else if (reader.optN("G;") > 0) {
-            return parseG();
-        } else if (reader.optN("IC;") > 0) {
-            return parseIC();
-        } else if (reader.optN("IR;") > 0) {
-            return parseIR();
-        } else if (reader.optN("IG;") > 0) {
-            return parseIG();
-        }
-        return (default_event, false);
-    }
-
-    private def parseEC() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var name = parseStr(';', true);
-        var params = parseParams(0);
-        if (!params.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.FuncEntry(
-            int.view(Values.v_w_32(idx.0)),
-            name, params.0), true);
-    }
-
-    private def parseTC() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var name = parseStr(';', true);
-        var table_idx = parseIntDec();
-        if (!table_idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var params = parseParams(0);
-        if (!params.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.FuncEntryTable(
-            int.view(Values.v_w_32(idx.0)),
-            int.view(Values.v_w_32(table_idx.0)), name, params.0),
-            true);
-    }
-
-    private def parseL() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var offset = parseIntDec();
-        if (!offset.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var data = parseBytes();
-        if (!data.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.Load(
-            int.view(Values.v_w_32(idx.0)),
-            Values.v_w(offset.0), data.0),
-            true);
-    }
-
-    private def parseMG() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var amount = parseIntDec();
-        if (!amount.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.MemGrow(
-            int.view(Values.v_w_32(idx.0)),
-            int.view(Values.v_w_32(amount.0))),
-            true);
-    }
-
-    private def parseT() -> (WasmEvent, bool) {
-        var table_idx = parseIntDec();
-        if (!table_idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var table_name = parseStr(';', true);
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var fuc_idx = parseIntDec();
-        if (!fuc_idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var func_name = parseStr('\n', false);
-        return (WasmEvent.TableGet(
-            int.view(Values.v_w_32(table_idx.0)),
-            table_name,
-            int.view(Values.v_w_32(idx.0)),
-            int.view(Values.v_w_32(fuc_idx.0)),
-            func_name), true);
-    }
-
-    private def parseTG() -> (WasmEvent, bool) {
-        var table_idx = parseIntDec();
-        if (!table_idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var table_name = parseStr(';', true);
-        var amt = parseIntDec();
-        if (!amt.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.TableGrow(
-            int.view(Values.v_w_32(table_idx.0)),
-            table_name,
-            Values.v_w_32(amt.0)),
-            true);
-    }
-
-    private def parseIC() -> (WasmEvent, bool) {
-        import_call_count++;
-        var idx = parseIntDec();
-        if (!idx.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.ImportCall(
-            int.view(Values.v_w_32(idx.0))), true);
-    }
-
-    private def parseIR() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var results = parseParams(0);
-        if (!results.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.ImportReturn(
-            int.view(Values.v_w_32(idx.0)), results.0), true);
-    }
-
-    private def parseG() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var val = parseValue();
-        if (!val.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.GlobalGet(
-            int.view(Values.v_w_32(idx.0)), val.0), true);
-    }
-
-    private def parseIG() -> (WasmEvent, bool) {
-        var idx = parseIntDec();
-        if (!idx.1 || reader.req1(';') == -1) {
-            return (default_event, false);
-        }
-        var val = parseValue();
-        if (!val.1) {
-            return (default_event, false);
-        }
-        return (WasmEvent.ImportGlobal(
-            int.view(Values.v_w_32(idx.0)), val.0), true);
-    }
-
-    private def parseStr(term: byte, consume_term: bool) -> string {
-        var sb = StringBuilder.new();
-        while (reader.pos < reader.limit && reader.char != term) {
-            sb.putc(reader.char);
-            reader.advance1();
-        }
-        if (consume_term && reader.char == term) {
-            reader.advance1();
-        }
-        return sb.toString();
-    }
-
-    private def byteView(val: Value) -> byte {
-        return Values.v_w_8(val);
-    }
-
-    private def parseBytes() -> (Array<byte>, bool) {
-        var result = parseParams(1);
-        if (!result.1) {
-            return (null, false);
-        }
-        return (Arrays.map(result.0, byteView), true);
-    }
-
-    private def parseParams(min_count: int) -> (Array<Value>, bool) {
-        var vec = Vector<Value>.new();
-        if (reader.char == '\n' && min_count == 0) { // empty params list
-            return (vec.extract(), true);
-        }
-        var more_params = true;
-        while (more_params) {
-            var value = parseValue();
-            if (!value.1) {
-                return (null, false);
-            }
-            vec.put(value.0);
-            more_params = reader.char == ','; // params are comma-separated
-            if (more_params) {
-                reader.advance1();
-            }
-        }
-        if (vec.length < min_count) {
-            return (null, false);
-        }
-        return (vec.extract(), true);
-    }
-
-    private def parseValue() -> (Value, bool) {
-        if (reader.optN("0x") > -1) {
-            return parseFloatHex();
-        }
-        return parseIntDec();
-    }
-
-    // Parse a decimal integer, possibly negative.
-    private def parseIntDec() -> (Value, bool) {
-        var sign = 1ul;
-        if (reader.char == '-' || reader.char == '+') {
-            sign = if (reader.char == '-', u64.max, sign);
-            reader.advance1();
-        }
-	    var v1 = reader.char;
-        reader.advance1();
-	    if (v1 < '0' || v1 > '9') { // not decimal digit
-	    	return (Values.I64_0, false);
-	    }
-	    var accum = v1 - u64.!('0');
-	    while (reader.pos < reader.limit) {
-	    	var c = reader.char;
-	    	var d = c - '0';
-	    	if (d < 0 || d > 9) break;
-	    	accum = accum * 10 + d;
-	    	reader.advance1();
-	    }
-	    return (Value.I64(accum * sign), true);
+	// Parse the input file and populate the complete replay IR.
+	// returns -1 is parsing is successful, otherwise the line number of the error.
+	def parse() -> int {
+		reader.skipWs = noSkipWs;
+		replay_map[-1] = entry_func; // entry function always has index -1
+		ctx_stack.push(global_ctx);
+		while (reader.pos < reader.limit) {
+			if (reader.optN("ER\n") > -1 || reader.optN("ER") > -1) {
+				continue;
+			}
+			var event = parseLine();
+			if (!event.1 || reader.char != '\n') {
+				return reader.line - 1;
+			}
+			reader.advance1();
+			events.put(event.0);
+			processEvent(event.0);
+		}
+		return -1;
 	}
-    // Parses a hex number starting with 0x, returns the parsed value
-    // and whether the parse was successful.
-    private def parseFloatHex() -> (Value, bool) {
+
+	// Updates the types of imported globals based on the module, and update the key to
+	// the map from global id to import id.
+	def updateImportedGlobals(mod: Module) -> bool {
+		var updated_globals = HashMap<int, Value>.new(int.!<int>, int.==);
+		for (i < mod.globals.length) {
+			var global = mod.globals[i];
+			if (global.imp != null) {
+				var value = imported_global_vals[i];
+				var kind = Values.kind(value);
+				var expected_kind = ValueTypes.kind(global.valtype);
+				if (kind == expected_kind) {
+					updated_globals[global.imp.import_index] = value;
+					continue;
+				}
+				if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
+					updated_globals[global.imp.import_index] = Value.I32(Values.unbox_w32(value));
+					continue;
+				}
+				return false;
+			}
+		}
+		imported_global_vals = updated_globals;
+		return true;
+	}
+
+	// Updates the replay IR state with the newly parsed event.
+	private def processEvent(event: WasmEvent) {
+		match (event) {
+			ImportCall(idx) => {
+				var new_ctx = ReplayContext.new(Vector<WasmEvent>.new(), Array<Value>.new(0));
+				if (!replay_map.has(idx)) {
+					replay_map[idx] = ReplayFunction.new(Vector<ReplayContext>.new());
+				}
+				replay_map[idx].all_ctx.put(new_ctx);
+				ctx_stack.push(new_ctx);
+				last_ctx = new_ctx;
+			}
+			ImportReturn(_, results) => {
+				last_ctx = ctx_stack.pop();
+				last_ctx.results = results;
+			}
+			FuncEntry, FuncEntryTable => ctx_stack.peek().actions.put(event);
+			ImportGlobal(idx, initial) => imported_global_vals[idx] = initial;
+			_ => {
+				var import_call_returned = last_ctx != ctx_stack.peek();
+				if (import_call_returned || last_ctx.actions.length == 0) {
+					last_ctx.actions.put(event);
+					return;
+				}
+				var last_action_idx = last_ctx.actions.length - 1;
+				var last_action = last_ctx.actions[last_action_idx];
+				if (WasmEvent.FuncEntry.?(last_action) || WasmEvent.FuncEntryTable.?(last_action)) {
+					last_ctx.actions[last_action_idx] = event;
+					last_ctx.actions.put(last_action);
+				} else {
+					last_ctx.actions.put(event);
+				}
+			}
+		}
+	}
+
+	// Parse a single line of the input string into a WasmEvent.
+	private def parseLine() -> (WasmEvent, bool) {
+		if (reader.optN("EC;") > 0) {
+			return parseEC();
+		} else if (reader.optN("TC;") > 0) {
+			return parseTC();
+		} else if (reader.optN("L;") > 0) {
+			return parseL();
+		} else if (reader.optN("MG;") > 0) {
+			return parseMG();
+		} else if (reader.optN("T;") > 0) {
+			return parseT();
+		} else if (reader.optN("TG;") > 0) {
+			return parseTG();
+		} else if (reader.optN("G;") > 0) {
+			return parseG();
+		} else if (reader.optN("IC;") > 0) {
+			return parseIC();
+		} else if (reader.optN("IR;") > 0) {
+			return parseIR();
+		} else if (reader.optN("IG;") > 0) {
+			return parseIG();
+		}
+		return (default_event, false);
+	}
+
+	private def parseEC() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var name = parseStr(';', true);
+		var params = parseParams(0);
+		if (!params.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.FuncEntry(
+			int.view(Values.unbox_w32(idx.0)),
+			name, params.0), true);
+	}
+
+	private def parseTC() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var name = parseStr(';', true);
+		var table_idx = parseIntDec();
+		if (!table_idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var params = parseParams(0);
+		if (!params.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.FuncEntryTable(
+			int.view(Values.unbox_w32(idx.0)),
+			int.view(Values.unbox_w32(table_idx.0)), name, params.0),
+			true);
+	}
+
+	private def parseL() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var offset = parseIntDec();
+		if (!offset.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var data = parseBytes();
+		if (!data.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.Load(
+			int.view(Values.unbox_w32(idx.0)),
+			Values.unbox_w(offset.0), data.0),
+			true);
+	}
+
+	private def parseMG() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var amount = parseIntDec();
+		if (!amount.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.MemGrow(
+			int.view(Values.unbox_w32(idx.0)),
+			int.view(Values.unbox_w32(amount.0))),
+			true);
+	}
+
+	private def parseT() -> (WasmEvent, bool) {
+		var table_idx = parseIntDec();
+		if (!table_idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var table_name = parseStr(';', true);
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var fuc_idx = parseIntDec();
+		if (!fuc_idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var func_name = parseStr('\n', false);
+		return (WasmEvent.TableGet(
+			int.view(Values.unbox_w32(table_idx.0)),
+			table_name,
+			int.view(Values.unbox_w32(idx.0)),
+			int.view(Values.unbox_w32(fuc_idx.0)),
+			func_name), true);
+	}
+
+	private def parseTG() -> (WasmEvent, bool) {
+		var table_idx = parseIntDec();
+		if (!table_idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var table_name = parseStr(';', true);
+		var amt = parseIntDec();
+		if (!amt.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.TableGrow(
+			int.view(Values.unbox_w32(table_idx.0)),
+			table_name,
+			Values.unbox_w32(amt.0)),
+			true);
+	}
+
+	private def parseIC() -> (WasmEvent, bool) {
+		import_call_count++;
+		var idx = parseIntDec();
+		if (!idx.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.ImportCall(
+			int.view(Values.unbox_w32(idx.0))), true);
+	}
+
+	private def parseIR() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var results = parseParams(0);
+		if (!results.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.ImportReturn(
+			int.view(Values.unbox_w32(idx.0)), results.0), true);
+	}
+
+	private def parseG() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var val = parseValue();
+		if (!val.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.GlobalGet(
+			int.view(Values.unbox_w32(idx.0)), val.0), true);
+	}
+
+	private def parseIG() -> (WasmEvent, bool) {
+		var idx = parseIntDec();
+		if (!idx.1 || reader.req1(';') == -1) {
+			return (default_event, false);
+		}
+		var val = parseValue();
+		if (!val.1) {
+			return (default_event, false);
+		}
+		return (WasmEvent.ImportGlobal(
+			int.view(Values.unbox_w32(idx.0)), val.0), true);
+	}
+
+	private def parseStr(term: byte, consume_term: bool) -> string {
+		var sb = StringBuilder.new();
+		while (reader.pos < reader.limit && reader.char != term) {
+			sb.putc(reader.char);
+			reader.advance1();
+		}
+		if (consume_term && reader.char == term) {
+			reader.advance1();
+		}
+		return sb.toString();
+	}
+
+	private def byteView(val: Value) -> byte {
+		return Values.unbox_w8(val);
+	}
+
+	private def parseBytes() -> (Array<byte>, bool) {
+		var result = parseParams(1);
+		if (!result.1) {
+			return (null, false);
+		}
+		return (Arrays.map(result.0, byteView), true);
+	}
+
+	private def parseParams(min_count: int) -> (Array<Value>, bool) {
+		var vec = Vector<Value>.new();
+		if (reader.char == '\n' && min_count == 0) { // empty params list
+			return (vec.extract(), true);
+		}
+		var more_params = true;
+		while (more_params) {
+			var value = parseValue();
+			if (!value.1) {
+				return (null, false);
+			}
+			vec.put(value.0);
+			more_params = reader.char == ','; // params are comma-separated
+			if (more_params) {
+				reader.advance1();
+			}
+		}
+		if (vec.length < min_count) {
+			return (null, false);
+		}
+		return (vec.extract(), true);
+	}
+
+	private def parseValue() -> (Value, bool) {
+		if (reader.optN("0x") > -1) {
+			return parseFloatHex();
+		}
+		return parseIntDec();
+	}
+
+	// Parse a decimal integer, possibly negative.
+	private def parseIntDec() -> (Value, bool) {
+		var sign = 1ul;
+		if (reader.char == '-' || reader.char == '+') {
+			sign = if (reader.char == '-', u64.max, sign);
+			reader.advance1();
+		}
+		var v1 = reader.char;
+		reader.advance1();
+		if (v1 < '0' || v1 > '9') { // not decimal digit
+			return (Values.I64_0, false);
+		}
+		var accum = v1 - u64.!('0');
+		while (reader.pos < reader.limit) {
+			var c = reader.char;
+			var d = c - '0';
+			if (d < 0 || d > 9) break;
+			accum = accum * 10 + d;
+			reader.advance1();
+		}
+		return (Value.I64(accum * sign), true);
+	}
+	// Parses a hex number starting with 0x, returns the parsed value
+	// and whether the parse was successful.
+	private def parseFloatHex() -> (Value, bool) {
 		var accum = 0ul;;
-        var count = 0;
+		var count = 0;
 		while (reader.pos < reader.limit) {
 			var c = reader.char;
 			var v = Chars.hexValue(c);
 			if (v < 0 || v > 15) break;
 			accum = (accum << 4) + u64.!(v);
 			reader.advance1();
-            count++;
+			count++;
 		}
-        var output = if (count <= 8, Value.F32(u32.view(accum)), Value.F64(accum));
+		var output = if (count <= 8, Value.F32(u32.view(accum)), Value.F64(accum));
 		return (output, true);
 	}
-    private def noSkipWs(text_reader: TextReader) { }
+	private def noSkipWs(text_reader: TextReader) { }
 }
 
 component R3Utils {
-    // Ensures that all contexts of the function replay are consistent with the function signature,
-    // and updates certain value types in `replay_func` to match the expected signature.
-    def validateReplayFunction(
-        func_id: int,
-        replay_func: ReplayFunction,
-        mod: Module,
-        precheck: () -> bool,
-        fail_callback: () -> ()) {
-        if (!precheck()) return;
-        if (func_id != -1) {
-            if (mod.functions.length <= func_id || mod.functions[func_id].imp == null) {
-                return fail_callback();
-            }
-            var result_types = mod.functions[func_id].sig.results;
-            for (i < replay_func.all_ctx.length) {
-                var ctx = replay_func.all_ctx[i];
-                if (!validateValues(ctx.results, result_types)) {
-                    return fail_callback();
-                }
-            }
-        } else if (replay_func.all_ctx.length != 1 || replay_func.all_ctx[0].results.length != 0) {
-            // special check for the default entry function
-            return fail_callback();
-        }
-        for (i < replay_func.all_ctx.length) {
-            var ctx = replay_func.all_ctx[i];
-            if (!validateCtxActions(ctx.actions, mod)) {
-                return fail_callback();
-            }
-        }
-    }
+	// Ensures that all contexts of the function replay are consistent with the function signature,
+	// and updates certain value types in `replay_func` to match the expected signature.
+	def validateReplayFunction(
+		func_id: int,
+		replay_func: ReplayFunction,
+		mod: Module,
+		precheck: () -> bool,
+		fail_callback: () -> ()) {
+		if (!precheck()) return;
+		if (func_id != -1) {
+			if (mod.functions.length <= func_id || mod.functions[func_id].imp == null) {
+				return fail_callback();
+			}
+			var result_types = mod.functions[func_id].sig.results;
+			for (i < replay_func.all_ctx.length) {
+				var ctx = replay_func.all_ctx[i];
+				if (!validateValues(ctx.results, result_types)) {
+					return fail_callback();
+				}
+			}
+		} else if (replay_func.all_ctx.length != 1 || replay_func.all_ctx[0].results.length != 0) {
+			// special check for the default entry function
+			return fail_callback();
+		}
+		for (i < replay_func.all_ctx.length) {
+			var ctx = replay_func.all_ctx[i];
+			if (!validateCtxActions(ctx.actions, mod)) {
+				return fail_callback();
+			}
+		}
+	}
 
-    // Ensures that the sequence of events in the replay context is valid wrt. to the module,
-    // optionally updating the value types in the actions (e.g. params of FuncEntry/FuncTableEntry).
-    def validateCtxActions(actions: Vector<WasmEvent>, mod: Module) -> bool {
-        for (i < actions.length) {
-            var action = actions[i];
-            match (action) {
-                FuncEntry(idx, _, params) => {
-                    if (mod.functions.length <= idx 
-                        || !validateValues(params, mod.functions[idx].sig.params)) return false;
-                }
-                FuncEntryTable(idx, _, _, params) => {
-                    if (mod.functions.length <= idx 
-                        || !validateValues(params, mod.functions[idx].sig.params)) return false;
-                }
-                Load(idx, offset, data) => {
-                    var page = (offset + u64.view(data.length)) / BpConstants.WASM_PAGE_SIZE;
-                    if (!mod.memories[idx].maximum.check(page)) return false;
-                }
-                MemGrow(idx, amount) => {
-                    if (!mod.memories[idx].maximum.check(u64.view(amount))) return false;
-                }
-                TableGet(table_idx, _, entry_idx, _, _) => {
-                    if (!mod.tables[table_idx].maximum.check(u64.view(entry_idx))) return false;
-                }
-                TableGrow(table_idx, _, amount) => {
-                    if (!mod.tables[table_idx].maximum.check(amount)) return false;
-                }
-                GlobalGet(idx, value) => {
-                    if (idx >= mod.globals.length) return false;
-                    var kind = Values.kind(value);
-                    var expected_kind = ValueTypes.kind(mod.globals[idx].valtype);
-                    if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
-                        actions[i] = WasmEvent.GlobalGet(idx, Value.I32(Values.v_w_32(value)));
-                    } else if (kind != expected_kind) {
-                        return false;
-                    }
-                }
-                _ => ;
-            }
-        }
-        return true;
-    }
+	// Ensures that the sequence of events in the replay context is valid wrt. to the module,
+	// optionally updating the value types in the actions (e.g. params of FuncEntry/FuncTableEntry).
+	def validateCtxActions(actions: Vector<WasmEvent>, mod: Module) -> bool {
+		for (i < actions.length) {
+			var action = actions[i];
+			match (action) {
+				FuncEntry(idx, _, params) => {
+					if (mod.functions.length <= idx 
+						|| !validateValues(params, mod.functions[idx].sig.params)) return false;
+				}
+				FuncEntryTable(idx, _, _, params) => {
+					if (mod.functions.length <= idx 
+						|| !validateValues(params, mod.functions[idx].sig.params)) return false;
+				}
+				Load(idx, offset, data) => {
+					var page = (offset + u64.view(data.length)) / BpConstants.WASM_PAGE_SIZE;
+					if (!mod.memories[idx].maximum.check(page)) return false;
+				}
+				MemGrow(idx, amount) => {
+					if (!mod.memories[idx].maximum.check(u64.view(amount))) return false;
+				}
+				TableGet(table_idx, _, entry_idx, _, _) => {
+					if (!mod.tables[table_idx].maximum.check(u64.view(entry_idx))) return false;
+				}
+				TableGrow(table_idx, _, amount) => {
+					if (!mod.tables[table_idx].maximum.check(amount)) return false;
+				}
+				GlobalGet(idx, value) => {
+					if (idx >= mod.globals.length) return false;
+					var kind = Values.kind(value);
+					var expected_kind = ValueTypes.kind(mod.globals[idx].valtype);
+					if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
+						actions[i] = WasmEvent.GlobalGet(idx, Value.I32(Values.unbox_w32(value)));
+					} else if (kind != expected_kind) {
+						return false;
+					}
+				}
+				_ => ;
+			}
+		}
+		return true;
+	}
 
-    // Ensures that the values in `vals` are consistent with the types in `types`, updating
-    // the values in `vals` fro i64 to i32 if necessary.
-    def validateValues(vals: Array<Value>, types: Array<ValueType>) -> bool {
-        if (vals.length != types.length) {
-            return false;
-        }
-        for (i < types.length) {
-            var value = vals[i];
-            var kind = Values.kind(value);
-            var expected_kind = ValueTypes.kind(types[i]);
-            if (kind == expected_kind) continue;
-            if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
-                vals[i] = Value.I32(Values.v_w_32(value));
-                continue;
-            }
-            return false;
-        }
-        return true;
-    }
+	// Ensures that the values in `vals` are consistent with the types in `types`, updating
+	// the values in `vals` fro i64 to i32 if necessary.
+	def validateValues(vals: Array<Value>, types: Array<ValueType>) -> bool {
+		if (vals.length != types.length) {
+			return false;
+		}
+		for (i < types.length) {
+			var value = vals[i];
+			var kind = Values.kind(value);
+			var expected_kind = ValueTypes.kind(types[i]);
+			if (kind == expected_kind) continue;
+			if (kind == ValueKind.I64 && expected_kind == ValueKind.I32) {
+				vals[i] = Value.I32(Values.unbox_w32(value));
+				continue;
+			}
+			return false;
+		}
+		return true;
+	}
 }

@@ -43,6 +43,10 @@ function update {
     
     pushd $DIR
     echo "##+[$b] make"
+    if [ -x "$(which opam)" ]; then
+	# Needed for Ocaml build
+	eval $(opam env)
+    fi
     make
     RESULT=$?
     check $RESULT

@@ -28,7 +28,6 @@ else
         "branches" "branches{c}" 
         "hotness" "hotness{c}"
         "globals" 
-        "memory"
         "profile_bytecode{switch_size=16}")
 fi
 
