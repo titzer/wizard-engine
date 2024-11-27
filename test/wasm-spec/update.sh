@@ -12,11 +12,9 @@ WIZENG_LOC=${WIZENG_LOC:=$(cd $DIR/.. && pwd)}
 . $DIR/../common.sh update
 
 PROPOSALS="$@"
-if [ "$#" = 0 ]; then
+if [ "$PROPOSALS" = "" ]; then
     PROPOSALS=spec
 fi
-
-
 
 for p in $PROPOSALS; do
     printf "Updating proposal ${CYAN}%-22s${NORM} " $p

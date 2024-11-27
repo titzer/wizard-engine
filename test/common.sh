@@ -52,6 +52,15 @@ TEST_TARGET=${TEST_TARGET:=v3i}
 T=/tmp/$USER/wizeng-test/$harness/$TEST_TARGET/$TEST_MODE/
 mkdir -p $T
 
+### Set default batching level for tests
+if [ "$BATCHING" = "" ]; then
+    if [ "$TEST_TARGET" = jvm ]; then
+        BATCHING=20
+    else
+        BATCHING=1
+    fi
+fi
+
 ### Configure fatal and trace options
 PROGRESS_PIPE=1
 if [ "$(which progress)" = "" ]; then
