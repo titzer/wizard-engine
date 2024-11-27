@@ -1,8 +1,18 @@
 #!/bin/bash
 
+if [ "$#" -lt 1 ]; then
+    echo "Usage: build-test.sh <target>"
+    exit 1
+fi
+
+set -e
+
 # first argument must be the target
 export TEST_TARGET=$1
 shift
+
+# for CI, use line-by-line test output
+export PROGRESS_ARGS=l
 
 # remaining arguments are appended to V3C_OPTS
 V3C_OPTS="$V3C_OPTS $@"
@@ -33,9 +43,7 @@ opam install menhir -y
 eval $(opam config env)
 
 # Set up specification tests
-cd test/wasm-spec
-./update.sh
-cd ../..
+./test/wasm-spec/update.sh
 
 # Run all tests
-PROGRESS_ARGS=c ./test/all.sh
+./test/all.sh

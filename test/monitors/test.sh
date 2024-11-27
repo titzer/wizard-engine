@@ -2,22 +2,22 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
     SOURCE="$(readlink "$SOURCE")"
-    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+    [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh monitors
+. $HERE/../common.sh monitors
 
-make_binary wizeng || exit $?
+make_wizeng || exit $?
 
-WIZENG="../../$BINARY $WIZENG_OPTS -colors=false"
+CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS -colors=false"
 
 target=$TEST_TARGET
 
 print_testing
-cd $DIR
+cd $HERE
 
 if [ $# -gt 0  ]; then
     MONITORS=($@)
@@ -55,9 +55,9 @@ function run_test {
         local P=$T/$test.$suffix
 
         if [ -f $test.in  ]; then
-            $WIZENG $flags $mflag "$test" $args < $test.in > $P.out
+            $CMD $flags $mflag "$test" $args < $test.in > $P.out
         else
-            $WIZENG $flags $mflag "$test" $args > $P.out
+            $CMD $flags $mflag "$test" $args > $P.out
         fi  
 
         if [ -f expected/$test.$suffix.out  ]; then
