@@ -6,9 +6,8 @@ while [ -h "$SOURCE" ]; do
   SOURCE="$(readlink "$SOURCE")"
   [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-
-export WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
+export WIZENG_TEST="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+export WIZENG_LOC=${WIZENG_LOC:=$(cd $WIZENG_TEST/.. && pwd)}
 
 CYAN='[0;36m'
 RED='[0;31m'
@@ -26,17 +25,13 @@ if [ ! -x "$CUR_V3C" ]; then
     exit 1
 fi
 
-# Progress arguments. By default the inline (i) mode is used, while the CI sets
-# it to character (c) mode
-PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
-PROGRESS="progress $PROGRESS_ARGS"
+CUR_V3C_LOC=$(dirname $CUR_V3C)
+if [ "$VIRGIL_LOC" = "" ]; then
+    VIRGIL_LOC=$(cd $CUR_V3C_LOC/../ && pwd)
+fi
 
 if [ "$VIRGIL_LIB_UTIL" = "" ]; then
-    if [ "$VIRGIL_LOC" = "" ]; then
-	VIRGIL_LIB_UTIL=$(dirname $CUR_V3C)/../lib/util/
-    else
-	VIRGIL_LIB_UTIL=${VIRGIL_LOC}/lib/util
-    fi
+    VIRGIL_LIB_UTIL=${VIRGIL_LOC}/lib/util
 fi
 
 if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
@@ -47,10 +42,25 @@ if [ ! -e "$VIRGIL_LIB_UTIL/Vector.v3" ]; then
     exit 1
 fi
 
+# Progress arguments. By default the inline (i) mode is used, while the CI sets
+# it to character (c) mode
+PROGRESS_ARGS=${PROGRESS_ARGS:="tti"}
+PROGRESS="progress $PROGRESS_ARGS"
+
+
 ### Set up the test target
 TEST_TARGET=${TEST_TARGET:=v3i}
 T=/tmp/$USER/wizeng-test/$harness/$TEST_TARGET/$TEST_MODE/
 mkdir -p $T
+
+### Set default batching level for tests
+if [ "$BATCHING" = "" ]; then
+    if [ "$TEST_TARGET" = jvm ]; then
+        BATCHING=20
+    else
+        BATCHING=1
+    fi
+fi
 
 ### Configure fatal and trace options
 PROGRESS_PIPE=1
@@ -134,6 +144,15 @@ function make_binary() {
     fi
 }
 
+### Utility to make the wizeng binary and add some environment variables
+function make_wizeng() {
+    make_binary wizeng
+    ret=$?
+    export WIZENG=$WIZENG_LOC/$BINARY
+    export WIZENG_CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS"
+    return $ret
+}
+
 ### Utility for printing a testing line
 function print_testing() {
     ARG=$1
@@ -176,15 +195,27 @@ function check_exit {
 }
 
 function update_proposal_repo {
-    b=$1
+    p=$1
     REPOS=${WIZENG_LOC}/wasm-spec/repos
-    REPO=${REPOS}/$b/
-    if [ ! -d "$DIR" ]; then
+    REPO=${REPOS}/$p/
+    if [ ! -d "$REPO" ]; then
 	mkdir -p $REPOS
 	pushd $REPOS
 	echo "##+git clone [$REPO]"
-        # TODO: check whether repo exists publicly
-	git clone --depth 1 https://github.com/WebAssembly/$b 2>&1 | cat -A
+        # check whether repo exists publicly
+	remote=https://github.com/WebAssembly/$p
+	curl -s https://api.github.com/repos/WebAssembly/$p > $REPOS/check.$p
+	if [ "$?" != 0 ]; then
+	    echo "##-fail: no such repo: $remote"
+	    return 1
+	else
+	    grep status $REPOS/check.$p | grep 404 > /dev/null
+	    if [ $? = 0 ]; then
+		echo "##-fail: proposal not found: $remote"
+		return 1
+	    fi
+	fi
+	git clone --depth 1 $remote 2>&1 | cat -A
 	check_exit $?
 	popd
     else
@@ -209,11 +240,11 @@ function update_proposal_repo {
 }
 
 function make_proposal_tests {
-    b=$1
-    REPO=${WIZENG_LOC}/wasm-spec/repos/$b
+    p=$1
+    REPO=${WIZENG_LOC}/wasm-spec/repos/$p
     WASM=${REPO}/interpreter/wasm
-    SRC=${WIZENG_LOC}/test/wasm-spec/src/$b
-    BIN=${WIZENG_LOC}/test/wasm-spec/bin/$b
+    SRC=${WIZENG_TEST}/wasm-spec/src/$p
+    BIN=${WIZENG_TEST}/wasm-spec/bin/$p
     mkdir -p $BIN
     mkdir -p $SRC
     # clean up old tests
