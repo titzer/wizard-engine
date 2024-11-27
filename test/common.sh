@@ -166,3 +166,81 @@ function run_batched() {
 	i=$(($i + $batching))
     done
 }
+
+function check_exit {
+    if [ $1 = 0 ]; then
+        echo "##-ok"
+    else
+        echo "##-fail"
+    fi
+}
+
+function update_proposal_repo {
+    b=$1
+    REPOS=${WIZENG_LOC}/wasm-spec/repos
+    REPO=${REPOS}/$b/
+    if [ ! -d "$DIR" ]; then
+	mkdir -p $REPOS
+	pushd $REPOS
+	echo "##+git clone [$REPO]"
+        # TODO: check whether repo exists publicly
+	git clone --depth 1 https://github.com/WebAssembly/$b 2>&1 | cat -A
+	check_exit $?
+	popd
+    else
+	pushd $REPO
+	echo "##+git pull [$REPO]"
+	git pull 2>&1 | cat -A
+	check_exit $?
+	popd
+    fi
+
+    pushd $REPO/interpreter
+    echo "##+make [$REPO/interpreter]"
+    if [ -x "$(which opam)" ]; then
+	# Needed for Ocaml build
+        eval $(opam env)
+    fi
+    make 2>&1  | cat -A
+    RESULT=$?
+    check_exit $RESULT
+    popd
+    return $RESULT
+}
+
+function make_proposal_tests {
+    b=$1
+    REPO=${WIZENG_LOC}/wasm-spec/repos/$b
+    WASM=${REPO}/interpreter/wasm
+    SRC=${WIZENG_LOC}/test/wasm-spec/src/$b
+    BIN=${WIZENG_LOC}/test/wasm-spec/bin/$b
+    mkdir -p $BIN
+    mkdir -p $SRC
+    # clean up old tests
+    find $SRC -name '*.wast' -delete
+    find $BIN -name '*.wast' -delete
+
+    cd $REPO/test/core
+    TESTS=$(find . -name '*.wast')
+
+    FAIL=0
+
+    for test in $TESTS; do
+        t=${test#./}
+        dir=$(dirname $t)
+        file=$(basename $t)
+        mkdir -p $SRC/$dir
+        mkdir -p $BIN/$dir
+
+	cp $t $SRC
+        OUT=$BIN/${t/%.wast/}.bin.wast
+	echo "##+translating $OUT"
+	$WASM $t -o $OUT
+        #	$WASM $t -o $BIN/$dir/${t/%.wast/}.wasm
+        result=$?
+        check_exit $result
+        FAIL=$(($FAIL | $result))
+    done
+
+    return $FAIL
+}
