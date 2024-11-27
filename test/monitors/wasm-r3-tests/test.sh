@@ -2,25 +2,18 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
     SOURCE="$(readlink "$SOURCE")"
-    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+    [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../../common.sh R3-monitor
+. $HERE/../../common.sh R3-monitor
 
-make_binary wizeng || exit $?
-
-WIZENG="../../../$BINARY $WIZENG_OPTS -colors=false"
+make_wizeng || exit $?
 
 print_testing
-cd $DIR
-
-V3C=${V3C:=$(which v3c)}
-V3C_LOC=$(dirname $(which v3c))
-VIRGIL_LOC=$(cd $V3C_LOC/../ && pwd)
-VIRGIL_LIB=${VIRGIL_LOC}/lib/
+cd $HERE
 
 R3_FE_TESTS=$(ls *.wasm | grep -v index)
 R3_BE_TESTS=$(ls *.index.wasm)
@@ -33,7 +26,7 @@ function run_fe_tests {
         testcase=$(basename "${file%.wasm}")
         echo "##+$testcase (frontend)"
         trace_file="${file%.*}.r3"
-        $WIZENG '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB/util/*.v3 validate-trace.v3 $trace_file
+        $WIZENG_CMD -colors=false '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB_UTIL/*.v3 validate-trace.v3 $trace_file
         if [ $? -ne 0 ]; then
             echo "##-fail"
         else

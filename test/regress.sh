@@ -30,7 +30,7 @@ function run_tests() {
 		arg="-${BASH_REMATCH[1]}"
 		# TODO: handle tests with multiple extensions properly
 		if [ $arg = "-ext:stack-switching" ]; then
-		arg="-ext:all"
+		    arg="-ext:all"
 		fi
 		TESTS="$ext/*.bin.wast"
 		$CMD $arg $TESTS
