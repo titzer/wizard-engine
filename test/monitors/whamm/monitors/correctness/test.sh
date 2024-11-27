@@ -2,23 +2,21 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-PROJ_BASE="$DIR/../../../../.."
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $PROJ_BASE/test/common.sh whamm
+. $HERE/../../../../common.sh whamm
 
-make_binary wizeng || exit $?
-WIZENG="$PROJ_BASE/$BINARY $WIZENG_OPTS -colors=false"
+make_wizeng || exit $?
 
 target=$TEST_TARGET
 
 print_testing
 
-cd $DIR
+cd $HERE
 
 if [ "$#" = 0 ]; then
     # Generate fresh .wasm from .wat files
@@ -54,9 +52,9 @@ function run_test() {
 
 	echo "$WIZENG $flags --monitors=$test $imports $app"
     if [ -f $test.in ]; then
-	$WIZENG $flags --monitors=$test $imports $app < $test.in > $P.out 2> $P.err
+	$WIZENG_CMD -colors=false $flags --monitors=$test $imports $app < $test.in > $P.out 2> $P.err
     else
-	$WIZENG $flags --monitors=$test $imports $app > $P.out 2> $P.err
+	$WIZENG_CMD -colors=false $flags --monitors=$test $imports $app > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 

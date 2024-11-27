@@ -8,11 +8,12 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 WIZENG_LOC=${WIZENG_LOC:=$(cd $HERE/.. && pwd)}
+
 # TODO: Update to WebAssembly owned repository once it gets merged
 REPO=https://github.com/pco2699/wasi-testsuite
 BRANCH=prod/testsuite-base
 REPOS=${WIZENG_LOC}/wasi/repos/
-DIR=${REPOS}/wasi-testsuite/
+REPO=${REPOS}/wasi-testsuite/
 
 function check {
     if [ $1 = 0 ]; then
@@ -42,8 +43,8 @@ function update {
 }
 
 update
-python3 $DIR/test-runner/wasi_test_runner.py \
-    -t $DIR/tests/assemblyscript/testsuite/ \
-        $DIR/tests/c/testsuite/ \
-        $DIR/tests/rust/testsuite/ \
-    -r $DIR/adapters/wizard.py 
+python3 $REPO/test-runner/wasi_test_runner.py \
+    -t $REPO/tests/assemblyscript/testsuite/ \
+        $REPO/tests/c/testsuite/ \
+        $REPO/tests/rust/testsuite/ \
+    -r $REPO/adapters/wizard.py 
