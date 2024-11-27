@@ -20,15 +20,8 @@ make_binary spectest || exit $?
 function run {
     p=$1
     cd $WIZENG_LOC
-    DIR=test/wasm-spec/bin/$p
 
-    if [ ! -d $DIR ]; then
-	echo "##+run"
-	echo "##-directory not found: $DIR"
-	return 1
-    fi
-
-    TESTS=$(find $DIR -name '*.bin.wast')
+    TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast')
 
     if [[ "$p" != "spec" && "$p" != "" ]]; then
 	EXT_OPTS="-ext:$p"

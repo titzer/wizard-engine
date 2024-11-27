@@ -2,18 +2,18 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh wizeng-monitors-update
+. $HERE/../common.sh wizeng-monitors-update
 
-make_binary wizeng || exit $?
+make_wizeng || exit $?
 
-cd $DIR
-WIZENG="../../$BINARY -colors=false"
+cd $HERE
+CMD="$WIZENG_LOC/$BINARY -colors=false"
 
 if [ $# -gt 0 ]; then
     MONITORS=($@)
@@ -47,7 +47,7 @@ function update_tests_from {
                 args=$(cat $wasm_file.args)
             fi
             echo "##+$monitor | $wasm_file"
-            $WIZENG $flags $mflag "$wasm_path" $args > $T/$wasm_file.tmp
+            $CMD $flags $mflag "$wasm_path" $args > $T/$wasm_file.tmp
             if [ $? = 0 ]; then
                 local suffix=$(echo "$monitor" | tr '{}=,' '-')
                 cp -f $T/$wasm_file.tmp expected/$wasm_file.$suffix.out
@@ -59,9 +59,6 @@ function update_tests_from {
     done
 }
 
-WIZENG_TESTS=$DIR
-SPEC_TESTS=$WIZENG_LOC/test/wasm-spec/bin/spec
-
-update_tests_from $WIZENG_TESTS | $PROGRESS
+update_tests_from $HERE | $PROGRESS
 # TODO: Add spec tests
-# update_tests_from $SPEC_TESTS   | $PROGRESS
+# update_tests_from $WIZENG_LOC/test/wasm-spec/bin/spec   | $PROGRESS

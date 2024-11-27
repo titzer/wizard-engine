@@ -2,23 +2,21 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh wizeng
+. $HERE/../common.sh wizeng
 
-make_binary wizeng || exit $?
-
-WIZENG="../../$BINARY $WIZENG_OPTS -colors=false"
+make_wizeng || exit $?
 
 target=$TEST_TARGET
 
 print_testing
 
-cd $DIR
+cd $HERE
 if [ "$#" = 0 ]; then
     TESTS=$(ls *.wasm)
 else
@@ -44,9 +42,9 @@ function run_test() {
     local P=$T/$test
 
     if [ -f $test.in ]; then
-	$WIZENG $flags $test -- $args < $test.in > $P.out 2> $P.err
+	$WIZENG_CMD -colors=false $flags $test -- $args < $test.in > $P.out 2> $P.err
     else
-	$WIZENG $flags $test -- $args > $P.out 2> $P.err
+	$WIZENG_CMD -colors=false $flags $test -- $args > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 

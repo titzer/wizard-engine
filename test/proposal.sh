@@ -20,7 +20,7 @@ shift
 
 make_binary spectest || exit $?
 
-CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_LOC/test/proposal:$PROPOSAL.failures -expected=$WIZENG_LOC/test/proposal:$PROPOSAL.failures.${TEST_TARGET}"
+CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_TEST/proposal:$PROPOSAL.failures -expected=$WIZENG_TEST/proposal:$PROPOSAL.failures.${TEST_TARGET}"
 
 printf "Updating proposal ${CYAN}%-22s${NORM} " $PROPOSAL
 update_proposal_repo $PROPOSAL | $PROGRESS || exit $?
@@ -29,8 +29,7 @@ printf "Building tests    ${CYAN}%-22s${NORM} " $PROPOSAL
 make_proposal_tests $PROPOSAL | $PROGRESS || exit $?
 
 cd $WIZENG_LOC
-DIR=test/wasm-spec/bin/$PROPOSAL
-TESTS=$(find $DIR -name '*.bin.wast')
+TESTS=$(find test/wasm-spec/bin/$PROPOSAL -name '*.bin.wast')
 
 printf "Running tests     ${CYAN}%-22s${NORM} " $PROPOSAL
 run_batched $BATCHING "$CMD -ext:$PROPOSAL" $TESTS | $PROGRESS
