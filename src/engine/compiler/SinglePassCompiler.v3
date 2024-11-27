@@ -103,6 +103,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var last_probe = 0;
 	var skip_to_end: bool;
 
+	// tracks the last masm writer offset to generate instruction trace for each bytecode.
+	var codegen_offset: u64 = 0;
+
 	new() {
 		masm.unimplemented = unsupported;
 		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
@@ -352,6 +355,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_debugger_breakpoint();
 				return;
 			}
+			x: WhammProbe => {
+				if (SpcTuning.intrinsifyWhammProbe && WasmFunction.?(x.func)) {
+					emitWhammProbe(x);
+					return;
+				}
+			}
 		}
 		// spill everything
 		state.emitSaveAll(resolver, probeSpillMode);
@@ -368,6 +377,80 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_reload_regs();
 		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
+
+	// saves the overhead of using a runtime call by directly invoking the wasm function associated with the whamm probe
+	def emitWhammProbe(probe: WhammProbe) {
+		// spill entire value stack.
+		state.emitSaveAll(resolver, probeSpillMode);
+		// set up args and push to frame slots.
+		var whamm_sig = probe.sig;
+		var offsets = masm.getOffsets();
+		var callee_func = WasmFunction.!(probe.func);
+		for (i < whamm_sig.length) {
+			var slot_tag_addr = masm.tagAddr(state.sp + u32.view(i));
+			var slot_addr = masm.slotAddr(state.sp + u32.view(i));
+			var kind: byte;
+			match(whamm_sig[i]) {
+				FrameAccessor => {
+					masm.emit_call_runtime_getFrameAccessorMetaRef();
+					masm.emit_mov_m_r(ValueKind.REF, slot_addr, xenv.runtime_ret0);
+					kind = ValueKind.REF.code;
+				}
+				Val(val) => {
+					var is_v128 = false;
+					var low: u64, high: u64;
+					match (val) {
+						I31(v) => { low = v; kind = ValueKind.REF.code; }
+						I32(v) => { low = v; kind = ValueKind.I32.code; }
+						I64(v) => { low = v; kind = ValueKind.I64.code; }
+						F32(v) => { low = v; kind = ValueKind.F32.code; }
+						F64(v) => { low = v; kind = ValueKind.F64.code; }
+						V128(l, h) => {
+							low = l;
+							high = h;
+							is_v128 = true;
+							kind = ValueKind.V128.code;
+						}
+						Ref(val) => { low = u64.view(Pointer.atObject(val) - Pointer.NULL); kind = ValueKind.REF.code; }
+					}
+					masm.emit_mov_m_d(slot_addr, low);
+					if (is_v128) {
+						masm.emit_mov_m_d(slot_addr.plus(8), high);
+					}
+				}
+				Operand(_, i) => {
+					var slot = state.sp + u32.view(i) - 1;
+					kind = state.state[slot].kind().code;
+					masm.emit_mov_m_m(ValueKind.REF, slot_addr, masm.slotAddr(slot));
+				}
+				Local(_, i) => {
+					var slot = u32.view(i);
+					kind = state.state[slot].kind().code;
+					masm.emit_mov_m_m(ValueKind.REF, slot_addr, masm.slotAddr(slot));
+				}
+			}
+			masm.emit_mov_m_i(slot_tag_addr, kind);
+		}
+		var whamm_instance = callee_func.instance;
+		var func_id = callee_func.decl.func_index;
+
+		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var func_reg = allocTmpFixed(ValueKind.REF, regs.func_arg);
+		var tmp = allocTmp(ValueKind.REF);
+
+		// Load the target code/entrypoint.
+		masm.emit_mov_r_l(func_reg, Pointer.atObject(whamm_instance.functions[func_id]) - Pointer.NULL);
+		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(func_reg, offsets.WasmFunction_decl));
+		masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.FuncDecl_target_code));
+		// adjust vsp_reg to compute the "true" VSP, accounting for args to WhammProbe's WasmFunction
+		emit_compute_vsp(vsp_reg, state.sp + u32.view(whamm_sig.length));
+		// Call to the entrypoint.
+		masm.emit_call_r(tmp);
+		emit_unwind_check();
+		emit_reload_regs();
+		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+	}
+
 	def visit_CRASH_EXEC() {
 		masm.emit_intentional_crash();
 	}
@@ -540,6 +623,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			state.popArgsAndPushResults(func.sig);
 		}
 	}
+
 	def emitMoveTailCallArgs(sig: SigDecl) {
 		var p = sig.params, count = u32.!(p.length);
 		var base = state.sp - count;
@@ -1457,6 +1541,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var pc = it.pc - start_pos;
 		instrTracer.instr_width = Opcodes.longestName + 1;
 		instrTracer.putPcAndInstr(OUT, module, func, pc, orig);
+		if (Trace.asm) {
+			OUT.puts("JIT code: ");
+			masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
+			codegen_offset = masm.curCodeBytes();
+			OUT.ln();
+		}
 	}
 }
 // Different branch instructions have different repush
