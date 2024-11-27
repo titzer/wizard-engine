@@ -2,25 +2,18 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
     SOURCE="$(readlink "$SOURCE")"
-    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+    [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh Linker
+. $HERE/../common.sh Linker
 
-make_binary wizeng || exit $?
-
-WIZENG="../../../$BINARY $WIZENG_OPTS -colors=false"
+make_wizeng || exit $?
 
 print_testing
-cd $DIR
-
-V3C=${V3C:=$(which v3c)}
-V3C_LOC=$(dirname $(which v3c))
-VIRGIL_LOC=$(cd $V3C_LOC/../ && pwd)
-VIRGIL_LIB=${VIRGIL_LOC}/lib/
+cd $HERE
 
 TEST_COUNT=$(ls -d */ | wc -l)
 TESTS=$(ls -d */)
@@ -44,7 +37,7 @@ function run_tests {
             fi
         done
         options="--expose=wizeng"
-        $WIZENG $options $combined_files main.wasm > $T/$testcase.out
+        $WIZENG_CMD -colors=false $options $combined_files main.wasm > $T/$testcase.out
         diff ../$testcase.out $T/$testcase.out | tee $T/$testcase.out.diff
         DIFF=${PIPESTATUS[0]}
         if [ "$DIFF" != 0  ]; then

@@ -2,13 +2,13 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $DIR/../common.sh virgil
+. $HERE/../common.sh virgil
 
 make_binary spectest || exit $?
 
@@ -16,7 +16,7 @@ CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS "
 
 TESTS="$@"
 
-cd $DIR
+cd $HERE
 if [ "$TESTS" =  "" ]; then
     for dir in bin; do
 	TESTS=$(ls $dir/*.bin.wast)
