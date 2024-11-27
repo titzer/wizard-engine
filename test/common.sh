@@ -176,15 +176,27 @@ function check_exit {
 }
 
 function update_proposal_repo {
-    b=$1
+    p=$1
     REPOS=${WIZENG_LOC}/wasm-spec/repos
-    REPO=${REPOS}/$b/
-    if [ ! -d "$DIR" ]; then
+    REPO=${REPOS}/$p/
+    if [ ! -d "$REPO" ]; then
 	mkdir -p $REPOS
 	pushd $REPOS
 	echo "##+git clone [$REPO]"
-        # TODO: check whether repo exists publicly
-	git clone --depth 1 https://github.com/WebAssembly/$b 2>&1 | cat -A
+        # check whether repo exists publicly
+	remote=https://github.com/WebAssembly/$p
+	curl -s https://api.github.com/repos/WebAssembly/$p > $REPOS/check.$p
+	if [ "$?" != 0 ]; then
+	    echo "##-fail: no such repo: $remote"
+	    return 1
+	else
+	    grep status $REPOS/check.$p | grep 404 > /dev/null
+	    if [ $? = 0 ]; then
+		echo "##-fail: proposal not found: $remote"
+		return 1
+	    fi
+	fi
+	git clone --depth 1 $remote 2>&1 | cat -A
 	check_exit $?
 	popd
     else
@@ -209,11 +221,11 @@ function update_proposal_repo {
 }
 
 function make_proposal_tests {
-    b=$1
-    REPO=${WIZENG_LOC}/wasm-spec/repos/$b
+    p=$1
+    REPO=${WIZENG_LOC}/wasm-spec/repos/$p
     WASM=${REPO}/interpreter/wasm
-    SRC=${WIZENG_LOC}/test/wasm-spec/src/$b
-    BIN=${WIZENG_LOC}/test/wasm-spec/bin/$b
+    SRC=${WIZENG_LOC}/test/wasm-spec/src/$p
+    BIN=${WIZENG_LOC}/test/wasm-spec/bin/$p
     mkdir -p $BIN
     mkdir -p $SRC
     # clean up old tests

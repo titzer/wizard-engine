@@ -11,16 +11,16 @@ WIZENG_LOC=${WIZENG_LOC:=$(cd $DIR/.. && pwd)}
 
 . $DIR/../common.sh update
 
-BRANCHES="$@"
+PROPOSALS="$@"
 if [ "$#" = 0 ]; then
-    BRANCHES=spec
+    PROPOSALS=spec
 fi
 
 
 
-for b in $BRANCHES; do
-    printf "Updating proposal ${CYAN}%-22s${NORM} " $b
-    update_proposal_repo $b | $PROGRESS || exit $?
-    printf "Building tests    ${CYAN}%-22s${NORM} " $b
-    make_proposal_tests $b | $PROGRESS || exit $?
+for p in $PROPOSALS; do
+    printf "Updating proposal ${CYAN}%-22s${NORM} " $p
+    update_proposal_repo $p | $PROGRESS || exit $?
+    printf "Building tests    ${CYAN}%-22s${NORM} " $p
+    make_proposal_tests $p | $PROGRESS || exit $?
 done
