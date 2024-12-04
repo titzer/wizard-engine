@@ -90,6 +90,7 @@ function run_test() {
 			continue # test was found in expected failures
 		    fi
 		fi
+
 		echo "##-fail: $P.$check.diff"
 		return 1
 	    fi

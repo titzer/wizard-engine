@@ -22,11 +22,11 @@
             (param $arg1_0 i32) (param $local1 i32) (param $arg0_0 i32) (param $arg0_1 i32) (param $local0 i32) (param $imm0 i32)
         (call $puts (i32.const 0x0) (i32.const 13))
         (block $error
-            (br_if $error (i32.ne (i32.const 1) (local.get $arg1_0)))
-            (br_if $error (i32.ne (i32.const 1) (local.get $local1)))
-            (br_if $error (i32.ne (i32.const 0) (local.get $arg0_0)))
-            (br_if $error (i32.ne (i32.const 0) (local.get $arg0_1)))
-            (br_if $error (i32.ne (i32.const 0) (local.get $local1)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $arg1_0)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $local1)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $arg0_0)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $arg0_1)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $local0)))
             (br_if $error (i32.ne (i32.const 1) (local.get $imm0)))
             return
         )
@@ -37,8 +37,8 @@
     (func $call_probe1 (export "wasm:opcode:call(arg1, local1)") (param $arg1 i32) (param $local1 i32)
         (call $puts (i32.const 0xFF) (i32.const 13))
         (block $error
-            (br_if $error (i32.ne (i32.const 1) (local.get $arg1)))
-            (br_if $error (i32.ne (i32.const 1) (local.get $local1)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $arg1)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $local1)))
             return
         )
         unreachable
