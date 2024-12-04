@@ -102,7 +102,9 @@ function wat2wasm_avail() {
     command -v wat2wasm >/dev/null 2>&1
 }
 
-WAT2WASM=${WAT2WASM:="$(which wat2wasm) --enable-all"}
+if wat2wasm_avail; then
+    WAT2WASM=${WAT2WASM:="$(which wat2wasm) --enable-all"}
+fi
 function wat2wasm() {
     # if wat2wasm doesn't exist, skip this utility func
     ! wat2wasm_avail && return 0
