@@ -90,7 +90,12 @@ function run_test() {
 			continue # test was found in expected failures
 		    fi
 		fi
+
 		echo "##-fail: $P.$check.diff"
+		if [ -v PRINT_DIFF_TO ]; then
+		    echo "hi" >>/tmp/test
+			cat "$P.$check.diff" >>$PRINT_DIFF_TO
+		fi
 		return 1
 	    fi
 	fi
