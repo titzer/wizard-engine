@@ -46,7 +46,4 @@ eval $(opam config env)
 ./test/wasm-spec/update.sh
 
 # Run all tests
-PRINT_DIFF_TO=/tmp/diff-output ./test/all.sh
-
-cat /tmp/diff-output 2>/dev/null
-exit 0
+./test/all.sh
