@@ -18,14 +18,14 @@
     (data (i32.const 0x0) "hello br_if!\n")
     (data (i32.const 0xFF) "hello call!\n")
 
-    (func $brif_pred (param $fid i32) (result i32)
+    (func (export "$brif_pred") (param $fid i32) (result i32)
         (i32.eq (i32.const 1) (local.get $fid))
     )
-    (func $brif_probe (export "wasm:opcode:br_if / $brif_pred(fid) /")
+    (func $brif_probe (export "wasm:opcode:br_if / $brif_pred(fid) / ")
         (call $puts (i32.const 0x0) (i32.const 13))
     )
 
-    (func $call_pred (param $fid i32) (param $pc i32) (result i32)
+    (func (export "$call_pred") (param $fid i32) (param $pc i32) (result i32)
         (i32.and
             (i32.eq (i32.const 1) (local.get $fid))
             (i32.eq (i32.const 25) (local.get $pc))
