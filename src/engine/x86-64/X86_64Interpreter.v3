@@ -294,6 +294,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def r_runtime_arg0	= G(xenv.runtime_arg0);
 	def r_runtime_arg1	= G(xenv.runtime_arg1);
 	def r_runtime_arg2	= G(xenv.runtime_arg2);
+	def r_runtime_ret0	= G(xenv.runtime_ret0);
+	def r_runtime_ret1	= G(xenv.runtime_ret1);
 	def r_dispatch		= G(xenv.dispatch);
 	def r_ret_throw		= G(xenv.ret_throw);
 	def r_scratch		= G(xenv.scratch);
@@ -2155,6 +2157,190 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			incrementVsp();
 			endHandler();
 		}
+		// ext:typed-continuation
+		bindHandler(Opcode.CONT_NEW); {
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(r_tmp0);
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_CONT_NEW), [r_instance, r_tmp0], true);
+			restoreCallerIVars();
+			endHandler();
+		}
+		bindHandler(Opcode.CONT_BIND); {
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(r_tmp0);
+			genReadUleb32(r_tmp1);
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_CONT_BIND), [r_instance, r_tmp0, r_tmp1], true);
+			restoreCallerIVars();
+			endHandler();
+		}
+		bindHandler(Opcode.RESUME); {
+			var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+			var cont_id = r_tmp0, ip_store = r_tmp1;
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+
+			asm.movq_r_r(ip_store, r_ip);
+			genReadUleb32(cont_id); // read signature index
+			asm.movq_r_r(r_ip, ip_store);
+
+			var r_stack = r_tmp1;
+			asm.movq_r_m(r_stack, m_curStack);
+
+			// mov [%stack.vsp], %vsp
+			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
+
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_process_resume), [r_instance, cont_id], true);
+			restoreCallerIVars();
+			asm.movq_r_m(r_stack, m_curStack);
+
+			var r_cont = r_tmp0;
+			decrementVsp(); // pop cont ref from stack
+			asm.movq_r_m(r_cont, vsph[0].value);
+
+			var resume_stub = X86_64Label.new(), done = X86_64Label.new();
+			saveCallerIVars();
+			asm.call_rel_far(resume_stub);
+			// check for error (in %rax)
+			if (FeatureDisable.stackUnwind) {
+				genAbruptRetCheck();
+			} else {
+				asm.q.cmp_r_i(r_ret_throw, 0);
+				asm.jc_rel_near(X86_64Conds.Z, done);
+				callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_ret_throw], true);
+			}
+
+			asm.bind(done);
+			restoreDispatchTableReg();
+			restoreCallerIVars();
+			// load %stack
+			asm.movq_r_m(r_stack, m_curStack);
+			// mov %vsp, [%stack.vsp]
+			asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
+
+			// skip the handler table
+			var handler_length = r_tmp1;
+			genSkipLeb();
+			genReadUleb32(handler_length); // read handler length
+			
+			// skip handler table
+			var cnt = r_tmp3;
+			asm.movq_r_r(cnt, handler_length);
+			// loop for `cnt` times
+			var read_start = X86_64Label.new(), read_done = X86_64Label.new(), read_switch = X86_64Label.new();
+			asm.bind(read_start);
+			// while (--cnt >= 0)
+			asm.d.dec_r(cnt);
+			// goto read_done
+			asm.jc_rel_near(C.S, read_done);
+			// read handler type
+			genReadUleb32(r_scratch);
+			asm.q.cmp_r_i(r_scratch, 0);
+			// if {handler_type} is 0x01, read switch handler
+			asm.jc_rel_near(X86_64Conds.NZ, read_switch);
+			// read normal handler
+			genSkipLeb();
+			genSkipLeb();
+			asm.jmp_rel_near(read_start);
+			// read switch handler
+			asm.bind(read_switch);
+			genSkipLeb();
+			asm.jmp_rel_near(read_start);
+			asm.bind(read_done);
+
+			// adjust sidetable
+			asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
+			// calculate length of handler entries in sidetable
+			asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
+			asm.q.add_r_r(r_stp, handler_length);
+
+			endHandler();
+
+			{
+				asm.bind(resume_stub);
+				var r_bottom = r_tmp3;
+				asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
+				// mov [%r_bottom.parent_rsp_ptr], rsp
+				asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
+				asm.movq_m_r(r_scratch.plus(0), r_sp);
+
+				var r_new = r_tmp0;
+				asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
+
+				// mov [%curStack, %new]
+				asm.movq_m_r(m_curStack, r_new);
+
+				// save before switching to new stack pointer
+				// mov [%stack.vsp], %vsp
+				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
+				// mov [%stack.rsp], %rsp
+				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
+
+				// mov %rsp, [%newStack.rsp]
+				asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
+				// mov %vsp, [%newStack.vsp]
+				asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
+
+				// pop return address and jump to it
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				// jump *%tmp
+				masm.emit_jump_r(xenv.scratch);
+			}
+		}
+		bindHandler(Opcode.SUSPEND); {
+			var tag_index = r_tmp0;
+			var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(tag_index); // read tag index
+
+			saveCallerIVars();
+
+			var suspend_stub = X86_64Label.new();
+			// save the new rsp with added reentry address
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_m_r(r_scratch.plus(offsets.X86_64Stack_rsp), r_sp);
+			asm.q.sub_m_i(r_scratch.plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
+
+			callRuntime(refRuntimeCall(RT.runtime_handle_suspend), [r_instance, tag_index], false);
+			asm.call_rel_far(suspend_stub);
+			restoreCallerIVars();
+			endHandler();
+
+			asm.bind(suspend_stub); {
+				var noexcept = X86_64Label.new();
+				asm.d.cmp_r_i(r_ret_throw, -1);
+				asm.jc_rel_near(X86_64Conds.NZ, noexcept);
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				asm.jmp_rel_far(newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+				asm.bind(noexcept);
+				var order = r_tmp0;
+				asm.movq_r_r(order, r_ret_throw);
+
+				var r_stack = r_tmp1;
+				// mov %stack, [%curStack]
+				asm.movq_r_m(r_stack, m_curStack);
+				// mov %rsp, [%stack.rsp]
+				asm.movq_r_m(r_sp, r_stack.plus(offsets.X86_64Stack_rsp));
+				// mov %vsp, [%stack.vsp]
+				asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
+
+				// load regs from handler stack
+				restoreCallerIVars();
+
+				// stp += Sidetable_ResumeEntry.size
+				asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
+				asm.imul_r_i(order, Sidetable_SuspendHandlerEntry.size);
+				asm.q.add_r_r(r_stp, order); 
+
+				asm.jmp_rel_far(controlTransferLabel);
+			}
+    }
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			computeCurIpFromIp(-1);
 			computePcFromCurIp();

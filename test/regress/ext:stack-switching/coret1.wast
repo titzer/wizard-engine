@@ -10,9 +10,9 @@
      (loop (param i32)
         (f32.convert_i32_s)
         (local.set $sum (f32.add (local.get $sum)))
-	(suspend $s (local.get $sum))
-	(br_if 0)
-	drop
+        (suspend $s (local.get $sum))
+        (br_if 0)
+        (drop)
      )
      (f64.promote_f32 (local.get $sum))
   )
