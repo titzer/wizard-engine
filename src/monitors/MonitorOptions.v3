@@ -8,6 +8,9 @@ component MonitorOptions {
 	def X_ = OptionsRegistry.addParseFunc(parse);
 	
 	private var monitors = Vector<Monitor>.new();
+	// Track the Whamm modules that need to be linked.
+	// A list of groups of modules.
+	private var modulesToLink = Vector<Vector<(string, Module)>>.new();
 
 	// Parse a command-line argument, configuring and updating monitors. Return {true}
 	// if the argument was matched and parsed successfully.
@@ -44,21 +47,67 @@ component MonitorOptions {
 			var engine = Engine.new();
 			engine.extensions = Extension.set.all;
 			var tiering_override = if(SpcTuning.compileWhammModules, ExecuteOptions.getModeOrDefault("jit"), Execute.tiering);
-			var result = engine.loadWasmFileWithTiering(name, tiering_override); // TODO: limits
-			match (result) {
-				Ok(m) => {
-					monitors.put(WhammMonitor.new(m));
-					return;
+
+			// Split by '+'
+			var s = 0, pos = s;
+			var whammModuleName = "";
+			var otherModuleNames = Vector<string>.new();
+			while (pos < name.length) {
+				match (name[pos]) {
+					'+' => {
+						var name = Arrays.range(name, s, pos);
+
+						// First module is the whamm module, otherwise it's a library to link
+						if (whammModuleName.length == 0) {
+							whammModuleName = name;
+						} else {
+							otherModuleNames.put(name);
+						}
+						s = pos + 1;
+						pos++;
+					}
+					_ => pos++;
 				}
-				FileNotFound => return ErrorBuilder.new()
-					.puts("wizeng: could not load monitor file ")
-					.puts(name)
-					.ln()
-					.exit<void>();
-				ParseError(code, path, section, error_index, error_pos, error_msg) => return ErrorBuilder.new()
-					.render(code, path, section, error_index, error_pos, error_msg)
-					.exit<void>();
 			}
+			// If whamm module hasn't been set yet, we don't have any libraries to link
+			var finalName = Arrays.range(name, s, pos);
+			if (!Strings.endsWith(finalName, ".wasm")) {
+				ErrorBuilder.new()
+					.puts(finalName)
+					.puts(": unknown file format, expected .wasm\n")
+					.exit(4);
+				return;
+			}
+			if (whammModuleName.length == 0) {
+				whammModuleName = finalName;
+			} else {
+				// add the last module to link!
+				otherModuleNames.put(finalName);
+			}
+
+			var whammModule = loadModule(engine, whammModuleName, tiering_override, "wizeng: could not load monitor file ");
+			if (whammModule == null) return; // Something bad happened during load
+
+			Trace.OUT.puts("finished loading module\n").flush();
+			monitors.put(WhammMonitor.new(whammModule));
+
+			// If there are library modules to link, instantiate them here and save them to a group specific to this Whamm monitor.
+			if (otherModuleNames.length > 0) {
+				var otherModules = Vector<(string, Module)>.new();
+				otherModules.put(("whamm", whammModule));
+
+				for (i < otherModuleNames.length) {
+					var name = otherModuleNames[i];
+					Trace.OUT.puts(name).ln().flush();
+					var module = loadModule(engine, name, tiering_override, "wizeng: could not load monitor library file ");
+					if (module == null) return; // Something bad happened during load
+					otherModules.put((name, module));
+				}
+				modulesToLink.put(otherModules);
+			}
+
+			Trace.OUT.puts("finished loading linked module(s)\n").flush();
+			return;
 		}
 		var entry = MonitorRegistry.lookupName(name);
 		if (entry != null) {
@@ -68,6 +117,28 @@ component MonitorOptions {
 				if (msg != null) Trace.OUT.put2("%s: %s", name, msg).ln();
 			}
 			monitors.put(entry.monitor);
+		}
+	}
+	private def loadModule(engine: Engine, path: string, tiering_override: ExecutionStrategy, onError: string) -> Module {
+		var result = engine.loadWasmFileWithTiering(path, tiering_override); // TODO: limits
+		match (result) {
+			Ok(m) => {
+				return m;
+			}
+			FileNotFound => {
+				ErrorBuilder.new()
+					.puts(onError)
+					.puts(path)
+					.ln()
+					.exit<void>();
+				return null;
+			}
+			ParseError(code, path, section, error_index, error_pos, error_msg) => {
+				ErrorBuilder.new()
+					.render(code, path, section, error_index, error_pos, error_msg)
+					.exit<void>();
+				return null;
+			}
 		}
 	}
 	private def parseMonitorArgs(entry: MonitorRegistryEntry, args: string) {
@@ -92,6 +163,10 @@ component MonitorOptions {
 	def getMonitors() -> Vector<Monitor> {
 		return monitors;
 	}
+	// Get the groups of modules to link, if any, configured by the above.
+	def getModulesToLink() -> Vector<Vector<(string, Module)>> {
+		return modulesToLink;
+	}
 	def printHelp(out: TraceBuilder) {
 		var H = out.putsln, L = out.ln;
 		H("Wizard offers instrumentation and dynamic analyses of Wasm programs via monitors.");
@@ -114,5 +189,16 @@ component MonitorOptions {
 		L();
 		H("   --monitors=loops,coverage{code=instr}");
 		out.ln();
+
+		L();
+		H("A Whamm monitor can also be used, which is provided as a path to a Wasm module.");
+		H("If the module must be dynamically linked with support libraries, append paths to");
+		H("those libraries delimited with '+'.");
+		H("The Whamm monitor module should come FIRST in this list.");
+		L();
+		H("Example usage:");
+		L();
+		H("   --monitors=path/to/whamm-monitor.wasm+path/to/lib.wasm");
+		L();
 	}
 }
