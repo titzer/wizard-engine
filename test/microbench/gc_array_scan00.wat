@@ -1,4 +1,4 @@
-;; INNER_CALIBRATION = 3310
+;; INNER_CALIBRATION = 24000
 (module
   (type $at (array i8))
   (func $main (export "main")

@@ -17,7 +17,7 @@
     (memory (export "mem") 1 1)
     (data (i32.const 0xc00) "hello world!\n")
 
-    (func $br_pred (param $fid i32) (param $pc i32) (result i32)
+    (func (export "$br_pred") (param $fid i32) (param $pc i32) (result i32)
         (i32.and
             (i32.eq (i32.const 1) (local.get $fid))
             (i32.eq (i32.const 323) (local.get $pc))

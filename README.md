@@ -21,14 +21,16 @@ Wizard fully supports these Wasm proposals:
   * Exception handling
   * Tail-call
   * GC
-  * Multi-memory
   * Function References
-  * Relaxed section order
+  * Multi-memory
 
 Other features under development:
 
   * Threads
   * Stack-switching
+  * Memory64
+  * Custom page sizes
+  * Relaxed section order
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.
