@@ -103,3 +103,87 @@ class ExternalDebuggerBreakpointProbe extends Probe {
 		return Resumption.Continue; // TODO: currently only has effect in SPC code
 	}
 }
+
+// A probe that instruments memory read, intrinsified by SPC. 
+class MemoryReadProbe extends Probe {
+	var imm: MemArg;
+	var size: u8;
+	// fallback invocation when not intrinsified.
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var address: u64 = Values.unbox_u(accessor.getTopOfStack());
+		address += imm.offset;
+		var memory = dynamicLoc.func.instance.memories[imm.memory_index];
+		var size = u32.view(size);
+		var mem_ptr_trap = memory.range_ol_64(address, size);
+		if (mem_ptr_trap.trapped())
+			return Resumption.Trap(mem_ptr_trap.reason, true);
+		var low: u64, high: u64;
+		var mem_ptr = mem_ptr_trap.result;
+		match (size) {
+			1 => {
+				low = DataReaders.read_range_u8(mem_ptr);
+			}
+			2 => {
+				low = DataReaders.read_range_u16(mem_ptr);
+			}
+			4 => {
+				low = DataReaders.read_range_u32(mem_ptr);
+			}
+			8 => {
+				low = DataReaders.read_range_u64(mem_ptr);
+			}
+			16 => {
+				var data_result = DataReaders.read_range_u128(mem_ptr);
+				low = data_result.0;
+				high = data_result.1;
+			}
+			_ => ;
+		}
+		fire_probe(address, low, high);
+		return Resumption.Continue;
+	}
+	def fire_probe(addr: u64, val_lower: u64, val_upper: u64) {}
+}
+
+// A probe that instruments memory write, intrinsified by SPC. 
+// if writeMirror is set, any probed writes to the main memory will also be performed on this mirror.
+class MemoryWriteProbe extends Probe {
+	var imm: MemArg, size: u8, writeMirror: Memory, has_fire_probe: bool;
+
+	// fallback invocation when not intrinsified.
+	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var address: u64 = Values.unbox_u(accessor.getOperand(-1));
+		address += imm.offset;
+		var size = u32.view(size);
+		var newval_lower: u64, newval_upper: u64;
+		match (accessor.getTopOfStack()) {
+			I32(v) => newval_lower = v;
+			I64(v) => newval_lower = v;
+			F32(v) => newval_lower = v;
+			F64(v) => newval_lower = v;
+			V128(low, high) => {
+				newval_lower = low;
+				newval_upper = high;
+			}
+			_ => ;
+		}
+		// apply write mirroring
+		if (writeMirror != null) {
+			var mirror_ptr = writeMirror.range_ol_64(address, size);
+			if (mirror_ptr.ok()) {
+				match (size) {
+					1 => DataWriters.write_range_u8(mirror_ptr.result, u8.view(newval_lower));
+					2 => DataWriters.write_range_u16(mirror_ptr.result, u16.view(newval_lower));
+					4 => DataWriters.write_range_u32(mirror_ptr.result, u32.view(newval_lower));
+					8 => DataWriters.write_range_u64(mirror_ptr.result, newval_lower);
+					16 => DataWriters.write_range_u128(mirror_ptr.result, (newval_lower, newval_upper));
+				}
+			}
+		}
+		fire_probe(address, newval_lower, newval_upper);
+		return Resumption.Continue;
+	}
+	def fire_probe(addr: u64, newval_lower: u64, newval_upper: u64) {}
+}

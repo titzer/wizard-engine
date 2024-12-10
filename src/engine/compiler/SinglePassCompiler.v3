@@ -112,6 +112,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
+	var intrinsified_read_probe: MemoryReadProbe = null;
+	var intrinsified_write_probe: MemoryWriteProbe = null;
+
 	new() {
 		masm.unimplemented = unsupported;
 		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
@@ -331,6 +334,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Check for intrinsified probes.
 		match (probe) { // TODO: emit code for multiple intrinsified probes.
 			null => ;
+			x: MemoryReadProbe => if (SpcTuning.intrinsifyMemoryProbes && x.size <= 8) {
+				intrinsified_read_probe = x;
+				return;
+			}
+			x: MemoryWriteProbe => if (SpcTuning.intrinsifyMemoryProbes && x.size <= 8) {
+				intrinsified_write_probe = x;
+				return;
+			}
 			x: CountProbe => if (SpcTuning.intrinsifyCountProbe) { // TODO: check for subclass override
 				var tmp = allocTmp(ValueKind.REF);
 				masm.emit_increment_CountProbe(tmp, x, 1);
@@ -1510,8 +1521,33 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var nflags = IN_REG | SpcConsts.kindToFlags(kind);
 		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
+
+		if (intrinsified_read_probe != null) {
+			// spill everything
+			state.emitSaveAll(resolver, probeSpillMode);
+			// compute VSP for potential frame access
+			emit_compute_vsp(regs.vsp, state.sp);
+			emit_spill_vsp(regs.vsp);
+			masm.emit_store_curstack_vsp(regs.vsp);
+
+			// load RT args (addr, val) and call RT
+			if (index_reg.index == 0) { // fixed addr
+				index_reg = allocTmp(ValueKind.I32);
+				masm.emit_mov_r_i(index_reg, i32.!(offset));
+			} else {
+				masm.emit_addw_r_i(index_reg, i32.!(offset));
+			}
+			var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
+			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
+			masm.emit_mov_r_r(ValueKind.REF, arg1, index_reg);
+			masm.emit_mov_r_m(kind, arg2, masm.slotAddr(state.sp - 1));
+			masm.emit_call_MemoryReadProbe_fire(intrinsified_read_probe);
+			emit_reload_regs();
+			if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+			intrinsified_read_probe = null;
+		}
 	}
-	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ()) {
+	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, Reg, u32) -> ()) {
 		var base_reg = regs.mem0_base;
 		if (imm.memory_index != 0) {
 			// XXX: cache the base register for memories > 0
@@ -1534,7 +1570,62 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		} else {
 			index_reg = popReg().reg;
 		}
-		meth(kind, sv.reg, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+		var mirror_base: Reg;
+		if (intrinsified_write_probe != null) {
+			if (intrinsified_write_probe.has_fire_probe) {
+				// temporarily push values back in order to preserve the register values across RT call
+				if (index_reg.index != 0)
+					state.push(KIND_I32 | IN_REG, index_reg, 0);
+				state.push((byte.view(sv.kind().tag) << 4) | IN_REG, sv.reg, 0);
+
+				// spill everything
+				state.emitSaveAll(resolver, probeSpillMode);
+				// compute VSP for potential frame access
+				emit_compute_vsp(regs.vsp, state.sp);
+				emit_spill_vsp(regs.vsp);
+				masm.emit_store_curstack_vsp(regs.vsp);
+
+				// load RT args (addr, val) and call RT
+				if (index_reg.index == 0) { // fixed addr
+					index_reg = allocTmp(ValueKind.I32);
+					masm.emit_mov_r_i(index_reg, i32.!(offset));
+				} else {
+					masm.emit_addw_r_i(index_reg, i32.!(offset));
+				}
+				var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
+				var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
+				masm.emit_mov_r_r(ValueKind.REF, arg1, index_reg);
+				masm.emit_mov_r_m(kind, arg2, masm.slotAddr(state.sp - 1));
+				masm.emit_call_MemoryWriteProbe_fire(intrinsified_write_probe);
+				emit_reload_regs();
+				if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+				// restore abstract state
+				if (index_reg.index != 0) pop();
+				pop();
+			}
+
+			if (intrinsified_write_probe.writeMirror != null) { // setup write mirror base
+				var mirror_mem_addr = Pointer.atObject(intrinsified_write_probe.writeMirror) - Pointer.NULL;
+				mirror_base = allocTmp(ValueKind.REF);
+				masm.emit_mov_r_l(mirror_base, mirror_mem_addr);
+				masm.emit_read_v3_mem_base(mirror_base, mirror_base);
+			}
+			intrinsified_write_probe = null;
+		}
+		meth(kind, sv.reg, base_reg, mirror_base, index_reg, u32.!(offset)); // TODO: memory64
+	}
+
+	def emitIntrinsifiedMemoryReadProbe() {
+		// spill everything
+		state.emitSaveAll(resolver, probeSpillMode);
+		// compute VSP for potential frame access
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+
+
+		emit_reload_regs();
+		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 
 	//====================================================================
