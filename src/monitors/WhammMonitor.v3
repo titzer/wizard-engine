@@ -13,7 +13,7 @@
 //  - binding callbacks
 //  - define frame accessor methods
 //  - externref in Virgil
-class WhammMonitor(whamm: Module) extends Monitor {
+class WhammMonitor(whamm: (string, Module), toLink: Vector<(string, Module)>) extends Monitor {
 	var onParseF: int = -1;
 	var onInstantiateF: int = -1;
 	var onStartF: int = -1;
@@ -25,13 +25,13 @@ class WhammMonitor(whamm: Module) extends Monitor {
 	var err: ErrorGen;
 
 	new() {
-		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.filename).ln();
-		for (i < whamm.exports.length) {
-			var e = whamm.exports[i], name = e.0, decl = e.1;
+		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.1.filename).ln();
+		for (i < whamm.1.exports.length) {
+			var e = whamm.1.exports[i], name = e.0, decl = e.1;
 			if (!FuncDecl.?(decl)) continue;
 			if (Trace.whamm) Trace.OUT.put2("  export %d: \"%s\" = ", i, name).ln();
 			var func = FuncDecl.!(decl);
-			var r = TextReader.new(whamm.filename, name);
+			var r = TextReader.new(whamm.1.filename, name);
 			var t = Whamm.parseOpcodePattern(r), op = t.0, params = t.1, pred = t.2;
 			if (!r.ok) {
 				// parse error
@@ -358,13 +358,47 @@ class WhammMonitor(whamm: Module) extends Monitor {
 		for (l = whammInstances; l != null; l = l.tail) {
 			if (l.head.0 == module) return (l.head.1, l.head.2);
 		}
-		if (Trace.whamm) Trace.OUT.put2("Instantiating whamm module %s for %s", whamm.filename, module.filename).ln();
-		var imports = Array<Exportable>.new(whamm.imports.length), err = ErrorGen.new(whamm.filename);
-		var i = Instantiator.new(Extension.set.all, whamm, imports, err);
-		i.processors.put(WizengModule.new());
+		if (Trace.whamm) Trace.OUT.put2("Instantiating whamm module %s for %s", whamm.1.filename, module.filename).ln();
+		var imports = Array<Exportable>.new(whamm.1.imports.length), err = ErrorGen.new(whamm.1.filename);
+
+		// Perform the linking for Whamm monitor support libraries.
+		var engine = Engine.new();
+		engine.extensions = Extension.set.all;
+		if (engine.extensions.WIZENG) ModuleRegistry.expose("wizeng");
+
+		toLink.put((whamm.0, whamm.1)); // Add the whamm module to the linking context
+		var toLink = toLink.extract();
+		var toLinkNames = Array<(string, Module)>.new(toLink.length);
+		for (i < toLink.length) {
+			var path = toLink[i].0;
+			var module = toLink[i].1;
+
+			toLinkNames[i] = (PathUtil.extractName(path), module);
+		}
+
+		var binder: (Decl, Exportable) -> Exportable;
+		// var err = ErrorGen.new(toLink[0].0);
+		if (BasicTracing.moduleFilter != null) binder = ImportTracer.new(BasicTracing.moduleFilter).wrap;
+		var linker = ModuleLinker.new(engine, [], toLinkNames, binder, err);
+		var all_instantiators = linker.link();
+		if (!err.ok()) {
+			ErrorBuilder.new()
+				.render(err.error_code,
+						if(u32.view(err.index) < toLink.length, toLink[err.index].0, toLink[toLink.length - 1].0),
+						err.section,
+						err.error_index,
+						err.error_pos,
+						err.error_msg)
+				.exit(6);
+			return (null, null);
+		}
+
+		// var i = Instantiator.new(Extension.set.all, whamm, imports, err);
+		// Get the whamm instantiator (the last one)
+		var i = all_instantiators[all_instantiators.length - 1];
 		var instance = i.run();
 		if (!err.ok()) return ErrorBuilder.new()
-			.render(err.error_code, whamm.filename, err.section, err.error_index, err.error_pos, err.error_msg)
+			.render(err.error_code, whamm.1.filename, err.section, err.error_index, err.error_pos, err.error_msg)
 			.exit((null, null));
 		var instRef = InstanceRef.new(instance);
 		whammInstances = List.new((module, instance, instRef), whammInstances);
@@ -373,6 +407,7 @@ class WhammMonitor(whamm: Module) extends Monitor {
 
 	def onFinish(i: Instance, r: Result) {
 		def wi = getWhammInstance(i.module).0;
+		if (wi == null) return;
 		def exports = wi.module.exports;
 		// TODO make wasm:exit part of parsing whamm module
 		def lookupR = FuncDecl.!(lookup(exports, "wasm:exit", Strings.equal, null));
