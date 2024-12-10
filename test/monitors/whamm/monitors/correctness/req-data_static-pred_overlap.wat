@@ -19,7 +19,7 @@
     (data (i32.const 27) "hello call0!\n")
     (data (i32.const 40) "hello call1!\n")
 
-    (func $call_pred0 (param $fid i32) (param $pc i32) (param $local1 i32) (param $arg0 i32) (param $imm0 i32) (result i32)
+    (func (export "$call_pred0") (param $fid i32) (param $pc i32) (param $local1 i32) (param $arg0 i32) (param $imm0 i32) (result i32)
         (call $puts (i32.const 0) (i32.const 12))
         (block $error
             (br_if $error (i32.ne (i32.const 0) (local.get $fid)))
@@ -48,7 +48,7 @@
         unreachable
     )
 
-    (func $call_pred1 (param $fid i32) (param $pc i32) (param $local1 i32) (param $arg0 i32) (param $imm0 i32) (result i32)
+    (func (export "$call_pred1") (param $fid i32) (param $pc i32) (param $local1 i32) (param $arg0 i32) (param $imm0 i32) (result i32)
         (call $puts (i32.const 0) (i32.const 12))
         (block $error
             (br_if $error (i32.ne (i32.const 0) (local.get $fid)))

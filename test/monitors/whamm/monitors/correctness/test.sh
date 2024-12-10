@@ -20,9 +20,10 @@ cd $HERE
 
 if [ "$#" = 0 ]; then
     # Generate fresh .wasm from .wat files
-    wat2wasm_dir "./"
-    wat2wasm_dir "./imported_modules/"
-    wat2wasm_dir "../../apps/"
+    # TODO: disabling .wasm generation for now
+    # wat2wasm_dir "./"
+    # wat2wasm_dir "./imported_modules/"
+    # wat2wasm_dir "../../apps/"
 
     TESTS=$(ls *.wasm)
 else
@@ -90,6 +91,7 @@ function run_test() {
 			continue # test was found in expected failures
 		    fi
 		fi
+
 		echo "##-fail: $P.$check.diff"
 		return 1
 	    fi

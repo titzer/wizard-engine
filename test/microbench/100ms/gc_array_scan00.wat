@@ -1,12 +1,12 @@
-;; INNER_CALIBRATION = 3310
+;; INNER_CALIBRATION = 24000
 (module
   (type $at (array i8))
   (func $main (export "main")
     (local $y i32)
 
-    (local.set $y (i32.const 10))
+    (local.set $y (i32.const 1))
     (loop $l
-      (call $scan (array.new_default $at (i32.const 33100)))
+      (call $scan (array.new_default $at (i32.const 2400000)))
       drop
       (local.tee $y (i32.sub (local.get $y) (i32.const 1)))
       (br_if $l)
