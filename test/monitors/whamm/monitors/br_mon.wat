@@ -20,11 +20,34 @@
   (data (i32.const 0xf10) ",")
   (data (i32.const 0xf20) "]")
 
+  (func $check_memsize (param $bytes_needed i32)
+      (local $entry i32)
+
+      (local $bytes_per_page i32)
+      (local $curr_pages i32)
+      (local $max_needed_addr i32)
+
+      (local.set $bytes_per_page (i32.const 65_536))
+      (local.set $curr_pages (memory.size))
+
+      (local.set $max_needed_addr (i32.add (global.get $last_entry) (local.get $bytes_needed)))
+
+      (if (i32.lt_u (i32.mul (local.get $bytes_per_page) (local.get $curr_pages)) (local.get $max_needed_addr))
+          (then
+              i32.const 1
+              memory.grow
+              drop
+          )
+      )
+  )
+
   ;; Table entry
   ;; 0      4      8      12         20
   ;; | func |  pc  |   1  |  # taken |
   (func $alloc_br (param $func i32) (param $pc i32) (result i32)
     (local $entry i32)
+
+    (call $check_memsize (i32.const 20))
 
     global.get $last_entry
     local.set $entry
@@ -55,6 +78,8 @@
   (func $alloc_br_if (param $func i32) (param $pc i32) (result i32)
     (local $entry i32)
 
+    (call $check_memsize (i32.const 28))
+
     global.get $last_entry
     local.set $entry
 
@@ -84,10 +109,21 @@
   ;; | func |  pc  |   n  |  0 taken |   ...  | n taken |
   (func $alloc_br_table (param $func i32) (param $pc i32) (param $count i32) (result i32)
     (local $entry i32)
+    (local $needed_bytes i32)
+
     local.get $count
     i32.const 1
     i32.add
     local.set $count
+
+    i32.const 12
+    i32.const 8
+    local.get $count
+    i32.mul
+    i32.add
+    local.set $needed_bytes
+
+    (call $check_memsize (local.get $needed_bytes))
 
     global.get $last_entry
     local.set $entry
@@ -104,11 +140,7 @@
     local.get $count
     i32.store offset=8
 
-    i32.const 12
-    i32.const 8
-    local.get $count
-    i32.mul
-    i32.add
+    local.get $needed_bytes
     local.get $entry
     i32.add
     global.set $last_entry
