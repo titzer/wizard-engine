@@ -21,4 +21,9 @@ fi
 ENGINE="$SRC_DIR/engine/*.v3 $SRC_DIR/util/*.v3 $VIRGIL_LIB/util/*.v3"
 TARGET_V3="$SRC_DIR/engine/v3/*.v3"
 
-v3i $ENGINE $TARGET_V3 $DIR/*.v3
+if ! v3i $ENGINE $TARGET_V3 $DIR/*.v3 $DIR; then
+    exit 1
+fi
+
+wat2wasm $DIR/hotness-mon.wat -o $DIR/hotness-mon.wasm
+mv $DIR/*.wa* $DIR/../..
