@@ -11,10 +11,15 @@ class X86_64Stack extends WasmStack {
 	var vsp: Pointer;
 	var rsp: Pointer;
 	var func: Function;
+	
+	// For tail-calling purposes (from V3): ALWAYS, ALWAYS use this instead of
+	// [%parent.rsp]. In case of linking two stacks (due to one resuming the
+	// other, assert that this is {null} on the child stack and manually set it).
 	var parent_rsp_ptr: Pointer;
-	private var params_arity = -1;
-	private var return_results: Array<ValueType>;
-	private var state_: StackState;
+
+	var params_arity = -1;
+	var return_results: Array<ValueType>;
+	var state_: StackState;
 
 	new(size) {
 		if (mapping == null) fatal("out of memory allocating value stack");
@@ -63,8 +68,13 @@ class X86_64Stack extends WasmStack {
 		while (bottom.parent != null) bottom = X86_64Stack.!(bottom.parent); // find bottom of this stack
 		state_ = StackState.RUNNING;
 		var thrown = V3_STACK_RESUME_FUNC.get()(this, bottom);
-		if (thrown != null) return Result.Throw(thrown);
-		// TODO: deal with suspend
+		if (thrown != null) {
+			if (Trap.?(thrown) && Trap.!(thrown).reason == TrapReason.INVALID_SUSPEND) {
+				// TODO[ss]: suspend info
+				return Result.StackSwitch(StackSwitchInfo.Suspend(null, null, []));
+			}
+			return Result.Throw(thrown);
+		}
 		var r = popResult(return_results);
 		clear();
 		return r;
@@ -75,7 +85,8 @@ class X86_64Stack extends WasmStack {
 	def caller(loc: FrameLoc) -> FrameLoc;
 	// "Throw" a trap on this stack.
 	def trap(reason: TrapReason) -> Throwable {
-		return throw(Trap.new(reason, null, null));
+		var thrown = throw(Trap.new(reason, null, null));
+		return thrown;
 	}
 	// Throw a throwable on this stack, unwinding to the handler, if there is one.
 	def throw(thrown: Throwable) -> Throwable {
@@ -145,6 +156,21 @@ class X86_64Stack extends WasmStack {
 	def setRsp(ptr: Pointer) -> this {
 		rsp = ptr;
 	}
+	// This function returns {(-1, -1)} if a handler IS NOT found, and otherwise
+	// returns {(stp_idx, order)}.
+	def findSuspendHandler(frame: TargetFrame, tag: Tag) -> (int, int) {
+		var accessor = frame.getFrameAccessor();
+		var func = accessor.func();
+		var handler = func.decl.findSuspendHandler(func.instance, tag, accessor.pc());
+
+		if (handler.order >= 0) {
+			var e = func.decl.sidetable.getSusHandlerEntry(handler.sidetable_entry);
+			if (Trace.stack) Trace.OUT.put2("  found suspend handler: \xCE\x94pc=%d, \xCE\x94stp=%d", e.dpc, e.dstp).ln();
+			return (handler.sidetable_entry, handler.order);
+		}
+
+		return (-1, -1);
+	}
 	private def findExHandler(frame: TargetFrame, ex: Exception) -> bool {
 		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
 		var func = accessor.func();
@@ -206,7 +232,9 @@ class X86_64Stack extends WasmStack {
 		parent_rsp_ptr = Pointer.NULL;
 		func = null;
 	}
-
+	// def pushReenterStub() {
+	// 	pushRspPointer(STACK_REENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
+	// }
 	private def pushRspPointer(p: Pointer) -> Pointer {
 		rsp = rsp + -Pointer.SIZE;
 		(rsp + 0).store<Pointer>(p);
@@ -239,7 +267,10 @@ class X86_64Stack extends WasmStack {
 	def pushu(v: u32) {
 		pushPair(BpTypeCode.I32.code, u64.view(v));
 	}
-	def popN(t: Array<ValueType>) -> Array<Value> {
+	def pushN(vs: Range<Value>) {
+		for (i < vs.length) push(vs[i]);
+	}
+	def popN(t: Range<ValueType>) -> Array<Value> {
 		var r = Array<Value>.new(t.length);
 		for (j = t.length - 1; j >= 0; j--) r[j] = pop(t[j]);
 		return r;
@@ -421,6 +452,8 @@ class X86_64Stack extends WasmStack {
 def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
 
 component X86_64Stacks {
+	var RESUME_STUB_POINTER: Pointer;
+
 	def getFrameAccessor(sp: Pointer) -> X86_64FrameAccessor {
 		var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 		var code = RiRuntime.findUserCode(retip);
@@ -454,6 +487,7 @@ component X86_64Stacks {
 	}
 }
 
+// TODO: clean this up
 def NOP_ENTRY = 1;
 def RETADDR_SIZE = Pointer.SIZE;
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
@@ -554,6 +588,8 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var m_curStack = MasmAddr(Reg(0), int.!(masm.getOffsets().X86_64Runtime_curStack - Pointer.NULL));
 	var r_stack = xenv.tmp0;
 	var r_parent = xenv.tmp1;
+	var r_return_arity = xenv.tmp3;
+	var r_parent_vsp = xenv.tmp4;
 
 	// Nothing calls this stub; it is only returned to. A nop serves as a placeholder for a non-existent
 	// call instruction so that stackwalking logic works properly.
@@ -567,11 +603,37 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	// if %parent == 0 goto l_return ; don't copy values onto parent stack
 	var l_return = masm.newLabel(-1);
 	masm.emit_br_r(r_parent, MasmBrCond.REF_NULL, l_return);
-	// TODO: mov %vsp, [%parent.vsp]
-	// TODO: do_value_copy(%parent.vsp, %vsp, %stack.return_arity)
-	// mov [%stack.parent], nullptr ; XXX: redundant?
+	// if %ret_throw != 0 goto l_return ; don't copy values if this stack errors
+	masm.emit_br_r(xenv.ret_throw, MasmBrCond.REF_NONNULL, l_return);
+
+	// set %return_arity
+	masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(r_stack, masm.offsets.X86_64Stack_return_results));
+	masm.emit_mov_r_m(ValueKind.I32, r_return_arity, MasmAddr(xenv.scratch, masm.offsets.Array_length));
+
+	// use %stack as temp reg
+	var r_count = xenv.tmp0;
+	masm.emit_mov_r_r(ValueKind.I32, r_count, r_return_arity);
+	// mov %parent_vsp, [%parent.vsp]
+	masm.emit_mov_r_m(ValueKind.REF, r_parent_vsp, MasmAddr(r_parent, masm.offsets.X86_64Stack_vsp));
+	// %stack.vsp -= slot_size * %return_arity
+	masm.emit_mov_r_r(ValueKind.I32, xenv.scratch, r_return_arity);
+	asm.q.imul_r_i(G(xenv.scratch), Target.tagging.slot_size);
+	asm.q.sub_r_r(G(xenv.vsp), G(xenv.scratch));
+	// emit_value_copy(%parent.vsp, %stack.vsp, %count, r_xmm0);
+	masm.emit_value_copy(G(r_parent_vsp), G(xenv.vsp), G(r_count), X(xenv.xmm0));
+	// parent_vsp += slot_size * %return_arity
+	masm.emit_mov_r_r(ValueKind.I32, xenv.scratch, r_return_arity);
+	asm.q.imul_r_i(G(xenv.scratch), Target.tagging.slot_size);
+	asm.q.add_r_r(G(r_parent_vsp), G(xenv.scratch));
+	// [%parent.vsp] = %parent_vsp
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(r_parent, masm.offsets.X86_64Stack_vsp), r_parent_vsp);
+
+	// restore %stack
+	// mov %stack, [cur_stack]
+	masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+	// mov [%stack.parent], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
-	// mov [%stack.parent_rsp_ptr], nullptr ; XXX: redundant?
+	// mov [%stack.parent_rsp_ptr], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp_ptr), 0);
 	// l_return:
 	masm.bindLabel(l_return);
