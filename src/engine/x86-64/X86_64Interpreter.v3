@@ -511,11 +511,54 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		ic.header.hostCallStubEnd = w.pos;
 	}
 	def genStackSwitchStubs() {
+		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+
 		ic.header.resumeStubOffset = w.pos;
+		asm.bind(resumeStub); {
+			var r_cont = r_tmp0, r_stack = r_tmp1;
+			// pop cont ref from stack
+			decrementVsp();
+			asm.movq_r_m(r_cont, vsph[0].value);
+			// mov %stack, [%curStack]
+			asm.movq_r_m(r_stack, m_curStack);
+
+			var r_bottom = r_tmp3;
+			asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
+			// mov [%r_bottom.parent_rsp_ptr], rsp
+			asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
+			asm.movq_m_r(r_scratch.plus(0), r_sp);
+
+			var r_new = r_tmp0;
+			asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
+
+			// mov [%curStack, %new]
+			asm.movq_m_r(m_curStack, r_new);
+
+			// save before switching to new stack pointer
+			// mov [%stack.vsp], %vsp
+			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
+			// mov [%stack.rsp], %rsp
+			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
+
+			// mov %rsp, [%newStack.rsp]
+			asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
+			// mov %vsp, [%newStack.vsp]
+			asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
+
+			// mov %ret_throw, [%newStack.throw_on_resume]
+			asm.movq_r_m(r_ret_throw, r_new.plus(offsets.X86_64Stack_throw_on_resume));
+			// mov [%newStack.throw_on_resume], 0
+			asm.movq_m_i(r_new.plus(offsets.X86_64Stack_throw_on_resume), 0);
+
+			// pop return address and jump to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			// jump *%tmp
+			masm.emit_jump_r(xenv.scratch);
+		}
 		ic.header.resumeStubEnd = w.pos;
 
-		
 		ic.header.suspendStubOffset = w.pos;
+		asm.bind(suspendStub);
 		ic.header.suspendStubEnd = w.pos;
 	}
 	def genInterpreterEntry() {
@@ -2194,110 +2237,18 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
 
+			// read info and rewind %ip (need %ip at start of opcode during call)
 			asm.movq_r_r(ip_store, r_ip);
-			genReadUleb32(cont_id); // read signature index
+			// read signature index
+			genReadUleb32(cont_id);
 			asm.movq_r_r(r_ip, ip_store);
 
 			saveCallerIVars();
 			callRuntime(refRuntimeCall(RT.runtime_process_resume), [r_instance, cont_id], true);
-			restoreCallerIVars();
-			var r_stack = r_tmp1;
-			asm.movq_r_m(r_stack, m_curStack);
-
-			var r_cont = r_tmp0;
-			decrementVsp(); // pop cont ref from stack
-			asm.movq_r_m(r_cont, vsph[0].value);
-
-			var resume_stub = X86_64Label.new(), done = X86_64Label.new();
-			saveCallerIVars();
-			asm.call_rel_far(resume_stub);
-			// check for error (in %rax)
-			if (FeatureDisable.stackUnwind) {
-				genAbruptRetCheck();
-			} else {
-				asm.q.cmp_r_i(r_ret_throw, 0);
-				asm.jc_rel_near(X86_64Conds.Z, done);
-				callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_ret_throw], true);
-			}
-
-			asm.bind(done);
-			restoreDispatchTableReg();
-			restoreCallerIVars();
-			// load %stack
-			asm.movq_r_m(r_stack, m_curStack);
-			// mov %vsp, [%stack.vsp]
-			asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
-
-			// skip the handler table
-			var handler_length = r_tmp1;
-			genSkipLeb();
-			genReadUleb32(handler_length); // read handler length
-			
-			// skip handler table
-			var cnt = r_tmp3;
-			asm.movq_r_r(cnt, handler_length);
-			// loop for `cnt` times
-			var read_start = X86_64Label.new(), read_done = X86_64Label.new(), read_switch = X86_64Label.new();
-			asm.bind(read_start);
-			// while (--cnt >= 0)
-			asm.d.dec_r(cnt);
-			// goto read_done
-			asm.jc_rel_near(C.S, read_done);
-			// read handler type
-			genReadUleb32(r_scratch);
-			asm.q.cmp_r_i(r_scratch, 0);
-			// if {handler_type} is 0x01, read switch handler
-			asm.jc_rel_near(X86_64Conds.NZ, read_switch);
-			// read normal handler
-			genSkipLeb();
-			genSkipLeb();
-			asm.jmp_rel_near(read_start);
-			// read switch handler
-			asm.bind(read_switch);
-			genSkipLeb();
-			asm.jmp_rel_near(read_start);
-			asm.bind(read_done);
-
-			// adjust sidetable
-			asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
-			// calculate length of handler entries in sidetable
-			asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
-			asm.q.add_r_r(r_stp, handler_length);
-
+			asm.call_rel_far(resumeStub);
+			genOnResumeFinish(false);
 			endHandler();
-
-			{
-				asm.bind(resume_stub);
-				var r_bottom = r_tmp3;
-				asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
-				// mov [%r_bottom.parent_rsp_ptr], rsp
-				asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
-				asm.movq_m_r(r_scratch.plus(0), r_sp);
-
-				var r_new = r_tmp0;
-				asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
-
-				// mov [%curStack, %new]
-				asm.movq_m_r(m_curStack, r_new);
-
-				// save before switching to new stack pointer
-				// mov [%stack.vsp], %vsp
-				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
-				// mov [%stack.rsp], %rsp
-				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
-
-				// mov %rsp, [%newStack.rsp]
-				asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
-				// mov %vsp, [%newStack.vsp]
-				asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
-
-				// pop return address and jump to it
-				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-				// jump *%tmp
-				masm.emit_jump_r(xenv.scratch);
-			}
 		}
-		// TODO[ss]: merge
 		bindHandler(Opcode.RESUME_THROW); {
 			var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp3;
 			computeCurIpForTrap(-1);
@@ -2310,108 +2261,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			saveCallerIVars();
 			callRuntime(refRuntimeCall(RT.runtime_process_resume_throw), [r_instance, cont_id, tag_index], true);
-			restoreCallerIVars();
-			var r_stack = r_tmp1;
-			asm.movq_r_m(r_stack, m_curStack);
-
-			var r_cont = r_tmp0;
-			decrementVsp(); // pop cont ref from stack
-			asm.movq_r_m(r_cont, vsph[0].value);
-
-			var resume_stub = X86_64Label.new(), done = X86_64Label.new();
-			saveCallerIVars();
-			asm.call_rel_far(resume_stub);
-			// check for error (in %rax)
-			if (FeatureDisable.stackUnwind) {
-				genAbruptRetCheck();
-			} else {
-				asm.q.cmp_r_i(r_ret_throw, 0);
-				asm.jc_rel_near(X86_64Conds.Z, done);
-				callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_ret_throw], true);
-			}
-
-			asm.bind(done);
-			restoreDispatchTableReg();
-			restoreCallerIVars();
-			// load %stack
-			asm.movq_r_m(r_stack, m_curStack);
-			// mov %vsp, [%stack.vsp]
-			asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
-
-			// skip the handler table
-			var handler_length = r_tmp1;
-			genSkipLeb(); // skip cont signature
-			genSkipLeb(); // skip tag index
-			genReadUleb32(handler_length); // read handler length
-			
-			// skip handler table
-			var cnt = r_tmp3;
-			asm.movq_r_r(cnt, handler_length);
-			// loop for `cnt` times
-			var read_start = X86_64Label.new(), read_done = X86_64Label.new(), read_switch = X86_64Label.new();
-			asm.bind(read_start);
-			// while (--cnt >= 0)
-			asm.d.dec_r(cnt);
-			// goto read_done
-			asm.jc_rel_near(C.S, read_done);
-			// read handler type
-			genReadUleb32(r_scratch);
-			asm.q.cmp_r_i(r_scratch, 0);
-			// if {handler_type} is 0x01, read switch handler
-			asm.jc_rel_near(X86_64Conds.NZ, read_switch);
-			// read normal handler
-			genSkipLeb();
-			genSkipLeb();
-			asm.jmp_rel_near(read_start);
-			// read switch handler
-			asm.bind(read_switch);
-			genSkipLeb();
-			asm.jmp_rel_near(read_start);
-			asm.bind(read_done);
-
-			// adjust sidetable
-			asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
-			// calculate length of handler entries in sidetable
-			asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
-			asm.q.add_r_r(r_stp, handler_length);
-
+			asm.call_rel_far(resumeStub);
+			genOnResumeFinish(true);
 			endHandler();
-
-			{
-				asm.bind(resume_stub);
-				var r_bottom = r_tmp3;
-				asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
-				// mov [%r_bottom.parent_rsp_ptr], rsp
-				asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
-				asm.movq_m_r(r_scratch.plus(0), r_sp);
-
-				var r_new = r_tmp0;
-				asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
-
-				// mov [%curStack, %new]
-				asm.movq_m_r(m_curStack, r_new);
-
-				// save before switching to new stack pointer
-				// mov [%stack.vsp], %vsp
-				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
-				// mov [%stack.rsp], %rsp
-				asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
-
-				// mov %rsp, [%newStack.rsp]
-				asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
-				// mov %vsp, [%newStack.vsp]
-				asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
-
-				// mov %ret_throw, [%newStack.throw_on_resume]
-				asm.movq_r_m(r_ret_throw, r_new.plus(offsets.X86_64Stack_throw_on_resume));
-				// mov [%newStack.throw_on_resume], 0
-				asm.movq_m_i(r_new.plus(offsets.X86_64Stack_throw_on_resume), 0);
-
-				// pop return address and jump to it
-				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-				// jump *%tmp
-				masm.emit_jump_r(xenv.scratch);
-			}
 		}
 		bindHandler(Opcode.SUSPEND); {
 			var tag_index = r_tmp0;
@@ -3854,6 +3706,64 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def reportOom(w: DataWriter, nlength: int) -> DataWriter {
 		fatal("ran out of buffer space");
 		return w;
+	}
+	private def genOnResumeFinish(skip_tag: bool) {
+		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+		var done = X86_64Label.new();
+		// check for error (in %rax)
+		if (FeatureDisable.stackUnwind) {
+			genAbruptRetCheck();
+		} else {
+			asm.q.cmp_r_i(r_ret_throw, 0);
+			asm.jc_rel_near(X86_64Conds.Z, done);
+			callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_ret_throw], true);
+		}
+
+		asm.bind(done);
+		restoreDispatchTableReg();
+		restoreCallerIVars();
+		var r_stack = r_tmp1;
+		// load %stack
+		asm.movq_r_m(r_stack, m_curStack);
+		// mov %vsp, [%stack.vsp]
+		asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
+
+		// skip the handler table
+		var handler_length = r_tmp1;
+		genSkipLeb(); // skip cont signature
+		if (skip_tag) { genSkipLeb(); } // skip throw tag
+		genReadUleb32(handler_length); // read handler length
+		
+		// skip handler table
+		var cnt = r_tmp3;
+		asm.movq_r_r(cnt, handler_length);
+		// loop for `cnt` times
+		var read_start = X86_64Label.new(), read_done = X86_64Label.new(), read_switch = X86_64Label.new();
+		asm.bind(read_start);
+		// while (--cnt >= 0)
+		asm.d.dec_r(cnt);
+		// goto read_done
+		asm.jc_rel_near(C.S, read_done);
+		// read handler type
+		genReadUleb32(r_scratch);
+		asm.q.cmp_r_i(r_scratch, 0);
+		// if {handler_type} is 0x01, read switch handler
+		asm.jc_rel_near(X86_64Conds.NZ, read_switch);
+		// read normal handler
+		genSkipLeb();
+		genSkipLeb();
+		asm.jmp_rel_near(read_start);
+		// read switch handler
+		asm.bind(read_switch);
+		genSkipLeb();
+		asm.jmp_rel_near(read_start);
+		asm.bind(read_done);
+
+		// adjust sidetable
+		asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
+		// calculate length of handler entries in sidetable
+		asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
+		asm.q.add_r_r(r_stp, handler_length);
 	}
 }
 
