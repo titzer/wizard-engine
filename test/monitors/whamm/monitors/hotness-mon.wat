@@ -17,8 +17,30 @@
     (data (i32.const 0xf10) ",")
     (data (i32.const 0xf20) "]")
 
+    (func $check_memsize (param $bytes_needed i32)
+        (local $entry i32)
+
+        (local $bytes_per_page i32)
+        (local $curr_pages i32)
+        (local $max_needed_addr i32)
+
+        (local.set $bytes_per_page (i32.const 65_536))
+        (local.set $curr_pages (memory.size))
+
+        (local.set $max_needed_addr (i32.add (global.get $last_entry) (local.get $bytes_needed)))
+
+        (if (i32.lt_u (i32.mul (local.get $bytes_per_page) (local.get $curr_pages)) (local.get $max_needed_addr))
+            (then
+                i32.const 1
+                memory.grow
+                drop
+            )
+        )
+    )
     (func (export "$alloc") (param $func i32) (param $pc i32) (result i32)
         (local $entry i32)
+
+        (call $check_memsize (i32.const 20))
 
         global.get $last_entry
         local.set $entry
