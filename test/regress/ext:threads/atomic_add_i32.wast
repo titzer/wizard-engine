@@ -38,4 +38,3 @@
 (assert_return (invoke "test_i32_atomic_add_8") (i32.const 5))
 (assert_return (invoke "test_i32_atomic_add_16") (i32.const 5))
 (assert_return (invoke "main"))
-
