@@ -26,4 +26,3 @@
 
 (assert_trap (invoke "main" (i64.const 22) (i32.const 44)) "continuation already consumed")
 (assert_trap (invoke "main" (i64.const -444) (i32.const 111)) "continuation already consumed")
-
