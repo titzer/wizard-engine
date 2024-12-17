@@ -14,9 +14,6 @@ shift
 # for CI, use line-by-line test output
 export PROGRESS_ARGS=l
 
-# remaining arguments are appended to V3C_OPTS
-V3C_OPTS="$V3C_OPTS $@"
-
 # Clone virgil
 cd ..
 git clone https://github.com/titzer/virgil
@@ -27,6 +24,9 @@ export PATH=$PATH:"$PWD/bin:$PWD/bin/dev:$PWD/test/config"
 # TODO: test configure is only needed for progress, get elsewhere?
 ./test/configure
 make
+
+# remaining arguments are appended to V3C_OPTS
+export V3C_OPTS="$V3C_OPTS $@"
 
 # Set up wizard
 cd ../wizard-engine
