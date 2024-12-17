@@ -12,7 +12,7 @@
 ;; - multi-memory? false
 ;; - linking? true
 (module
-    (import "bidir-instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
+    (import "bidir-instr" "call_pred" (func $call_pred (param i32 i32 i32) (result i32)))
     (import "bidir-instr" "call_probe" (func $call_probe (param i32 i32 i32 i32 i32 i32)))
     
     (import "wizeng" "puts" (func $puts (param i32 i32)))
@@ -21,7 +21,8 @@
     (data (i32.const 13) "hello call!\n")
 
     ;; out of order to test that the order is not assumed for these!
-    (export "wasm:opcode:call / $call_pred(fid, pc, local1, arg0, imm0) / (imm0, arg1, local1)" (func $call_probe))
+    (export "wasm:opcode:call / $call_pred(fid, pc, imm0) / (arg1, local1, arg0, arg0, local0, imm0)" (func $call_probe))
+    (export "$call_pred" (func $call_pred))
     
     ;; basic print funcs
     (func $print_pred (export "print_pred")
