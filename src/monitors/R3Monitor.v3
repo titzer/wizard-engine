@@ -26,7 +26,6 @@ class R3Monitor extends Monitor {
 		var mm = ModuleInstrumenter.new(module);
 		R3MonitorBytecodeInstrumenter.new(handler, module).runMatching(filterReplayFunctions);
 		mm.forEachFuncMatching(filterReplayFunctions, instrumentFunctionEnter);
-		mm.beforeMemReadMatching(filterReplayFunctions, handler.onMemoryRead);
 		mm.beforeMemWriteMatching(filterReplayFunctions, handler.onMemoryWrite);
 		mm.beforeMemGrowMatching(filterReplayFunctions, handler.onMemoryGrow);
 	}
@@ -60,6 +59,10 @@ private class R3MonitorBytecodeInstrumenter extends BytecodeInstrumenter {
 
 	new(handler: EventHandler, module: Module) super(module) {
 		handler = handler;
+	}
+
+	def visitLoad(op: Opcode, imm: MemArg, size: u8) {
+		checkCallReturnAndInsertProbe(R3MemoryReadProbe.new(handler, imm, size));
 	}
 
 	def visitOp(op: Opcode) {
@@ -612,6 +615,42 @@ private class MemoryFillProbe(handler: EventHandler, mem_index: u31) extends Pro
 		return Resumption.Continue;
 	}
 }
+
+private class R3MemoryReadProbe extends MemoryReadProbe {
+	def var handler: EventHandler;
+
+	new(handler: EventHandler, imm: MemArg, size: u8) {
+		this.imm = imm;
+		this.size = size;
+		this.handler = handler;
+	}
+
+	def fire_probe(addr: u64, val_lower: u64, val_upper: u64) {
+		var size = u32.view(size);
+		var shadow_mem = handler.shadowMems[imm.memory_index];
+		var shadow_ptr = shadow_mem.range_ol_64(addr, size).result;
+		var shadow_data_lo: u64, shadow_data_hi: u64;
+		match (size) {
+			1 => shadow_data_lo = DataReaders.read_range_u8(shadow_ptr);
+			2 => shadow_data_lo = DataReaders.read_range_u16(shadow_ptr);
+			4 => shadow_data_lo = DataReaders.read_range_u32(shadow_ptr);
+			8 => shadow_data_lo = DataReaders.read_range_u64(shadow_ptr);
+			16 => {
+				var shadow_result = DataReaders.read_range_u128(shadow_ptr);
+				shadow_data_lo = shadow_result.0;
+				shadow_data_hi = shadow_result.1;
+			}
+			_ => ;
+		}
+		var val_range = Array<byte>.new(16);
+		DataWriters.write_range_u64(val_range, val_lower);
+		DataWriters.write_range_u64(val_range[8 ... 16], val_upper);
+		if (shadow_data_lo != val_lower || (size == 16 && (shadow_data_hi != val_upper))) {
+			handler.trace.put(WasmEvent.Load(imm.memory_index, addr, Arrays.range(val_range, 0, int.view(size))));
+			shadow_mem.copyIn(u32.view(addr), val_range, 0, size);
+		}
+	}
+}	
 
 private type CallStackEntry(func_id: int, kind: CallKind);
 
