@@ -270,8 +270,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var tailCallReentryLabel = X86_64Label.new();
 	var hostTailCallStubLabel = masm.newLabel(-1);
 	var hostCallStubLabel = masm.newLabel(-1);
+	var resumeStub = X86_64Label.new();
+	var suspendStub = X86_64Label.new();
 	var spcEntryLabel = X86_64Label.new();
-	var abruptRetLabel = X86_64Label.new();
 	var controlFallThruLabel = X86_64Label.new();
 	var controlTransferLabel = X86_64Label.new();
 	var controlSkipSidetableAndDispatchLabel = X86_64Label.new();
@@ -294,6 +295,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def r_runtime_arg0	= G(xenv.runtime_arg0);
 	def r_runtime_arg1	= G(xenv.runtime_arg1);
 	def r_runtime_arg2	= G(xenv.runtime_arg2);
+	def r_runtime_ret0	= G(xenv.runtime_ret0);
+	def r_runtime_ret1	= G(xenv.runtime_ret1);
 	def r_dispatch		= G(xenv.dispatch);
 	def r_ret_throw		= G(xenv.ret_throw);
 	def r_scratch		= G(xenv.scratch);
@@ -378,6 +381,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		reserveDispatchTables();
 		// Begin code generation
 		genHostCallStub();
+		genStackSwitchStubs();
 		genInterpreterEntry();
 		genOpcodeHandlers();
 		handlerEndOffset = w.atEnd().pos;
@@ -480,10 +484,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// Check if WasmFunction != null, which means host tail-called Wasm
 		var call_wasm = masm.newLabel(-1);
 		masm.emit_br_r(r_func, MasmBrCond.REF_NONNULL, call_wasm); // XXX: near jump
-		if (false) {
-			// mov [%stack.rsp], %rsp   ; possibly unwind stack
-			masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(r_stack, offsets.X86_64Stack_rsp));
-		}
 		// Otherwise return (possibly null) throwable
 		masm.emit_ret();
 
@@ -504,6 +504,57 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_jump_r(xenv.tmp2);
 		}
 		ic.header.hostCallStubEnd = w.pos;
+	}
+	def genStackSwitchStubs() {
+		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+
+		ic.header.resumeStubOffset = w.pos;
+		asm.bind(resumeStub); {
+			var r_cont = r_tmp0, r_stack = r_tmp1;
+			// pop cont ref from stack
+			decrementVsp();
+			asm.movq_r_m(r_cont, vsph[0].value);
+			// mov %stack, [%curStack]
+			asm.movq_r_m(r_stack, m_curStack);
+
+			var r_bottom = r_tmp3;
+			asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
+			// mov [%r_bottom.parent_rsp_ptr], rsp
+			asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
+			asm.movq_m_r(r_scratch.plus(0), r_sp);
+
+			var r_new = r_tmp0;
+			asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
+
+			// mov [%curStack, %new]
+			asm.movq_m_r(m_curStack, r_new);
+
+			// save before switching to new stack pointer
+			// mov [%stack.vsp], %vsp
+			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
+			// mov [%stack.rsp], %rsp
+			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
+
+			// mov %rsp, [%newStack.rsp]
+			asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
+			// mov %vsp, [%newStack.vsp]
+			asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
+
+			// mov %ret_throw, [%newStack.throw_on_resume]
+			asm.movq_r_m(r_ret_throw, r_new.plus(offsets.X86_64Stack_throw_on_resume));
+			// mov [%newStack.throw_on_resume], 0
+			asm.movq_m_i(r_new.plus(offsets.X86_64Stack_throw_on_resume), 0);
+
+			// pop return address and jump to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			// jump *%tmp
+			masm.emit_jump_r(xenv.scratch);
+		}
+		ic.header.resumeStubEnd = w.pos;
+
+		ic.header.suspendStubOffset = w.pos;
+		asm.bind(suspendStub);
+		ic.header.suspendStubEnd = w.pos;
 	}
 	def genInterpreterEntry() {
 		var shared_entry = X86_64Label.new();
@@ -1001,7 +1052,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(r_tmp0);
 			saveCallerIVars();
 			callRuntime(refRuntimeCall(RT.runtime_THROW), [r_instance, r_tmp0], true);
-			genAbruptRetCheck(); // TODO: should always fail
 			restoreCallerIVars();
 			restoreDispatchTableReg();
 			genDispatchOrJumpToDispatch();
@@ -1013,7 +1063,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			decrementVsp();
 			saveCallerIVars();
 			callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_tmp0], true);
-			genAbruptRetCheck(); // TODO: should always fail
 			restoreCallerIVars();
 			restoreDispatchTableReg();
 			genDispatchOrJumpToDispatch();
@@ -1123,7 +1172,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			} else {
 				asm.call_rel_far(callReentryLabel);
 			}
-			genAbruptRetCheck();
 			restoreCallerIVars();
 			if (!FeatureDisable.multiTier) restoreDispatchTableReg();
 			genDispatchOrJumpToDispatch();
@@ -1131,7 +1179,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// HostFunction: call into runtime
 			asm.bind(call_host.label);
 			asm.call_rel_far(hostCallStubLabel.label);
-			genAbruptRetCheck();
 			restoreCallerIVars();
 			restoreDispatchTableReg();
 			genJumpToDispatch();
@@ -1317,10 +1364,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			saveCallerIVars();
 			asm.movd_r_i(r_tmp0, 0);
 			callRuntime(t.1, [r_instance, r_tmp0, r_tmp1], true);
-			genAbruptRetCheck();
 			restoreCallerIVars();
 			endHandler();
 		}
+		// TODO: ATOMIC_FENCE
 	}
 	def genAtomicLoadsAndStores() {
 		// Load Seq_Cst -> MOV (from memory)
@@ -1593,7 +1640,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		bindHandler(Opcode.I32_ATOMIC_RMW16_SUB_U);
 		bindHandler(Opcode.I64_ATOMIC_RMW16_SUB_U);
 		genAtomicSub(asm.xaddw_m_r, asm.negw_r);
-		// Atomic RMW And 
+		// Atomic RMW And
 		bindHandler(Opcode.I32_ATOMIC_RMW_AND);
 		bindHandler(Opcode.I64_ATOMIC_RMW32_AND_U);
 		genAtomicBinop(asm.andd_m_r, asm.xchgd_m_r);
@@ -1602,7 +1649,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		bindHandler(Opcode.I32_ATOMIC_RMW8_AND_U);
 		bindHandler(Opcode.I64_ATOMIC_RMW8_AND_U);
 		genAtomicBinop(asm.andb_m_r, asm.xchgb_m_r);
-		bindHandler(Opcode.I32_ATOMIC_RMW16_AND_U); 
+		bindHandler(Opcode.I32_ATOMIC_RMW16_AND_U);
 		bindHandler(Opcode.I64_ATOMIC_RMW16_AND_U);
 		genAtomicBinop(asm.andw_m_r, asm.xchgw_m_r);
 		// Atomic RMW Or
@@ -1670,16 +1717,16 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 		genReadUleb32(r_tmp0);			// decode offset
 		if (isCmpAndExchange) {
-        	asm.movq_r_m(r_tmp1, vsph[-3].value);    // read index
-        	asm.q.add_r_r(r_tmp0, r_tmp1);        // add index + offset
-        	asm.movq_r_m(r_tmp1, vsph[-2].value);     // new value for cmpxchg
-        	spillReg(R.RAX);
-        	asm.movq_r_m(R.RAX, vsph[-1].value); 
-        	asm.lock();
-        	op(r_mem0_base.plusR(r_tmp0, 1, 0), r_tmp1);
-        	// asm.movq_r_m(r_tmp1, r_mem0_base.plusR(r_tmp0, 1, 0)); // This will return the return of the operation
-        	restoreReg(R.RAX);  // Restore the original RAX if it was used elsewhere
-        	decrementVsp();
+			asm.movq_r_m(r_tmp1, vsph[-3].value);	 // read index
+			asm.q.add_r_r(r_tmp0, r_tmp1);	      // add index + offset
+			asm.movq_r_m(r_tmp1, vsph[-2].value);	  // new value for cmpxchg
+			spillReg(R.RAX);
+			asm.movq_r_m(R.RAX, vsph[-1].value);
+			asm.lock();
+			op(r_mem0_base.plusR(r_tmp0, 1, 0), r_tmp1);
+			// asm.movq_r_m(r_tmp1, r_mem0_base.plusR(r_tmp0, 1, 0)); // This will return the return of the operation
+			restoreReg(R.RAX);  // Restore the original RAX if it was used elsewhere
+			decrementVsp();
 		} else {
 			asm.movq_r_m(r_tmp1, vsph[-2].value);	// read index
 			asm.q.add_r_r(r_tmp0, r_tmp1);		// add index + offset
@@ -1706,11 +1753,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(r_tmp0);			// decode offset
 
 			if (isCmpAndExchange) {
-				asm.movq_r_m(r_tmp1, vsph[-3].value);    // read index
-				asm.q.add_r_r(r_tmp0, r_tmp1);        // add index + offset
-				asm.movq_r_m(r_tmp1, vsph[-2].value);     // new value for cmpxchg
+				asm.movq_r_m(r_tmp1, vsph[-3].value); 	// read index
+				asm.q.add_r_r(r_tmp0, r_tmp1);		// add index + offset
+				asm.movq_r_m(r_tmp1, vsph[-2].value);	// new value for cmpxchg
 				spillReg(R.RAX);
-				asm.movq_r_m(R.RAX, vsph[-1].value); 
+				asm.movq_r_m(R.RAX, vsph[-1].value);
 				asm.lock();
 				op(r_mem0_base.plusR(r_tmp0, 1, 0), r_tmp1);
 				// asm.movq_r_m(r_tmp1, r_mem0_base.plusR(r_tmp0, 1, 0)); // This will return the return of the operation
@@ -2097,6 +2144,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		patchDispatchTable(Opcode.EXTERN_CONVERT_ANY, firstDispatchOffset);
 	}
 	def genMisc() {
+		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
 		bindHandler(Opcode.MEMORY_SIZE); {
 			genReadUleb32(r_tmp1);
 			asm.movq_r_m(r_tmp0, r_instance.plus(offsets.Instance_memories));
@@ -2155,6 +2203,108 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			incrementVsp();
 			endHandler();
 		}
+		// ext:typed-continuation
+		bindHandler(Opcode.CONT_NEW); {
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(r_tmp0);
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_CONT_NEW), [r_instance, r_tmp0], true);
+			restoreCallerIVars();
+			endHandler();
+		}
+		bindHandler(Opcode.CONT_BIND); {
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(r_tmp0);
+			genReadUleb32(r_tmp1);
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_CONT_BIND), [r_instance, r_tmp0, r_tmp1], true);
+			restoreCallerIVars();
+			endHandler();
+		}
+		bindHandler(Opcode.RESUME); {
+			var cont_id = r_tmp0, ip_store = r_tmp1;
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+
+			// read info and rewind %ip (need %ip at start of opcode during call)
+			asm.movq_r_r(ip_store, r_ip);
+			genReadUleb32(cont_id); // read signature index
+			asm.movq_r_r(r_ip, ip_store);
+
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_process_resume), [r_instance, cont_id], true);
+			asm.call_rel_far(resumeStub);
+			genOnResumeFinish(false);
+			endHandler();
+		}
+		bindHandler(Opcode.RESUME_THROW); {
+			var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp3;
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+
+			// read info and rewind %ip (need %ip at start of opcode during call)
+			asm.movq_r_r(ip_store, r_ip);
+			genReadUleb32(cont_id); // read signature index
+			genReadUleb32(tag_index); // read tag index
+			asm.movq_r_r(r_ip, ip_store);
+
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_process_resume_throw), [r_instance, cont_id, tag_index], true);
+			asm.call_rel_far(resumeStub);
+			genOnResumeFinish(true);
+			endHandler();
+		}
+		bindHandler(Opcode.SUSPEND); {
+			var tag_index = r_tmp0;
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(tag_index); // read tag index
+
+			saveCallerIVars();
+
+			var suspend_stub = X86_64Label.new();
+			// save the new rsp with added reentry address
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_m_r(r_scratch.plus(offsets.X86_64Stack_rsp), r_sp);
+			asm.q.sub_m_i(r_scratch.plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
+
+			callRuntime(refRuntimeCall(RT.runtime_handle_suspend), [r_instance, tag_index], false);
+			asm.call_rel_far(suspend_stub);
+			restoreCallerIVars();
+			endHandler();
+
+			asm.bind(suspend_stub); {
+				var noexcept = X86_64Label.new();
+				asm.d.cmp_r_i(r_ret_throw, -1);
+				asm.jc_rel_near(X86_64Conds.NZ, noexcept);
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				asm.jmp_rel_far(newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+				asm.bind(noexcept);
+				var order = r_tmp0;
+				asm.movq_r_r(order, r_ret_throw);
+
+				var r_stack = r_tmp1;
+				// mov %stack, [%curStack]
+				asm.movq_r_m(r_stack, m_curStack);
+				// mov %rsp, [%stack.rsp]
+				asm.movq_r_m(r_sp, r_stack.plus(offsets.X86_64Stack_rsp));
+				// mov %vsp, [%stack.vsp]
+				asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
+
+				// load regs from handler stack
+				restoreCallerIVars();
+
+				// stp += Sidetable_ResumeEntry.size
+				asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
+				asm.imul_r_i(order, Sidetable_SuspendHandlerEntry.size);
+				asm.q.add_r_r(r_stp, order);
+
+				asm.jmp_rel_far(controlTransferLabel);
+			}
+    }
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			computeCurIpFromIp(-1);
 			computePcFromCurIp();
@@ -2474,7 +2624,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(r_tmp1);
 			saveCallerIVars();
 			callRuntime(t.1, [r_instance, r_tmp0, r_tmp1], true);
-			genAbruptRetCheck();
 			restoreCallerIVars();
 			endHandler();
 		}
@@ -2945,7 +3094,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdUnop_xx_x(Opcode.F32X4_DEMOTE_F64X2_ZERO, asm.cvtpd2ps_s_s);
 		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F32X4_S, masm.emit_i32x4_trunc_sat_f32x4_s(_, r_xmm1));
 		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F32X4_U, masm.emit_i32x4_trunc_sat_f32x4_u(_, r_xmm1, r_xmm2));
- 		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F64X2_S_ZERO, masm.emit_i32x4_trunc_sat_f64x2_s_zero(_, r_tmp0, r_xmm1, r_xmm2));
+		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F64X2_S_ZERO, masm.emit_i32x4_trunc_sat_f64x2_s_zero(_, r_tmp0, r_xmm1, r_xmm2));
 		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F64X2_U_ZERO, masm.emit_i32x4_trunc_sat_f64x2_u_zero(_, r_tmp0, r_xmm1, r_xmm2));
 		genSimdUnop_xxtmp_x(Opcode.F64X2_CONVERT_LOW_I32X4_U, masm.emit_f64x2_convert_low_i32x4_u(_, r_tmp0, _));
 		genSimdUnop_x_x(Opcode.I16X8_EXTEND_HIGH_I8X16_S, masm.emit_i16x8_s_convert_i8x16_high);
@@ -3083,12 +3232,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (slots < 0) asm.q.sub_r_i(r_vsp, (0 - slots) * valuerep.slot_size);
 		else asm.q.add_r_i(r_vsp, slots * valuerep.slot_size);
 	}
-	def genAbruptRetCheck() {
-		if (FeatureDisable.stackUnwind) {
-			asm.q.cmp_r_i(Target.V3_RET_GPRS[0], 0);
-			asm.jc_rel_far(C.NZ, abruptRetLabel);
-		}
-	}
 	def saveCallerIVars() {
 		saveIVar(r_ip);
 		saveIVar(r_stp);
@@ -3128,8 +3271,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		for (i < dst.length) orderMoves(dst, stk, i);
 		// emit actual call
 		asm.callr(int.!((abs - (ic.start + w.pos + 5)))); // TODO: handle 64-bit {abs} with movq_r_l
-		// check for trap
-		if (canTrap) genAbruptRetCheck();
 		restoreDispatchTableReg();
 		// restore VSP from valueStack.sp
 		asm.movq_r_m(r_vsp, masm.absPointer(offsets.X86_64Runtime_curStack));
@@ -3526,8 +3667,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movq_r_m(r_tmp1, m_wasm_func);
 		// XXX: load runtime arg registers directly
 		callRuntime(refRuntimeCall(RT.runtime_TRAP), [r_tmp1, r_curpc, r_tmp4], true);
-		asm.bind(abruptRetLabel);
-		genPopFrameAndRet();
 
 		for (reason in TrapReason) {
 			if (reason == TrapReason.STACK_OVERFLOW) continue; // must be special
@@ -3548,14 +3687,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movq_r_m(r_tmp1, m_wasm_func);
 		asm.movd_r_i(r_tmp4, TrapReason.DIV_BY_ZERO.tag);
 		callRuntime(refRuntimeCall(RT.runtime_TRAP), [r_tmp1, r_curpc, r_tmp4], true);
-		asm.jmp_rel_near(abruptRetLabel);
+		// does not return
 
 		// stack overflow cannot call into runtime, because it might be out of stack (!)
 		var stackoverflow_label = newTrapLabel(TrapReason.STACK_OVERFLOW);
 		asm.bind(stackoverflow_label);
 		var trapObj = Pointer.atObject(Execute.trapObjects[TrapReason.STACK_OVERFLOW.tag]);
 		asm.movq_r_l(Target.V3_RET_GPRS[0], trapObj - Pointer.NULL);
-		asm.jmp_rel_near(abruptRetLabel);
+		genPopFrameAndRet();
 		ic.header.stackOverflowHandlerOffset = stackoverflow_label.pos;
 		ic.header.oobMemoryHandlerOffset = newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS).pos;
 		ic.header.divZeroHandlerOffset = newTrapLabel(TrapReason.DIV_BY_ZERO).pos;
@@ -3578,6 +3717,60 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def reportOom(w: DataWriter, nlength: int) -> DataWriter {
 		fatal("ran out of buffer space");
 		return w;
+	}
+	private def genOnResumeFinish(skip_tag: bool) {
+		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+		var done = X86_64Label.new();
+		// check for error (in %rax)
+		asm.q.cmp_r_i(r_ret_throw, 0);
+		asm.jc_rel_near(X86_64Conds.Z, done);
+		callRuntime(refRuntimeCall(RT.runtime_THROW_REF), [r_ret_throw], true);
+
+		asm.bind(done);
+		restoreDispatchTableReg();
+		restoreCallerIVars();
+		var r_stack = r_tmp1;
+		// load %stack
+		asm.movq_r_m(r_stack, m_curStack);
+		// mov %vsp, [%stack.vsp]
+		asm.movq_r_m(r_vsp, r_stack.plus(offsets.X86_64Stack_vsp));
+
+		// skip the handler table
+		var handler_length = r_tmp1;
+		genSkipLeb(); // skip cont signature
+		if (skip_tag) { genSkipLeb(); } // skip throw tag
+		genReadUleb32(handler_length); // read handler length
+
+		// skip handler table
+		var cnt = r_tmp3;
+		asm.movq_r_r(cnt, handler_length);
+		// loop for `cnt` times
+		var read_start = X86_64Label.new(), read_done = X86_64Label.new(), read_switch = X86_64Label.new();
+		asm.bind(read_start);
+		// while (--cnt >= 0)
+		asm.d.dec_r(cnt);
+		// goto read_done
+		asm.jc_rel_near(C.S, read_done);
+		// read handler type
+		genReadUleb32(r_scratch);
+		asm.q.cmp_r_i(r_scratch, 0);
+		// if {handler_type} is 0x01, read switch handler
+		asm.jc_rel_near(X86_64Conds.NZ, read_switch);
+		// read normal handler
+		genSkipLeb();
+		genSkipLeb();
+		asm.jmp_rel_near(read_start);
+		// read switch handler
+		asm.bind(read_switch);
+		genSkipLeb();
+		asm.jmp_rel_near(read_start);
+		asm.bind(read_done);
+
+		// adjust sidetable
+		asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
+		// calculate length of handler entries in sidetable
+		asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
+		asm.q.add_r_r(r_stp, handler_length);
 	}
 }
 
