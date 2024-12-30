@@ -13,12 +13,12 @@
 ;; - linking? true
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
-    (import "base-instr" "call_pred" (func $call_pred (param i32 i32 i32 i32 i32) (result i32)))
+    (import "base-instr" "call_pred" (func $call_pred (param i32 i32 i32) (result i32)))
     (memory (export "mem") 1 1)
     (data (i32.const 0) "hello call!\n")
 
     ;; out of order to test that the order is not assumed for these!
-    (func $call_probe (export "wasm:opcode:call / $call_pred(fid, pc, local1, arg0, imm0) / (imm0, arg1, local1)")
+    (func $call_probe (export "wasm:opcode:call / $call_pred(fid, pc, imm0) / (imm0, arg1, local1)")
             (param $imm0 i32) (param $arg1 i32) (param $local1 i32)
         (call $puts (i32.const 0) (i32.const 12))
         (block $error
@@ -29,4 +29,5 @@
         )
         unreachable
     )
+    (export "$call_pred" (func $call_pred))
 )
