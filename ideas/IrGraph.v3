@@ -1,0 +1,471 @@
+type IrOutput(kind: IrEdgeKind, node_id: u28, uses: IrUses) #unboxed {
+	def addUse(input_id: u28) -> IrOutput {
+		match (uses) {
+			None => return IrOutput(kind, node_id, IrUses.Single(input_id));
+			Single(first_id) => return IrOutput(kind, node_id, IrUses.Multiple(Lists.cons2(input_id, first_id)));
+			Multiple(list) => return IrOutput(kind, node_id, IrUses.Multiple(List.new(input_id, list)));
+		}
+	}
+}
+
+type IrUses #unboxed {
+	case None;
+	case Single(input_id: u28);
+	case Multiple(list: List<u28>);
+}
+
+enum IrEdgeKind {
+	KILLED,
+	CONTROL,
+	EFFECT,
+	VALUE,
+	FORWARD
+}
+
+type IrInput(kind: IrEdgeKind, output_id: u28) #unboxed;
+type IrEdgeKinds(controls: u16, effects: u16, values: u28) #unboxed;
+
+def ONE_VALUE_OUTPUT = IrEdgeKinds(0, 0, 1);
+
+class IrGraph {
+	private def nodes = Vector<IrNode>.new();
+	private def outputs = Vector<IrOutput>.new();
+	private def inputs = Vector<IrInput>.new();
+	private var cur_id: u28;
+
+	def newNode(op: Operator, ins: Range<IrInput>) -> IrNode {
+		return newNode2(op, op.outputKinds(), ins);
+	}
+	def newNode2(op: Operator, outs: IrEdgeKinds, ins: Range<IrInput>) -> IrNode {
+		var node_id = cur_id = u28.!(nodes.length);
+		var output_start = u28.!(outputs.length);
+		if (outs.controls > 0) outputs.putn(IrOutput(IrEdgeKind.CONTROL, node_id, IrUses.None), outs.controls);
+		if (outs.effects > 0) outputs.putn(IrOutput(IrEdgeKind.EFFECT, node_id, IrUses.None), outs.effects);
+		if (outs.values > 0) outputs.putn(IrOutput(IrEdgeKind.VALUE, node_id, IrUses.None), outs.values);
+		var input_start = u28.!(inputs.length);
+		for (i < ins.length) {
+			var input = ins[i];
+			inputs.put(input);
+			connect(input.output_id, u28.!(input_start + i));
+		}
+		var input_end = u28.!(inputs.length);
+		var n = IrNode.new(this, node_id, op, outs, output_start, input_start, input_end);
+		nodes.put(n);
+		return n;
+	}
+	def newPureNode(op: Operator, ins: Range<u28>) -> IrNode { // a specialization that skips control and effect
+		var node_id = cur_id = u28.!(nodes.length);
+		var output_start = u28.!(outputs.length);
+		outputs.put(IrOutput(IrEdgeKind.VALUE, node_id, IrUses.None));
+		var input_start = u28.!(inputs.length);
+		for (i < ins.length) {
+			var output_id = ins[i];
+			inputs.put(IrInput(IrEdgeKind.VALUE, output_id));
+			connect(output_id, u28.!(input_start + i));
+		}
+		var input_end = u28.!(inputs.length);
+		var n = IrNode.new(this, node_id, op, ONE_VALUE_OUTPUT, output_start, input_start, input_end);
+		nodes.put(n);
+		return n;
+		
+	}
+	def connect(output_id: u28, input_id: u28) -> u28 {
+		var orig_id = output_id;
+		var input = inputs[input_id];
+		var output = outputs[output_id];
+		while (output.kind == IrEdgeKind.FORWARD) {
+			output_id = output.node_id;
+			output = outputs[output_id];
+		}
+		if (output.kind != input.kind) {
+			error2("cannot connect input edge of kind %s to output of kind %s", input.kind, output.kind);
+		}
+		outputs[output_id] = output.addUse(input_id);
+		if (orig_id != output_id) inputs[input_id] = IrInput(input.kind, output_id);
+		return output_id;
+	}
+// Sketching operations to simplify effects and control
+	def makePure(n: IrNode);
+	def removeAllEffects(n: IrNode);
+	def removeAllControl(n: IrNode);
+	def removeWriteEffect(n: IrNode);
+	def removeThrowControl(n: IrNode);
+	def removeStuckControl(n: IrNode);
+//	def relaxEffects(n: IrNode, remainder: EffectSet);
+
+	def error(msg: string) -> this;
+	def error1<A>(msg: string, a: A) -> this;
+	def error2<A, B>(msg: string, a: A, b: B) -> this;
+}
+
+class IrNode {
+	def graph: IrGraph;
+	def id: u28;
+	def var op: Operator;
+	private def outputs: IrEdgeKinds;
+	private def output_start: u28;
+	private var input_start: u28;
+	private var input_end: u28;
+	var facts: Fact.set;
+	
+	new(graph, id, op, outputs, output_start, input_start, input_end) { }
+
+	def allOutputs() -> Range<IrOutput>;
+	def controlOutputs() -> Range<IrOutput>;
+	def effectOutputs() -> Range<IrOutput>;
+	def valueOutputs() -> Range<IrOutput>;
+
+	def allInputs() -> Range<IrInput>;
+	def controlInputs() -> Range<IrInput>;
+	def effectInputs() -> Range<IrInput>;
+	def valueInputs() -> Range<IrInput>;
+
+	def kill();
+}
+
+enum Fact {
+	O_PURE, O_FOLDABLE, O_COMMUTATIVE, O_IDEMPOTENT
+}
+
+class Operator(op: Opcode) {
+	private var paramType: Type;
+	private var paramTypes: Array<Type>;
+	private var resultType: Type;
+	private var resultTypes: Array<Type>;
+
+	def outputKinds() -> IrEdgeKinds;
+	def inputKinds() -> IrEdgeKinds;
+	def getParamType() -> Type {
+		if (paramType != null) return paramType;
+		return computeTypes().paramType;
+	}
+	def getParamTypes() -> Array<Type> {
+		if (paramTypes != null) return paramTypes;
+		return computeTypes().paramTypes;
+	}
+	def getResultType() -> Type {
+		if (resultType != null) return resultType;
+		return computeTypes().resultType;
+	}
+	def getResultTypes() -> Array<Type> {
+		if (resultTypes != null) return resultTypes;
+		return computeTypes().resultTypes;
+	}
+	def subst(func: Type -> Type) -> Operator {
+		match (op) {
+			Start,
+			If,
+			Switch,
+			Merge,
+			Loop,
+			ThrowIf,
+			End,
+			BoolEq,
+			BoolAnd,
+			BoolOr,
+			BoolNot,
+			IntEq,
+			IntAdd,
+			IntLt,
+			FloatAdd,
+			IntCastF => ;
+			Return(ts) => {
+				var nts = Arrays.subst(ts, func);
+				if (nts != ts) return Operator.new(Opcode.Return(nts));
+			}
+			Param(index, t) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.Param(index, nt));
+			}
+			RefEq(t) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.RefEq(nt));
+			}
+			TupleCreate(t) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.TupleCreate(TupleType.!(nt)));
+			}
+			TupleGetElem(t, index) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.TupleGetElem(TupleType.!(nt), index));
+			}
+			ClassAlloc(t, method) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.ClassAlloc(ClassType.!(nt), method));
+			}
+			ClassGetField(t, field) => {
+				var nt = func(t);
+				if (nt != t) return Operator.new(Opcode.ClassGetField(ClassType.!(nt), field));
+			}
+			ClassGetMethod(t, method, args) => {
+				var nt = func(t), nargs = Arrays.subst(args, func);
+				if (nt != t || nargs != args) return Operator.new(Opcode.ClassGetMethod(ClassType.!(nt), method, nargs));
+			}
+		}
+		return this;
+	}
+	private def computeTypes() -> this {
+		match (op) {
+			Start => 		set(TYPE_v, arr_v, TYPE_v, arr_v);
+			Param(index, t) =>	set(TYPE_v, arr_v, t, [t]);
+			If => 			set(TYPE_z, arr_z, TYPE_v, arr_v);
+			Switch(t) => 		set(t, [t], TYPE_v, arr_v);
+			Merge =>		set(TYPE_v, arr_v, TYPE_v, arr_v);
+			Loop =>			set(TYPE_v, arr_v, TYPE_v, arr_v);
+			ThrowIf(ex, source) =>	set(TYPE_z, arr_z, TYPE_v, arr_v);
+			Return(ts) =>		set(TupleType.new(ts), ts, TYPE_v, arr_v);
+			End => 			set(TYPE_v, arr_v, TYPE_v, arr_v);
+			BoolEq,
+			BoolAnd,
+			BoolOr => set(TYPE_zz, arr_zz, TYPE_z, arr_z);
+			BoolNot => set(TYPE_z, arr_z, TYPE_z, arr_z);
+			IntEq(t) => {
+				var tt = TupleType.new([t, t]);
+				set(tt, tt.elems, TYPE_z, arr_z);
+			}
+			IntAdd(t) => {
+				var tt = TupleType.new([t, t]);
+				set(tt, tt.elems, t, [t]);
+			}
+			IntLt(t) => {
+				var tt = TupleType.new([t, t]);
+				set(tt, tt.elems, TYPE_z, arr_z);
+			}
+			FloatAdd(t) => {
+				var tt = TupleType.new([t, t]);
+				set(tt, tt.elems, t, [t]);
+			}
+			IntCastF(to, from) => {
+				set(from, [from], to, [to]);
+			}
+			RefEq(t) => {
+				set(t, [t], TYPE_z, arr_z);
+			}
+			TupleCreate(t) => {
+				set(t, t.elems, t, t.elems);
+			}
+			TupleGetElem(t, index) => {
+				var e = t.elems[index];
+				set(t, t.elems, e, [e]);
+			}
+			ClassAlloc(t, method) => {
+				var sig = method.sigWhenIn(t, null);
+				set(sig.paramType, sig.paramTypes, t, [t]);
+			}
+			ClassGetField(t, field) => {
+				var f = field.typeWhenIn(t);
+				set(t, [t], f, [f]);
+			}
+			ClassGetMethod(t, method, args) => {
+				var sig = method.sigWhenIn(t, args);
+				var funcType = sig.funcType(null);
+				set(t, [t], funcType, [funcType]);
+			}
+		}
+	}
+	private def set(p: Type, pa: Array<Type>, r: Type, ra: Array<Type>) {
+		paramType = p;
+		paramTypes = pa;
+		resultType = r;
+		resultTypes = ra;
+	}
+	def numValueOutputs() -> u32;
+	def numEffectOutputs() -> u32;
+	def numControlOutputs() -> u32;
+}
+
+def TYPE_v = VoidType.new();
+def TYPE_z = BoolType.new();
+def arr_v: Array<Type> = [];
+def arr_z: Array<Type> = [TYPE_z];
+def arr_zz: Array<Type> = [TYPE_z, TYPE_z];
+def TYPE_zz = TupleType.new(arr_zz);
+
+type Opcode {
+	// Control operators
+	case Start;
+	case Param(index: u31, t: Type);
+// TODO	case Block(id: u31);
+	case If;
+	case Switch(t: IntType);
+	case Merge;
+	case Loop;
+	case ThrowIf(ex: string, source: Source);
+	case Return(t: Array<Type>);
+	case End;
+	// Boolean operators
+	case BoolEq;
+	case BoolAnd;
+	case BoolOr;
+	case BoolNot;
+	// Integer arithmetic and conversions
+	case IntEq(t: IntType);
+	case IntAdd(t: IntType);
+	case IntLt(t: IntType);
+	// Floating point arithmetic
+	case FloatAdd(t: FloatType);
+	// Integer casts
+	case IntCastF(to: IntType, from: FloatType);
+	// Reference equality
+	case RefEq(t: Type);
+	// Tuple operations
+	case TupleCreate(t: TupleType);
+	case TupleGetElem(t: TupleType, index: u31);
+	// Class operations
+	case ClassAlloc(t: ClassType, method: IrMethod);
+	case ClassGetField(t: ClassType, field: IrField);
+	case ClassGetMethod(t: ClassType, method: IrMethod, args: Array<Type>);
+}
+
+class Type {
+}
+class VoidType extends Type {
+}
+class BoolType extends Type {
+}
+class IntType(signed: bool, width: byte) extends Type {
+}
+class FloatType(exp_width: byte, fraction_width: byte) extends Type {
+	def total_width: byte = byte.!(1) + exp_width + fraction_width;
+}
+class ClassType extends Type {
+}
+class FuncType(paramType: Type, resultType: Type) extends Type {
+}
+class TupleType(elems: Array<Type>) extends Type {
+}
+
+class IrClass { }
+class IrMethod {
+	def sigWhenIn(t: ClassType, typeArgs: Array<Type>) -> Signature;
+}
+class IrField {
+	def typeWhenIn(t: ClassType) -> Type;
+}
+
+class Signature(paramType: Type, paramTypes: Array<Type>, resultType: Type, resultTypes: Array<Type>) {
+	def funcType(receiver: Type) -> FuncType;
+}
+
+class Source {
+}
+
+def INT_TYPE = IntType.new(true, 32);
+
+/*
+def buildDiamond() -> Node {
+	var code = IrBuilder.new([INT_TYPE]);
+	var i_start = code.addStartNode();
+	var i_p1 = code.addParam(INT_TYPE);
+	var i_p2 = code.addParam(INT_TYPE);
+	var i_cmp = code.op_IntLt(i_p1, i_p2);
+
+	var b_if = code.op_If(i_cmp, [INT_TYPE]);
+	code.assignVar(b_if.vars[0], code.intConst(11));
+	code.op_Else(b_if);
+	code.assignVar(b_if.vars[0], code.intConst(11));
+	code.op_EndIf(b_if);
+	var i_phi = b_if.vars[0];
+
+	return i_start;
+}
+
+class Label {
+}
+class IfHelper {
+	def vars: Array<VarHelper>;
+	def end: Label;
+}
+class LoopHelper {
+	def start: Label;
+}
+
+class VarHelper {
+	def index: int;
+}
+
+class IrBuilder(returnTypes: Array<Type>) {
+	private var linear: bool = true;
+	private var cur_control: Node;
+	private var cur_effect: Node;
+	private var start: Node;
+	private var current: Node;
+	private var intOpAdd: Operator;
+	private var intOpLt: Operator;
+	def params = Vector<Node>.new();
+
+	def op_If(x: Node, varTypes: Array<Type>) -> IfHelper;
+	def op_Else(i: IfHelper);
+	def op_Br(target: Label);
+	def op_BrIf(x: Node, target: Label);
+	def op_BrTable(x: Node, targets: Range<Label>);
+	def op_EndIf(i: IfHelper);
+	def op_Loop() -> LoopHelper;
+	def op_Return(x: Node) -> Node {
+		return addNode()
+			.setOperator(Operator.new(Opcode.Return(returnTypes)))
+			.setInputs1(x);
+	}
+	def op_Throw(ex: string);
+
+	def op_IntAdd(x: Node, y: Node) -> Node {
+		return addPureNode()
+			.setOperator(if(intOpAdd != null, intOpAdd, intOpAdd = Operator.new(Opcode.IntAdd(INT_TYPE))))
+			.setInputs2(x, y);
+	}
+	def op_IntLt(x: Node, y: Node) -> Node {
+		return addPureNode()
+			.setOperator(if(intOpLt != null, intOpLt, intOpLt = Operator.new(Opcode.IntLt(INT_TYPE))))
+			.setInputs2(x, y);
+	}
+	def addNode() -> Node {
+		var node = Node.new();
+		if (linear) {
+			if (current != null) {
+				match (current.control) {
+					Linear(prev, next) => current.control = Control.Linear(prev, node);
+					Merge(prev, next) => current.control = Control.Merge(prev, node);
+					_ => ;
+				}
+			}
+			node.control = Control.Linear(current, null);
+			node.effect = Effect.All;
+			current = node;
+		}
+		return node;
+	}
+	def addPureNode() -> Node {
+		var node = Node.new();
+		if (linear) {
+		} else {
+			node.control = Control.None;
+			node.effect = Effect.None;
+		}
+		return node;
+	}
+	def addStartNode() -> Node {
+		var start = Node.new();
+		start.operator = Operator.new(Opcode.Start);
+		start.control = Control.Start;
+		start.effect = Effect.Start;
+		return current = this.start = start;
+	}
+	def addParam(t: Type) -> Node {
+		var node = Node.new();
+		node.operator = Operator.new(Opcode.Param(u31.!(params.length), t));
+		node.control = Control.Dependence(start);
+		node.effect = Effect.Dependence(start);
+		params.put(node);
+		return node;
+	}
+	def assignVar(v: VarHelper, x: Node) {
+	}
+	def intConst(x: int) -> Node {
+	}
+}
+
+def main() -> int {
+	var node = buildDiamond();
+	
+}
+*/
