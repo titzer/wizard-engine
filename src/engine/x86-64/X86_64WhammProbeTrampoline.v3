@@ -1,3 +1,6 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
 def env = X86_64MasmRegs.INT_EXEC_ENV;
 def PAGE_SIZE_i: int = 4096;
 def default_target_code: X86_64SpcModuleCode;
@@ -5,92 +8,90 @@ var trampoline_code: X86_64SpcModuleCode;
 var trampoline_entries: List<(Array<WhammArg>, Pointer)>;
 
 component X86_64WhammTrampoline {
-	def genSingleProbe(probe: WhammProbe, ic: X86_64InterpreterCode) {
+	// Make a trampoline for the given {probe} by first looking for a trampoline with an identical
+	// signature, or generating one if a previous one doesn't exist.
+	def makeTrampoline(probe: WhammProbe, ic: X86_64InterpreterCode) {
 		if (trampoline_code == default_target_code) allocateCodeForTrampoline();
 		var whamm_sig = probe.sig;
 		var entry_ptr = getEntry(whamm_sig);
-		if (entry_ptr == Pointer.NULL) {
-			var w = DataWriter.new();
-			var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
-			var valuerep = masm.valuerep;
-			var offsets = masm.getOffsets();
-			for (i < whamm_sig.length) {
-				var slot_tag_addr = MasmAddr(env.vsp, i * valuerep.slot_size);
-				var slot_addr = MasmAddr(env.vsp, i * valuerep.slot_size + valuerep.tag_size);
-				match(whamm_sig[i]) {
-					FrameAccessor => {
-						masm.emit_call_runtime_getFrameAccessorMetaRef();
-						masm.emit_mov_m_r(ValueKind.REF, slot_addr, env.runtime_ret0);
-						masm.emit_mov_m_i(slot_tag_addr, ValueKind.REF.code);
-					}
-					Val(val) => {
-						var kind: byte;
-						var is_v128 = false;
-						var low: u64, high: u64;
-						match (val) {
-							I31(v) => { low = v; kind = ValueKind.REF.code; }
-							I32(v) => { low = v; kind = ValueKind.I32.code; }
-							I64(v) => { low = v; kind = ValueKind.I64.code; }
-							F32(v) => { low = v; kind = ValueKind.F32.code; }
-							F64(v) => { low = v; kind = ValueKind.F64.code; }
-							V128(l, h) => {
-								low = l;
-								high = h;
-								is_v128 = true;
-								kind = ValueKind.V128.code;
-							}
-							Ref(val) => { low = u64.view(Pointer.atObject(val) - Pointer.NULL); kind = ValueKind.REF.code; }
+		if (entry_ptr == Pointer.NULL) entry_ptr = genTrampolineCode(whamm_sig, ic);
+		probe.trampoline = TargetCode(entry_ptr);
+	}
+	def genTrampolineCode(whamm_sig: Array<WhammArg>, ic: X86_64InterpreterCode) -> Pointer {
+		var w = DataWriter.new();
+		var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+		var valuerep = masm.valuerep;
+		var offsets = masm.getOffsets();
+		for (i < whamm_sig.length) {
+			var slot_tag_addr = MasmAddr(env.vsp, i * valuerep.slot_size);
+			var slot_addr = MasmAddr(env.vsp, i * valuerep.slot_size + valuerep.tag_size);
+			match (whamm_sig[i]) {
+				FrameAccessor => {
+					masm.emit_call_runtime_getFrameAccessorMetaRef();
+					masm.emit_mov_m_r(ValueKind.REF, slot_addr, env.runtime_ret0);
+					masm.emit_mov_m_i(slot_tag_addr, ValueKind.REF.code);
+				}
+				Val(val) => {
+					var kind: byte;
+					var is_v128 = false;
+					var low: u64, high: u64;
+					match (val) {
+						I31(v) => { low = v; kind = ValueKind.REF.code; }
+						I32(v) => { low = v; kind = ValueKind.I32.code; }
+						I64(v) => { low = v; kind = ValueKind.I64.code; }
+						F32(v) => { low = v; kind = ValueKind.F32.code; }
+						F64(v) => { low = v; kind = ValueKind.F64.code; }
+						V128(l, h) => {
+							low = l;
+							high = h;
+							is_v128 = true;
+							kind = ValueKind.V128.code;
 						}
-						masm.emit_mov_m_d(slot_addr, low);
-						if (is_v128) {
-							masm.emit_mov_m_d(slot_addr.plus(8), high);
-						}
-						masm.emit_mov_m_i(slot_tag_addr, kind);
+						Ref(val) => { low = u64.view(Pointer.atObject(val) - Pointer.NULL); kind = ValueKind.REF.code; }
 					}
-					Operand(_, i) => {
-						var src_addr = MasmAddr(env.vsp, (i - 1) * valuerep.slot_size + valuerep.tag_size);
-						var src_tag_addr = MasmAddr(env.vsp, (i - 1) * valuerep.slot_size);
-						masm.emit_mov_m_m(ValueKind.REF, slot_addr, src_addr);
-						masm.emit_mov_m_m(ValueKind.REF, slot_tag_addr, src_tag_addr);
+					masm.emit_mov_m_d(slot_addr, low);
+					if (is_v128) {
+						masm.emit_mov_m_d(slot_addr.plus(8), high);
 					}
-					Local(_, i) => {
-						var src_addr = MasmAddr(env.vfp, i * valuerep.slot_size + valuerep.tag_size);
-						var src_tag_addr = MasmAddr(env.vfp, i * valuerep.slot_size);
-						masm.emit_mov_m_m(ValueKind.REF, slot_addr, src_addr);
-						masm.emit_mov_m_m(ValueKind.REF, slot_tag_addr, src_tag_addr);
-					}
+					masm.emit_mov_m_i(slot_tag_addr, kind);
+				}
+				Operand(_, i) => {
+					var src_addr = MasmAddr(env.vsp, (i - 1) * valuerep.slot_size + valuerep.tag_size);
+					var src_tag_addr = MasmAddr(env.vsp, (i - 1) * valuerep.slot_size);
+					masm.emit_mov_m_m(ValueKind.REF, slot_addr, src_addr);
+					masm.emit_mov_m_m(ValueKind.REF, slot_tag_addr, src_tag_addr);
+				}
+				Local(_, i) => {
+					var src_addr = MasmAddr(env.vfp, i * valuerep.slot_size + valuerep.tag_size);
+					var src_tag_addr = MasmAddr(env.vfp, i * valuerep.slot_size);
+					masm.emit_mov_m_m(ValueKind.REF, slot_addr, src_addr);
+					masm.emit_mov_m_m(ValueKind.REF, slot_tag_addr, src_tag_addr);
 				}
 			}
-			// update vsp and call the probe function within interpreter
-			masm.emit_addw_r_i(env.vsp, whamm_sig.length * valuerep.slot_size);
-			masm.asm.movq_r_l(masm.scratch, (ic.start + ic.header.intIntEntryOffset) - Pointer.NULL);
-			masm.asm.icall_r(masm.scratch);
-
-			// jump back to whamm probe handler
-			masm.emit_mov_r_l(env.tmp0, (ic.start + ic.header.whammReentryOffset) - Pointer.NULL);
-			masm.emit_jump_r(env.tmp0);
-			var addr = setTrampolineCode(masm);
-			trampoline_entries = List<(Array<WhammArg>, Pointer)>.new((whamm_sig, addr), trampoline_entries);
-			entry_ptr = addr;
 		}
-		probe.trampoline = TargetCode(entry_ptr);
+		// update vsp and call the probe function within interpreter
+		masm.emit_addw_r_i(env.vsp, whamm_sig.length * valuerep.slot_size);
+		// XXX: check for SPC call as well
+		masm.asm.movq_r_l(masm.scratch, (ic.start + ic.header.intIntEntryOffset) - Pointer.NULL);
+		masm.asm.icall_r(masm.scratch);
+
+		// jump back to whamm probe handler
+		masm.emit_mov_r_l(env.tmp0, (ic.start + ic.header.whammReentryOffset) - Pointer.NULL);
+		masm.emit_jump_r(env.tmp0);
+		var addr = setTrampolineCode(masm);
+		trampoline_entries = List<(Array<WhammArg>, Pointer)>.new((whamm_sig, addr), trampoline_entries);
+		return addr;
 	}
 }
 
 def getEntry(sig: Array<WhammArg>) -> Pointer {
+	// XXX: use a HashMap
 	for (entry = trampoline_entries; entry != null; entry = entry.tail) {
-		if (sigArraysMatch(entry.head.0, sig)) {
+		if (Arrays.equal(entry.head.0, sig)) {
 			return entry.head.1;
 		}
 	}
 	return Pointer.NULL;
-}
-
-def sigArraysMatch(x: Array<WhammArg>, y: Array<WhammArg>) -> bool {
-	if (x == y) return true;
-	if (x.length != y.length) return false;
-	for (i < x.length) if (x[i] != y[i]) return false;
-	return true;
 }
 
 def allocateCodeForTrampoline() {
@@ -110,7 +111,7 @@ def setTrampolineCode(masm: X86_64MacroAssembler) -> Pointer {
 	var addr = trampoline_code.appendCode(masm);
 	var end = addr + masm.w.atEnd().pos;
 	if (Trace.compiler) {
-		Trace.OUT.put1("Single WhammProbe trampoline code: break *0x%x", addr - Pointer.NULL)
+		Trace.OUT.put1("WhammProbe trampoline code: break *0x%x", addr - Pointer.NULL)
 			.put2(" disass 0x%x, 0x%x", addr - Pointer.NULL, end - Pointer.NULL).ln();
 		var cur_byte = addr;
 		Trace.OUT.puts("JIT code: ");
