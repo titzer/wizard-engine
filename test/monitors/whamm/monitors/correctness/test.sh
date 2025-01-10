@@ -40,22 +40,23 @@ function run_test() {
     echo "##+$test"
 
     if [ -f app/$test.app ]; then
-	app=$(cat app/$test.app)
+		app=$(cat app/$test.app)
     fi
     if [ -f flags/$test.flags ]; then
-	flags=$(cat flags/$test.flags)
+		flags=$(cat flags/$test.flags)
     fi
     if [ -f imports/$test.imports ]; then
-	imports=$(cat imports/$test.imports)
+		# Combine all imports with the '+' delimiter (should have no trailing '+')
+		imports="+$(cat imports/$test.imports | grep -v "^$" | tr '\n' '+' | sed 's/+$//')"
     fi
 
     local P=$T/$test
 
-	echo "$WIZENG $flags --monitors=$test $imports $app"
+	echo "$WIZENG $flags --monitors=$test$imports $app"
     if [ -f $test.in ]; then
-	$WIZENG_CMD -colors=false $flags --monitors=$test $imports $app < $test.in > $P.out 2> $P.err
+		$WIZENG_CMD -colors=false $flags --monitors=$test$imports $app < $test.in > $P.out 2> $P.err
     else
-	$WIZENG_CMD -colors=false $flags --monitors=$test $imports $app > $P.out 2> $P.err
+		$WIZENG_CMD -colors=false $flags --monitors=$test$imports $app > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 
@@ -73,27 +74,27 @@ function run_test() {
 	    diff expected/$test.$check $P.$check | tee $P.$check.diff
 	    DIFF=${PIPESTATUS[0]}
 	    if [ "$DIFF" != 0 ]; then
-		if [ -f failures.$target ]; then
-		    grep $test failures.$target
-		    if [ $? = 0 ]; then
-			continue # test was found in expected failures
-		    fi
-		fi
-		if [ -f failures.$target.$TEST_MODE ]; then
-		    grep $test failures.$target.$TEST_MODE
-		    if [ $? = 0 ]; then
-			continue # test was found in expected failures
-		    fi
-		fi
-		if [ -f failures.all ]; then
-		    grep $test failures.all
-		    if [ $? = 0 ]; then
-			continue # test was found in expected failures
-		    fi
-		fi
+			if [ -f failures.$target ]; then
+				grep $test failures.$target
+				if [ $? = 0 ]; then
+					continue # test was found in expected failures
+				fi
+			fi
+			if [ -f failures.$target.$TEST_MODE ]; then
+				grep $test failures.$target.$TEST_MODE
+				if [ $? = 0 ]; then
+					continue # test was found in expected failures
+				fi
+			fi
+			if [ -f failures.all ]; then
+				grep $test failures.all
+				if [ $? = 0 ]; then
+					continue # test was found in expected failures
+				fi
+			fi
 
-		echo "##-fail: $P.$check.diff"
-		return 1
+			echo "##-fail: $P.$check.diff"
+			return 1
 	    fi
 	fi
     done
@@ -104,7 +105,7 @@ function run_test() {
 function run_tests() {
     printf "##>%d\n" $#
     for t in $@; do
-	run_test $t
+		run_test $t
     done
 }
 
