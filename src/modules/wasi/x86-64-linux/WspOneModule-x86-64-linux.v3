@@ -14,6 +14,9 @@ def SYS_lseek = 8;
 def SYS_sched_yield = 24;
 def SYS_kill = 37;
 def SYS_getpid = 39;
+def SYS_statx = 332;
+
+def AT_SYMLINK_NOFOLLOW = 0x100;
 
 // Linux lseek whence values
 def WHENCE_SET = 0;
@@ -25,8 +28,18 @@ def O_CLOEXEC = 0x80000;
 def O_PATH = 0x200000;
 def O_DIRECTORY = 0x10000;
 
+def S_IFMT   = 0xF000; // bit mask for the file type bit field
+def S_IFSOCK = 0xC000; // socket
+def S_IFLNK  = 0xA000; // symbolic link
+def S_IFREG  = 0x8000; // regular file
+def S_IFBLK  = 0x6000; // block device
+def S_IFDIR  = 0x4000; // directory
+def S_IFCHR  = 0x2000; // character device
+def S_IFIFO  = 0x1000; // FIFO
+
 // IO buffers
 def timespec = Array<long>.new(2);
+def statxbuf = Ref<statx>.of(Array<byte>.new(statx.size));
 
 // A special value, which tells the fd of the current working directory used in openat
 def AT_FDCWD = -100;
@@ -42,7 +55,7 @@ class X86_64Linux_WspOneModule extends WspOneModule {
 		for (ii < dirs.length) {
 			var dir = dirs[ii];
 			// call openat system call
-			var fd = Linux.syscall(SYS_openat, 
+			var fd = Linux.syscall(SYS_openat,
 				(AT_FDCWD,
 				 Pointer.atContents(dir),
 				 LinuxConst.O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY
@@ -96,7 +109,7 @@ class X86_64Linux_WspOneModule extends WspOneModule {
 	}
 	def fd_seek(args: Range<Value>) -> HostResult {
 		// question: whence is a u32, but in preview1 it is defined as struct
-		
+
 		var fd = Values.unbox_i(args[0]);
 		var offset = Values.unbox_l(args[1]);
 		var whence = Values.unbox_u(args[2]);
@@ -168,6 +181,50 @@ class X86_64Linux_WspOneModule extends WspOneModule {
 		var wasi_fd = fdmap.alloc();
 		fdmap.set(wasi_fd, WasiFd.new(int.view(result_fd), wasi_filetype.CHARACTER_DEVICE, false, Ranges.dup(pathz.result)));
 		return SUCCESS;
+	}
+	def path_filestat_get(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var flags	= Values.unbox_i(args[1]);
+		var pathptr	= args[2];
+		var pathlen	= args[3];
+		var filestatptr = args[4];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return HostResult.Value1(Values.box_i(WspOneErrno.BADF.code));
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return i(WspOneErrno.INVAL.code);
+
+		def filestat = getRegion3(memory, filestatptr, Values.box_i(Wasi_filestat.size));
+		if (filestat.trapped()) return i(WspOneErrno.INVAL.code);
+
+		var sysflags = if((flags & 1) == 0, AT_SYMLINK_NOFOLLOW);
+		var sysmask = -1;
+
+		var t = Linux.syscall(SYS_statx, (dir_fd.sysfd, Pointer.atContents(pathz.result), sysflags, sysmask, Pointer.atRef(statxbuf)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		var result = Ref<Wasi_filestat>.of(filestat.result);
+		result.dev = 		u64.view(statxbuf.stx_dev_major) << 32 | statxbuf.stx_dev_minor;
+		result.ino = 		statxbuf.stx_ino;
+		result.nlink = 	statxbuf.stx_nlink;
+		result.size = 	statxbuf.stx_size;
+		result.atim = 	statxbuf.stx_atime;
+		result.mtim = 	statxbuf.stx_mtime;
+		result.ctim = 	statxbuf.stx_ctime;
+
+		var ftype: Wasi_filetype;
+		match (statxbuf.stx_mode & S_IFMT) {
+			S_IFSOCK => ftype = Wasi_filetype.SOCKET_DGRAM; // TODO: mode?
+			S_IFLNK  => ftype = Wasi_filetype.SYMBOLIC_LINK;
+			S_IFREG  => ftype = Wasi_filetype.REGULAR_FILE;
+			S_IFBLK  => ftype = Wasi_filetype.BLOCK_DEVICE;
+			S_IFDIR  => ftype = Wasi_filetype.DIRECTORY;
+			S_IFCHR  => ftype = Wasi_filetype.CHARACTER_DEVICE;
+			S_IFIFO  => ftype = Wasi_filetype.SOCKET_STREAM;
+		}
+
+		result.filetype = ftype;
+		return HostResult.Value1(Values.I32_0);
 	}
 	def sched_yield(args: Range<Value>) -> HostResult {
 		var t = Linux.syscall(SYS_sched_yield, ());
