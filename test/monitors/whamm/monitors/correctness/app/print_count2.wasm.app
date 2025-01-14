@@ -1,0 +1,1 @@
+../../apps/call2.wasm
