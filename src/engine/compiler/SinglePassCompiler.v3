@@ -111,6 +111,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
+	var intrinsified_read_probe: MemoryReadProbe = null;
+
 	new() {
 		masm.unimplemented = unsupported;
 		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
@@ -322,6 +324,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Check for intrinsified probes.
 		match (probe) { // TODO: emit code for multiple intrinsified probes.
 			null => ;
+			x: MemoryReadProbe => if (SpcTuning.intrinsifyMemoryProbes && x.size <= 8) {
+				intrinsified_read_probe = x;
+				return;
+			}
 			x: CountProbe => if (SpcTuning.intrinsifyCountProbe) { // TODO: check for subclass override
 				var tmp = allocTmp(ValueKind.REF);
 				masm.emit_increment_CountProbe(tmp, x, 1);
@@ -1594,6 +1600,27 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var nflags = IN_REG | SpcConsts.kindToFlags(kind);
 		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
+
+		if (intrinsified_read_probe != null) {
+			// spill everything
+			state.emitSaveAll(resolver, probeSpillMode);
+
+			// load RT args (addr, val) and call RT
+			if (index_reg.index == 0) { // fixed addr
+				index_reg = allocTmp(ValueKind.I32);
+				masm.emit_mov_r_i(index_reg, i32.!(offset));
+			} else {
+				masm.emit_addw_r_i(index_reg, i32.!(offset));
+			}
+			var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
+			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
+			masm.emit_mov_r_r(ValueKind.REF, arg1, index_reg);
+			masm.emit_mov_r_m(ValueKind.REF, arg2, masm.slotAddr(state.sp - 1));
+			masm.emit_call_MemoryReadProbe_fire(intrinsified_read_probe);
+			emit_reload_regs();
+			if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+			intrinsified_read_probe = null;
+		}
 	}
 	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ()) {
 		var base_reg = regs.mem0_base;
@@ -1619,6 +1646,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			index_reg = popReg().reg;
 		}
 		meth(kind, sv.reg, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+	}
+
+	def emitIntrinsifiedMemoryReadProbe() {
+		// spill everything
+		state.emitSaveAll(resolver, probeSpillMode);
+		// compute VSP for potential frame access
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+
+
+		emit_reload_regs();
+		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 
 	//====================================================================
