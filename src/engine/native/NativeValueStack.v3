@@ -1,0 +1,289 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A value stack implementation that unboxes and tags values with a custom
+// memory layout. In this implementation, the stack grows towards higher addresses.
+// A guard page is used to check for stack overflow.
+class NativeValueStack extends ValueStack {
+	def valuerep: Tagging;
+	def mapping: MemoryMapping;	// the raw memory used to store slots
+	var vsp: Pointer;
+
+	new(valuerep, mapping) {
+		if (valuerep.tagged) RiGc.registerScanner(this, NativeValueStack.scanSlots);
+	}
+
+	def clear() -> this {
+		clearSlots();
+	}
+	def clearSlots() -> this {
+		vsp = mapping.range.start;
+	}
+
+	def peekRef() -> Value {
+		if (valuerep.tagged) {
+			var got = peekTag();
+			if (!valuerep.maybeRefTag(got)) fatal(Strings.format1("value stack tag mismatch, expected ref, got %x", got));
+		}
+		return readI31OrObject(vsp + (valuerep.tag_size - valuerep.slot_size));
+	}
+	def popN(t: Range<ValueType>) -> Array<Value> {
+		var r = Array<Value>.new(t.length);
+		for (j = t.length - 1; j >= 0; j--) r[j] = pop(t[j]);
+		return r;
+	}
+	def popV(t: ValueType) -> Value {
+		return pop(t);
+	}
+	def pop(t: ValueType) -> Value {
+		match (t) {
+			I32 => return Value.I32(popb32(BpTypeCode.I32.code));
+			I64 => return Value.I64(popb64(BpTypeCode.I64.code));
+			F32 => return Value.F32(popb32(BpTypeCode.F32.code));
+			F64 => return Value.F64(popb64(BpTypeCode.F64.code));
+			V128 => {
+				checkTopTag(BpTypeCode.V128.code); // XXX: factor out
+				vsp += -(valuerep.slot_size);
+				var low = (vsp + valuerep.tag_size).load<u64>();
+				var high = (vsp + valuerep.tag_size + 8).load<u64>();
+				return Value.V128(low, high);
+			}
+			Host => return Value.Ref(popObject());
+			Ref(nullable, heap) => match(heap) { // TODO: tighter checking of ref value tags
+				ANY, EXTERN, EQ, I31 => return popRef();
+				Func => return Value.Ref(popFunction());
+				_ => return Value.Ref(popObject());
+			}
+			_ => fatal(Strings.format1("unexpected type: %s", t.name));
+		}
+		return Value.Ref(null);
+	}
+	def popRef() -> Value {
+		var val = peekRef();
+		vsp += -(valuerep.slot_size);
+		return val;
+	}
+	def popi() -> i32 {
+		return i32.view(popb32(BpTypeCode.I32.code));
+	}
+	def popu() -> u32 {
+		return popb32(BpTypeCode.I32.code);
+	}
+	def popl() -> i64 {
+		return i64.view(popb64(BpTypeCode.I64.code));
+	}
+	def popw() -> u64 {
+		return popb64(BpTypeCode.I64.code);
+	}
+	def popb32(tag: byte) -> u32 {
+		checkTopTag(tag);
+		vsp += -(valuerep.slot_size);
+		return (vsp + valuerep.tag_size).load<u32>();
+	}
+	def popb64(tag: byte) -> u64 {
+		checkTopTag(tag);
+		vsp += -(valuerep.slot_size);
+		return (vsp + valuerep.tag_size).load<u64>();
+	}
+	def popObject() -> Object {
+		if (valuerep.tagged) {
+			var got = peekTag();
+			if (!valuerep.maybeRefTag(got)) fatal(Strings.format1("value stack tag mismatch, expected ref, got %x", got));
+		}
+		vsp += -(valuerep.slot_size);
+		var val = (vsp + valuerep.tag_size).load<u64>();
+		if ((val & 1) == 1) fatal("expected ref, got i31");
+		return (vsp + valuerep.tag_size).load<Object>();
+	}
+	def popResult(rt: Array<ValueType>) -> Result {
+		var r = Array<Value>.new(rt.length);
+		for (i = r.length - 1; i >= 0; i--) r[i] = pop(rt[i]);
+		return Result.Value(r);
+	}
+	def push(v: Value) {
+		match (v) {
+			Ref(obj) => pushPair(BpTypeCode.REF_NULL.code, obj);
+			I31(val) => pushPair(BpTypeCode.I31REF.code, (u64.view(val) << 1) | 1);
+			I32(val) => pushPair(BpTypeCode.I32.code, u64.view(val));
+			I64(val) => pushPair(BpTypeCode.I64.code, u64.view(val));
+			F32(bits) => pushPair(BpTypeCode.F32.code, u64.view(bits));
+			F64(bits) => pushPair(BpTypeCode.F64.code, u64.view(bits));
+			V128(low, high) => {
+				if (valuerep.tagged) vsp.store<u8>(BpTypeCode.V128.code); // XXX: factor out
+				(vsp + valuerep.tag_size).store(u64.view(low));
+				(vsp + valuerep.tag_size + 8).store(u64.view(high));
+				vsp += valuerep.slot_size;
+			}
+		}
+	}
+	def pushi(v: int) {
+		pushPair(BpTypeCode.I32.code, u64.view(v));
+	}
+	def pushu(v: u32) {
+		pushPair(BpTypeCode.I32.code, u64.view(v));
+	}
+	def pushN(vs: Range<Value>) {
+		for (i < vs.length) push(vs[i]);
+	}
+	private def checkTopTag(tag: byte) -> byte {
+		if (!valuerep.tagged) return tag;
+		var got = peekTag();
+		if (got == tag) return tag;
+		fatal(Strings.format2("value stack tag mismatch, expected: %x, got %x", tag, got));
+		return tag;
+	}
+	private def peekTag() -> byte {
+		return (vsp + -(valuerep.slot_size)).load<u8>() & '\x7F';
+	}
+	private def pushPair<T>(tag: byte, bits: T) {
+		if (valuerep.tagged) vsp.store<u8>(tag);
+		(vsp + valuerep.tag_size).store(bits);
+		vsp += valuerep.slot_size;
+	}
+	private def readValue(base: Pointer, offset: int) -> Value {
+		if (!valuerep.tagged) fatal("untyped frame access requires value tagging to be enabled");
+		var tp = base + offset * valuerep.slot_size;
+		if (!mapping.range.contains(tp)) System.error("FrameAccessError", "out of bounds");
+		var vp = tp + valuerep.tag_size;
+		var tag = tp.load<u8>() & '\x7F';
+		match (tag) {
+			BpTypeCode.ANYREF.code,
+			BpTypeCode.EQREF.code,
+			BpTypeCode.REF_NULL.code,
+			BpTypeCode.REF.code,
+			BpTypeCode.EXTERNREF.code,
+			BpTypeCode.NULLEXTERNREF.code,
+			BpTypeCode.I31REF.code => return readI31OrObject(vp);
+
+			BpTypeCode.STRUCTREF.code,
+			BpTypeCode.NULLREF.code,
+			BpTypeCode.ARRAYREF.code,
+			BpTypeCode.FUNCREF.code,
+			BpTypeCode.EXNREF.code,
+			BpTypeCode.NULLFUNCREF.code => return Value.Ref(vp.load<Object>());
+
+			BpTypeCode.I32.code => return Value.I32(vp.load<u32>());
+			BpTypeCode.I64.code => return Value.I64(vp.load<u64>());
+			BpTypeCode.F32.code => return Value.F32(vp.load<u32>());
+			BpTypeCode.F64.code => return Value.F64(vp.load<u64>());
+			BpTypeCode.V128.code => return Value.V128(vp.load<u64>(), (vp + 8).load<u64>());
+			_ => {
+				fatal(Strings.format2("unknown value tag 0x%x @ 0x%x", tag, (tp - Pointer.NULL)));
+				return Values.REF_NULL;
+			}
+		}
+	}
+	private def writeValue(base: Pointer, offset: int, v: Value) {
+		if (!valuerep.tagged) fatal("untyped frame access requires value tagging to be enabled");
+		var tp = base + offset * valuerep.slot_size;
+		var vp = tp + valuerep.tag_size;
+		var tag = tp.load<u8>() & '\x7F';
+		match (tag) {
+			BpTypeCode.I32.code => vp.store<u32>(Values.unbox_u(v));
+			BpTypeCode.I64.code => vp.store<u64>(Values.unbox_w(v));
+			BpTypeCode.F32.code => vp.store<u32>(Values.unbox_fu32(v));
+			BpTypeCode.F64.code => vp.store<u64>(Values.unbox_du64(v));
+			BpTypeCode.V128.code => {
+				var vv = Value.V128.!(v);
+				vp.store<u64>(vv.low);
+				(vp + 8).store<u64>(vv.high);
+			}
+			_ => {
+				// TODO: allow reference value writes
+				fatal(Strings.format2("unknown or unsupported write of value tag %x @ 0x%x", tag, (tp - Pointer.NULL)));
+			}
+		}
+	}
+	private def readI31OrObject(vp: Pointer) -> Value {
+		var bits = vp.load<u64>();
+		if (bits == 0) return Values.REF_NULL;
+		if ((bits & 1) == 1) return Value.I31(u31.view(bits >> 1));
+		var obj = vp.load<Object>();
+		return Value.Ref(obj);
+	}
+	// GC callback to scan slots containing (maybe tagged) values in this stack.
+	private def scanSlots() {
+		if (Trace.gc) {
+			Trace.OUT.put1("scanStack obj=0x%x", u64.view(Pointer.atObject(this) - Pointer.NULL)).ln();
+		}
+		// Iterate values on the value stack.
+		for (p = mapping.range.start; p < vsp; p += valuerep.slot_size) {
+			var tag = p.load<byte>();
+			if (Trace.gc) {
+				Trace.OUT.put2("scanValue @ 0x%x = %x", u64.view(p - Pointer.NULL), tag).ln();
+			}
+			if (valuerep.maybeRefTag(tag)) {
+				var val = (p + valuerep.tag_size).load<u64>();
+				if ((val & 1) != 1) RiGc.scanRoot(p + valuerep.tag_size); // low bit == 1 => i31ref
+			}
+		}
+	}
+}
+
+// Layouts for tagged values.
+layout NativeTaggedSlot {
+	+0	tag:	u8;
+	=32;
+}
+layout NativeTagged_I32 {
+	+0	tag:	u8;	// == BpTypeCode.I32.code
+	+16	val:	u32;
+	=32;
+}
+layout NativeTagged_I64 {
+	+0	tag:	u8;	// == BpTypeCode.I64.code
+	+16	val:	u64;
+	=32;
+}
+layout NativeTagged_F32 {
+	+0	tag:	u8;	// == BpTypeCode.F32.code
+	+16	val:	float;
+	=32;
+}
+layout NativeTagged_F64 {
+	+0	tag:	u8;	// == BpTypeCode.F32.code
+	+16	val:	double;
+	=32;
+}
+layout NativeTagged_V128 {
+	+0	tag:	u8;	// == BpTypeCode.V128.code
+	+16	low:	u64;
+	+24	high:	u64;
+	=32;
+}
+layout NativeTagged_Ref {
+	+0	tag:	u8;	// == BpTypeCode.REF.code
+	+16	refi31:	u64;	// reference or i31
+	=32;
+}
+
+// Layouts for untagged values.
+layout NativeSlot {
+	=16;
+}
+layout Native_I32 {
+	+0	val:	u32;
+	=16;
+}
+layout Native_I64 {
+	+0	val:	u64;
+	=16;
+}
+layout Native_F32 {
+	+0	val:	float;
+	=16;
+}
+layout Native_F64 {
+	+0	val:	double;
+	=16;
+}
+layout Native_V128 {
+	+0	low:	u64;
+	+8	high:	u64;
+	=16;
+}
+layout Native_Ref {
+	+0	refi31:	u64;	// reference or i31
+	=16;
+}
+
