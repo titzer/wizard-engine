@@ -1,8 +1,72 @@
 // Copyright 2025 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// A memory implementation that uses native off-heap memory to represent
-// Wasm memory, using guard pages to avoid bounds checks when possible.
-// Only usable on 64-bit native targets.
+// A memory implementation that uses native off-heap memory to represent Wasm memory, using guard
+// pages to avoid bounds checks when possible. Only usable on 64-bit native targets.
+// Relies on OS/Arch-specific {Mmap} for virtual memory protections.
 class NativeMemory extends Memory {
+	var mapping: Mapping;
+	var start: Pointer;
+	var limit: Pointer;
+	var end: Pointer;
+
+	new(decl: MemoryDecl) super(decl) {
+		if (decl == null) return;
+		var num_pages: u64 = decl.size.initial;
+		var num_bytes: u64 = num_pages << decl.log2_pageSize;
+		if (num_pages > Target.limit_memory_pages) {
+			oom = true;
+		} else {
+			// Reserve memory, unmapped, inaccessible
+			mapping = Mmap.reserve(EIGHT_GB, Mmap.PROT_NONE);
+			if (mapping == null) {
+				oom = true; // fail out of memory
+				return;
+			}
+			start = mapping.range.start;
+			end = mapping.range.end;
+			limit = start + long.view(num_bytes);
+			// adjust permissions on guard region pages
+			if (!Mmap.protect(start, num_bytes, Mmap.PROT_READ | Mmap.PROT_WRITE)) {
+				deallocate();
+				oom = true;
+				return;
+			}
+			PrivateMemoryAccess.setSize(this, num_pages, num_bytes);
+		}
+		if (Trace.memory) {
+			Trace.OUT
+				.put3("new memory ([0x%x ... 0x%x] ... 0x%x)", start - Pointer.NULL, limit - Pointer.NULL, end - Pointer.NULL)
+				.ln();
+		}
+	}
+	def deallocate() {
+		mapping.range.unmap();
+		mapping = null;
+		start = limit = end = Pointer.NULL;
+	}
+	def grow(add_pages: u64) -> int {
+		var cur_pages = num_pages;
+		var cur_bytes = num_bytes;
+		if (Trace.memory) {
+			Trace.OUT
+				.put3("grow memory [0x%x ..+ (%d pages)] by %d pages", start - Pointer.NULL, cur_pages, add_pages)
+				.ln();
+		}
+		if (add_pages == 0) return int.!(cur_pages); // degenerate case
+		var new_pages = cur_pages + add_pages;
+		if (new_pages > decl.size.maximum.min(Target.limit_memory_pages)) return -1; // exceeded maximum
+		var add_bytes = u64.view(add_pages) << decl.log2_pageSize;
+		var new_bytes = cur_bytes + add_bytes;
+		// adjust permissions on guard region pages
+		if (!Mmap.protect(limit, add_bytes, Mmap.PROT_READ | Mmap.PROT_WRITE)) return -1;
+		limit += i64.view(add_bytes);
+
+		PrivateMemoryAccess.setSize(this, new_pages, new_bytes);
+		return int.!(cur_pages);
+	}
+	def getReadWriteAlias64(start: u64, end: u64) -> Range<byte> {
+		return CiRuntime.forgeRange<byte>(this.start + long.!(start), int.!(end - start));
+	}
 }
+def EIGHT_GB = 8uL * 1024u * 1024u * 1024u;
