@@ -810,22 +810,53 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var func_reg = sv.reg;
 		emit_load_instance(regs.instance);
 
-		var treg = allocTmp(ValueKind.REF);
-		var tmp2 = allocTmp(ValueKind.REF);
+		var table_reg = allocTmp(ValueKind.REF);
+		var tmp_reg = allocTmp(ValueKind.REF);
 
 		// tmp1 = load table[table_index] from instance
-		masm.emit_mov_r_m(ValueKind.REF, treg, MasmAddr(regs.instance, offsets.Instance_tables));
-		masm.emit_read_v3_array_r_i(ValueKind.REF, treg, treg, int.!(table_index));
+		masm.emit_mov_r_m(ValueKind.REF, table_reg, MasmAddr(regs.instance, offsets.Instance_tables));
+		masm.emit_read_v3_array_r_i(ValueKind.REF, table_reg, table_reg, int.!(table_index));
 		// bounds check
-		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(treg, offsets.Table_ids));
-		masm.emit_bounds_check_v3_array(tmp2, func_reg, newTrapLabel(TrapReason.FUNC_INVALID));
+		masm.emit_mov_r_m(ValueKind.REF, tmp_reg, MasmAddr(table_reg, offsets.Table_ids));
+		masm.emit_bounds_check_v3_array(tmp_reg, func_reg, newTrapLabel(TrapReason.FUNC_INVALID));
 		// signature check
-		masm.emit_read_v3_array_r_r(ValueKind.I32, tmp2, tmp2, func_reg); // XXX: using ref reg as int
-		masm.emit_breq_r_i(tmp2, -1, newTrapLabel(TrapReason.FUNC_INVALID));
-		masm.emit_brne_r_i(tmp2, sig.canon_id, newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
-		// load from table
-		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(treg, offsets.Table_funcs));
-		masm.emit_read_v3_array_r_r(ValueKind.REF, func_reg, tmp2, func_reg);
+		masm.emit_read_v3_array_r_r(ValueKind.I32, tmp_reg, tmp_reg, func_reg); // XXX: using ref reg as int
+		masm.emit_breq_r_i(tmp_reg, -1, newTrapLabel(TrapReason.FUNC_INVALID));
+
+		if (sig.final) {
+			// Final signatures can do an exact signature check.
+			masm.emit_brne_r_i(tmp_reg, sig.canon_id, newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
+			// load from table
+			masm.emit_mov_r_m(ValueKind.REF, tmp_reg, MasmAddr(table_reg, offsets.Table_funcs));
+			masm.emit_read_v3_array_r_r(ValueKind.REF, func_reg, tmp_reg, func_reg);
+		} else {
+			// Non-final signatures do a fast-path check and then fallback to a runtime call.
+			var sigokpt = masm.newLabel(it.pc);
+			masm.emit_breq_r_i(tmp_reg, sig.canon_id, sigokpt);
+			state.emitSaveAll(resolver, SpillMode.SAVE_AND_REMEMBER_STORED); // XXX: no need to save all regs?
+			var arg2 = regs.runtime_arg2;
+			// load from table into runtime arg0
+			masm.emit_mov_r_m(ValueKind.REF, arg2, MasmAddr(table_reg, offsets.Table_funcs));
+			masm.emit_read_v3_array_r_r(ValueKind.REF, arg2, arg2, func_reg);
+			// call runtime
+			emit_load_instance(regs.runtime_arg0);
+			masm.emit_mov_r_i(regs.runtime_arg1, sig_index);
+			masm.emit_call_runtime_checkFuncSigSubtyping(); // XXX: emit inline code for subtype check
+			// result == null implies sig mismatch
+			masm.emit_br_r(regs.runtime_ret0, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
+			masm.emit_mov_r_r(ValueKind.REF, func_reg, regs.runtime_ret0);
+
+			emit_reload_regs();
+			state.emitRestoreAll(resolver);
+			var end = masm.newLabel(it.pc);
+			masm.emit_br(end);
+
+			// load from table
+			masm.bindLabel(sigokpt);
+			masm.emit_mov_r_m(ValueKind.REF, tmp_reg, MasmAddr(table_reg, offsets.Table_funcs));
+			masm.emit_read_v3_array_r_r(ValueKind.REF, func_reg, tmp_reg, func_reg);
+			masm.bindLabel(end);
+		}
 
 		// Handle the current stack state.
 		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
@@ -844,15 +875,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 
 		masm.bindLabel(wasmcall_label);
-		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(func_reg, offsets.WasmFunction_decl));
-		masm.emit_mov_r_m(ValueKind.REF, tmp2, MasmAddr(tmp2, offsets.FuncDecl_target_code));
+		masm.emit_mov_r_m(ValueKind.REF, tmp_reg, MasmAddr(func_reg, offsets.WasmFunction_decl));
+		masm.emit_mov_r_m(ValueKind.REF, tmp_reg, MasmAddr(tmp_reg, offsets.FuncDecl_target_code));
 
 		// Call or jump to the entrypoint.
 		if (tailCall) {
-			masm.emit_jump_r(tmp2);
+			masm.emit_jump_r(tmp_reg);
 			setUnreachable();
 		} else {
-			masm.emit_call_r(tmp2);
+			masm.emit_call_r(tmp_reg);
 			masm.bindLabel(retpt);
 			emit_reload_regs();
 			state.popArgsAndPushResults(sig);
