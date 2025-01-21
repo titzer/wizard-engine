@@ -4,4 +4,4 @@
   (func $t1 (param (ref $s1)) (result (ref $s1))
      (ref.null $s1)
   )  
-))
+) "type mismatch")
