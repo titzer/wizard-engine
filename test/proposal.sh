@@ -22,11 +22,13 @@ make_binary spectest || exit $?
 
 CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_TEST/proposal:$PROPOSAL.failures -expected=$WIZENG_TEST/proposal:$PROPOSAL.failures.${TEST_TARGET}"
 
-printf "Updating proposal ${CYAN}%-22s${NORM} " $PROPOSAL
-update_proposal_repo $PROPOSAL | $PROGRESS || exit $?
+if [ ! -d test/wasm-spec/bin/$PROPOSAL ]; then
+    printf "Updating proposal ${CYAN}%-22s${NORM} " $PROPOSAL
+    update_proposal_repo $PROPOSAL | $PROGRESS || exit $?
 
-printf "Building tests    ${CYAN}%-22s${NORM} " $PROPOSAL
-make_proposal_tests $PROPOSAL | $PROGRESS || exit $?
+    printf "Building tests    ${CYAN}%-22s${NORM} " $PROPOSAL
+    make_proposal_tests $PROPOSAL | $PROGRESS || exit $?
+fi
 
 cd $WIZENG_LOC
 TESTS=$(find test/wasm-spec/bin/$PROPOSAL -name '*.bin.wast')
