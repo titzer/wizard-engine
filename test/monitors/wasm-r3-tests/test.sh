@@ -8,7 +8,7 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-. $HERE/../../common.sh R3-monitor
+. $HERE/../../common.sh r3
 
 make_wizeng || exit $?
 
