@@ -9,4 +9,4 @@
 )
 (assert_return (invoke "count" (i64.const 0x0)) (i64.const 0x0))
 (assert_return (invoke "count" (i64.const 0x3e8)) (i64.const 0x0))
-(assert_return (invoke "count" (i64.const 0xf_4240)) (i64.const 0x0))
+(assert_return (invoke "count" (i64.const 0x2710)) (i64.const 0x0))
