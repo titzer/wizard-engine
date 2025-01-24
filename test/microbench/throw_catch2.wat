@@ -4,7 +4,7 @@
   (func $main (export "main")
     (local $y i32)
 
-    (local.tee $y (i32.const __INNER_ITERATIONS__))
+    (local.tee $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (loop $l (param i32)
       drop
       (i32.eqz (local.tee $y (i32.sub (local.get $y) (i32.const 1))))

@@ -15,7 +15,7 @@
   (func $main (export "main")
     (local $y i32)
 
-    (local.set $y (i32.const __INNER_ITERATIONS__))
+    (local.set $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (loop $l
       (call $find (i32.const 6677))
       (drop)

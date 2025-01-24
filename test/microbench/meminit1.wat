@@ -24,7 +24,7 @@
   )
   (func $main (export "main")
     (local $y i32)
-    (local.set $y (i32.const __INNER_ITERATIONS__))
+    (local.set $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (loop $l
       (memory.init 0 (i32.const 0) (i32.const 0) (i32.const 256))
       (memory.init 0 (i32.const 256) (i32.const 0) (i32.const 256))

@@ -6,7 +6,7 @@
   (func $main (export "main")
     (local $y i32)
     (local $z i32)
-    (local.set $y (i32.const __INNER_ITERATIONS__))
+    (local.set $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (local.set $z (i32.const 10))
     (loop $l
       (call $rec1 (local.get $z))

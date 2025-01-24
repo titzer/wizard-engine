@@ -7,7 +7,7 @@
 
     (local.set $z (call $alloc (ref.null $st) (i32.const 65)))
 
-    (local.set $y (i32.const __INNER_ITERATIONS__))
+    (local.set $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (loop $l
       (call $walk (local.get $z))
       drop
