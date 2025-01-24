@@ -9,6 +9,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 	var tiering: ExecutionStrategy;
 	var validate_code = true;
 	var names = !TraceOptions.NO_NAMES.get();
+	var outline: ModuleOutline;
 
 	private def cache = Canon.globalCache;
 	private var validator: CodeValidator;
@@ -22,6 +23,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 	private var subtype_list: Vector<(u64, int)>;
 
 	new() super(Module.new(filename)) {
+		module.outline = outline;
 		fsm = BpFsm.new(extensions, limits, err, this);
 		decoder = fsm.decoder;
 		parser = WasmParser.new(extensions, limits, module, err, fsm.decoder);
@@ -32,7 +34,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 	// array is not modified or retained by this call; internal copies of
 	// data are made if necessary. However, do not pass an array that could
 	// be concurrently modified, as it may be decoded in place.
-	def push(x: Array<byte>, xpos: int, xlength: int) -> this {
+	def push(x: Array<byte>, xpos: int, xlength: int) -> this { // XXX: refactor to Range<byte>
 		if (xlength == 0) return; // nothing to do
 		if (err.error()) return;  // already hit an error
 
@@ -56,7 +58,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 	}
 
 	def decodeSection(kind: BpSection, size: u32, d: DataReader) {
-		var start = d.pos;
+		var start = d.pos, startAddr = d.startAddr + u32.view(start);
 		decoder = parser.decoder = d;
 //		parser.debugBuffer();
 		enforceSectionOrder(kind, d.addr_of(d.pos-1));
@@ -65,37 +67,37 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 			Unknown => readCustomSection(size);
 			Type => {
 				var count = readCountAndReserve("types", module.heaptypes, limits.max_num_types);
-				readLoop("type", count, readDefType);
+				readLoop("type", count, readDefType, if(outline != null, outline.heaptypes.set(startAddr, size)));
 			}
 			Import => {
 				var count = readCountAndReserve("imports", module.imports, limits.max_num_imports);
-				readLoop("imports", count, readImportDecl);
+				readLoop("imports", count, readImportDecl, if(outline != null, outline.imports.set(startAddr, size)));
 			}
 			Function => {
 				var count = readCountAndReserve("functions", module.functions, limits.max_num_functions);
 				declared_func_count = u32.!(count);
-				readLoop("functions", count, readFuncDecl);
+				readLoop("functions", count, readFuncDecl, if(outline != null, outline.functions.set(startAddr, size)));
 			}
 			Table => {
 				var count = readCountAndReserve("tables", module.tables, limits.max_num_tables);
-				readLoop("tables", count, readTableDecl);
+				readLoop("tables", count, readTableDecl, if(outline != null, outline.tables.set(startAddr, size)));
 			}
 			Memory => {
 				var count = readCountAndReserve("memories", module.memories, limits.max_num_memories);
-				readLoop("memories", count, readMemoryDecl);
+				readLoop("memories", count, readMemoryDecl, if(outline != null, outline.memories.set(startAddr, size)));
 			}
 			Tag => {
 				var count = readCountAndReserve("tags", module.tags, limits.max_num_tags);
-				readLoop("tags", count, readTagDecl);
+				readLoop("tags", count, readTagDecl, if(outline != null, outline.tags.set(startAddr, size)));
 			}
 			Global => {
 				var count = readCountAndReserve("globals", module.globals, limits.max_num_globals);
-				readLoop("globals", count, readGlobalDecl);
+				readLoop("globals", count, readGlobalDecl, if(outline != null, outline.globals.set(startAddr, size)));
 			}
 			Export => {
 				var count = readCountAndReserve("exports", module.exports, limits.max_num_exports);
 				var set = StringSet.new(count);
-				readLoop("exports", count, readExportDecl(_, set));
+				readLoop("exports", count, readExportDecl(_, set), if(outline != null, outline.exports.set(startAddr, size)));
 			}
 			// note: Code section handled specially by BpFsm.
 			Data => {
@@ -104,11 +106,11 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 				if (module.explicit_data_count >= 0 && count != module.explicit_data_count) {
 					return err.rel(decoder, pos).DataCountMismatch(module.explicit_data_count, u32.!(count));
 				}
-				readLoop("data segments", count, readDataDecl);
+				readLoop("data segments", count, readDataDecl, if(outline != null, outline.data.set(startAddr, size)));
 			}
 			Element => {
 				var count = readCountAndReserve("elements", module.elems, limits.max_num_table_entries);
-				readLoop("elements", count, readElemDecl);
+				readLoop("elements", count, readElemDecl, if(outline != null, outline.elements.set(startAddr, size)));
 			}
 			Start => readStartSection();
 			DataCount => readDataCountSection();
@@ -145,6 +147,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 	}
 	def readCustomSection(size: u32) {
 		var start = decoder.pos;
+		if (outline != null) outline.custom_sections.put(decoder.addr(), decoder.addr() + size);
 		var name = parser.readUtf8String("custom section name");
 		var payload_len = int.!(size) - (decoder.pos - start);
 		if (payload_len < 0) {
@@ -154,10 +157,11 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 		module.custom_sections.put(CustomSection.new(name, payload));
 		if (names && Strings.equal("name", name)) module.names = NameSection.new(module, payload);
 	}
-	def readLoop(thing_name: string, count: int, read: int -> void) {
+	def readLoop(thing_name: string, count: int, read: int -> void, outline: Vector<u32>) {
 		for (i < count) {
 			if (err.error()) break;
 			err.index = i;
+			if (outline != null) outline.put(u31.!(decoder.addr()));
 			if (Trace.binparse) Trace.OUT.put2("-->%s #%d", thing_name, i).ln();
 			read(i);
 		}
