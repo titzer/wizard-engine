@@ -1,42 +1,43 @@
 // Copyright 2023 Wizard Authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-/// Links the main module with the pre-loaded modules, and returns the main module instance.
-///
-/// The linker partially instantiates all the modules, then resolve each import to its original
-/// provider, then completes the instantiation. This allows bi-directional imports among multiple modules,
-/// as long as the import chain is acyclic.
+// Links the main module with the pre-loaded modules and returns the main module instance.
+// The linker partially instantiates all the modules, then resolve each import to its original
+// provider, then completes the instantiation. This allows bi-directional imports among multiple
+// modules, as long as the import chain is acyclic.
 class ModuleLinker(engine: Engine,
-				   program_args: Array<string>,
-				   named_modules: Array<(string, Module)>,
-				   binder: (Decl, Exportable) -> Exportable,
-				   error: ErrorGen) {
-    private def instantiators = Strings.newMap<(Instantiator, int)>();
-	private def exportable_cache = Array<Array<(Exportable, Decl)>>.new(named_modules.length);
-	private def deferred_imports = Array<Array<int>>.new(named_modules.length);
+		   program_args: Array<string>,
+		   error: ErrorGen) {
+	def named_modules = Vector<NamedModule>.new();
+	var binder: (Decl, Exportable) -> Exportable;
+	private def instantiators = Strings.newMap<(Instantiator, int)>();
+	private var exportable_cache: Array<Array<(Exportable, Decl)>>;
+	private var deferred_imports: Array<Array<int>>;
 
 	def link() -> Array<Instantiator> {
 		// Expose the wizeng HostModule if it's an activated extension
 		if (engine.extensions.WIZENG) ModuleRegistry.expose("wizeng");
 
+		exportable_cache = Array.new(named_modules.length);
+		deferred_imports = Array.new(named_modules.length);
+
 		for (i < named_modules.length) {
-			var named_module = named_modules[i];
+			var nm = named_modules[i];
 			var instantiator = partiallyInstantiate(i);
 			if (error.error()) return null;
-			instantiators[named_module.0] = (instantiator, i);
-			if (named_module.1.exports.length > 0) {
-				exportable_cache[i] = Array<(Exportable, Decl)>.new(named_module.1.exports.length);
+			instantiators[nm.name] = (instantiator, i);
+			if (nm.module.exports.length > 0) {
+				exportable_cache[i] = Array<(Exportable, Decl)>.new(nm.module.exports.length);
 			}
 		}
 		for (i < named_modules.length) {
 			if (deferred_imports[i].length == 0) continue;
-			var name = named_modules[i].0;
-			var module = named_modules[i].1;
-			var instantiator = instantiators[name].0;
+			var nm = named_modules[i];
+			var instantiator = instantiators[nm.name].0;
 			var imports = instantiator.imports;
-			for (j < module.imports.length) {
+			for (j < nm.module.imports.length) {
 				if (instantiator.imports[j] == null) {
-					var imp_decl = module.imports[j];
+					var imp_decl = nm.module.imports[j];
 					var requested_mod = imp_decl.imp.module_name;
 					var requested_field = imp_decl.imp.field_name;
 					instantiator.imports[j] = resolveImport(
@@ -52,20 +53,19 @@ class ModuleLinker(engine: Engine,
 			if (error.error()) return null;
 		}
 		var all_instantiators = Array<Instantiator>.new(named_modules.length);
-		for (i < named_modules.length) all_instantiators[i] = instantiators[named_modules[i].0].0;
+		for (i < named_modules.length) all_instantiators[i] = instantiators[named_modules[i].name].0;
 		return all_instantiators;
-    }
-
-    private def partiallyInstantiate(module_id: int) -> Instantiator {
-		var name = named_modules[module_id].0;
-		var module = named_modules[module_id].1;
+	}
+	private def partiallyInstantiate(module_id: int) -> Instantiator {
+		var name = named_modules[module_id].name;
+		var module = named_modules[module_id].module;
 		var imports = Array<Exportable>.new(module.imports.length);
 		var i = Instantiator.new(engine.extensions, module, imports, error);
 		i.binder = binder;
 		var deferred_imports = Vector<int>.new();
 		var processor_map = Strings.newMap<ImportProcessor>();
 		for (j < module.imports.length) {
-	    	var imp_mod_name = module.imports[j].imp.module_name;
+			var imp_mod_name = module.imports[j].imp.module_name;
 			// first try to match the import to loaded wasm modules,
 			// then instantiate host module processors
 			if (isDynamicImport(imp_mod_name, name)) {
@@ -74,12 +74,11 @@ class ModuleLinker(engine: Engine,
 			}
 			addHostModuleProcessors(module_id, j, imp_mod_name, i.processors, processor_map);
 			if (error.error()) return null;
-	    }
+		}
 		this.deferred_imports[module_id] = deferred_imports.extract();
 		i.runPartial(this.deferred_imports[module_id]);
 		return i;
 	}
-
 	// finds the Exportable instance for each import from a partially instantiated wasm module.
 	private def resolveImport(
 			imp_decl: Decl,
@@ -89,7 +88,7 @@ class ModuleLinker(engine: Engine,
 			max_steps: int) -> (Exportable, Decl) {
 		var requested_ins = instantiators[requested_module].0.instance;
 		var req_mod_id = instantiators[requested_module].1;
-		var importer_mod_name = named_modules[importer_id].0;
+		var importer_mod_name = named_modules[importer_id].name;
 		error.index = importer_id;
 		for (exp_id < requested_ins.module.exports.length) {
 			var exp = requested_ins.module.exports[exp_id];
@@ -119,38 +118,38 @@ class ModuleLinker(engine: Engine,
 				return exportable;
 			}
 		}
+		// TODO: factor out errors into their own methods in ErrorGen
 		error.abs(u64.view(importer_id)).setc(WasmError.IMPORT_COUNT_MISMATCH, StringBuilder.new()
 			.put3("%s.wasm: field \"%s\" from module \"%s\" not found\n",
-					importer_mod_name, field_name, requested_module)
+				importer_mod_name, field_name, requested_module)
 			.toString());
 		return (null, null);
 	}
-
 	private def addHostModuleProcessors(
-				mod_id: int,
-				import_id: int,
-				imp_mod_name: string,
-				processors: Vector<ImportProcessor>,
-				processor_map: HashMap<string, ImportProcessor>) {
+		mod_id: int,
+		import_id: int,
+		imp_mod_name: string,
+		processors: Vector<ImportProcessor>,
+		processor_map: HashMap<string, ImportProcessor>) {
+
 		if (processor_map[imp_mod_name] == null) {
-			var mod_name = named_modules[mod_id].0;
-	    	var p = ModuleRegistry.get(imp_mod_name);
+			var mod_name = named_modules[mod_id].name;
+			var p = ModuleRegistry.get(imp_mod_name);
 			error.index = mod_id;
-	    	if (p == null) {
+			if (p == null) {
 				error.abs(u64.view(import_id)).setc(WasmError.IMPORT_COUNT_MISMATCH, StringBuilder.new()
-	    			.put2("%s.wasm: import from unknown module \"%s\"\n", mod_name, imp_mod_name).toString());
+				.put2("%s.wasm: import from unknown module \"%s\"\n", mod_name, imp_mod_name).toString());
 				return;
 			}
 			var trace = BasicTracing.moduleFilter != null && BasicTracing.moduleFilter.matchesStr(imp_mod_name, null);
 			p.init(program_args, trace, error);
-	    	processor_map[imp_mod_name] = p;
+			processor_map[imp_mod_name] = p;
 			processors.put(processor_map[imp_mod_name]);
-	    }
+		}
 	}
-
 	private def isDynamicImport(module_name: string, self_name: string) -> bool {
 		if (Strings.equal(module_name, self_name)) return false;
-		for (i < named_modules.length) if (Strings.equal(named_modules[i].0, module_name)) return true;
+		for (i < named_modules.length) if (Strings.equal(named_modules[i].name, module_name)) return true;
 		return false;
 	}
 }
