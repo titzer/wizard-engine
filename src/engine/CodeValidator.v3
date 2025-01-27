@@ -14,6 +14,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def ctlxfer = SidetableBuilder.new();
 	def ex_handlers = Vector<ExHandlerEntry>.new();
 	def suspend_handlers = Vector<ExHandlerEntry>.new();
+	def switch_handlers = Vector<ExHandlerEntry>.new();
 	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
 	var func_start_pos: int;
 	var func: FuncDecl;
@@ -68,6 +69,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 
 		if (ex_handlers.length > 0) func.handlers = ex_handlers.extract();
 		if (suspend_handlers.length > 0) func.suspend_handlers = suspend_handlers.extract();
+		if (switch_handlers.length > 0) func.switch_handlers = switch_handlers.extract();
 
 		// Report metrics and return success.
 		if (err.ok()) {
@@ -1150,12 +1152,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				SUSPEND => {
 					var tag = parser.readTagRef();
 					if (tag == null) return;
-					var tag_sig = module.heaptypes[tag.sig_index];
-					if (!SigDecl.?(tag_sig)) {
-						err_atpc().ExpectedSignature(tag_sig);
-						return;
-					}
-
+					var tag_sig = getTagSig(tag);
+					if (tag_sig == null) return;
 					checkSignature(SigDecl.!(tag_sig));
 				}
 				RESUME => {
@@ -1185,7 +1183,40 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 
 					readAndCheckContHandlerTable(ct, handlers);
 				}
+				SWITCH => {
+					var ct1 = parser.readCont();
+					if (ct1 == null) return;
+					var tag = parser.readTagRef();
+					if (tag == null) return;
 
+					var tag_sig = getTagSig(tag);
+					if (tag_sig == null) return;
+					if (tag_sig.params.length != 0) return err_atpc().InvalidTagSignatureParam(tag_sig);
+					var t = tag_sig.results;
+
+					if (ct1.sig.params.length == 0) return err_atpc().ExpectedContInParam(ct1);
+					var ct2_val = ct1.sig.params[ct1.sig.params.length - 1];
+					if (!ValueType.Ref.?(ct2_val)) return err_atpc().ExpectedRefType(ct2_val);
+					var ct2_ref = ValueType.Ref.!(ct2_val).heap;
+					if (!HeapType.Cont.?(ct2_ref)) return err_atpc().ExpectedContinuation(ct2_ref.decl());
+					var ct2 = HeapType.Cont.!(ct2_ref).cont;
+					var t1 = Arrays.range(ct1.sig.params, 0, ct1.sig.params.length - 1);
+					var t2 = ct2.sig.params;
+					var te1 = ct1.sig.results;
+					var te2 = ct2.sig.results;
+
+					popE(ValueTypes.Ref(true, ct1));
+					checkAndPopArgs(t1);
+					pushTypes(t2);
+
+					if (te1.length != t.length) return err_atpc().ArityMismatchInSwitch(t.length, te1.length);
+					if (te2.length != t.length) return err_atpc().ArityMismatchInSwitch(t.length, te2.length);
+
+					for (i < t.length) {
+						if (!ValueTypes.isAssignable(te1[i], t[i])) return err_atpc().ExpectedType(t[i], te1[i]);
+						if (!ValueTypes.isAssignable(t[i], te2[i])) return err_atpc().ExpectedType(te2[i], t[i]);
+					}
+ 				}
 				INVALID => {
 					codeptr.at(opcode_pos);
 					err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
@@ -1360,28 +1391,48 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		if (c.exnref) ct = Arrays.append(ValueTypes.EXNREF, ct); // XXX: avoid array copy
 		if (ct.length != p.length) return err_atpc().ArityMismatchInHandler("catch", i, p.length, ct.length);
 		for (j < p.length) {
-			if (!ValueTypes.isAssignable(ct[j], p[j])) err_atpc().TypeMismatchInHandler("catch", i, p[i], ct[i]);
+			if (!ValueTypes.isAssignable(ct[j], p[j])) err_atpc().TypeMismatchInHandler("catch", i, j, p[j], ct[j]);
 		}
+	}
+	def getTagSig(tag: TagDecl) -> SigDecl {
+		var tag_type = module.heaptypes[tag.sig_index];
+		if (!SigDecl.?(tag_type)) {
+			err_atpc().ExpectedSignature(tag_type);
+			return null;
+		}
+		return SigDecl.!(tag_type);
 	}
 	def readAndCheckContHandlerTable(cont: ContDecl, handlers: Array<SusHandler>) {
 		var sidetable_pos = ctlxfer.sidetable.length;
 		for (i < handlers.length) {
+			// Same sidetable structure is used for both {suspend} and {switch}.
+			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
+			var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
+			var resume_pos = opcode_pos - func_start_pos;
 			match (handlers[i]) {
 				Suspend(tag, depth) => {
 					var target = getControl(depth);
 					if (target == null) return;
 					checkContHandle(i, tag, cont, target);
-					ctlxfer.refC(target, tag, false, "refH");
-
-					var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
-					var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
-					var tag_index = tag.tag_index;
-					var resume_pos = opcode_pos - func_start_pos;
-					suspend_handlers.put(ExHandlerEntry(tag_index, resume_pos, resume_pos + 1, info));
+					ctlxfer.refC(target, tag, false, "refH[suspend]");
+					suspend_handlers.put(ExHandlerEntry(tag.tag_index, resume_pos, resume_pos + 1, info));
 				}
-				Switch(t) => {
-					err_atpc().setc(WasmError.OOB_LABEL, "unimplemented");
-					return;
+				Switch(tag) => {
+					var expected = cont.sig.results;
+					var tag_type = module.heaptypes[tag.sig_index];
+					if (!SigDecl.?(tag_type)) return err_atpc().ExpectedSignature(tag_type);
+					var tag_sig = SigDecl.!(tag_type);
+					if (tag_sig.params.length != 0) return err_atpc().ExpectedEmptySwitchTagParams(tag_sig);
+					if (tag_sig.results.length != expected.length) {
+						return err_atpc().ArityMismatchInHandler("switch", i, expected.length, tag_sig.params.length);
+					}
+					for (j < expected.length) {
+						if (!ValueTypes.isAssignable(tag_sig.results[j], expected[j])) {
+							return err_atpc().TypeMismatchInHandler("switch", i, j, tag_sig.results[j], expected[j]);
+						}
+					}
+					ctlxfer.refC(null, tag, false, "refH[switch]");
+					switch_handlers.put(ExHandlerEntry(tag.tag_index, resume_pos, resume_pos + 1, info));
 				}
 			}
 		}
@@ -1394,20 +1445,19 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			return;
 		}
 
-		var tag_type = module.heaptypes[tag.sig_index];
-		if (!SigDecl.?(tag_type)) return err_atpc().ExpectedSignature(tag_type);
-		var tag_sig = SigDecl.!(tag_type);
+		var tag_sig = getTagSig(tag);
+		if (tag_sig == null) return;
 
 		// p := [<output from label>, (ref null? label_cont)]
-		// [<input to tag>] <: [<output from label>]
+		// [<input to tag>] :> [<output from label>]
 		var n_label_res = p.length - 1;
 		if (tag_sig.params.length != n_label_res) {
 			err_atpc().ArityMismatchInHandler("resume", i, n_label_res, tag_sig.params.length);
 			return;
 		}
 		for (j < n_label_res) {
-			if (!ValueTypes.isAssignable(p[j], tag_sig.params[j])) {
-				return err_atpc().TypeMismatchInHandler("resume", i, tag_sig.params[i], p[i]);
+			if (!ValueTypes.isAssignable(tag_sig.params[j], p[j])) {
+				return err_atpc().TypeMismatchInHandler("resume", i, j, p[j], tag_sig.params[j]);
 			}
 		}
 
@@ -1652,16 +1702,19 @@ class SidetableBuilder {
 		Sidetables.putResumeEntry(sidetable, n_args, n_handlers);
 	}
 	// Emit a sidetable entry for a catch entry or suspension handler.
+	// {target} is nullable and is {null} for a switch handler.
 	def refC(target: ControlEntry, tag: TagDecl, exnref: bool, name: string) {
 		var handler_pc = 0;
 		var stp = sidetable.length;
+		var val_stk_top = if(target != null, target.val_stack_top, 0);
+		var first_ref = if(target != null, target.first_ref, -1);
 		if (Trace.validation) {
 			OUT.put1("    %s", name);
-			OUT.put3("(@+pc tag=%d exnref=%z vsp=%d", if(tag != null, tag.tag_index, -1), exnref, target.val_stack_top);
+			OUT.put3("(@+pc tag=%d exnref=%z vsp=%d", if(tag != null, tag.tag_index, -1), exnref, val_stk_top);
 			OUT.ln();
 		}
-		Sidetables.putCatchEntry(sidetable, handler_pc, target.val_stack_top, target.first_ref);
-		target.first_ref = stp;
+		Sidetables.putCatchEntry(sidetable, handler_pc, val_stk_top, first_ref);
+		if (target != null) target.first_ref = stp;
 	}
 	// Bind the label for {target} at {pos} and {sidetable_pos} and resolve references to it.
 	def bind(target: ControlEntry, pos: int, sidetable_pos: int) {
