@@ -10,6 +10,7 @@
   (export "$alloc_br_table" (func $alloc_br_table))
   (export "wasm:opcode:br($alloc_br(fid, pc))" (func $probe_br))
   (export "wasm:opcode:br_if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
+  (export "wasm:opcode:if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
   (export "wasm:opcode:br_table($alloc_br_table(fid, pc, imm0), arg0)" (func $probe_br_table))
   (export "wasm:exit" (func $print_entries))
 
