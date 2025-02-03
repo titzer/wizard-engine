@@ -148,7 +148,8 @@ function make_binary() {
 
 ### Utility to make the wizeng binary and add some environment variables
 function make_wizeng() {
-    make_binary wizeng
+    local target=$1
+    make_binary wizeng $target
     ret=$?
     export WIZENG=$WIZENG_LOC/$BINARY
     export WIZENG_CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS"
