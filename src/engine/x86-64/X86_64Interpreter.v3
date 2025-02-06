@@ -261,6 +261,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def valuerep = Target.tagging;
 	def initialSize = w.data.length;
 
+	def m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
+
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
@@ -270,8 +272,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	var tailCallReentryLabel = X86_64Label.new();
 	var hostTailCallStubLabel = masm.newLabel(-1);
 	var hostCallStubLabel = masm.newLabel(-1);
-	var resumeStub = X86_64Label.new();
-	var suspendStub = X86_64Label.new();
 	var spcEntryLabel = X86_64Label.new();
 	var controlFallThruLabel = X86_64Label.new();
 	var controlTransferLabel = X86_64Label.new();
@@ -381,7 +381,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		reserveDispatchTables();
 		// Begin code generation
 		genHostCallStub();
-		genStackSwitchStubs();
 		genInterpreterEntry();
 		genOpcodeHandlers();
 		handlerEndOffset = w.atEnd().pos;
@@ -504,67 +503,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_jump_r(xenv.tmp2);
 		}
 		ic.header.hostCallStubEnd = w.pos;
-	}
-	def genStackSwitchStubs() {
-		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
-
-		ic.header.resumeStubOffset = w.pos;
-		asm.bind(resumeStub); {
-			var r_cont = r_tmp0, r_stack = r_tmp1;
-			// pop cont ref from stack
-			decrementVsp();
-			asm.movq_r_m(r_cont, vsph[0].value);
-			// mov %stack, [%curStack]
-			asm.movq_r_m(r_stack, m_curStack);
-
-			var r_bottom = r_tmp3;
-			asm.movq_r_m(r_bottom, r_cont.plus(offsets.Continuation_bottom));
-			// mov [%r_bottom.parent_rsp_ptr], rsp
-			asm.movq_r_m(r_scratch, r_bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
-			asm.movq_m_r(r_scratch.plus(0), r_sp);
-
-			var r_new = r_tmp0;
-			asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
-
-			// mov [%curStack, %new]
-			asm.movq_m_r(m_curStack, r_new);
-
-			// save before switching to new stack pointer
-			// mov [%stack.vsp], %vsp
-			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_vsp), r_vsp);
-			// mov [%stack.rsp], %rsp
-			asm.movq_m_r(r_stack.plus(offsets.X86_64Stack_rsp), r_sp);
-
-			// mov %rsp, [%newStack.rsp]
-			asm.movq_r_m(r_sp, r_new.plus(offsets.X86_64Stack_rsp));
-			// mov %vsp, [%newStack.vsp]
-			asm.movq_r_m(r_vsp, r_new.plus(offsets.X86_64Stack_vsp));
-
-			// TODO[ss]: specialize this
-			// mov %ret_throw, [%newStack.throw_on_resume]
-			asm.movq_r_m(r_ret_throw, r_new.plus(offsets.X86_64Stack_throw_on_resume));
-			// mov [%newStack.throw_on_resume], 0
-			asm.movq_m_i(r_new.plus(offsets.X86_64Stack_throw_on_resume), 0);
-
-			// pop return address and jump to it
-			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-			// jump *%tmp
-			masm.emit_jump_r(xenv.scratch);
-		}
-		ic.header.resumeStubEnd = w.pos;
-
-		ic.header.suspendStubOffset = w.pos;
-		asm.bind(suspendStub); {
-			asm.movq_r_m(r_scratch, m_curStack);
-			asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
-			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
-
-			// load regs from handler stack
-			restoreCallerIVars();
-			restoreDispatchTableReg();
-			endHandler();
-		}
-		ic.header.suspendStubEnd = w.pos;
 	}
 	def genInterpreterEntry() {
 		var shared_entry = X86_64Label.new();
@@ -2146,7 +2084,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		patchDispatchTable(Opcode.EXTERN_CONVERT_ANY, firstDispatchOffset);
 	}
 	def genMisc() {
-		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
 		bindHandler(Opcode.MEMORY_SIZE); {
 			genReadUleb32(r_tmp1);
 			asm.movq_r_m(r_tmp0, r_instance.plus(offsets.Instance_memories));
@@ -2226,24 +2163,28 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.RESUME); {
-			var cont_id = r_tmp0, ip_store = r_tmp1;
+			var resumeStub = X86_64Label.new();
+			var cont_id = r_tmp0, r_ip_store = r_tmp1;
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
 			// read info and rewind %ip (need %ip at start of opcode during call)
-			asm.movq_r_r(ip_store, r_ip);
+			asm.movq_r_r(r_ip_store, r_ip);
 			genReadUleb32(cont_id); // read signature index
-			asm.movq_r_r(r_ip, ip_store);
-
+			asm.movq_r_r(r_ip, r_ip_store);
 			saveCallerIVars();
-			callRuntime(refRuntimeCall(RT.runtime_process_resume), [r_instance, cont_id], true);
+			var r_cont = r_tmp1;
+			genResume(cont_id, r_cont, r_tmp3);
+			// move parameter values from %curStack to %cont.top
+			var r_nvals = cont_id;
+			masm.emit_cont_mv(r_vsp, r_cont, r_nvals, r_tmp3, r_tmp4, r_xmm0);
 			asm.call_rel_far(resumeStub);
-
 			/* === CHILD STACK RUNNING === */
-
 			genOnResumeFinish(false);
 			endHandler();
+			asm.bind(resumeStub); { genResumeStub(r_cont, r_tmp0, r_tmp3, false); }
 		}
 		bindHandler(Opcode.RESUME_THROW); {
+			var resumeStub = X86_64Label.new();
 			var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp3;
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
@@ -2252,18 +2193,26 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(cont_id); // read signature index
 			genReadUleb32(tag_index); // read tag index
 			asm.movq_r_r(r_ip, ip_store);
-
 			saveCallerIVars();
-			callRuntime(refRuntimeCall(RT.runtime_process_resume_throw), [r_instance, cont_id, tag_index], true);
+			var r_cont = r_tmp1;
+			genResume(cont_id, r_cont, r_tmp4);
+			var r_tag = r_tmp3;
+			asm.movq_r_m(r_scratch, r_instance.plus(offsets.Instance_tags));
+			asm.movq_r_m(r_tag, r_scratch.plusR(tag_index, offsets.REF_SIZE, offsets.Array_contents));
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_process_resume_throw), [r_instance, r_cont, r_tag], false);
+			asm.movq_r_r(r_cont, r_runtime_ret0);
+			restoreCallerIVars();
 			asm.call_rel_far(resumeStub);
-
 			/* === CHILD STACK RUNNING === */
-
 			genOnResumeFinish(true);
 			endHandler();
+
+			asm.bind(resumeStub); { genResumeStub(r_cont, r_tmp0, r_tmp3, true); }
 		}
 		bindHandler(Opcode.SUSPEND); {
 			var tag_index = r_tmp0;
+			var suspendStub = X86_64Label.new();
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
 			genReadUleb32(tag_index); // read tag index
@@ -2277,6 +2226,15 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			restoreDispatchTableReg();
 			endHandler();
+
+			asm.bind(suspendStub); {
+				asm.movq_r_m(r_scratch, m_curStack);
+				asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
+				asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
+				restoreCallerIVars();
+				restoreDispatchTableReg();
+				endHandler();
+			}
     }
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			computeCurIpFromIp(-1);
@@ -3700,8 +3658,51 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		fatal("ran out of buffer space");
 		return w;
 	}
+	// generates {resume} code (factored out for both {resume} and {resume_throw})
+	// params:
+	// - r_cont_id[input/output]: index of the continuation type (output no. of params)
+	// - r_tag_id[input]: index of the {resume_throw} tag
+	// - r_cont[output]: pointer to the popped continuation
+	private def genResume(r_cont_id: X86_64Gpr, r_cont: X86_64Gpr, tmp1: X86_64Gpr) {
+		var r_nvals = r_cont_id; // reuse due to non-overlapping live ranges
+		genPopInto(r_cont);
+		// get number of bind arguments from signature
+		asm.movq_r_m(r_scratch, r_instance.plus(offsets.Instance_heaptypes));
+		asm.movq_r_m(r_scratch, r_scratch.plusR(r_cont_id, offsets.REF_SIZE, offsets.Array_contents));
+		masm.emit_get_params_length(r_scratch, r_nvals);
+		// validates continuation
+		// if (%cont == null) trap(NULL_DEREF);
+		asm.q.cmp_r_i(r_cont, 0);
+		asm.jc_rel_far(X86_64Conds.Z, newTrapLabel(TrapReason.NULL_DEREF));
+		// if ([%cont.used]) trap(USED_CONTINUATION);
+		asm.movq_r_m(r_scratch, r_cont.plus(offsets.Continuation_used));
+		asm.q.cmp_r_i(r_scratch, 0);
+		asm.jc_rel_far(X86_64Conds.NZ, newTrapLabel(TrapReason.USED_CONTINUATION));
+		// mov [%cont.used], 1
+		asm.movq_m_i(r_cont.plus(offsets.Continuation_used), 1);
+		// set flags for both stack and set %bottom.parent
+		var r_curStack = tmp1;
+		asm.movq_r_m(r_curStack, m_curStack);
+		masm.emit_configure_cont(r_curStack, r_cont);
+	}
+	// generates a call stub for {resume}; necessary for stack switching logic
+	// %cont must be populated; other parameters are for designated register usage
+	private def genResumeStub(r_cont: X86_64Gpr, r_old: X86_64Gpr, r_new: X86_64Gpr, is_resume_throw: bool) {
+		asm.movq_r_m(r_old, m_curStack);
+		masm.emit_set_cont_bottom_parent(r_cont, r_sp);
+		asm.movq_r_m(r_new, r_cont.plus(offsets.Continuation_top));
+		asm.movq_m_r(m_curStack, r_new);
+		masm.emit_switch_stack_ptr_context(r_old, r_new, r_sp, r_vsp);
+		if (is_resume_throw) masm.emit_set_error_on_resume(r_new, r_ret_throw);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_jump_r(xenv.scratch);
+	}
+	private def genPopInto(reg: X86_64Gpr) {
+		decrementVsp();
+		asm.movq_r_m(reg, vsph[0].value);
+	}
+	// generates cleanup code for after a child stack returns
 	private def genOnResumeFinish(skip_tag: bool) {
-		var m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
 		var done = X86_64Label.new();
 		// check for error (in %rax)
 		asm.q.cmp_r_i(r_ret_throw, 0);
