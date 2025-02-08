@@ -18,7 +18,7 @@
   (type $c2 (cont $f2))
 
   ;; type of $to
-  (type $f3 (func (param i32 i32 (ref null $c2)) (result i32 i32)))
+  (type $f3 (func (param (ref null $s) (ref null $c2)) (result i32 i32)))
   (type $c3 (cont $f3))
 
   ;; dummy continuation type to test for suspension
@@ -28,17 +28,16 @@
   (tag $e (result i32 i32))
 
   (func $from (param $i (ref null $s)) (result i32 i32)
-    (struct.get $s 0 (local.get $i))
-    (struct.get $s 1 (local.get $i))
+    (local.get $i)
     (switch $c3 $e (cont.new $c3 (ref.func $to)))
     (drop)
     (return)
   )
   (elem declare func $from)
 
-  (func $to (param $a i32) (param $b i32) (param $cont (ref null $c2)) (result i32 i32)
-    (i32.add (local.get $a) (i32.const 100))
-    (i32.add (local.get $b) (i32.const 200))
+  (func $to (param $i (ref null $s)) (param $cont (ref null $c2)) (result i32 i32)
+    (i32.add (struct.get $s 0 (local.get $i)) (i32.const 100))
+    (i32.add (struct.get $s 1 (local.get $i)) (i32.const 200))
     (switch $c2 $e (local.get $cont))
     (unreachable)
   )
