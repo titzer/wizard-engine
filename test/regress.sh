@@ -20,9 +20,13 @@ TESTS="$@"
 
 function run_tests() {
 	if [ "$TESTS" =  "" ]; then
-		for dir in core gen; do
-		TESTS=$(ls test/regress/$dir/*.bin.wast)
-		$CMD $TESTS
+		for dir in core gen legacy-exception-handling; do
+		    TESTS=$(ls test/regress/$dir/*.bin.wast)
+		    FLAGS=
+		    if [ -e test/regress/$dir/flags ]; then
+			FLAGS=$(cat test/regress/$dir/flags)
+		    fi
+		    $CMD $FLAGS $TESTS
 		done
 
 	for ext in $(find test/regress -type d) ; do
