@@ -6,31 +6,27 @@ The Wizard Research Engine is a fully-featured WebAssembly engine (virtual machi
 Its implementation is designed to be flexible and easy to grasp, ideal for instrumentation, experimentation and modification.
 Built with the future in mind, it is written in a fast and lightweight, safe, garbage-collected programming language, [Virgil](https://github.com/titzer/virgil).
 
-## Features ##
+## Feature Support ##
 
-Wizard supports Wasm standard features, including:
+Wizard supports most Wasm standard features, including all of Wasm 2.0.
+Never features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
 
-  * Wasm MVP features
-  * Multi-values
-  * Reference types
-  * Bulk-memory operations
-  * SIMD
-
-Wizard fully supports these Wasm proposals:
-
-  * Exception handling
-  * Tail-call
-  * GC
-  * Function References
-  * Multi-memory
-
-Other features under development:
-
-  * Threads
-  * Stack-switching
-  * Memory64
-  * Custom page sizes
-  * Relaxed section order
+| Feature / Proposal | load | v3-int | fast-int | spc |
+| ------------------ | ------ | ------ | -------- | --- |
+| Wasm MVP  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| multi-value  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| reference-types  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| bulk-memory  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| SIMD  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| tail-call  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| gc | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| function-references  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
+| exception-handling  | &#x2705;| &#x2705; | &#x2705; | &#9745; |
+| custom-page-sizes  | &#x2705;| &#x2705; |  |  |
+| stack-switching  | &#x2705;| &#x2705; | &#x2705; |  |
+| threads  | &#x2705;| &#9745; | &#x2705; |  |
+| memory64 | &#x2705;| &#x2705; | | |
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.
@@ -53,13 +49,13 @@ Wizard has special support on the `x86-64-linux` target, with a fast, hand-writt
 
 ## Design and Implementation ##
 
-Wizard is simple!
-As opposed to engines focused on performance, Wizard is just a few thousand lines of code.
-Instead, its architecture is focused on flexibility and readability, making it suitable for language and VM research.
+Wizard is remarkably simple for its feature set!
+Its architecture is focused on flexibility and readability, making it suitable for language and VM research, rather than ultimate performance.
+That makes it better suited to research and experimentation.
 
 Wizard is implemented in Virgil, a fast and lightweight programming language.
 Learning Virgil is easy; you can pick it up in no time!
-Using Virgil allows Wizard to compile to a single native binary of just a few hundred kilobytes.
+Using Virgil allows Wizard to compile to a single native binary of about one megabyte.
 Development with Wizard is very quick turnaround, as a full production build takes less than a second.
 Virgil is garbage-collected, thus Wasm proposals such as GC reuse the collector of the underlying language, which keeps Wizard small and easy to understand.
 
