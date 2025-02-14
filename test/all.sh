@@ -62,6 +62,7 @@ function do_script() {
         TEST_MODE=jit $SCRIPT_LOC/${script}.sh || exit_if_failure $?
         TEST_MODE=lazy $SCRIPT_LOC/${script}.sh || exit_if_failure $?
         TEST_MODE=dyn $SCRIPT_LOC/${script}.sh || exit_if_failure $?
+        TEST_MODE=spc $SCRIPT_LOC/${script}.sh || exit_if_failure $?
     fi
 }
 
