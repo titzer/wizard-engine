@@ -12,7 +12,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 make_binary spectest || exit $?
 
-CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_LOC/test/regress.failures -expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET}"
+CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_LOC/test/regress.failures -expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET} -expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET}.${TEST_MODE}"
 
 cd $WIZENG_LOC
 
