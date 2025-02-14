@@ -5,7 +5,7 @@ class V3Interpreter extends WasmStack {
 	private var instrTracer: InstrTracer;
 	private def values = ArrayStack<Value>.new();	// storage of all WasmValues
 	private var state_: StackState;
-	private var stack_switch_info: StackSwitchInfo;	// set when `state_` is `SUSPENDED` or `CALL_CHILD`
+	private var goto_stack: V3Interpreter; // set when state_ == {CALL_CHILD|SUSPENDED}
 	private var cache: V3Frame;			// cache of all V3Frame objects (bottom of stack)
 	private var frame: V3Frame;
 	private var host_frame: HostFrame;
@@ -60,11 +60,11 @@ class V3Interpreter extends WasmStack {
 		match (state_) {
 			THROWING => return clearAndThrow();
 			RETURNING => return clearAndReturn();
-			SUSPENDED => return Result.StackSwitch(stack_switch_info);
-			CALL_CHILD => return Result.StackSwitch(stack_switch_info);
+			SUSPENDED, CALL_CHILD => return Result.Switch(goto_stack);
 			_ => {
 				clear();
-				return Result.Throw(Trap.new(TrapReason.ERROR, "invalid interpreter state", null)); // TODO: error message for wrong state
+				var trap = Trap.new(TrapReason.ERROR, Strings.format1("invalid interpreter state: %s", state_.name), null);
+				return Result.Throw(trap);
 			}
 		}
 	}
@@ -1157,15 +1157,10 @@ class V3Interpreter extends WasmStack {
 				var cont = popContinuation();
 				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
-				cont.used = true;
+				if (Trace.stack) Trace.OUT.put1("resume %q", cont.render).ln();
 
-				var n_binds = cont_type.sig.params.length;
-				cont.top.bind(values.peekn(n_binds));
-				values.top -= n_binds;
-
-				prev_resume_pc = frame.pc;
-				state_ = StackState.CALL_CHILD;
-				stack_switch_info = StackSwitchInfo.RunChildStack(cont);
+				cont.top.bind(popN(cont_type.sig.params));
+				setupResume(cont);
 				return; // skip setting frame.pc = codeptr.pos
 			}
 			RESUME_THROW => {
@@ -1178,27 +1173,25 @@ class V3Interpreter extends WasmStack {
 				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 
-				var exn_tag = frame.func.instance.tags[tag_idx];
-				var n_vals = exn_tag.sig.params.length;
-				var vals = Ranges.dup(values.peekn(n_vals));
-				values.top -= n_vals;
-				var throwable = Exception.new(exn_tag, vals, null);
-
-				cont.used = true;
-				var res = cont.top.throw(throwable);
-				prev_resume_pc = frame.pc;
-				state_ = StackState.CALL_CHILD;
-				stack_switch_info = StackSwitchInfo.RunChildStack(cont);
+				var tag = frame.func.instance.tags[tag_idx];
+				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
+				cont.top.throw(Exception.new(tag, popN(tag.sig.params), null));
+				setupResume(cont);
+				return; // skip setting frame.pc = codeptr.pos
 			}
 			SUSPEND => {
 				var tag = frame.func.instance.tags[codeptr.read_uleb32()];
-				var n_vals = tag.sig.params.length;
-				var range = Ranges.dup(values.peekn(n_vals));
-				values.top -= n_vals;
 
 				state_ = StackState.SUSPENDED;
 				params_arity = tag.sig.results.length;
-				stack_switch_info = StackSwitchInfo.Suspend(this, tag, range);
+
+				var bottom = unwindParentChain(V3Interpreter.tryHandleSuspend(_, tag));
+				if (bottom == null) return;
+				var cont = Continuation.new(this, bottom);
+				var handler = V3Interpreter.!(bottom.parent);
+				handler.pushN(popN(tag.sig.params));
+				handler.push(Value.Ref(cont));
+				goto_stack = handler;
 			}
 			SWITCH => {
 				// `other_cont`: the continuation to switch to
@@ -1213,16 +1206,25 @@ class V3Interpreter extends WasmStack {
 				if (other_cont == null) return void(trap(TrapReason.NULL_DEREF));
 				if (other_cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 
-				var n_vals = other_cont_decl.sig.params.length - 1; // -1 to exclude continuation parameter
-				var range = Ranges.dup(values.peekn(n_vals));
-				values.top -= n_vals;
+				// -1 to exclude continuation parameter
+				var other_params = other_cont_decl.sig.params;
+				var vals = popN(other_params[0 ... other_params.length - 1]);
 
 				var other_top_val = other_cont_decl.sig.params[other_cont_decl.sig.params.length - 1];
 				var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(other_top_val).heap).cont);
 
 				state_ = StackState.SUSPENDED;
 				params_arity = this_cont_decl.sig.params.length;
-				stack_switch_info = StackSwitchInfo.Switch(other_cont, this, tag, range);
+
+				var bottom = unwindParentChain(V3Interpreter.canHandleSwitch(_, tag));
+				if (bottom == null) return;
+				var handler = V3Interpreter.!(bottom.parent);
+				bottom.parent = null;
+				other_cont.bottom.parent = handler;
+				other_cont.top.bind(vals);
+				other_cont.top.bind([Value.Ref(Continuation.new(this, bottom))]);
+
+				goto_stack = V3Interpreter.!(other_cont.top);
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
 			_ => {
@@ -1519,15 +1521,16 @@ class V3Interpreter extends WasmStack {
 		var handler = frame.func.decl.findSwitchHandler(frame.func.instance, tag, prev_resume_pc);
 		return handler.handler_pc >= 0; // {switch} entries uses `0` as dummy handler pc
 	}
-	// Returns whether the suspend got handled.
-	def tryHandleSuspend(cont: Continuation, tag: Tag, vals: Array<Value>) -> bool {
+	// Returns whether the suspend got handled. This does NOT push the values and
+	// the remaining continuation, but implicit popping and goto are handled.
+	def tryHandleSuspend(tag: Tag) -> bool {
 		var handler = frame.func.decl.findSuspendHandler(frame.func.instance, tag, prev_resume_pc);
 		if (handler.handler_pc < 0) return false;
 
 		prev_resume_pc = -1;
 		values.top = frame.fp + handler.val_stack_top + frame.func.decl.num_locals;
-		values.pusha(vals);
-		values.push(Value.Ref(cont));
+		// values.pusha(vals);
+		// values.push(Value.Ref(cont));
 
 		var code = frame.func.decl.cur_bytecode;
 		frame.pc = handler.handler_pc;
@@ -1624,6 +1627,7 @@ class V3Interpreter extends WasmStack {
 	def pushd(val: double) { values.push(Value.F64(u64.view(val))); }
 	def pushz(val: bool) { values.push(if(val, Values.I32_1, Values.I32_0)); }
 	def pushs(low: u64, high: u64) { values.push(Value.V128(low, high)); }
+	def pushN(vs: Range<Value>) { for (i < vs.length) push(vs[i]); }
 	def popN(t: Range<ValueType>) -> Array<Value> {
 		var result = Array<Value>.new(t.length);
 		var sp = values.top - t.length;
@@ -1825,6 +1829,24 @@ class V3Interpreter extends WasmStack {
 			out.ln();
 			last_fp = f.fp;
 		}
+	}
+	private def setupResume(cont: Continuation) {
+		cont.used = true;
+		prev_resume_pc = frame.pc;
+		state_ = StackState.CALL_CHILD;
+		cont.bottom.parent = this;
+		goto_stack = V3Interpreter.!(cont.top);
+	}
+	// returns the last stack where {pred} is {false} on
+	private def unwindParentChain(pred: V3Interpreter -> bool) -> V3Interpreter {
+		var stack = this;
+		while (stack.parent != null) {
+			var prev = stack;
+			stack = V3Interpreter.!(stack.parent);
+			if (pred(stack)) return prev;
+		}
+		trap(TrapReason.INVALID_SUSPEND);
+		return null;
 	}
 }
 
