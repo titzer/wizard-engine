@@ -19,6 +19,7 @@ Never features are under development and vary in their support in the different 
 | bulk-memory  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | SIMD  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | tail-call  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
+| multi-memory  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | gc | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | function-references  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
