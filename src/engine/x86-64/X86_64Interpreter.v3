@@ -644,11 +644,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.jc_rel_near(C.NZ, start);
 		asm.bind(done);
 
-		// Check for any exception handler slots
-		if (FastIntTuning.legacyExceptionHandling) {
-			asm.movwzx_r_m(r_tmp2, r_func_decl.plus(offsets.FuncDecl_num_ex_slots));
-			asm.d.shl_r_i(r_tmp2, valuerep.slot_size_log);
-			asm.q.add_r_r(r_vsp, r_tmp2); // skip ex slots; ok to leave uninitialized.
+		// Check for any frame variables, which are used for either legacy exceptions or probes.
+		if (!FeatureDisable.frameVariables) {
+			asm.movq_r_m(r_tmp2, r_func_decl.plus(offsets.FuncDecl_frame_var_tags));
+			asm.q.cmp_r_i(r_tmp2, 0);
+			genConditionalJumpDeferred(C.NZ, genPushFrameVarTags(_, r_tmp2));
 		}
 
 		// Check for function entry probe.
@@ -657,9 +657,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
 		}
 
-		// execute first instruction
+		// Dispatch to first instruction.
 		genDispatchOrJumpToDispatch();
 
+		// Bind an entrypoint for deopt reentry.
 		ic.header.deoptReentryOffset = w.atEnd().pos;
 		restoreCallerIVars();
 		restoreReg(r_vsp);
@@ -691,6 +692,24 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		restoreCallerIVars();
 		//TODO: restoreDispatchTableReg();
 		genJumpToDispatch();
+	}
+	def genPushFrameVarTags(retpoint: X86_64Label, r_frame_var_tags: X86_64Gpr) {
+		var r_start = r_frame_var_tags, r_end = r_tmp1, r_tag = r_tmp3;
+		asm.movd_r_m(r_end, r_frame_var_tags.plus(offsets.Array_length));
+		asm.q.lea(r_start, r_frame_var_tags.plus(offsets.Array_contents));
+		asm.q.add_r_r(r_end, r_start);
+		var loop = X86_64Label.new();
+		// while (r_start < r_end)
+		asm.bind(loop);
+		asm.q.cmp_r_r(r_start, r_end);
+		asm.jc_rel_far(C.GE, retpoint);
+		asm.movbzx_r_m(r_tag, r_start.plus(0));
+		genTagPushR(r_tag);			// *(sp) = type
+		asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
+		incrementVsp();	// sp += 1 slot
+		// gen: while (--num != 0)
+		asm.q.inc_r(r_start);
+		asm.jmp_rel_near(loop);
 	}
 	def genDeferred() {
 		for (l = deferred; l != null; l = l.tail) {
@@ -1034,7 +1053,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			// should not return
 			asm.invalid();
 		}
-		if (FastIntTuning.legacyExceptionHandling) {
+		if (!FeatureDisable.legacyExceptions) {
 			bindHandler(Opcode.DELEGATE);
 			genSkipLeb();
 			endHandler();
