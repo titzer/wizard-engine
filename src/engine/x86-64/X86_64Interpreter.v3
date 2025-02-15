@@ -362,6 +362,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		ivar_CURPC
 	];
 
+	var deferred: List<(X86_64Label, X86_64Label, X86_64Label -> void)>;
+
 	new() {
 		w.refill = reportOom;
 		var p = Patcher.new(w);
@@ -402,6 +404,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				.ln();
 		}
 		if (w.pos > initialSize) fatal(Strings.format2("need %d bytes for interpreter code, only allocated %d", w.pos, initialSize));
+	}
+	def genConditionalJumpDeferred(cond: X86_64Cond, emit: X86_64Label -> void) {
+		var ool = X86_64Label.new();
+		asm.jc_rel_far(cond, ool);
+		var retpoint = X86_64Label.new();
+		asm.bind(retpoint);
+		deferred = List.new((ool, retpoint, emit), deferred);
 	}
 	def genTypeTagTable() {
 		if (FeatureDisable.complexBlockTypes) return;
@@ -616,9 +625,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// check for extended LEB, abstract type, or type with immediate
 		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
-		var complex_type_decode = X86_64Label.new();
-		asm.jc_rel_far(C.NZ, complex_type_decode);
-		asm.bind(type_done);
+		genConditionalJumpDeferred(C.NZ, genComplexTypeDecode(_, typeGpr));
 
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
@@ -645,47 +652,54 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 
 		// Check for function entry probe.
-		var func_entry_probe_label: X86_64Label;
 		if (!FeatureDisable.entryProbes) {
-			func_entry_probe_label = asm.newLabel();
 			asm.test_m_i(r_func_decl.plus(offsets.FuncDecl_entry_probed), 1);
-			asm.jc_rel_far(C.NZ, func_entry_probe_label);
+			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
 		}
 
 		// execute first instruction
 		genDispatchOrJumpToDispatch();
 
-		// handle extended LEB, types with immediates, and abstract types
-		var type_not_leb = X86_64Label.new();
-		asm.bind(complex_type_decode);
-		asm.d.test_r_i(typeGpr, LEB_UPPER_BIT);		// check for LEB first
-		asm.jc_rel_near(C.Z, type_not_leb);
-		genSkipLeb0(r_tmp4);
-		asm.bind(type_not_leb);
-		// check for types that have an immediate
-		asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
-		asm.jc_rel_near(C.Z, type_done);
-		genSkipLeb0(r_tmp4);			// skip offset
-		asm.jmp_rel_near(type_done);
-
-		// Emit code for function entry probe. XXX: move further out-of-line
-		if (func_entry_probe_label != null) {
-			asm.bind(func_entry_probe_label);
-			computePcFromCurIp();
-			if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
-			saveCallerIVars();
-			asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
-			callRuntime(refRuntimeCall(RT.runtime_PROBE_instr), [r_tmp0, r_curpc], true);
-			// fall through
-			restoreCallerIVars();
-			//TODO: restoreDispatchTableReg();
-			genJumpToDispatch();
-		}
 		ic.header.deoptReentryOffset = w.atEnd().pos;
 		restoreCallerIVars();
 		restoreReg(r_vsp);
 		restoreDispatchTableReg();
 		genJumpToDispatch();
+		genDeferred();
+	}
+	def genComplexTypeDecode(retpoint: X86_64Label, r_type: X86_64Gpr) {
+		// handle extended LEB, types with immediates, and abstract types
+		var type_not_leb = X86_64Label.new();
+		asm.d.test_r_i(r_type, LEB_UPPER_BIT);		// check for LEB first
+		asm.jc_rel_near(C.Z, type_not_leb);
+		genSkipLeb0(r_tmp4);
+		asm.bind(type_not_leb);
+		// check for types that have an immediate
+		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
+		asm.d.test_m_i(r_type.plus(typeTableAddr), TYPE_HAS_IMM);
+		asm.jc_rel_far(C.Z, retpoint);
+		genSkipLeb0(r_tmp4);			// skip offset
+		asm.jmp_rel_near(retpoint);
+	}
+	def genFuncEntryProbe(retpoint: X86_64Label) {
+		computePcFromCurIp();
+		if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
+		saveCallerIVars();
+		asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
+		callRuntime(refRuntimeCall(RT.runtime_PROBE_instr), [r_tmp0, r_curpc], true);
+		// fall through
+		restoreCallerIVars();
+		//TODO: restoreDispatchTableReg();
+		genJumpToDispatch();
+	}
+	def genDeferred() {
+		for (l = deferred; l != null; l = l.tail) {
+			var t = l.head;
+			var ool = t.0, retpoint = t.1, emit = t.2;
+			asm.bind(ool);
+			emit(retpoint);
+		}
+		deferred = null;
 	}
 
 	// Generate all the opcode handlers.
