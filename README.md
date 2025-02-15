@@ -85,9 +85,11 @@ Read how to build your own custom [monitors](doc/CustomMonitors.md) for instrume
 
 ### Research Projects
 
-Currently, Wizard supports three closely related research projects:
+Currently, Wizard supports multiple research projects:
 
  * Fast-int: the fast, in-place interpreter for Wasm
+ * [Wasm-R3](https://github.com/sola-st/wasm-r3), a record-reduce-replay framework for Wasm
+ * [Whamm!](https://github.com/ejrgilbert/whamm), a instrumentation DSL for Wasm 
  * Stack-switching: a fast implementation of [WasmFX](https://wasmfx.dev) for Wizard
 
 ## License
