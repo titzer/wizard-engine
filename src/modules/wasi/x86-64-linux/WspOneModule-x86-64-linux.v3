@@ -25,7 +25,7 @@ def SYS_kill = 37;
 def SYS_getpid = 39;
 def SYS_statx = 332;
 def SYS_ftruncate = 77;
-def SYS_getdents = 78;
+def SYS_getdents64 = 217;
 
 def STATX_ALL = 0x00000FFF; // all currently-supported flags
 def AT_SYMLINK_NOFOLLOW = 0x100;
@@ -55,20 +55,15 @@ def S_IFIFO  = 0x1000; // FIFO
 def UTIME_NOW = (1L << 30) - 1L;
 def UTIME_OMIT = (1L << 30) - 2L;
 
-
+// Linux readv/writev limit
 def IOV_MAX = 1024;
-
-layout Wasi_iovec {
-	+0	buf:		u32;
-	+4	buf_len:	u32;
-	=8;
-}
-
 
 // IO buffers
 def timespec = Array<long>.new(4);
 def statxbuf = Ref<statx>.of(Array<byte>.new(statx.size));
 def emptystring = Array<byte>.new(1);
+def direntbuf = Array<byte>.new(1024);
+def wasidirentbuf = Array<byte>.new(Wasi_dirent.size);
 
 // A special value, which tells the fd of the current working directory used in openat
 def AT_FDCWD = -100;
@@ -236,6 +231,70 @@ class X86_64Linux_WspOneModule extends WspOneModule {
 		var t = Linux.syscall(SYS_lseek, (wasi_fd.sysfd, 0, WHENCE_CUR));
 		if (t.0 < 0) return i(mapErrno(t.0));
 		DataWriters.write_range_i64(range.result, t.0);
+		return SUCCESS;
+	}
+	def fd_readdir(args: Range<Value>) -> HostResult {
+		// 0=fd 1=ptr 2=len 3=cookie 4=size
+		var fd		= Values.unbox_i(args[0]);
+		var ptr		= Values.unbox_u(args[1]);
+		var len		= Values.unbox_u(args[2]);
+		var cookie	= Values.unbox_l(args[3]);
+		var size	= Values.unbox_u(args[4]);
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return i(WspOneErrno.BADF.code);
+		var range = memory.range_ol_32(ptr, len);
+		if (range.reason != TrapReason.NONE) return HostResult.Throw(Trap.new(range.reason, null, null));
+		var sizeRange = memory.range_ol_32(size, 4);
+		if (sizeRange.reason != TrapReason.NONE) return HostResult.Throw(Trap.new(sizeRange.reason, null, null));
+
+		var t = Linux.syscall(SYS_lseek, (wasi_fd.sysfd, cookie, 0));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		// Output buffer
+		var buf = range.result;
+		var used = 0;
+		// Input buffer (direntbuf, statically allocated)
+		var pos = 0;
+		var avail = 0;
+		while (used < len) {
+			if (pos == avail) {
+				// Note that SYS_getdents does not use the same dirent layout
+				t = Linux.syscall(SYS_getdents64, (wasi_fd.sysfd, Pointer.atContents(direntbuf), direntbuf.length));
+				if (t.0 < 0) return i(mapErrno(t.0));
+				pos = 0;
+				avail = int.!(t.0);
+				if (avail == 0) break;
+			}
+			var d = Ref<dirent>.of(direntbuf[pos ...]);
+			var wd = Ref<Wasi_dirent>.of(wasidirentbuf);
+			wd.d_next = d.d_off;
+			wd.d_ino = d.d_ino;
+			var name = direntbuf[pos + dirent.size - 1 ...];
+			var namelen = 0;
+			while (name[namelen] != 0) namelen++;
+			wd.d_namelen = u32.!(namelen);
+		       	var typ : Wasi_filetype;
+			match (int.!(d.d_type)) {
+				LinuxConst.DT_CHR => typ = Wasi_filetype.CHARACTER_DEVICE;
+				LinuxConst.DT_DIR => typ = Wasi_filetype.DIRECTORY;
+				LinuxConst.DT_BLK => typ = Wasi_filetype.BLOCK_DEVICE;
+				LinuxConst.DT_REG => typ = Wasi_filetype.REGULAR_FILE;
+				LinuxConst.DT_LNK => typ = Wasi_filetype.SYMBOLIC_LINK;
+				LinuxConst.DT_SOCK => typ = Wasi_filetype.SOCKET_STREAM;
+				_ => typ = Wasi_filetype.UNKNOWN;
+			}
+			wd.d_type = typ;
+			copyBytes(wasidirentbuf, buf[used ...]);
+			used += Wasi_dirent.size;
+			if (used >= len) break;
+			copyBytes(name[0 ..+ namelen], buf[used ...]);
+			used += namelen;
+			if (used >= len) break;
+			pos += d.d_reclen;
+		}
+		if (used > len) used = int.!(len);
+		DataWriters.write_range_i32(sizeRange.result, used);
 		return SUCCESS;
 	}
         def path_unlink_file(args: Range<Value>) -> HostResult {
@@ -561,5 +620,10 @@ class X86_64Linux_WspOneModule extends WspOneModule {
                 } else {
                 	timespec[3] = UTIME_OMIT;
                 }
+        }
+        def copyBytes(src : Range<byte>, dst : Range<byte>) {
+        	var len = src.length;
+                if (len >= dst.length) len = dst.length;
+                for (i < len) dst[i] = src[i];
         }
 }
