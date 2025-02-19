@@ -198,6 +198,59 @@ component X86_64Runtime {
 		}
 		return stack.trap(TrapReason.INVALID_SUSPEND);
 	}
+	// Suspends this stack and sets {curStack} to the stack to switch to (or
+	// throw an error on the top-most stack if no such handler is found). Then,
+	// the tag parameters and the continuation is pushed onto the target stack.
+	def runtime_handle_switch(instance: Instance, target_cont_idx: int, tag_index: int) -> Throwable {
+		var stack = X86_64Stack.!(curStack.setRsp(CiRuntime.callerSp()));
+		var tag = instance.tags[tag_index];
+
+		// unraveling all relevant signatures
+		var target_cont_decl = ContDecl.!(instance.heaptypes[target_cont_idx]);
+		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
+		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
+		// unload target continuation and values from {curStack}
+		var target_cont = Continuation.!(stack.popObject());
+		var target_params = target_cont_decl.sig.params;
+		var vals = stack.popN(target_params[0 ... target_params.length - 1]);
+
+		if (target_cont == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (target_cont.used) return stack.trap(TrapReason.USED_CONTINUATION);
+		target_cont.used = true;
+
+		var prev = stack;
+		while (prev.parent != null) {
+			var parent = X86_64Stack.!(prev.parent);
+			var frame = TargetFrame(parent.rsp + Pointer.SIZE);
+			if (!parent.findSwitchHandler(frame, tag)) { // handler found
+				var this_cont = Continuation.new(stack, prev);
+
+				// set stack params arity
+				stack.params_arity = this_cont_decl.sig.params.length;
+				stack.state_ = StackState.SUSPENDED;
+				// dummy bind with 0 values to update stack state
+				stack.bind([]);
+
+				// overwrite {parent_rsp_ptr}
+				var bottom = X86_64Stack.!(target_cont.bottom);
+				bottom.parent = parent;
+				bottom.parent_rsp_ptr.store<Pointer>(prev.parent_rsp_ptr.load<Pointer>());
+				// set up new stack configuration
+				prev.parent = null;
+				prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
+				curStack = X86_64Stack.!(target_cont.top);
+				curStack.state_ = StackState.RUNNING;
+				curStack.pushN(vals);
+				curStack.push(Value.Ref(this_cont));
+
+				// reserve space for suspend stub addr
+				stack.rsp += -Pointer.SIZE;
+				return null;
+			}
+			prev = parent;
+		}
+		return stack.trap(TrapReason.INVALID_SUSPEND);
+	}
 
 	//=====================================================================
 	// GC proposal callbacks
