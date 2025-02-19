@@ -147,10 +147,10 @@ component X86_64Runtime {
 		var stack = curStack.setRsp(rsp);
 		return stack.throw(thrown);
 	}
-	def runtime_CONT_NEW(instance: Instance, cont_index: u32) -> Throwable {
+	def runtime_CONT_NEW(instance: Instance, cont_index: u31) -> Throwable {
 		return Runtime.CONT_NEW(curStack.setRsp(CiRuntime.callerSp()), instance, cont_index, make_new_x86_stack);
 	}
-	def runtime_CONT_BIND(instance: Instance, in_cont_index: u32, out_cont_index: u32) -> Throwable {
+	def runtime_CONT_BIND(instance: Instance, in_cont_index: u31, out_cont_index: u31) -> Throwable {
 		return Runtime.CONT_BIND(curStack.setRsp(CiRuntime.callerSp()), instance, in_cont_index, out_cont_index);
 	}
 	def runtime_process_resume_throw(instance: Instance, cont: Continuation, tag: Tag) -> Pointer {
@@ -168,35 +168,71 @@ component X86_64Runtime {
 	// the suspension (or throw an error on the top-most stack if no such handler
 	// is found). Then, the tag parameters and the continuation is pushed onto
 	// the handler stack.
-	def runtime_handle_suspend(instance: Instance, tag_index: int) -> Throwable {
+	def runtime_handle_suspend(instance: Instance, tag_id: u31) -> Throwable {
 		var stack = X86_64Stack.!(curStack.setRsp(CiRuntime.callerSp()));
-		var tag = instance.tags[tag_index];
-		var prev = stack;
+		var tag = instance.tags[tag_id];
 		var vals = stack.popN(tag.sig.params);
-		while (prev.parent != null) {
-			var parent = X86_64Stack.!(prev.parent);
-			var frame = TargetFrame(parent.rsp + Pointer.SIZE);
-			if (!parent.findSuspendHandler(frame, tag)) { // handler found
-				var cont = Continuation.new(stack, prev);
-				// set stack params arity
-				stack.params_arity = tag.sig.results.length;
-				stack.state_ = StackState.SUSPENDED;
-				// dummy bind with 0 values to update stack state
-				stack.bind([]);
-				// set up new stack configuration
-				prev.parent = null;
-				curStack = parent;
-				curStack.state_ = StackState.RUNNING;
-				curStack.pushN(vals);
-				curStack.push(Value.Ref(cont));
-				curStack.rsp += Pointer.SIZE; // pop ret addr
-				// reserve space for suspend stub addr
-				stack.rsp += -Pointer.SIZE;
-				return null;
-			}
-			prev = parent;
-		}
-		return stack.trap(TrapReason.INVALID_SUSPEND);
+		var cont = Runtime.unwindStackChain(curStack, instance, tag_id, SuspensionType.SUSPEND);
+		if (cont == null) return stack.trap(TrapReason.INVALID_SUSPEND);
+		// set stack params arity
+		stack.params_arity = tag.sig.results.length;
+		stack.state_ = StackState.SUSPENDED;
+		stack.bind([]); // dummy bind with 0 values to update stack state
+
+		// set up new stack configuration
+		curStack = X86_64Stack.!(cont.bottom.parent);
+		curStack.state_ = StackState.RUNNING;
+		curStack.pushN(vals);
+		curStack.push(Value.Ref(cont));
+		curStack.rsp += Pointer.SIZE; // pop ret addr
+		stack.rsp += -Pointer.SIZE; // reserve space for suspend stub addr
+		cont.bottom.parent = null;
+		return null;
+	}
+	// Suspends this stack and sets {curStack} to the stack to switch to (or
+	// throw an error on the top-most stack if no such handler is found). Then,
+	// the tag parameters and the continuation is pushed onto the target stack.
+	def runtime_handle_switch(instance: Instance, target_cont_idx: int, tag_id: u31) -> Throwable {
+		var stack = X86_64Stack.!(curStack.setRsp(CiRuntime.callerSp()));
+		var tag = instance.tags[tag_id];
+
+		// unraveling all relevant signatures
+		var target_cont_decl = ContDecl.!(instance.heaptypes[target_cont_idx]);
+		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
+		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
+		// unload target continuation and values from {curStack}
+		var target_cont = Continuation.!(stack.popObject());
+		var target_params = target_cont_decl.sig.params;
+		var vals = stack.popN(target_params[0 ... target_params.length - 1]);
+
+		if (target_cont == null) return stack.trap(TrapReason.NULL_DEREF);
+		if (target_cont.used) return stack.trap(TrapReason.USED_CONTINUATION);
+		target_cont.used = true;
+
+		var this_cont = Runtime.unwindStackChain(curStack, instance, tag_id, SuspensionType.SWITCH);
+		if (this_cont == null) return stack.trap(TrapReason.INVALID_SUSPEND);
+		var prev = X86_64Stack.!(this_cont.bottom);
+		// set stack params arity
+		stack.params_arity = this_cont_decl.sig.params.length;
+		stack.state_ = StackState.SUSPENDED;
+		// dummy bind with 0 values to update stack state
+		stack.bind([]);
+
+		// overwrite {parent_rsp_ptr}
+		var bottom = X86_64Stack.!(target_cont.bottom);
+		bottom.parent = prev.parent;
+		bottom.parent_rsp_ptr.store<Pointer>(prev.parent_rsp_ptr.load<Pointer>());
+		// set up new stack configuration
+		prev.parent = null;
+		prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
+		curStack = X86_64Stack.!(target_cont.top);
+		curStack.state_ = StackState.RUNNING;
+		curStack.pushN(vals);
+		curStack.push(Value.Ref(this_cont));
+
+		// reserve space for suspend stub addr
+		stack.rsp += -Pointer.SIZE;
+		return null;
 	}
 
 	//=====================================================================
