@@ -36,6 +36,7 @@ test/regress/ext:stack-switching/resume0_ii_f.bin.wast
 test/regress/ext:stack-switching/resume0_iii_f.bin.wast
 test/regress/ext:stack-switching/resume0_l_l.bin.wast
 test/regress/ext:stack-switching/resume0_s_s.bin.wast
+test/regress/ext:stack-switching/resume0z.bin.wast
 test/regress/ext:stack-switching/resume10b.bin.wast
 test/regress/ext:stack-switching/resume10.bin.wast
 test/regress/ext:stack-switching/resume10c.bin.wast
