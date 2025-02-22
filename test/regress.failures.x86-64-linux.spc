@@ -153,3 +153,9 @@ test/regress/legacy-exceptions/try_delegate1.bin.wast
 test/regress/legacy-exceptions/try_delegate3.bin.wast
 test/regress/legacy-exceptions/try_delegate4.bin.wast
 test/regress/legacy-exceptions/try_delegate5.bin.wast
+
+test/regress/ext:threads/atomic_add_i64.bin.wast
+test/regress/ext:threads/atomic_sub_i64.bin.wast
+test/regress/ext:threads/atomic_and_i64.bin.wast
+test/regress/ext:threads/atomic_or_i64.bin.wast
+test/regress/ext:threads/atomic_xor_i64.bin.wast
