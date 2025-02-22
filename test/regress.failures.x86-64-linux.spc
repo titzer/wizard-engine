@@ -163,3 +163,5 @@ test/regress/ext:threads/atomic_load_i32.bin.wast
 test/regress/ext:threads/atomic_store_i32.bin.wast
 test/regress/ext:threads/atomic_load_i64.bin.wast
 test/regress/ext:threads/atomic_store_i64.bin.wast
+test/regress/ext:threads/atomic_cmpxchg_i32.bin.wast
+test/regress/ext:threads/atomic_cmpxchg_i64.bin.wast
