@@ -159,3 +159,7 @@ test/regress/ext:threads/atomic_sub_i64.bin.wast
 test/regress/ext:threads/atomic_and_i64.bin.wast
 test/regress/ext:threads/atomic_or_i64.bin.wast
 test/regress/ext:threads/atomic_xor_i64.bin.wast
+test/regress/ext:threads/atomic_load_i32.bin.wast
+test/regress/ext:threads/atomic_store_i32.bin.wast
+test/regress/ext:threads/atomic_load_i64.bin.wast
+test/regress/ext:threads/atomic_store_i64.bin.wast
