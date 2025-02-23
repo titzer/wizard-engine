@@ -110,3 +110,9 @@ This monitor could statically detect pure functions (through simple analysis) an
 ## `metadata` Monitor
 
 This monitor would track and report engine-level metadata for a Wasm program, including the sizes of data structures used to represent the code and data.
+
+## `r3-gc` Monitor extension
+
+Wizard includes a monitor capable of recording a Wasm program's interactions with the outside world and producing a replay module that executes the original program with generated functions that replay the original execution.
+However, due to limitations in how this monitor works, it doesn't support Wasm GC.
+This monitor should be extended to support structs, arrays, and function references.
