@@ -6,7 +6,7 @@ def sig_v_v = SigCache.v_v; // XXX: needed to force initialization
 def imm: ImmSigs;
 // An enumeration of the WebAssembly opcodes, including their mnenomic names,
 // the kind of immediate expected, and the (monomorphic) operator signature.
-enum Opcode(prefix: u8, code: u8, mnemonic: string, imms: Array<ImmKind>, sig: SigDecl) {
+enum Opcode(prefix: u8, code: u16, mnemonic: string, imms: Array<ImmKind>, sig: SigDecl) {
 	// Default, invalid opcode.
 	INVALID			(0x00, 0xFF, "<invalid>", imm.NONE, null),
 	// Control and calls.
@@ -700,21 +700,64 @@ enum OpcodeAttribute {
 class OpcodePage(prefix: byte) {
 	private def valid = Array<u32>.new(8);  // bitmap for valid
 	def opcodes = Array<Opcode>.new(256);
-	def var oneByte = true;
+	def subpages = Array<OpcodePage>.new(256);
+	var oneByte = true;
+	var numSubPages: int;
 
 	def put(opcode: Opcode) {
-		valid[opcode.code >> 5] |= 1u << u5.view(opcode.code);
-		opcodes[opcode.code] = opcode;
-		if (prefix != 0 && opcode.code >= 128) oneByte = false; // need full LEB decoding for this page
+		var p = getPage(opcode.code);
+		var page = p.0;
+		var slot = p.1;
+		if (page.opcodes[slot] == Opcode.INVALID) {
+			page.opcodes[slot] = opcode;
+			page.valid[slot >> 5] |= 1u << u5.view(slot);
+			if (prefix != 0 && opcode.code >= 128) oneByte = false; // need full LEB decoding for this page
+		} else {
+			// System.error("OpcodePagePutAtError", Strings.format3("opcode slot already used for %s, prefix=%x, code =%x\n", opcode.name, opcode.prefix, opcode.code));
+		}
+	}
+	def getPage(code: u32) -> (OpcodePage, byte) {
+		if (code > 0xFFFF) {
+			System.error("OpcodePageLookupPageError", Strings.format1("code %x too large", code));
+		}
+		var upper = byte.view(code >> 8);
+		var lower = byte.view(code);
+		if (upper == 0) return (this, lower);
+		var pg = subpages[lower];
+		if (pg == null) {
+			if (opcodes[lower] != Opcode.INVALID) {
+				// System.error("OpcodePageGetPageError", Strings.format2("opcode present for code %x", code));
+			}
+			pg = OpcodePage.new(lower);
+			subpages[lower] = pg;
+			oneByte = false;  // subpages necessarily require LEB encoding
+			++numSubPages;
+			Opcodes.subpage_added();
+		}
+		return (pg, upper);
+	}
+	def lookupPage(code: u32) -> (OpcodePage, byte) {
+		var upper = byte.view(code >> 8);
+		var lower = byte.view(code);
+		if (upper == 0) return (this, lower);
+		var pg = subpages[lower];
+		if (pg == null) {
+			System.error("OpcodePageLookupPageError", Strings.format2("page not present for 0x%x, prefix=0x%x)", prefix, code));
+		}
+		return (pg, upper);
 	}
 	def isValid(code: u32) -> bool {
-		if (code >= opcodes.length) return false;
-		var entry = valid[u8.view(code >> 5)];
-		return (entry & (1u << u5.view(code))) != 0;
+		var p = lookupPage(code);
+		var entry = p.0.valid[u8.view(p.1 >> 5)];
+		return (entry & (1u << u5.view(p.1))) != 0;
 	}
 	def [code: u32] -> Opcode {
-		if (code >= opcodes.length) return Opcode.UNREACHABLE;
-		return opcodes[u8.view(code)];
+		var p = lookupPage(code);
+		var entry = p.0.valid[u8.view(p.1 >> 5)];
+		if ((entry & (1u << u5.view(p.1))) == 0) {
+			return Opcode.INVALID;
+		}
+		return opcodes[p.1];
 	}
 }
 
@@ -727,30 +770,24 @@ def countOpcodes() -> i31 {
 component Opcodes {
 	def count = countOpcodes();
 	def page_by_prefix = Array<OpcodePage>.new(256);
-	def opcode_by_prefix = Array<Opcode>.new(256);
+	// def opcode_by_prefix = Array<Opcode>.new(256);
 
-	def page_00 = OpcodePage.new(0);
+	// def page_00 = OpcodePage.new(0);
 	def attributes = Array<OpcodeAttribute.set>.new(count);
+	def opcodes = Array<Opcode>.new(256);
 	def page_FB = page_by_prefix[0xFB] = OpcodePage.new(0xFB);
 	def page_FC = page_by_prefix[0xFC] = OpcodePage.new(0xFC);
 	def page_FD = page_by_prefix[0xFD] = OpcodePage.new(0xFD);
 	def page_FE = page_by_prefix[0xFE] = OpcodePage.new(0xFE);
 	def code_pages = [page_FB, page_FC, page_FD, page_FE];
 	def var longestName: int;
+	def var num_subpages: int;
 	private var nameMap: HashMap<string, Opcode>;
 
 	new() {
 		for (op in Opcode) {
 			if (op == Opcode.INVALID) continue;
-			if (op.mnemonic.length > longestName) longestName = op.mnemonic.length;
-			attributes[op.tag] |= OpcodeAttribute.VALID;
-			if (op.sig != null && op.imms.length == 0) attributes[op.tag] |= OpcodeAttribute.SHORT_OP;
-			if (op.prefix == 0) {
-				opcode_by_prefix[op.code] = op;
-				page_00.put(op);
-			} else {
-				page_by_prefix[op.prefix].put(op);
-			}
+			init(op);
 		}
 		attributes[Opcode.INVALID.tag] = OpcodeAttribute.INTERNAL;
 
@@ -764,22 +801,47 @@ component Opcodes {
 			attributes[op.tag] |= OpcodeAttribute.EXTENDED_CONSTANT;
 		}
 	}
+	def init(opcode: Opcode) {
+		if (opcode.mnemonic.length > longestName) longestName = opcode.mnemonic.length;
+		if (opcode.prefix == 0) {
+			// Record non-prefixed opcode
+			var c = opcode.tag;
+			attributes[c] |= OpcodeAttribute.VALID;
+			if (opcode.sig != null && opcode.imms.length == 0) attributes[c] |= OpcodeAttribute.SHORT_OP;
+			opcodes[op8(opcode.code)] = opcode;
+			return;
+		}
+		// attributes[opcode.prefix] |= OpcodeAttribute.PREFIX;
+		var page = page_by_prefix[opcode.prefix];
+		if (page != null) {
+			page_by_prefix[opcode.prefix].put(opcode);
+		} else {
+			System.error("OpcodesInitError", Strings.format2("no page found for %s, prefix=%x", opcode.name, opcode.prefix));
+		}
+	}
 
 	// Render a single-byte opcode.
-	def render(buf: StringBuilder, prefix: byte) -> StringBuilder {
-		var op = opcode_by_prefix[prefix];
-		if (op != Opcode.INVALID) return buf.puts(op.mnemonic);
-		if (isPrefix(prefix)) return buf.put1("%x (prefix)", prefix);
-		for (op in InternalOpcode) {
-			if (op.code == prefix) return buf.put2("%x %s", prefix, op.mnemonic);
+	def render(buf: StringBuilder, code: u16) -> StringBuilder {
+		if (attributes[opcodes[op8(code)].tag].VALID) {
+			return buf.puts(opcodes[code].mnemonic);
+		} else if (page_by_prefix[op8(code)] != null) {
+			return buf.put1("%x (prefix)", code);
+		} else {
+			return buf.put1("%x (invalid)", code);
 		}
-		return buf.put1("%x (invalid)", prefix);
 	}
 	// Lookup an opcode, if it exists. Returns {Opcode.INVALID} if not.
 	def find(prefix: byte, code: u32) -> Opcode {
-		if (prefix == 0) return opcode_by_prefix[code];
-		var page = page_by_prefix[prefix];
-		return if(page != null, page[code], Opcode.INVALID);
+		if (prefix == 0) return opcodes[code & 0xFF];
+		for (page in code_pages) {
+			if (page.prefix == prefix) {
+				var upper = byte.view(code >> 8);
+				var lower = byte.view(code);
+				var p = page.getPage(code);
+				return p.0.opcodes[p.1];
+			}
+		}
+		return Opcode.INVALID;
 	}
 	// Look up an opcode by its mnemonic. Returns {Opcode.INVALID} if not found.
 	def findByName(str: string) -> Opcode {
@@ -824,6 +886,34 @@ component Opcodes {
 		}
 		return Opcode.INVALID;
 	}
+	def subpage_added () {
+		++num_subpages;
+	}
+
+	def op8(code: u16) -> u8 {
+		if (code <= 0xFF) return u8.view(code);
+		return u8.view(code / 0);  // force failure
+	}
+	def op16l(code: u16) -> u8 {
+		if (code <= 0xFF) return u8.view(code / 0);  // force failure
+		return u8.view(code & 0xFF);
+	}
+	def op16h(code: u16) -> u8 {
+		if (code <= 0xFF) return u8.view(code / 0);  // force failure
+		return u8.view(code >> 8);
+	}
+	def op7(code: u16) -> u7 {
+		if (code <= 0x7F) return u7.view(code);
+		return u7.view(code / 0);  // force failure
+	}
+	def op14l(code: u16) -> u8 {
+		if (code <= 0x7F) return u7.view(code / 0);  // force failure
+		return u8.view((code & 0x7F) | 0x80);
+	}
+	def op14h(code: u16) -> u8 {
+		if (code <= 0x7F) return u7.view(code / 0);  // force failure
+		return u8.view(code >> 7);
+	}
 	def isConstant(extensions: Extension.set, op: Opcode) -> bool {
 		var empty: OpcodeAttribute.set;
 		var mask: OpcodeAttribute.set = OpcodeAttribute.CONSTANT;
@@ -831,7 +921,7 @@ component Opcodes {
 		return (Opcodes.attributes[op.tag] & mask) != empty;
 	}
 	def isOneByte(b: byte) -> bool {
-		return opcode_by_prefix[b] != Opcode.INVALID;
+		return opcodes[b] != Opcode.INVALID;
 	}
 	def isPrefix(b: byte) -> bool {
 		return page_by_prefix[b] != null;
@@ -1041,7 +1131,7 @@ class InstrTracer {
 		}
 
 		var b = codeptr.read1();
-		var op = Opcodes.opcode_by_prefix[b];
+		var op = Opcodes.opcodes[b];
 		if (op != Opcode.INVALID) {
 			out.puts(op.mnemonic);
 		} else if (Opcodes.isPrefix(b)) {
