@@ -26,8 +26,9 @@ Never features are under development and vary in their support in the different 
 | exception-handling  | &#x2705;| &#x2705; | &#x2705; | &#9745; |
 | custom-page-sizes  | &#x2705;| &#x2705; |  |  |
 | stack-switching  | &#x2705;| &#x2705; | &#x2705; |  |
-| threads  | &#x2705;| &#9745; | &#x2705; |  |
+| threads  | &#x2705;| &#9745; | &#9745; |  |
 | memory64 | &#x2705;| &#x2705; | | |
+| relaxed-simd | | | | |
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.

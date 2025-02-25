@@ -89,6 +89,7 @@ class X86_64InterpreterCode extends RiUserCode {
 		if (func == null) buf.puts("(func=null)");
 		else if (instance == null) func.render(null, buf);
 		else func.render(instance.module.names, buf);
+		if (Debug.stack) buf.put2(" [ip=0x%x, sp=0x%x]", ip - Pointer.NULL, sp - Pointer.NULL);
 		buf.ln().send(out);
 		buf.reset();
 	}
@@ -103,6 +104,12 @@ class X86_64InterpreterCode extends RiUserCode {
 	// Called from V3 runtime when the garbage collector needs to scan an interpreter stack frame.
 	def scanFrame(ip: Pointer, sp: Pointer) {
 		// Handle code and interior pointers
+		if (Debug.stack) {
+			var buf = X86_64Runtime.globalFrameDescriptionBuf;
+			buf.put2("scanInterpreterFrame [ip=0x%x, sp=0x%x]", ip - Pointer.NULL, sp - Pointer.NULL).ln().send(Trace.STDOUT);
+			buf.reset();
+		}
+
 		var code_loc = (sp + X86_64InterpreterFrame.code.offset);
 		var code = code_loc.load<Pointer>();
 		var ip_delta = (sp + X86_64InterpreterFrame.ip.offset).load<Pointer>() - code;
@@ -895,13 +902,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movd_r_r(r_scratch, valcount);
 		asm.d.shl_r_i(r_scratch, valuerep.slot_size_log);
 		asm.q.sub_r_r(r_vsp, r_scratch);
-		// do { [vsp] = [vsp + popcount]; vsp++; valcount--; } while (valcount != 0)
+		// while(valcount-- >= 0) { [vsp] = [vsp + popcount]; vsp++; }
 		var loop = X86_64Label.new();
 		asm.bind(loop);
+		asm.d.dec_r(valcount);
+		asm.jc_rel_near(C.S, ctl_xfer_nostack);
 		genCopySlot(r_vsp.plus(0), r_vsp.plusR(popcount, 1, 0));
 		incrementVsp();
-		asm.d.dec_r(valcount);
-		asm.jc_rel_near(C.G, loop);
+		asm.jmp_rel_near(loop);
 
 		// ELSE, (legal) CATCH, (legacy) CATCH_ALL: unconditional ctl xfer without stack copying
 		bindHandlerNoAlign(Opcode.CATCH);
@@ -2108,6 +2116,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genSkipLeb();            	// skip target label
 			genSkipLeb();            	// skip src heaptype
 			genReadSleb32_inline(r_tmp1);	// read dest heaptype
+			computePcFromCurIp();
 			saveCallerIVars();
 			callRuntime(refRuntimeCall(RT.runtime_doCast), [r_instance, nullable_reg, r_tmp1], false);
 			restoreCurPcFromFrame();
@@ -2115,7 +2124,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			var cond = if(t.0, C.Z, C.NZ); // TODO: br_on_cast/fail only differ on condition
 			asm.jc_rel_far(cond, controlSkipSidetableAndDispatchLabel); // XXX: relies on no changes to flags
-			restoreIpFromCurIp(-1); // TODO: sidetable entries are relative to current IP; we are at nextIP
+			asm.movq_r_m(r_tmp1, m_code);
+			// TODO: we recompute the start of the current instruction from the curpc and the code object,
+			//       because the sidetable entry's delta_ip is encoded relative to 1 + curpc
+			asm.lea(r_ip, X86_64Addr.new(r_tmp1, r_curpc, 1, 1 + offsets.Array_contents));
 			asm.jmp_rel_far(controlTransferLabel);
 		}
 		bindHandler(Opcode.REF_AS_NON_NULL); {
@@ -3630,9 +3642,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def computeCurIpFromIp(delta: int) {
 		asm.q.lea(r_curpc, X86_64Addr.new(r_ip, null, 1, delta - offsets.Array_contents));
-	}
-	def restoreIpFromCurIp(delta: int) {
-		asm.q.lea(r_ip, r_curpc.plus(0 - (delta - offsets.Array_contents)));
 	}
 	def computePcFromCurIp() {
 		if (!FeatureDisable.stacktraces) asm.q.sub_r_m(r_curpc, m_code);
