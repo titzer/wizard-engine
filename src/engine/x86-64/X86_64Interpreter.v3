@@ -306,14 +306,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def r_runtime_ret1	= G(xenv.runtime_ret1);
 	def r_dispatch		= G(xenv.dispatch);
 	def r_ret_throw		= G(xenv.ret_throw);
-	def r_scratch		= G(xenv.scratch);
+	def r_scratch		= G(xenv.scratch);	// RBP
 	def r_curpc		= G(xenv.curpc);
 
-	def r_tmp0		= G(xenv.tmp0);
-	def r_tmp1		= G(xenv.tmp1);
-	def r_tmp2		= G(xenv.tmp2);
-	def r_tmp3		= G(xenv.tmp3);
-	def r_tmp4		= G(xenv.tmp4);
+	def r_tmp0		= G(xenv.tmp0);		// RCX
+	def r_tmp1		= G(xenv.tmp1);		// RDX
+	def r_tmp2		= G(xenv.tmp2);		// RBP == r_scratch
+	def r_tmp3		= G(xenv.tmp3);		// R8
+	def r_tmp4		= G(xenv.tmp4);		// R9
 
 	def r_xmm0		= X(xenv.xmm0);
 	def r_xmm1		= X(xenv.xmm1);
@@ -340,7 +340,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 	def vsph = VspHelper.new(r_vsp, valuerep, 3);
 
-	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef)>.new(Opcodes.code_pages.length + 1);
+	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef, byte, IcCodeRef)>.new(
+				Opcodes.code_pages.length + Opcodes.num_subpages + 1);
+				// prefix, table, table-if-leb, subpage index, subpage table
 
 	def ivar_MEM0_BASE	= (r_mem0_base, m_mem0_base);
 	def ivar_VFP		= (r_vfp, m_vfp);
@@ -403,7 +405,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				.put3("Finished asm interpreter @ (0x%x ... 0x%x), used %d bytes\n",
 					s, (range.end - Pointer.NULL), w.pos)
 				.put1("\tcall entry     = 0x%x\n", s + callEntryOffset);
-			for (t in dispatchTables) Trace.OUT.put2("\tdispatch %x    = 0x%x\n", byte.view(t.0), s + t.1.offset);
+			for (t in dispatchTables) {
+				Trace.OUT.put2("\tdispatch %x    = 0x%x", byte.view(t.0), s + t.1.offset);
+				Trace.OUT.put1("\tleb = 0x%x", if(t.2 == null, 0, s + t.2.offset));
+				if (t.4 != null)
+					Trace.OUT.put2("\tsubpage %x = 0x%x", byte.view(t.3), s + t.4.offset);
+				Trace.OUT.ln();
+			}
 			Trace.OUT
 				.put1("\tfirst dispatch = 0x%x\n", s + firstDispatchOffset)
 				.put1("\thandlers end   = 0x%x\n", s + handlerEndOffset)
@@ -441,7 +449,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var ref = IcCodeRef.new(-1);
 			ref.offset = ic.header.fastDispatchTableOffset = w.pos;
 			w.skipN(256 * FastIntTuning.dispatchEntrySize);
-			dispatchTables[0] = (0, ref, null);
+			dispatchTables[0] = (0, ref, null, 0, null);
 		}
 		if (!FeatureDisable.globalProbes) {
 			w.align(FastIntTuning.dispatchEntrySize);
@@ -449,6 +457,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			probedDispatchTableRef.offset = ic.header.probedDispatchTableOffset = w.pos;
 			w.skipN(256 * FastIntTuning.dispatchEntrySize);
 		}
+		var dispatchIndex = 1;
 		for (i < Opcodes.code_pages.length) {
 			var page = Opcodes.code_pages[i];
 			var ref = IcCodeRef.new(-1);
@@ -462,8 +471,21 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				ref2.offset = w.pos;
 				w.skipN(256 * FastIntTuning.dispatchEntrySize);
 			}
-
-			dispatchTables[i + 1] = (page.prefix, ref, ref2);
+			dispatchTables[dispatchIndex] = (page.prefix, ref, ref2, 0, null);
+			++dispatchIndex;
+			if (page.numSubPages > 0) {
+				for (j < 256) {
+					var subpage = page.subpages[j];
+					if (subpage == null) continue;
+					var refsub = IcCodeRef.new(-1);
+					w.align(FastIntTuning.dispatchEntrySize);
+					refsub.offset = w.pos;
+					w.skipN(256 * FastIntTuning.dispatchEntrySize);
+					dispatchTables[dispatchIndex] =
+						(page.prefix, ref, ref2, byte.!(j), refsub);
+					++dispatchIndex;
+				}
+			}
 		}
 	}
 	def genHostCallStub() {
@@ -731,39 +753,167 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	// Generate all the opcode handlers.
 	def genOpcodeHandlers() {
 		// Generate the default handler and initialize dispatch tables
-		var pos = w.atEnd().pos;
+		var trap_pos = w.atEnd().pos;
 		computeCurIpForTrap(-1);
 		asm.jmp_rel_far(newTrapLabel(TrapReason.INVALID_OPCODE));
+
+		// Fill all tables with default (trap INVALID_OPCODE)
 		for (t in dispatchTables) {
-			var ref = t.1;
-			for (i < 256) writeDispatchEntry(ref, i, pos);
+			var refsndary = t.1;
+			var refleb = t.2;
+			var refsub = t.4;
+			if (refsub != null) {
+				for (i < 256) writeDispatchEntry(refsub, i, trap_pos);
+				continue;
+			}
+			if (refleb != null) {
+				for (i < 256) writeDispatchEntry(refleb, i, trap_pos);
+			}
+			for (i < 256) writeDispatchEntry(refsndary, i, trap_pos);
 		}
 
-		// Generate the secondary dispatch tables and point main table at them
-		var ref0 = dispatchTables[0].1;
+		// Generate dispatches to secondary dispatch tables
+		// - Only for non-subpage entries (since they duplicate the main entry)
+		var ref0 = dispatchTables[0].1;		// main dispatch table address
 		for (t in dispatchTables) {
-			if (t.0 == 0) continue; // main dispatch table
+			var prefix = t.0;
+			if (prefix == 0) continue;	// skip main dispatch table
+			if (t.4 != null) continue;	// skip subpage
 			var pos = w.atEnd().pos;
+			var refsndary = t.1;
 			computeCurIpForTrap(-1);
-			genDispatch0(ip_ptr, t.1, true);
-			writeDispatchEntry(ref0, t.0, pos);
+			genDispatch0(ip_ptr, refsndary, true);
+			// main[prefix] = prefix's table
+			writeDispatchEntry(ref0, prefix, pos);
 		}
 
-		// Generate extended LEB landing pads for secondary dispatch tables
-		for (i = 1; i < dispatchTables.length; i++) {
-			var t = dispatchTables[i];
-			var pos = w.pos;
-			if (t.2 != null) {
-				// TODO: some code in this page are in the upper 128; read extended LEB
-				genDispatch0(null, t.2, false);
-			} else {
+		// Generate extended LEB landing pads for non-subpage secondary dispatch tables
+		for (t in dispatchTables) {
+			if (t.0 == 0) continue;		// skip main dispatch table
+			if (t.4 != null) continue;	// skip subpage
+			var leb_pos = w.pos;
+			var refsndary = t.1;
+			var refleb = t.2;
+			if (refleb == null) {
 				// all codes in this page are in the lower 128; just skip extended LEB
+				// happens only with non-minimal encoding
 				genSkipLeb();
+				asm.d.and_r_i(r_tmp0, 0x7F);		// clear upper bit
+				genDispatch0(null, refsndary, false);	// use secondary table
+			} else {
+				// code needs to grab next byte to see what to do
+				asm.movd_r_r(r_tmp2, r_tmp0);		// save opcode
+				asm.d.movbzx_r_m(r_tmp0, ip_ptr);	// load next byte
+				asm.q.inc_r(r_ip);			// increment pointer
+				// convert value to an index we can use into an unused portion
+				// of the LEB table
+
+				// Wish we had: asm.rolb_r_i(r_tmp0, 1) to rotate 8-bit reg.
+				// Encodes as 0xD0 0xCr, where r is register number,
+				//   available in reg's regnum field:
+				// asm.comment(";; rol cl, 1\n");
+				w.putb(0xD0);
+				w.putb(0xC0 | r_tmp0.regnum);
+				// alternative code sequence (encoding slightly different)
+				// asm.movq(r_scratch, r_tmp0);
+				// asm.d.sar_r_i(r_tmp0, 6);	// move upper bit to 0x2 position
+				// asm.d.andi(r_scratch, 0x1);
+				// asm.d.or_r_r(r_tmp0, r_scratch);
+				// a more clever alternative code sequence
+				// asm.imul_r_i(r_tmp0, 0x02020000)
+				//   low bit  ends up in 0x02000000 position (and another)
+				//   0x80 bit ends up in 0x01000000 position (and overflow)
+				// asm.q.slr_r_i(r_tmp0, 24)
+
+				// mapping using rol is:
+				// 0000 0000 -> 0000 0000 upper bit 0, no LEB continuation
+				// 0000 0001 -> 0000 0010 upper bit 1, no LEB continuation
+				// 1000 0000 -> 0000 0001 upper bit 0, LEB continues
+				// 1000 0001 -> 0000 0011 upper bit 1, LEB continues
+				// entries 0-3 of the LEB table are otherwise unused :-)
+				genDispatch0(null, refleb, false);
+
+				// create and install the four dispatch sequences for mapped second byte
+
+				var leb00_pos = w.pos;
+				// upper bit of opcode is 0, no LEB continuation:
+				// dispatch through secondary table after clearing upper bit
+				// not used when encoding is minimal
+				asm.movd_r_r(r_tmp0, r_tmp2);
 				asm.d.and_r_i(r_tmp0, 0x7F);
-				genDispatch0(null, t.1, false);
+				genDispatch0(null, refsndary, false);
+				writeDispatchEntry(refleb, 0x00, leb00_pos);
+
+				var leb01_pos = w.pos;
+				// upper bit of opcode is 0, has LEB continuation:
+				// dispatch through LEB table after skipping LEB and clearing upper bit
+				// not used when encoding is minimal
+				genSkipLeb();
+				asm.movd_r_r(r_tmp0, r_tmp2);	// EBM check this!
+				asm.d.and_r_i(r_tmp0, 0x7F);
+				genDispatch0(null, refsndary, false);
+				writeDispatchEntry(refleb, 0x01, leb01_pos);
+
+				var leb02_pos = w.pos;
+				// upper bit of opcode is 1, no LEB continuation:
+				// dispatch through LEB, don't clear upper bit
+				asm.movd_r_r(r_tmp0, r_tmp2);
+				genDispatch0(null, refleb, false);
+				writeDispatchEntry(refleb, 0x02, leb02_pos);
+
+				var leb03_pos = w.pos;
+				// upper bit of opcode is 1, has LEB continuation:
+				// dispatch through LEB table after skipping LEB
+				// don't clear upper bit
+				// not used when encoding is minimal
+				genSkipLeb();
+				asm.movd_r_r(r_tmp0, r_tmp2);
+				genDispatch0(null, refleb, false);
+				writeDispatchEntry(refleb, 0x03, leb03_pos);
 			}
 			for (i = 128; i < 256; i++) {
-				writeDispatchEntry(t.1, i, pos);
+				writeDispatchEntry(refsndary, i, leb_pos);
+			}
+		}
+		// Generate subpage dispatching
+		for (t in dispatchTables) {
+			if (t.0 == 0) continue;		// skip main dispatch table
+			if (t.4 == null) continue;	// skip non-subpages
+			// there are five cases for subpage index 0XXX XXXX:
+			// First byte  Second byte
+			// 0XXX XXXX   ---- ----    dispatch 0XXX XXXX in secondary table (not subpage)
+			//                          (doesn't get here)
+			// 1XXX XXXX   0000 0000    dispatch as 0XXX XXXX in secondary table
+			// 1XXX XXXX   0YYY YYYY    dispatch 0YYY YYYY in subpage table
+			// 1XXX XXXX   1000 0000    skip LEB, dispatch as 0XXX XXXX in secondary table
+			// 1XXX XXXX   1YYY YYYY    skip LEB, dispatch as 0YYY YYYY in subpage table
+			//                          avoid clearing upper bit by duplicating entry?
+
+			// create and install subpage dispatch
+			var subpage_pos = w.pos;
+			var refsndary = t.1;
+			var refleb = t.2;
+			var sub_index = t.3;
+			var sub_index_leb = sub_index | byte.view(0x80);
+			var refsub = t.4;
+
+			genDispatch0(ip_ptr, refsub, true);
+			// all uses of a subpage will have the LEB bit set
+			writeDispatchEntry(refsndary, sub_index_leb, subpage_pos);
+
+			// Note: writeDispatchEntry installs duplicately for second byte == 0,
+			// in the secondary table (at sub_index) and the subpage table at 0.
+			// The subpage entry at 0 and at 0x80 happen for non-minimal encodings.
+
+			// Generate redirecting handler for upper bit of second byte == 1,
+			// a non-minimal encoding.
+			
+			var subpage_leb_pos = w.pos;
+			genSkipLeb();
+			asm.d.and_r_i(r_tmp0, 0x7F);
+			genDispatch0(null, refsub, false);
+			for (i = 128; i < 256; ++i) {
+				writeDispatchEntry(refsub, i, subpage_leb_pos);
 			}
 		}
 
@@ -1323,7 +1473,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genLoad(Opcode.I64_LOAD8_S, BpTypeCode.I64.code, asm.movbsx_r_m);
 		genLoad(Opcode.I64_LOAD8_U, BpTypeCode.I64.code, asm.movbzx_r_m);
 		genLoad(Opcode.I64_LOAD16_S, BpTypeCode.I64.code, asm.movwsx_r_m);
-		genLoad(Opcode.I64_LOAD16_U, BpTypeCode.I64.code, asm.movwzx_r_m);
 		genLoad(Opcode.I64_LOAD16_U, BpTypeCode.I64.code, asm.movwzx_r_m);
 		genLoad(Opcode.I64_LOAD32_S, BpTypeCode.I64.code, masm.emit_movq_32s_r_m);
 		genLoad(Opcode.I64_LOAD32_U, BpTypeCode.I64.code, asm.movd_r_m);
@@ -2646,8 +2795,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		load_v128_s_r(r_xmm0, r_tmp0);
 	}
 	def load_imm8(r: X86_64Gpr) {
-		asm.movb_r_m(r, ip_ptr);
-		asm.q.add_r_i(r_ip, 1);
+		asm.movbzx_r_m(r, ip_ptr);
+		asm.q.inc_r(r_ip);
 	}
 	def decode_memarg(src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
 		asm.q.inc_r(r_ip);			// skip flags byte
@@ -3337,7 +3486,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
-			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
+			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
 		} else {
 			asm.q.inc_r(r_ip);				// skip flags byte
@@ -3370,7 +3520,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
-			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
+			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
 		} else {
 			asm.q.inc_r(r_ip);				// skip flags byte
@@ -3420,7 +3571,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var asm = this.asm.d;
 		asm.movbzx_r_m(dest, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
-		asm.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
+		// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+		asm.d.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
 		if (FastIntTuning.inlineAllLEBs) {
 			var leb_done = X86_64Label.new();
 			asm.jc_rel_near(C.Z, leb_done);
@@ -3522,7 +3674,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(more);
 		asm.movbzx_r_m(scratch, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
-		asm.test_r_i(scratch, LEB_UPPER_BIT);	// test most-significant bit
+		// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+		asm.d.test_r_i(scratch, LEB_UPPER_BIT);	// test most-significant bit
 		asm.jc_rel_near(C.NZ, more);
 	}
 	// End the handler for the current bytecode
@@ -3586,16 +3739,77 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
 	def patchDispatchTable(opcode: Opcode, pos: int) {
-		for (t in dispatchTables) {
-			if (t.0 != opcode.prefix) continue;
-			var ref1 = t.1;
-			if (opcode.prefix == 0 || opcode.code < 128) writeDispatchEntry(ref1, opcode.code, pos);
-			var ref2 = t.2;
-			if (ref2 != null) writeDispatchEntry(ref2, opcode.code, pos);
+		if (opcode.prefix == 0) {
+			if (opcode.code > 255) {
+				fatal("prefix 0 opcode > 255");
+			}
+			var ref0 = dispatchTables[0].1;		// main dispatch table
+			if (Debug.interpreter) {
+				Trace.OUT.put3("\t\tpatch main table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			}
+			writeDispatchEntry(ref0, opcode.code, pos);
 			w.atEnd();
 			return;
 		}
-		fatal("no dispatch table found for prefix");
+		// find closest matching info
+		var refsndary: IcCodeRef;
+		var refleb: IcCodeRef;
+		if (opcode.code > 0x3FFF) {
+			fatal("opcode > 0x3FFF");
+		}
+		var lower = opcode.code & 0x7F;		// subpage number when appropriate
+		var upper = opcode.code >> 7;
+		for (t in dispatchTables) {
+			var prefix = t.0;
+			if (prefix != opcode.prefix) continue;
+			refsndary = t.1;	// secondary table for this prefix
+			refleb = t.2;		// LEB table for this prefix
+			if (t.3 == lower) {
+				// code is in this subpage
+				var refsub = t.4;	// subpage table for this prefix and subpage
+				if (refsub == null) continue;
+				// if upper is 0, can encode as just lower, so put there as well
+				if (upper == 0) {
+					if (Debug.interpreter)
+						Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
+							       lower, opcode.prefix, opcode.code);
+					writeDispatchEntry(refsndary, lower, pos);
+				}
+				// write subpage entry at upper
+				// also covers case of non-minimal encoding of upper == 0
+				if (Debug.interpreter) {
+					Trace.OUT.put2("\t\tpatch subpage table %x at %x", lower, upper);
+					Trace.OUT.put2(" for prefix %x code %x\n", opcode.prefix, opcode.code);
+				}
+				writeDispatchEntry(refsub, upper, pos);
+				w.atEnd();
+				return;
+			}
+		}
+		if (refsndary == null) {
+			fatal("no dispatch table found for prefix");
+		}
+		if (opcode.code > 255) {
+			fatal("opcode > 255 but no matching subpage");
+		}
+		// here if prefix and not a subpage
+		if (opcode.code < 128) {
+			// minimal encoding goes to secondary
+			// other encodings will redirect here
+			if (Debug.interpreter)
+				Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			writeDispatchEntry(refsndary, opcode.code, pos);
+		} else {
+			// all encodings go to LEB table
+			if (Debug.interpreter)
+				Trace.OUT.put3("\t\tpatch LEB table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			writeDispatchEntry(refleb, opcode.code, pos);
+		}
+		w.atEnd();
+		return;
 	}
 	// Generate the out-of-line LEB decoding code.
 	def genOutOfLineLEBs() { // XXX: use a separate out-of-line assembler on the end of the buffer
