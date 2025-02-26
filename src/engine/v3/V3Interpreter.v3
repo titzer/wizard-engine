@@ -1183,16 +1183,16 @@ class V3Interpreter extends WasmStack {
 			I8X16_SWIZZLE => doSwizzle();
 			// ext:typed-continuation
 			CONT_NEW => {
-				var cont_index = codeptr.read_uleb32();
+				var cont_index = codeptr.read_uleb31();
 				Runtime.CONT_NEW(this, frame.func.instance, cont_index, V3Interpreter.new);
 			}
 			CONT_BIND => {
-				var in_cont_index = codeptr.read_uleb32();
-				var out_cont_index = codeptr.read_uleb32();
+				var in_cont_index = codeptr.read_uleb31();
+				var out_cont_index = codeptr.read_uleb31();
 				Runtime.CONT_BIND(this, frame.func.instance, in_cont_index, out_cont_index);
 			}
 			RESUME => {
-				var cont_idx = codeptr.read_uleb32();
+				var cont_idx = codeptr.read_uleb31();
 				var handlers = codeptr.read_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
@@ -1206,8 +1206,8 @@ class V3Interpreter extends WasmStack {
 				return; // skip setting frame.pc = codeptr.pos
 			}
 			RESUME_THROW => {
-				var cont_idx = codeptr.read_uleb32();
-				var tag_idx = codeptr.read_uleb32();
+				var cont_idx = codeptr.read_uleb31();
+				var tag_idx = codeptr.read_uleb31();
 				var handlers = codeptr.read_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
@@ -1222,52 +1222,52 @@ class V3Interpreter extends WasmStack {
 				return; // skip setting frame.pc = codeptr.pos
 			}
 			SUSPEND => {
-				var tag = frame.func.instance.tags[codeptr.read_uleb32()];
+				var tag_idx = codeptr.read_uleb31();
+				var tag = frame.func.instance.tags[tag_idx];
 
 				state_ = StackState.SUSPENDED;
 				params_arity = tag.sig.results.length;
 
-				var bottom = unwindParentChain(V3Interpreter.tryHandleSuspend(_, tag));
-				if (bottom == null) return;
-				var cont = Continuation.new(this, bottom);
-				var handler = V3Interpreter.!(bottom.parent);
+				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSuspension);
+				if (cont == null) return void(trap(TrapReason.INVALID_SUSPEND));
+				var handler = V3Interpreter.!(cont.bottom.parent);
 				handler.pushN(popN(tag.sig.params));
 				handler.push(Value.Ref(cont));
 				goto_stack = handler;
 			}
 			SWITCH => {
-				// `other_cont`: the continuation to switch to
+				// `target_cont`: the continuation to switch to
 				// `this_cont`: the continuation created by this {switch}:
 				//              (bottom: <handler stack child>, top: <curStack>)
-				var other_cont_idx = codeptr.read_uleb32();
-				var tag_idx = codeptr.read_uleb32();
+				var target_cont_idx = codeptr.read_uleb31();
+				var tag_idx = codeptr.read_uleb31();
 
 				var tag = frame.func.instance.tags[tag_idx];
-				var other_cont_decl = ContDecl.!(frame.func.instance.heaptypes[other_cont_idx]);
-				var other_cont = popContinuation();
-				if (other_cont == null) return void(trap(TrapReason.NULL_DEREF));
-				if (other_cont.used) return void(trap(TrapReason.USED_CONTINUATION));
+				var target_cont_decl = ContDecl.!(frame.func.instance.heaptypes[target_cont_idx]);
+				var target_cont = popContinuation();
+				if (target_cont == null) return void(trap(TrapReason.NULL_DEREF));
+				if (target_cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 
 				// -1 to exclude continuation parameter
-				var other_params = other_cont_decl.sig.params;
-				var vals = popN(other_params[0 ... other_params.length - 1]);
+				var target_params = target_cont_decl.sig.params;
+				var vals = popN(target_params[0 ... target_params.length - 1]);
 
-				var other_top_val = other_cont_decl.sig.params[other_cont_decl.sig.params.length - 1];
-				var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(other_top_val).heap).cont);
+				var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
+				var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
 
 				state_ = StackState.SUSPENDED;
 				params_arity = this_cont_decl.sig.params.length;
 
-				var bottom = unwindParentChain(V3Interpreter.canHandleSwitch(_, tag));
-				if (bottom == null) return;
-				var handler = V3Interpreter.!(bottom.parent);
-				bottom.parent = null;
+				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSwitch);
+				if (cont == null) return void(trap(TrapReason.INVALID_SUSPEND));
+				var handler = V3Interpreter.!(cont.bottom.parent);
+				cont.bottom.parent = null;
 
-				other_cont.used = true;
-				other_cont.bottom.parent = handler;
-				other_cont.top.bind(vals);
-				other_cont.top.bind([Value.Ref(Continuation.new(this, bottom))]);
-				goto_stack = V3Interpreter.!(other_cont.top);
+				target_cont.used = true;
+				target_cont.bottom.parent = handler;
+				target_cont.top.bind(vals);
+				target_cont.top.bind([Value.Ref(cont)]);
+				goto_stack = V3Interpreter.!(target_cont.top);
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
 /*
@@ -1583,29 +1583,33 @@ class V3Interpreter extends WasmStack {
 			_ => fail(Strings.format1("expected resume instruction in child terminate, got %s", opcode.name));
 		}
 	}
-	// Returns whether the switch is caught in this stack.
-	def canHandleSwitch(tag: Tag) -> bool {
-		var handler = frame.func.decl.findSwitchHandler(frame.func.instance, tag, prev_resume_pc);
-		return handler.handler_pc >= 0; // {switch} entries uses `0` as dummy handler pc
-	}
-	// Returns whether the suspend got handled. This does NOT push the values and
-	// the remaining continuation, but implicit popping and goto are handled.
-	def tryHandleSuspend(tag: Tag) -> bool {
-		var handler = frame.func.decl.findSuspendHandler(frame.func.instance, tag, prev_resume_pc);
-		if (handler.handler_pc < 0) return false;
-
+	def tryHandleSuspension(tag: Tag) -> ExHandler {
+		var handler = frame.func.decl.findSuspensionHandler(frame.func.instance, tag, prev_resume_pc);
+		if (handler.handler_pc < 0) { // not found
+			if (Trace.stack) Trace.OUT.puts("  suspension handler not found, continue to unwind").ln();
+			return handler;
+		}
+		if (Trace.stack) {
+			Trace.OUT.put1("  found suspend handler: pc=%d,", handler.handler_pc);
+			Trace.OUT.put1(" stp=%d", handler.sidetable_pos).ln();
+		}
 		prev_resume_pc = -1;
 		values.top = frame.fp + handler.val_stack_top + frame.func.decl.num_locals;
-		// values.pusha(vals);
-		// values.push(Value.Ref(cont));
-
 		var code = frame.func.decl.cur_bytecode;
 		frame.pc = handler.handler_pc;
 		frame.stp = handler.sidetable_pos;
 		codeptr.reset(code, frame.pc, code.length);
-
 		state_ = StackState.RESUMABLE;
-		return true;
+		return handler;
+	}
+	def tryHandleSwitch(tag: Tag) -> ExHandler {
+		var handler = frame.func.decl.findSwitchHandler(frame.func.instance, tag, prev_resume_pc);
+		if (handler.handler_pc < 0) { // not found
+			if (Trace.stack) Trace.OUT.puts("  switch handler not found, continue to unwind").ln();
+			return handler;
+		}
+		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
+		return handler;
 	}
 	def onChildThrow(t: Throwable) -> Throwable {
 		state_ = StackState.RESUMABLE;
@@ -1915,17 +1919,6 @@ class V3Interpreter extends WasmStack {
 		state_ = StackState.CALL_CHILD;
 		cont.bottom.parent = this;
 		goto_stack = V3Interpreter.!(cont.top);
-	}
-	// returns the last stack where {pred} is {false} on
-	private def unwindParentChain(pred: V3Interpreter -> bool) -> V3Interpreter {
-		var stack = this;
-		while (stack.parent != null) {
-			var prev = stack;
-			stack = V3Interpreter.!(stack.parent);
-			if (pred(stack)) return prev;
-		}
-		trap(TrapReason.INVALID_SUSPEND);
-		return null;
 	}
 }
 
