@@ -18,10 +18,8 @@ test/regress/ext:threads/atomic_xchg_i64.bin.wast
 test/regress/ext:threads/atomic_xor_i32.bin.wast
 test/regress/ext:threads/atomic_xor_i64.bin.wast
 
-test/regress/ext:stack-switching/cont_bind0.bin.wast
 test/regress/ext:stack-switching/cont_bind10.bin.wast
 test/regress/ext:stack-switching/cont_bind11.bin.wast
-test/regress/ext:stack-switching/cont_bind1.bin.wast
 test/regress/ext:stack-switching/cont_bind2.bin.wast
 test/regress/ext:stack-switching/cont_bind3.bin.wast
 test/regress/ext:stack-switching/cont_bind4.bin.wast
@@ -30,10 +28,6 @@ test/regress/ext:stack-switching/cont_bind6.bin.wast
 test/regress/ext:stack-switching/cont_bind7.bin.wast
 test/regress/ext:stack-switching/cont_bind8.bin.wast
 test/regress/ext:stack-switching/cont_bind9.bin.wast
-test/regress/ext:stack-switching/cont_new0.bin.wast
-test/regress/ext:stack-switching/cont_new1.bin.wast
-test/regress/ext:stack-switching/cont_new2.bin.wast
-test/regress/ext:stack-switching/cont_new_null.bin.wast
 test/regress/ext:stack-switching/cont_table0.bin.wast
 test/regress/ext:stack-switching/cont_table1.bin.wast
 test/regress/ext:stack-switching/coret1.bin.wast
