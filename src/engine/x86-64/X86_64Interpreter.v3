@@ -921,10 +921,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genControlFlow();
 		genLocals();
 		genCallsAndRet();
+		genGlobals();
 		genLoadsAndStores();
-		genAtomicWaitAndNotify();
-		genAtomicLoadsAndStores();
-        	genAtomicRMWOperations();
 		genCompares();
 		genI32Arith();
 		genI64Arith();
@@ -932,11 +930,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genF32Arith();
 		genF64Arith();
 		genFloatCmps();
-		genGcInstrs();
-		genFloatMinAndMax();
 		genFloatTruncs();
 		genFloatConversions();
+		genAtomicWaitAndNotify();
+		genAtomicLoadsAndStores();
+        	genAtomicRMWOperations();
 		genRuntimeCallOps();
+		genGcInstrs();
+		genFloatMinAndMax();
 		genSimdInstrs();
 		genMisc();
 		if (!FeatureDisable.globalProbes) genGlobalProbeSupport();
@@ -1460,6 +1461,55 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(done);
 		// set VSP properly
 		asm.q.lea(r_vsp, r_vfp.plusR(cnt, 1, 0));
+	}
+	def genGlobals() {
+		for (t in [
+			(Opcode.GLOBAL_GET, refRuntimeCall(RT.runtime_GLOBAL_GET)),
+			(Opcode.GLOBAL_SET, refRuntimeCall(RT.runtime_GLOBAL_SET))
+		]) {
+			bindHandler(t.0);
+			var runtime_call = X86_64Label.new();
+			genReadUleb32(r_tmp0);
+			if (FastIntTuning.inlineGlobalAccess) {
+				// Load instance.globals
+				asm.movq_r_m(r_tmp1, r_instance.plus(offsets.Instance_globals));
+				// Load instance.globals[r_tmp0]
+				var r_global = r_tmp2;
+				asm.movq_r_m(r_global, r_tmp1.plusR(r_tmp0, 8, offsets.Array_contents));
+				// Load Global.tag
+				asm.movbzx_r_m(r_tmp1, r_global.plus(offsets.Global_tag));
+				// check if tag is reference, which cannot be done inline because of i31
+				asm.d.cmp_r_i(r_tmp1, ValueKind.REF.code);
+				asm.jc_rel_near(C.Z, runtime_call);
+				// do inline global get or set
+				if (t.0 == Opcode.GLOBAL_GET) {
+					genTagPushR(r_tmp1); // set the tag
+					if (valuerep.value_size == 16) {
+						asm.movdqu_s_m(r_xmm0, r_global.plus(offsets.Global_low));
+						asm.movdqu_m_s(vsph[0].value, r_xmm0);
+					} else {
+						asm.movq_r_m(r_tmp0, r_global.plus(offsets.Global_low));
+						asm.movq_m_r(vsph[0].value, r_tmp0);
+					}
+					incrementVsp();
+				} else {
+					if (valuerep.value_size == 16) {
+						asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+						asm.movdqu_m_s(r_global.plus(offsets.Global_low), r_xmm0);
+					} else {
+						asm.movq_r_m(r_tmp0, vsph[-1].value);
+						asm.movq_m_r(r_global.plus(offsets.Global_low), r_tmp0);
+					}
+					decrementVsp();
+				}
+				genDispatchOrJumpToDispatch();
+			}		
+			asm.bind(runtime_call);
+			saveCallerIVars();
+			callRuntime(t.1, [r_instance, r_tmp0], false);
+			restoreCallerIVars();
+			endHandler();
+		}
 	}
 	def genLoadsAndStores() {
 		genLoad(Opcode.I32_LOAD, BpTypeCode.I32.code, asm.movd_r_m);
@@ -2727,10 +2777,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genRuntimeCallOps() {
 		// generate code for runtime calls with 1 LEB that cannot trap.
-		var call_irt = asm.newLabel();
 		for (t in [
-			(Opcode.GLOBAL_GET, refRuntimeCall(RT.runtime_GLOBAL_GET)),
-			(Opcode.GLOBAL_SET, refRuntimeCall(RT.runtime_GLOBAL_SET)),
 			(Opcode.MEMORY_GROW, refRuntimeCall(RT.runtime_MEMORY_GROW)),
 			(Opcode.TABLE_GROW, refRuntimeCall(RT.runtime_TABLE_GROW)),
 			(Opcode.STRUCT_NEW, refRuntimeCall(RT.runtime_STRUCT_NEW)),
@@ -2743,10 +2790,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 
 		// generate code for runtime calls with 1 LEB that can trap.
-		call_irt = asm.newLabel();
 		for (t in [
 			(Opcode.TABLE_GET, refRuntimeCall(RT.runtime_TABLE_GET)),
 			(Opcode.TABLE_SET, refRuntimeCall(RT.runtime_TABLE_SET)),
@@ -2769,10 +2814,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 
 		// generate code for runtime calls with 2 LEBS that can trap.
-		call_irt = asm.newLabel();
 		for (t in [
 			(Opcode.TABLE_INIT, refRuntimeCall(RT.runtime_TABLE_INIT)),
 			(Opcode.MEMORY_INIT, refRuntimeCall(RT.runtime_MEMORY_INIT)),
@@ -2798,7 +2841,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 	}
 
 	// helper method to move values from vsp to registers
