@@ -1,61 +1,92 @@
-enum WaliArg {
-	PATH,
-	FD,
-	VOID_POINTER,
-	NUM
-}
-
 def EBADFD = HostResult.Value1(Values.box_i(LinuxConst.EBADFD));
 
-class WaliCheck(fdmap: FileDescriptorMap, memory: Memory) {
-	/*
-	// NOTE: Range<Value> OK to be passed as syscall args?
-	def func_M(name: string, sig: SigDecl, hfp: (C, Range<Value>) -> HostResult) -> this {
-		module.closures[name] = ClosureEntry<C>(name, sig, closeOver<C, Range<Value>, HostResult>(_, hfp));
-	}
-	Nope does not work, unpacking tuple != unpacking range
-	*/
-	def Syscall(args_type: Array<WaliArg>, syscall_num: int, args: Range<Value>, syscall: (int, Range<Value>) -> HostResult) -> HostResult {
-	    var final_args = Array<Value>.new(args.length);
-	    for (i = 0; i < args_type.length; i++) {
-		    var arg_value: Value;
-		    match (args_type[i]) {
-			    FD => {
-				var sysfd = getFd(args[i]);
-				if (sysfd < 0) return EBADFD;
-				arg_value = Values.box(sysfd);
-			    }
-			    PATH => {
-				var path = getPath(args[i]);
-				if (path.reason != TrapReason.NONE) return path.toHostResultThrow();
-				// TODO: How?
-				arg_value = Values.box(Pointer.atContents(path.result));
-			    }
-			    VOID_POINTER => {
-				var p = getRegion(args, i);
-				i++;
-				if (p.reason != TrapReason.NONE) return p.toHostResultThrow();
-				// TODO: How?
-				arg_value = Values.box(Pointer.atContents(p.result));
-			    }
-			    NUM => arg_value = args[i];
-		    }
-		    final_args[i] = arg_value;
-	    }
-	    // TODO: matching
-	    return syscall(syscall_num, final_args);
-	}
-	def getFd(arg: Value) -> int {
+type ArgType {
+	def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult);
+	def getFd(fdmap: FileDescriptorMap, arg: Value) -> int {
 		return fdmap.get(Values.unbox_i(arg));
 	}
-	def getPath(arg: Value) -> MaybeTrap<Range<byte>> {
+	def getPath(memory: Memory, arg: Value) -> MaybeTrap<Range<byte>> {
 		var ptr = Values.unbox_u(arg);
 		return memory.range_o_32z(ptr, u32.!(LinuxConst.MAXPATHLEN));
 	}
-	def getRegion(args: Range<Value>, n: int) -> MaybeTrap<Range<byte>> {
+	def getRegion(memory: Memory, args: Range<Value>, n: int) -> MaybeTrap<Range<byte>> {
 		var ptr = Values.unbox_u(args[n]);
 		var len = Values.unbox_u(args[n+1]);
 		return memory.range_ol_32(ptr, len);
 	}
-	def fd_void_pointer: Array<WaliArg> = [WaliArg.FD, WaliArg.VOID_POINTER];
+	def getRegionOf(memory: Memory, args: Range<Value>, n: int, len: u32) -> MaybeTrap<Range<byte>> {
+		var ptr = Values.unbox_u(args[n]);
+		return memory.range_ol_32(ptr, len);
+	}
+	case FD_POINTER_LEN(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			var err_retval = (0, Pointer.NULL, 0);
+			var sysfd = getFd(fdmap, args[0]);
+			var range = getRegion(memory, args, 1);
+			if (sysfd < 0) return (T.!(err_retval), EBADFD);
+			if (range.reason != TrapReason.NONE) return (T.!(err_retval), range.toHostResultThrow());
+			return (T.!((sysfd, Pointer.atContents(range.result), range.result.length)), HostResult.Value0);
+		}
+	}
+	case FD_L_I(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			var err_retval = (0, 0, 0);
+			var sysfd = getFd(fdmap, args[0]);
+			if (sysfd < 0) return (T.!(err_retval), EBADFD);
+			var offset = Values.unbox_l(args[1]);
+			var mode = Values.unbox_i(args[2]);
+			return (T.!((sysfd, offset, mode)), HostResult.Value0);
+		}
+	}
+	case PATH_U_U(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			var err_retval = (Pointer.NULL, 0, 0);
+			var path = getPath(memory, args[0]);
+			var arg1 = Values.unbox_u(args[1]);
+			var arg2 = Values.unbox_u(args[2]);
+			if (path.reason != TrapReason.NONE) return (T.!(err_retval), path.toHostResultThrow());
+			return (T.!((Pointer.atContents(path.result), arg1, arg2)), HostResult.Value0);
+		}
+	}
+	case I(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			var err_retval = (0);
+			var fd = Values.unbox_i(args[0]);
+			var sysfd = fdmap.get(fd);
+			if (sysfd < 0) return (T.!(err_retval), EBADFD);
+			return (T.!((sysfd)), HostResult.Value0);
+		}
+	}
+	case PATH_STAT(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			var err_retval = (Pointer.NULL, Pointer.NULL);
+			var path = getPath(memory, args[0]);
+			if (path.reason != TrapReason.NONE) return (T.!(err_retval), path.toHostResultThrow());
+			var range = getRegionOf(memory, args, 1, u32.!(wali_stat.size));
+			if (range.reason != TrapReason.NONE) return (T.!(err_retval), range.toHostResultThrow());
+			// var incoming = Ref<wali_stat>.of(range.val);
+			// TODO: layout adjustment for minor stat buffer changes
+			return (T.!((Pointer.atContents(path.result), Pointer.atContents(range.result))), HostResult.Value0);
+		}
+	}
+	case Void(args: Range<Value>) {
+		def getArgs<T>(fdmap: FileDescriptorMap, memory: Memory) -> (T, HostResult) {
+			return (T.!(()), HostResult.Value0);
+		}
+	}
+}
+
+
+component WaliCheck {
+	def Syscall<T>(fdmap: FileDescriptorMap,
+			memory: Memory,
+			args_type: ArgType,
+			syscall_num: int,
+			syscall: (int, T, FileDescriptorMap, Memory) -> HostResult) -> HostResult {
+	   var res: (T, HostResult) = args_type.getArgs(fdmap, memory);
+	   var args = res.0;
+	   var host_result = res.1;
+	   if (host_result != HostResult.Value0) return host_result;
+	   return syscall(syscall_num, T.!(args), fdmap, memory);
+	}
 }
