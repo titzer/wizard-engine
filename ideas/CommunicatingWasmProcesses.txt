@@ -1,0 +1,481 @@
+Idea: Communicating Wasm Processes
+      A message-passing and actor model based on primitive Wasm types and functions
+
+Problem: How to communicate data between different Wasm programs when separated by
+         a network boundary or a buffer in a way that is space efficient and fast?
+
+Basic approach:
+         We use the core Wasm concepts of imported/exported functions and a shared
+         nothing model. No changes or additions to core Wasm are necessary, although
+	 an additional binary encoding scheme for message format is specified.
+	 We'll use the fact that messages and function calls are duals of each other.
+	 In particular, the name of a function is a message's tag and
+	 the arguments to the functions are the data items packaged into a message.
+         Because Wasm signatures are so simple, we can define a standardized, efficient binary
+	 format for messages. With a standard message format, we can connect modules
+	 across a network/buffer boundary by automatically generating the encoding/decoding
+	 logic and even inlining the processing across boundaries.
+
+
+=== One-way communication ====================================================
+
+First, let's consider one-way communication.
+Let's define a server that listens for messages from clients that report temperature and
+humidity readings.
+The purpose of the server might be to collecting statistics and perform monitoring.
+The server might make sense to be remote because it accepts readings from multiple clients
+and, centralizes summary information about multiple sensors over many readings, and allows
+queries.
+A simple server might simple store a cumulative average, a running average, or some selection of samples
+to disk, or a collection of outliers and spikes.
+However, from clients' perspective, the only operation is to report a reading and leave the processing
+to the server.
+
+-- Messages are imported functions with primitive parameter types -----------------------
+
+How do we define this protocol, including the messages that could be sent?
+While a server can be defined in terms of the messages that it accepts from clients,
+it could also equivalently be defined in terms of the messages that clients
+*would like to*, or *can legally* send to the server.
+For the temp/humidity example, we'll define the API in terms of a Wasm client module that
+"imports" functions from the server, and these functions take the raw temperature
+and humidity readings one at a time.
+
+;; A client module defines the server API which allows it to report data.
+#temp_hum_client.wat
+(module $temp_hum_client
+  (import "Server" "recordTemperature" (func (param f64)))
+  (import "Server" "recordHumidity" (func (param f64)))
+
+  ;; internal logic that we'll write to decide when/how to send readings.
+)
+
+-- Asynchronous is the same as no return value --------------------------------------------------
+
+Above, the two imported functions correspond 1-to-1 with messages that we'd like
+a client to send a server.
+From inside the module, the client just calls these imported functions.
+Notice that these functions no return value!
+These are "asynchronous" functions in that the client doesn't need to wait for
+a response to continue execution; the client can "fire and forget" a reading
+and continue execution without regard for what the server does with that reading.
+This is important--we'll model *all* asynchronous calls to the server as imported functions
+that have no return values.
+The fact that they are simply function calls means that the internals of the client are
+not concerned with how data is marshalled to the server, and the fact that there are
+no return values means the client is not concerned with getting a synchronous response.
+
+It's important that we use imported functions that directly take the data values, and not
+(in-memory) buffers of data values.
+With this, it's possible we could instantiate the client module with imports that
+don't talk to a server at all, but call a local implementation.
+Such a "direct" implementation doesn't need the overhead of marshalling and unmarshalling
+data via messages, but each message is just a call to an imported Wasm function, and the execution
+overhead is just a few machine instructions.
+With a remote server, the calls are automatically *buffered*, meaning the call and its
+arguments are encoded as messages and sent over a network.
+When buffered, the messages are represented by an efficient binary format for storage or transmission.
+The routines to encode and decode the data will be standard and highly performant.
+
+-- Every signature has a standard byte-exact memory/network layout ----------------------------------
+
+We'll restrict imported server functions' parameter types to primitives (i32, i64, f32, f64, v128) so
+that we can define the encoding of the parameters into a byte-oriented message in a standard way.
+We'll simply say that the byte format is equivalent to sequentially writing the argument values to memory
+with their respective Wasm store instructions (i32.store, i64.store, f32.store, f64.store, v128.store).
+Thus, we don't need to define a *new* binary format and encoding scheme; for any given Wasm parameter signature
+with only these five types, we can define the sequentialization of those as the binary format for a message.
+
+For example, given the function
+
+(func $f (param i32 i32 i64))
+
+An an illustration, we could consider an encoding function that writes the parameters to memory (or a packet) into the
+proper binary format at address 0 in some memory:
+
+(func $encode_i32_i32_i64 (param i32 i32 i64) (result i32)  ;; writes into memory and returns size
+  (i32.store offset=0 (i32.const 0) (local.get 0)) ;; writes data into memory at address 0
+  (i32.store offset=4 (i32.const 0) (local.get 1))
+  (i64.store offset=8 (i32.const 0) (local.get 2))
+  (i32.const 16) ;; all messages of this format are exactly 16 bytes
+)
+
+Now, of course, we don't *necessarily* need to expose raw encoded messages to the client or
+the server, this is just a way of precisely defining the binary format.
+We don't expect that clients or servers have to write messages by hand.
+
+When the client and server are separated by a buffer, e.g. a network boundary, this sequentialization will be
+the binary format that is sent over the wire.
+Since Wasm loads and stores use little endian byte order, this implicitly defines these message formats are also little-endian.
+Importantly, this means software *and hardware* can be written to encode/decode Wasm messages for interoperability and performance,
+independent of any programming language.
+
+Since the formats are so standardized, we can go to crazy lengths to optimize encode/decode of messages *below* the Wasm level.
+In a super-optimized server implementation, the encoding and decode routines are as close as
+possible to the ingestion of bytes from the network stack, so, e.g. the server can take bytes
+directly from the network card, decode them, and call the server routines will minimal overhead.
+
+-- Example: Averaging Temp/Humidity Server (ATHS) ---------------------------------------------------
+
+To see how incredibly efficient we could make a server, consider a temp/humidity server
+that simply tracks an overall average of both quantities.
+We write this as a Wasm module that has internal state in the form of global variables.
+The globals store the summary of the samples simply as a sum and a count, which
+allows computing the average at any time.
+
+#include averaging_server.wat
+
+The exported functions implement the server's logic for computing and storing the average.
+The names of the exported functions allow matching up client calls with server calls.
+(We'll see in a bit that this is a little bit more than string matching, but suffices for now.)
+
+-- A crazy fast server ------------------------------------------------------------------
+
+The potential of a highly efficient, standard format for messages is *the key* to
+eliminating the network boundary automatically.
+For ATHS, the implementation of the "recordTemperature" and "recordHumidity"
+functions will be compiled to highly efficient machine code by the Wasm engine.
+If the decoding routine is also automatically generated and *available as Wasm code*, then the server's
+routines can actually be inlined into the decoding routine.
+Further, since the decoding routine can also be specified as safe Wasm code, we could have an ATHS
+implementation that *is compiled into the network stack*.
+The sandboxing guarantees of Wasm allow us to push server code down into the lower levels
+of software, even the kernel, automatically and safely.
+
+But we can do better that by also eliminating a network boundary.
+Clearly, if we have both the client and the server module available at the same location,
+calls from the client module to record the temperature and humidity can go directly into
+the server module by a simple Wasm call.
+At first this seems difficult, because a server could be arbitrarily complicated and have
+lots of state.
+It also seems dangerous.
+But with Wasm, this is tractable, because Wasm modules are encapsulated and run inside of sandboxed
+instances.
+An instance doesn't even have to have memory!
+For example, the ATHS server module have its own state, but only four global variables.
+This state is perfectly encapsulated by a small Wasm instance; there's no need for 8GB of address
+space to have a HW bounds check for a memory that doesn't exist.
+Because the instance is so small, we can do even better, if the Wasm engine can *inline* the
+ATHS's implementation into the client, avoiding any function call overhead.
+The ATHS implementation is an online, streaming summary and its compiled code is just reading
+global variables (in the server), updating them, and then storing them back.
+This might be as few has a handful to ten machine instructions, directly in the client.
+
+Thus, the key to making super-fast client/server communications is the ability to push server
+logic into message decoding or even avoid the network boundary whenever possible with
+*direct calls.*
+
+-- Inlining synchrony, latency, blocking, and parallelism -----------------------------------------
+
+Given a client and a server module, we just saw how inlining the server implementation into
+the client could be a huge performance win.
+This is directly enabled by the duality between binary messages and Wasm function calls, so
+that the linkage between client and server works equally well in either case.
+
+But inlining might not necessarily always work.
+In particular, inlining a server's implementation into a client makes is *synchronous*; a
+function call must run to completion before it returns to the caller.
+If the server does a long calculation or even gets *stuck*, or "blocks", then because the client
+is on the call stack, it suffers the latency of the server computation and could also get
+stuck or block.
+
+So inlining won't always work; we sometimes want to retain a buffer so that some calls can be
+made asynchronously.
+But wait!
+Since the server function *has no return value*, technically the client could also *proceed
+in parallel*, since there is no result to wait for.
+So we actually have 3 options now for connecting server and client:
+
+1) Make the call asynchronous by using a buffer underneath, which is always possible and
+   is space efficient due to a standard binary format.
+2) Make the call synchronous and potentially inline it, avoiding buffering and potentially
+   allowing server code to be optimized in the context of client code.
+3) Make the call asynchronous *and parallel*, using a new thread (or process) on the same
+   machine to run the request.
+
+Both 2) and 3) are possible when colocating on the same machine, or more precisely, when
+one computer can manipulate both the client and server state and run mixed code.
+Both 1) and 3) use buffers of messages to communicate.
+There are a lot of optimizations for batching buffers possible, see later.
+
+-- Negotiating tags for messages ----------------------------------------------------------
+
+While we now have a highly-efficient binary format for encoding arguments into messages
+on one side and decoding them back into arguments on the other side, this is not
+enough for clients and servers to communicate.
+Even in our simple temp/humidity example, there are two different kinds of messages, one
+corresponding to the "recordTemperature" call and one for "recordHumidity".
+In a stream of messages with different kinds, we thus need a mechanism to distinguish the
+binary format of one message kind from another.
+We'll use a simple strategy where every message starts with data called a *tag*.
+The tag is a sequence of one or more bytes that denotes which of the legal message kinds follows.
+
+In the temp/humidity example, since there were only two kinds of messages, the binary format
+needs to encode at least one bit, so we could use a single byte as the tag.
+While space efficiency is nice, memory alignment might be important for high-performance
+decoding of events, so in practice using a full i32 for alignment is usually better.
+That comes with a problem: how do client and server agree on what the values of the tag byte mean?
+The client might want to encode "recordTemperature" == 0 and "recordHumidity" == 1, whereas
+the server might expect something different.
+The key thing to remember is that the tags only have to be *pairwise unique*--specifically *this* client
+and *this* server agree on the set of allowable messages.
+The set of allowable messages is determined by the names and thus determines the integer tag values.
+Thus there is an *out-of-band* negotiation of the tagging scheme for messages to arrive on a shared
+a mapping from small integer values to names.
+
+Tag negotiation schemes could be complex, as we'll see later, but for now, let's use
+the "client wins" negotiation scheme:
+
+In the "client wins" tag negotation scheme:
+  1. Tag values ar always encoded as an i32 prefix to the arguments of the message.
+  2. The tag value *0* is reserved for system use.
+  3. Tag values are assigned for each imported call in order of the client module's imports,
+     starting from *1*.
+  
+Using this tagging scheme, the binary format of a stream of events can be exactly described
+by a module that imports functions with names and signatures.
+
+In practice, most server/client setups across a network will include a connection step
+where clients first send their tag assignments to a server, effectively informing the
+server of which tags it should expect to receive.
+The server is not required to acknowledge this, though it might be a good idea.
+Further, the "client wins" scheme supports API evolution, as we'll see in more complex tag
+negotiations later.
+
+-- Bidirectional communication and asynchrony ---------------------------------------------
+
+So far, our simple example only has one-way communication.
+The server is effectively a data sink for temperature and humidity readings.
+That's particularly obvious when looking at the ATHS--it has internal state in the form
+of global variables that are not exported; there's no way to read them.
+
+The most straightforward way to expose the data is to add new requests (i.e. imported
+functions) from the server, so that in addition to reporting new readings, one can
+request the current average.
+
+(module $query
+  (import "Server" "getAverageTemperature" (result f64))
+  (import "Server" "getAverageHumidity" (result f64))
+)
+
+It's extremely tempting to make the *result* of that logical operator into an result of the
+function.
+But this bakes in a *synchronous* implementation strategy.
+The client assumes that calling the server to get the average temperature will:
+1. Not fail
+2. Return fast
+3. Not block indefinitely
+
+In particular, since the API is specified as a return value, the caller literally cannot
+make progress until the server responds.
+This basically implies a *synchronous remote procedure call*.
+With a network boundary, all kinds of failures and performance pathologies occur, which
+make RPCs a whole lot more complicated than they seem.
+
+One opportunity we have here with standard binary message formats and buffering and
+tag negotiation is that we have an easy, standard way of splitting a synchronous call
+into an asynchronous call by *redefining the API*.
+We simply *remove* the return types for a synchronous call (making it asynchronous)
+and introduce new *exports* that are functions that collect the results of a previous
+asynchronous call.
+
+(module $query2
+  (import "Server" "getAverageTemperature")
+  (import "Server" "getAverageHumidity")
+
+  (export "<-Server:getAverageTemperature" (param f64))
+  (export "<-Server:getAverageHumidity" (param f64))
+)
+
+With this scheme, the client that wants to query the server sends an *asynchronous* message
+to the server, and will (hopefully) later receive a callback with the result.
+This works in a natural way when the embedder runs the module is in an *event loop* where the
+clients' exports are being called in response to messages back from the server.
+
+But it seems like bad things could happen.
+In particular, it could be that the server crashes, or gets stuck, never returning a result.
+So it's possible that client model issues an asynchronous request that is never handled.
+But all of these possibilities are inherent in general remote communication.
+In particular, if we don't have reliable delivery or even out-of-order delivery of messages,
+lots of other things can happen, such as issuing a request for temperature but getting
+a reply for humidity.
+Thankfully, the fact that each is a separate event means that it's hard to confuse what
+an event means.
+But we have to be prepared for out-of-order replies, or duplicate replies, if the server
+and the underlying network allow that.
+
+-- Communicating error conditions ---------------------------------------------------------
+
+While our the simple averaging temp/humidity server doesn't have any failure conditions,
+other servers might.
+For example, suppose we upgraded our server to also store the last 5 samples and allow
+a client to request them, again by defining an asynchronous request and a reply.
+
+(module $query2
+  (import "Server" "getLastFiveTemperatureSamples")
+
+  (export "<-Server:getLastFiveTemperatureSamples" (param f64 f64 f64 f64 f64))
+)
+
+But what should happen if there aren't five samples stored yet?
+We could return 0, or maybe a sentinel value like NaN (convenient in floating point), which
+maybe works in this case, but we're essentially encoding error conditions into the (one)
+return message for an asynchronous call.
+
+Instead, we could define more possible outcomes by defining more exported functions.
+
+(module $query2
+  (import "Server" "getLastFiveTemperatureSamples")
+
+  (export "<-Server:getLastFiveTemperatureSamples" (param f64 f64 f64 f64 f64))
+  (export "<-Server:getLastFiveTemperatureSamples!noData" (param i32))
+)
+
+And now, if the server doesn't have five temperature samples stored, it could reply
+by sending the message "<-Server:getLastFiveTemperatureSamples!noData" (i32.const 1) to indicate
+that it only has one data sample.
+
+Keep in mind, there are lots of other possible ways to encode the result, e.g. we could have
+defined 
+  (export "<-Server:getLastFiveTemperatureSamples" (param i32 f64 f64 f64 f64 f64))
+where the first argument could represent the number of valid samples.
+
+-- Why no buffers? ------------------------------------------------------------------------
+
+-- Automatically translating between synchronous and asynchronous communication -------------
+
+-- Multiple in-flight requests with request IDs -------------------------------------------
+
+There are many situations where a server may choose to process requests out of order.
+For example, imagine a server whose primary purpose is to cache data from a slower
+form of storage, like a database or (very) remote server.
+As we've seen, we can expect that sending Wasm messages allows many messages to batched
+together, and the asynchronous pattern of calling imports with no returns and exporting
+matched functions that accept return values easily allows replies to be received out of
+order.
+To write a client/server architecture that allows completion of requests out of order,
+we can simply use a pattern of threading a client-chosen request ID through the API.
+
+(module
+  (import "CacheServer" "getFileSize" (param i64 i32 i32)) ;; first arg is client-chosen request ID
+  (export "<-CacheServer:getFileSize" (param i64 i64)) ;; first arg is returned request ID, then size
+)
+
+In this example, a server allows a client to send a request ID as the first argument to
+"getFileSize", while the actual arguments to the query are the second argument.
+When the server returns, it send back the request ID so the client can match responses to requests.
+Then, the client can issue a large number of "getFileSize" asynchronous requests and match
+them up as they have replies out of order.
+
+-- Negotiating the meaning of message fields ----------------------------------------------
+
+Wasm is a low-level format, and everything discussed so far deals with binary encoding of
+messages.
+What do the arguments to a message mean?
+This is mostly an embedder's problem.
+After all, what do the strings in import/export names mean?
+In our examples, we used a little informal convenient where we matched up the results of
+asynchronous calls with the "<-" prefix and some naming conventions.
+That was an nice illustrative device, but how can be make messages more robust and support
+API evolution?
+
+The answer lies in the opacity of the import name string, which is one of core Wasm's core
+strengths.
+We can communicate information to the embedding in all kinds of ways, because Wasm does not
+prescribe the form that import names take.
+We'll make use of this to allow matching the arguments of messages as specified in the Wasm
+signature to an embedding-level notion of what they mean.
+
+(module
+  (import "Server" "reportReading(temp)" (param f64))
+  (import "Server" "reportReading(hum)" (param f64))
+)
+
+Here, we've changed the temperature/humidity server protocol a little.
+While we still have two distinct message types (because there are two imports), what they
+mean is described a little differently.
+In particular, they both now refer to this substring "reportReading" but specify a
+different named parameter encoded in the import string.
+The idea with this convention is that the parameter has a Wasm type (from the corresponding
+position in the Wasm params), but the parameter string name carries semantic meaning to the embedder.
+So this example presumes that "Server" understands the difference between "temp" and "hum" and
+"reportReading(temp)" and "reportReading(hum)" have a clear meaning to the server.
+Overall, this convention, and it is a convention, allows us to specify imported functions with a
+more flexible order of params, or a subset of params.
+Perhaps we could write:
+
+(module
+  (import "Server" "reportReading(temp,hum)" (param f64 f64))
+)
+
+And thus allow reporting two readings in one call!
+
+We can do a lot by encoding semantic information into important names.
+For example, maybe we'd like to also add the ability to *timestamp* our readings.
+With this parameter specification scheme, we can add additional parameters to
+an event, and the server can decide what to do with them.
+
+(module
+  (import "Server" "reportReading(time,temp)" (param i64 f64))
+)
+
+Here, the client adds the "time" parameter to the semantic information and adds the value's
+type to the Wasm signature.
+For a server that stores and makes use of the time, now samples can come in a pair with
+a timestampl.
+For a server that doesn't make use of timestamps, it could drop it.
+In either case, the client remains the same, and the message formats remain the same; the
+server and client still interchange data with a tag that corresponds to the client's
+import ordering.
+
+Handling a semantic mismatch between what a server *would like to accept* and what clients
+expect means that it's not as simple as name matching; argument adaption may be necessary.
+That could be simply reordering or dropping arguments, but in the limit could involve adding
+new values to a message.
+
+
+-- Batching messages for bulk processing ---------------------------------------------------
+
+Buffers allow asynchrony, parallelism, and also *batching*, meaning that many messages could
+be bundled into a single transmission unit (such as a network packet), sent in bulk, decoded in bulk, and executed in bulk.
+Since function calls typically have few parameters, messages are thus relatively small, so
+even kilobyte-sized packets could hold hundreds of messages.
+Batching is a well-known networking problem with a multi-dimensional tradeoff between latency,
+parallelism, memory consumption, and other factors.
+
+Batching is a performance optimization that amortizes data interchange costs.
+In particular, if we think of our ATHS example, if temperature readings are coming at high frequency--
+for example, maybe they are coming from a fusion experiment and represent temperature variations
+over *picoseconds*--we'd like to batch them into big buffers of messages.
+For temperature readings according to the protocol that we defined above, a long sequence of readings
+would look like:
+
+|01:00:00:00|dd:dd:dd:dd:dd:dd:dd:dd|01:00:00:00|dd:dd:dd:dd:dd:dd:dd:dd|
+ ^           ^ data = f64            ^           ^ data = f64
+ tag = recordTemperature             tag = recordTemperature
+
+So for millions of readings we'd have a 50% space overhead.
+
+-- Eliminating tags with repeats ----------------------------------------------------
+
+In the example where high-volume "recordTemperature" events are being generated, we can
+use a completely invisible binary encoding trick to allow repeating messages without a tag.
+For example, if we have 1000 "recordTemperature" messages in a row, we can simply have
+a way of encoding a repeat count, followed by a tag, and then followed by 1000 tag-less
+argument encodings:
+
+|08:03:00:80|01:00:00:00|dd:dd:dd:dd:dd:dd:dd:dd|dd:dd:dd:dd:dd:dd:dd:dd|  ...
+ ^                       ^ data[0]: f64         ^ data[1]: f64             ... data[999]
+ ^           ^ tag = recordTemperature
+ upper bit is set, indicates repeated message of count = 1000
+
+So for 1000 messages, the overhead is 8 bytes, which is less than 1%.
+This also means that the decoding routine can be "unswitched"--it's instead a tight loop it repeatedly
+load temperature readings then calls the internal implementation.
+It also quite nicely happens to be 8-byte aligned!
+Overly, this is highly efficient, because again, we could inline the implementation of
+"recordTemperature" directly into the unswitched decoding loop.
+For the ATHS, we'll end up with code that keeps the running average and count in registers
+while decoding a long run of temperature readings!
+As a side note, this is also a great scheme for processing PCM audio data, which consists of long sequences
+of integer samples.
