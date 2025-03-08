@@ -231,6 +231,10 @@ Both 2) and 3) are possible when colocating on the same machine, or more precise
 one computer can manipulate both the client and server state and run mixed code.
 Both 1) and 3) use buffers of messages to communicate.
 There are a lot of optimizations for batching buffers possible, see later.
+Further, for 3), since the server logic is in another module, with its own state, the
+client module is not impacted by the server's parallelism.
+The server module might also process multiple messages in parallel, in its own shared memory,
+but the client cannot have race conditions because of that.
 
 -- Negotiating tags for messages ----------------------------------------------------------
 
@@ -248,33 +252,41 @@ In the temp/humidity example, since there were only two kinds of messages, the b
 needs to encode at least one bit, so we could use a single byte as the tag.
 While space efficiency is nice, memory alignment might be important for high-performance
 decoding of events, so in practice using a full i32 for alignment is usually better.
-That comes with a problem: how do client and server agree on what the values of the tag byte mean?
+
+But adding a tag now exposes the problem: how do client and server agree on what the values of the tag byte/i32 mean?
 The client might want to encode "recordTemperature" == 0 and "recordHumidity" == 1, whereas
 the server might expect something different.
+The server might support *other* messages from other clients that our client doesn't know/care about.
+The client might also talk to multiple servers with different messages.
+
 The key thing to remember is that the tags only have to be *pairwise unique*--specifically *this* client
 and *this* server agree on the set of allowable messages.
-The set of allowable messages is determined by the names and thus determines the integer tag values.
-Thus there is an *out-of-band* negotiation of the tagging scheme for messages to arrive on a shared
-a mapping from small integer values to names.
+The set of allowable messages is determined by the set of imported names and thus determines the integer tag values.
+While we could consider an *out-of-band* negotiation of the tagging scheme for messages to arrive on a shared
+a mapping from small integer values to names, it could get involved.
 
-Tag negotiation schemes could be complex, as we'll see later, but for now, let's use
-the "client wins" negotiation scheme:
+To sidestep some complexity for now, let's use the "client wins" negotiation scheme:
 
 In the "client wins" tag negotation scheme:
-  1. Tag values ar always encoded as an i32 prefix to the arguments of the message.
+  1. Tag values are always encoded as a single i32 prefix to the arguments of the message.
   2. The tag value *0* is reserved for system use.
   3. Tag values are assigned for each imported call in order of the client module's imports,
-     starting from *1*.
+     starting from *1*. If a client talks to multiple servers, then the tags it uses are
+     unique across all calls to all imported functions.
   
 Using this tagging scheme, the binary format of a stream of events can be exactly described
 by a module that imports functions with names and signatures.
 
-In practice, most server/client setups across a network will include a connection step
-where clients first send their tag assignments to a server, effectively informing the
+One way to support this is to agree on tags when a connection is first established, e.g.
+when a TCP connection is formed.
+An easy way to do this is that clients first send their tag assignments to a server, effectively informing the
 server of which tags it should expect to receive.
 The server is not required to acknowledge this, though it might be a good idea.
 Further, the "client wins" scheme supports API evolution, as we'll see in more complex tag
 negotiations later.
+And the format for this communication could just be *an empty Wasm module* with imports and
+exports.
+No new binary format! Yay!
 
 -- Bidirectional communication and asynchrony ---------------------------------------------
 
@@ -282,6 +294,7 @@ So far, our simple example only has one-way communication.
 The server is effectively a data sink for temperature and humidity samples.
 That's particularly obvious when looking at the ATHS--it has internal state in the form
 of global variables that are not exported; there's no way to read them.
+The "server" consumes samples but never belches it back out.
 
 The most straightforward way to expose the data is to add new requests (i.e. imported
 functions) from the server, so that in addition to reporting new samples, one can
@@ -292,23 +305,23 @@ request the current average.
   (import "Server" "getAverageHumidity" (result f64))
 )
 
-It's extremely tempting to make the *result* of that logical operator into an result of the
-function.
-But this bakes in a *synchronous* implementation strategy.
-The client assumes that calling the server to get the average temperature will:
-1. Not fail
-2. Return fast
-3. Not block indefinitely
-
-In particular, since the API is specified as a return value, the caller literally cannot
-make progress until the server responds.
-This basically implies a *synchronous remote procedure call*.
-With a network boundary, all kinds of failures and performance pathologies occur, which
+It's extremely tempting to make the *result* of that request into an result of the function.
+There are a couple of immediate problems, as this bakes in a *synchronous* implementation strategy.
+With a network boundary, or really any buffering, all kinds of failures and performance pathologies occur, which
 make RPCs a whole lot more complicated than they seem.
+In particular, when there is a buffer between client and server, there are new possibilites:
+  1. Server fails and never returns a result (failure)
+  2. Server is slow, slowing client (performance)
+  3. Server blocks on another RPC, which blocks the client as well (priority inversion, deadlock?)
+
+This makes it extremely inconvenient to deal with failure; one would be tempted to use
+Wasm exception handling to express failure conditions.
+But Wasm exception handling isn't an effect system; there's no way to tell what requests
+can fail and how.
 
 One opportunity we have here with standard binary message formats and buffering and
 tag negotiation is that we have an easy, standard way of splitting a synchronous call
-into an asynchronous call by *redefining the API*.
+into an asynchronous call by moving return values into the parameters replies in a 1-on-1 way.
 We simply *remove* the return types for a synchronous call (making it asynchronous)
 and introduce new *exports* that are functions that collect the results of a previous
 asynchronous call.
@@ -321,27 +334,30 @@ asynchronous call.
   (export "<-Server:getAverageHumidity" (param f64))
 )
 
-With this scheme, the client that wants to query the server sends an *asynchronous* message
+-- Event loop to the rescue ---------------------------------------------------------------
+
+By moving return values to replies, the client that wants to query the server sends an *asynchronous* message
 to the server, and will (hopefully) later receive a callback with the result.
 This works in a natural way when the embedder runs the module is in an *event loop* where the
 clients' exports are being called in response to messages back from the server.
 
-But it seems like bad things could happen.
-In particular, it could be that the server crashes, or gets stuck, never returning a result.
-So it's possible that client model issues an asynchronous request that is never handled.
+So what about all those bad things could happen?
+Server crashes, performance problems, blocking, dropped requests, deadlock?
 But all of these possibilities are inherent in general remote communication.
 In particular, if we don't have reliable delivery or even out-of-order delivery of messages,
 lots of other things can happen, such as issuing a request for temperature but getting
 a reply for humidity.
-Thankfully, the fact that each is a separate event means that it's hard to confuse what
-an event means.
+The answer is: we simply enumerate all the bad things that can happen and allow the
+client module to handle them asynchronously with exports.
+The fact that each is a separate event means that it's hard to confuse what
+an event means; we won't (shouldn't) get confused if the client gets a reply for the
+humidity value, because the message was tagged.
 But we have to be prepared for out-of-order replies, or duplicate replies, if the server
 and the underlying network allow that.
 
 -- Communicating error conditions ---------------------------------------------------------
 
-While our the simple averaging temp/humidity server doesn't have any failure conditions,
-other servers might.
+While our simple averaging temp/humidity server doesn't have any failure conditions, other servers might.
 For example, suppose we upgraded our server to also store the last 5 samples and allow
 a client to request them, again by defining an asynchronous request and a reply.
 
@@ -352,8 +368,8 @@ a client to request them, again by defining an asynchronous request and a reply.
 )
 
 But what should happen if there aren't five samples stored yet?
-We could return 0, or maybe a sentinel value like NaN (convenient in floating point), which
-maybe works in this case, but we're essentially encoding error conditions into the (one)
+The could return 0.0 for those samples, or maybe a sentinel value like NaN (convenient in floating point),
+which maybe works in this case, but we're essentially encoding error conditions into the (one)
 return message for an asynchronous call.
 
 Instead, we could define more possible outcomes by defining more exported functions.
