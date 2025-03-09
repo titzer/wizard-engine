@@ -218,13 +218,13 @@ function update_proposal_repo {
 		return 1
 	    fi
 	fi
-	git clone --depth 1 $remote 2>&1 | cat -e -t
+	git clone --depth 1 $remote 2>&1 | cat -v
 	check_exit $?
 	popd
     else
 	pushd $REPO
 	echo "##+git pull [$REPO]"
-	git pull 2>&1 | cat -e -t
+	git pull 2>&1 | cat -v
 	check_exit $?
 	popd
     fi
@@ -235,7 +235,7 @@ function update_proposal_repo {
 	# Needed for Ocaml build
         eval $(opam env)
     fi
-    make 2>&1  | cat -e -t
+    make 2>&1  | cat -v
     RESULT=$?
     check_exit $RESULT
     popd
