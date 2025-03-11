@@ -306,14 +306,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def r_runtime_ret1	= G(xenv.runtime_ret1);
 	def r_dispatch		= G(xenv.dispatch);
 	def r_ret_throw		= G(xenv.ret_throw);
-	def r_scratch		= G(xenv.scratch);
+	def r_scratch		= G(xenv.scratch);	// RBP
 	def r_curpc		= G(xenv.curpc);
 
-	def r_tmp0		= G(xenv.tmp0);
-	def r_tmp1		= G(xenv.tmp1);
-	def r_tmp2		= G(xenv.tmp2);
-	def r_tmp3		= G(xenv.tmp3);
-	def r_tmp4		= G(xenv.tmp4);
+	def r_tmp0		= G(xenv.tmp0);		// RCX
+	def r_tmp1		= G(xenv.tmp1);		// RDX
+	def r_tmp2		= G(xenv.tmp2);		// RBP == r_scratch
+	def r_tmp3		= G(xenv.tmp3);		// R8
+	def r_tmp4		= G(xenv.tmp4);		// R9
 
 	def r_xmm0		= X(xenv.xmm0);
 	def r_xmm1		= X(xenv.xmm1);
@@ -340,7 +340,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 	def vsph = VspHelper.new(r_vsp, valuerep, 3);
 
-	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef)>.new(Opcodes.code_pages.length + 1);
+	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef, byte, IcCodeRef)>.new(
+				Opcodes.code_pages.length + Opcodes.num_subpages + 1);
+				// prefix, table, table-if-leb, subpage index, subpage table
 
 	def ivar_MEM0_BASE	= (r_mem0_base, m_mem0_base);
 	def ivar_VFP		= (r_vfp, m_vfp);
@@ -403,7 +405,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				.put3("Finished asm interpreter @ (0x%x ... 0x%x), used %d bytes\n",
 					s, (range.end - Pointer.NULL), w.pos)
 				.put1("\tcall entry     = 0x%x\n", s + callEntryOffset);
-			for (t in dispatchTables) Trace.OUT.put2("\tdispatch %x    = 0x%x\n", byte.view(t.0), s + t.1.offset);
+			for (t in dispatchTables) {
+				Trace.OUT.put2("\tdispatch %x    = 0x%x", byte.view(t.0), s + t.1.offset);
+				Trace.OUT.put1("\tleb = 0x%x", if(t.2 == null, 0, s + t.2.offset));
+				if (t.4 != null)
+					Trace.OUT.put2("\tsubpage %x = 0x%x", byte.view(t.3), s + t.4.offset);
+				Trace.OUT.ln();
+			}
 			Trace.OUT
 				.put1("\tfirst dispatch = 0x%x\n", s + firstDispatchOffset)
 				.put1("\thandlers end   = 0x%x\n", s + handlerEndOffset)
@@ -436,12 +444,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		w.atEnd();
 	}
 	def reserveDispatchTables() {
+		// XXX: optimize prefixed dispatch tables by only storing entries for
+		// valid opcodes and using invalid in the 256-entry LEB tables
 		{ // table #0
 			w.align(FastIntTuning.dispatchEntrySize);
 			var ref = IcCodeRef.new(-1);
 			ref.offset = ic.header.fastDispatchTableOffset = w.pos;
 			w.skipN(256 * FastIntTuning.dispatchEntrySize);
-			dispatchTables[0] = (0, ref, null);
+			dispatchTables[0] = (0, ref, null, 0, null);
 		}
 		if (!FeatureDisable.globalProbes) {
 			w.align(FastIntTuning.dispatchEntrySize);
@@ -449,21 +459,35 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			probedDispatchTableRef.offset = ic.header.probedDispatchTableOffset = w.pos;
 			w.skipN(256 * FastIntTuning.dispatchEntrySize);
 		}
+		var dispatchIndex = 1;
 		for (i < Opcodes.code_pages.length) {
 			var page = Opcodes.code_pages[i];
 			var ref = IcCodeRef.new(-1);
 			w.align(FastIntTuning.dispatchEntrySize);
 			ref.offset = w.pos;
-			w.skipN(256 * FastIntTuning.dispatchEntrySize);
+			w.skipN(Opcodes.largestPage * FastIntTuning.dispatchEntrySize);
 			var ref2: IcCodeRef;
 
 			if (!page.oneByte) {
 				ref2 = IcCodeRef.new(-1);
 				ref2.offset = w.pos;
-				w.skipN(256 * FastIntTuning.dispatchEntrySize);
+				w.skipN(Opcodes.largestPage * FastIntTuning.dispatchEntrySize);
 			}
-
-			dispatchTables[i + 1] = (page.prefix, ref, ref2);
+			dispatchTables[dispatchIndex] = (page.prefix, ref, ref2, 0, null);
+			++dispatchIndex;
+			if (page.numSubPages > 0) {
+				for (j < 256) {
+					var subpage = page.subpages[j];
+					if (subpage == null) continue;
+					var refsub = IcCodeRef.new(-1);
+					w.align(FastIntTuning.dispatchEntrySize);
+					refsub.offset = w.pos;
+					w.skipN(Opcodes.largestPage * FastIntTuning.dispatchEntrySize);
+					dispatchTables[dispatchIndex] =
+						(page.prefix, ref, ref2, byte.!(j), refsub);
+					++dispatchIndex;
+				}
+			}
 		}
 	}
 	def genHostCallStub() {
@@ -731,39 +755,167 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	// Generate all the opcode handlers.
 	def genOpcodeHandlers() {
 		// Generate the default handler and initialize dispatch tables
-		var pos = w.atEnd().pos;
+		var trap_pos = w.atEnd().pos;
 		computeCurIpForTrap(-1);
 		asm.jmp_rel_far(newTrapLabel(TrapReason.INVALID_OPCODE));
+
+		// Fill all tables with default (trap INVALID_OPCODE)
 		for (t in dispatchTables) {
-			var ref = t.1;
-			for (i < 256) writeDispatchEntry(ref, i, pos);
+			var refsndary = t.1;
+			var refleb = t.2;
+			var refsub = t.4;
+			if (refsub != null) {
+				for (i < 256) writeDispatchEntry(refsub, i, trap_pos);
+				continue;
+			}
+			if (refleb != null) {
+				for (i < 256) writeDispatchEntry(refleb, i, trap_pos);
+			}
+			for (i < 256) writeDispatchEntry(refsndary, i, trap_pos);
 		}
 
-		// Generate the secondary dispatch tables and point main table at them
-		var ref0 = dispatchTables[0].1;
+		// Generate dispatches to secondary dispatch tables
+		// - Only for non-subpage entries (since they duplicate the main entry)
+		var ref0 = dispatchTables[0].1;		// main dispatch table address
 		for (t in dispatchTables) {
-			if (t.0 == 0) continue; // main dispatch table
+			var prefix = t.0;
+			if (prefix == 0) continue;	// skip main dispatch table
+			if (t.4 != null) continue;	// skip subpage
 			var pos = w.atEnd().pos;
+			var refsndary = t.1;
 			computeCurIpForTrap(-1);
-			genDispatch0(ip_ptr, t.1, true);
-			writeDispatchEntry(ref0, t.0, pos);
+			genDispatch0(ip_ptr, refsndary, true);
+			// main[prefix] = prefix's table
+			writeDispatchEntry(ref0, prefix, pos);
 		}
 
-		// Generate extended LEB landing pads for secondary dispatch tables
-		for (i = 1; i < dispatchTables.length; i++) {
-			var t = dispatchTables[i];
-			var pos = w.pos;
-			if (t.2 != null) {
-				// TODO: some code in this page are in the upper 128; read extended LEB
-				genDispatch0(null, t.2, false);
-			} else {
+		// Generate extended LEB landing pads for non-subpage secondary dispatch tables
+		for (t in dispatchTables) {
+			if (t.0 == 0) continue;		// skip main dispatch table
+			if (t.4 != null) continue;	// skip subpage
+			var leb_pos = w.pos;
+			var refsndary = t.1;
+			var refleb = t.2;
+			if (refleb == null) {
 				// all codes in this page are in the lower 128; just skip extended LEB
+				// happens only with non-minimal encoding
 				genSkipLeb();
+				asm.d.and_r_i(r_tmp0, 0x7F);		// clear upper bit
+				genDispatch0(null, refsndary, false);	// use secondary table
+			} else {
+				// code needs to grab next byte to see what to do
+				asm.movd_r_r(r_tmp2, r_tmp0);		// save opcode
+				asm.d.movbzx_r_m(r_tmp0, ip_ptr);	// load next byte
+				asm.q.inc_r(r_ip);			// increment pointer
+				// convert value to an index we can use into an unused portion
+				// of the LEB table
+
+				// Wish we had: asm.rolb_r_i(r_tmp0, 1) to rotate 8-bit reg.
+				// Encodes as 0xD0 0xCr, where r is register number,
+				//   available in reg's regnum field:
+				// asm.comment(";; rol cl, 1\n");
+				w.putb(0xD0);
+				w.putb(0xC0 | r_tmp0.regnum);
+				// alternative code sequence (encoding slightly different)
+				// asm.movq(r_scratch, r_tmp0);
+				// asm.d.sar_r_i(r_tmp0, 6);	// move upper bit to 0x2 position
+				// asm.d.andi(r_scratch, 0x1);
+				// asm.d.or_r_r(r_tmp0, r_scratch);
+				// a more clever alternative code sequence
+				// asm.imul_r_i(r_tmp0, 0x02020000)
+				//   low bit  ends up in 0x02000000 position (and another)
+				//   0x80 bit ends up in 0x01000000 position (and overflow)
+				// asm.q.slr_r_i(r_tmp0, 24)
+
+				// mapping using rol is:
+				// 0000 0000 -> 0000 0000 upper bit 0, no LEB continuation
+				// 0000 0001 -> 0000 0010 upper bit 1, no LEB continuation
+				// 1000 0000 -> 0000 0001 upper bit 0, LEB continues
+				// 1000 0001 -> 0000 0011 upper bit 1, LEB continues
+				// entries 0-3 of the LEB table are otherwise unused :-)
+				genDispatch0(null, refleb, false);
+
+				// create and install the four dispatch sequences for mapped second byte
+
+				var leb00_pos = w.pos;
+				// upper bit of opcode is 0, no LEB continuation:
+				// dispatch through secondary table after clearing upper bit
+				// not used when encoding is minimal
+				asm.movd_r_r(r_tmp0, r_tmp2);
 				asm.d.and_r_i(r_tmp0, 0x7F);
-				genDispatch0(null, t.1, false);
+				genDispatch0(null, refsndary, false);
+				writeDispatchEntry(refleb, 0x00, leb00_pos);
+
+				var leb01_pos = w.pos;
+				// upper bit of opcode is 0, has LEB continuation:
+				// dispatch through LEB table after skipping LEB and clearing upper bit
+				// not used when encoding is minimal
+				genSkipLeb();
+				asm.movd_r_r(r_tmp0, r_tmp2);	// EBM check this!
+				asm.d.and_r_i(r_tmp0, 0x7F);
+				genDispatch0(null, refsndary, false);
+				writeDispatchEntry(refleb, 0x01, leb01_pos);
+
+				var leb02_pos = w.pos;
+				// upper bit of opcode is 1, no LEB continuation:
+				// dispatch through LEB, don't clear upper bit
+				asm.movd_r_r(r_tmp0, r_tmp2);
+				genDispatch0(null, refleb, false);
+				writeDispatchEntry(refleb, 0x02, leb02_pos);
+
+				var leb03_pos = w.pos;
+				// upper bit of opcode is 1, has LEB continuation:
+				// dispatch through LEB table after skipping LEB
+				// don't clear upper bit
+				// not used when encoding is minimal
+				genSkipLeb();
+				asm.movd_r_r(r_tmp0, r_tmp2);
+				genDispatch0(null, refleb, false);
+				writeDispatchEntry(refleb, 0x03, leb03_pos);
 			}
 			for (i = 128; i < 256; i++) {
-				writeDispatchEntry(t.1, i, pos);
+				writeDispatchEntry(refsndary, i, leb_pos);
+			}
+		}
+		// Generate subpage dispatching
+		for (t in dispatchTables) {
+			if (t.0 == 0) continue;		// skip main dispatch table
+			if (t.4 == null) continue;	// skip non-subpages
+			// there are five cases for subpage index 0XXX XXXX:
+			// First byte  Second byte
+			// 0XXX XXXX   ---- ----    dispatch 0XXX XXXX in secondary table (not subpage)
+			//                          (doesn't get here)
+			// 1XXX XXXX   0000 0000    dispatch as 0XXX XXXX in secondary table
+			// 1XXX XXXX   0YYY YYYY    dispatch 0YYY YYYY in subpage table
+			// 1XXX XXXX   1000 0000    skip LEB, dispatch as 0XXX XXXX in secondary table
+			// 1XXX XXXX   1YYY YYYY    skip LEB, dispatch as 0YYY YYYY in subpage table
+			//                          avoid clearing upper bit by duplicating entry?
+
+			// create and install subpage dispatch
+			var subpage_pos = w.pos;
+			var refsndary = t.1;
+			var refleb = t.2;
+			var sub_index = t.3;
+			var sub_index_leb = sub_index | byte.view(0x80);
+			var refsub = t.4;
+
+			genDispatch0(ip_ptr, refsub, true);
+			// all uses of a subpage will have the LEB bit set
+			writeDispatchEntry(refsndary, sub_index_leb, subpage_pos);
+
+			// Note: writeDispatchEntry installs duplicately for second byte == 0,
+			// in the secondary table (at sub_index) and the subpage table at 0.
+			// The subpage entry at 0 and at 0x80 happen for non-minimal encodings.
+
+			// Generate redirecting handler for upper bit of second byte == 1,
+			// a non-minimal encoding.
+			
+			var subpage_leb_pos = w.pos;
+			genSkipLeb();
+			asm.d.and_r_i(r_tmp0, 0x7F);
+			genDispatch0(null, refsub, false);
+			for (i = 128; i < 256; ++i) {
+				writeDispatchEntry(refsub, i, subpage_leb_pos);
 			}
 		}
 
@@ -771,10 +923,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genControlFlow();
 		genLocals();
 		genCallsAndRet();
+		genGlobals();
 		genLoadsAndStores();
-		genAtomicWaitAndNotify();
-		genAtomicLoadsAndStores();
-        	genAtomicRMWOperations();
 		genCompares();
 		genI32Arith();
 		genI64Arith();
@@ -782,11 +932,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genF32Arith();
 		genF64Arith();
 		genFloatCmps();
-		genGcInstrs();
-		genFloatMinAndMax();
 		genFloatTruncs();
 		genFloatConversions();
+		genAtomicWaitAndNotify();
+		genAtomicLoadsAndStores();
+        	genAtomicRMWOperations();
 		genRuntimeCallOps();
+		genGcInstrs();
+		genFloatMinAndMax();
 		genSimdInstrs();
 		genMisc();
 		if (!FeatureDisable.globalProbes) genGlobalProbeSupport();
@@ -1250,7 +1403,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		computeCurIpForTrap(-1);
 		var r_tmp5 = r_eip; // XXX, ugly, need one more register, and func_decl is not dirty and is not needed.
-		var sig_index = r_tmp5, table_index = r_tmp3, func_index = r_tmp0;
+		var sig_index = r_tmp5, table_index = r_tmp4, func_index = r_tmp0;
 		genReadUleb32(sig_index);
 		genReadUleb32(table_index);
 
@@ -1258,7 +1411,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movd_r_m(func_index, vsph[0].value);
 
 		var tmp = r_tmp2;
-		var sig_id = r_tmp4;
+		var sig_id = r_tmp3;
 		// load instance.sig_ids[sig_index] into sig_id
 		asm.movq_r_m(tmp, r_instance.plus(offsets.Instance_sig_ids));
 		asm.movd_r_m(sig_id, tmp.plusR(sig_index, offsets.INT_SIZE, offsets.Array_contents));
@@ -1311,6 +1464,55 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// set VSP properly
 		asm.q.lea(r_vsp, r_vfp.plusR(cnt, 1, 0));
 	}
+	def genGlobals() {
+		for (t in [
+			(Opcode.GLOBAL_GET, refRuntimeCall(RT.runtime_GLOBAL_GET)),
+			(Opcode.GLOBAL_SET, refRuntimeCall(RT.runtime_GLOBAL_SET))
+		]) {
+			bindHandler(t.0);
+			var runtime_call = X86_64Label.new();
+			genReadUleb32(r_tmp0);
+			if (FastIntTuning.inlineGlobalAccess) {
+				// Load instance.globals
+				asm.movq_r_m(r_tmp1, r_instance.plus(offsets.Instance_globals));
+				// Load instance.globals[r_tmp0]
+				var r_global = r_tmp2;
+				asm.movq_r_m(r_global, r_tmp1.plusR(r_tmp0, 8, offsets.Array_contents));
+				// Load Global.tag
+				asm.movbzx_r_m(r_tmp1, r_global.plus(offsets.Global_tag));
+				// check if tag is reference, which cannot be done inline because of i31
+				asm.d.cmp_r_i(r_tmp1, ValueKind.REF.code);
+				asm.jc_rel_near(C.Z, runtime_call);
+				// do inline global get or set
+				if (t.0 == Opcode.GLOBAL_GET) {
+					genTagPushR(r_tmp1); // set the tag
+					if (valuerep.value_size == 16) {
+						asm.movdqu_s_m(r_xmm0, r_global.plus(offsets.Global_low));
+						asm.movdqu_m_s(vsph[0].value, r_xmm0);
+					} else {
+						asm.movq_r_m(r_tmp0, r_global.plus(offsets.Global_low));
+						asm.movq_m_r(vsph[0].value, r_tmp0);
+					}
+					incrementVsp();
+				} else {
+					if (valuerep.value_size == 16) {
+						asm.movdqu_s_m(r_xmm0, vsph[-1].value);
+						asm.movdqu_m_s(r_global.plus(offsets.Global_low), r_xmm0);
+					} else {
+						asm.movq_r_m(r_tmp0, vsph[-1].value);
+						asm.movq_m_r(r_global.plus(offsets.Global_low), r_tmp0);
+					}
+					decrementVsp();
+				}
+				genDispatchOrJumpToDispatch();
+			}		
+			asm.bind(runtime_call);
+			saveCallerIVars();
+			callRuntime(t.1, [r_instance, r_tmp0], false);
+			restoreCallerIVars();
+			endHandler();
+		}
+	}
 	def genLoadsAndStores() {
 		genLoad(Opcode.I32_LOAD, BpTypeCode.I32.code, asm.movd_r_m);
 		genLoad(Opcode.I64_LOAD, BpTypeCode.I64.code, asm.movq_r_m);
@@ -1323,7 +1525,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genLoad(Opcode.I64_LOAD8_S, BpTypeCode.I64.code, asm.movbsx_r_m);
 		genLoad(Opcode.I64_LOAD8_U, BpTypeCode.I64.code, asm.movbzx_r_m);
 		genLoad(Opcode.I64_LOAD16_S, BpTypeCode.I64.code, asm.movwsx_r_m);
-		genLoad(Opcode.I64_LOAD16_U, BpTypeCode.I64.code, asm.movwzx_r_m);
 		genLoad(Opcode.I64_LOAD16_U, BpTypeCode.I64.code, asm.movwzx_r_m);
 		genLoad(Opcode.I64_LOAD32_S, BpTypeCode.I64.code, masm.emit_movq_32s_r_m);
 		genLoad(Opcode.I64_LOAD32_U, BpTypeCode.I64.code, asm.movd_r_m);
@@ -2242,7 +2443,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 		bindHandler(Opcode.RESUME_THROW); {
 			var resumeStub = X86_64Label.new();
-			var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp3;
+			var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp4;
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
 			// read info and rewind %ip (need %ip at start of opcode during call)
@@ -2252,7 +2453,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_r(r_ip, ip_store);
 			saveCallerIVars();
 			var r_cont = r_tmp1;
-			genResume(cont_id, r_cont, r_tmp4);
+			genResume(cont_id, r_cont, r_tmp3);
 			var r_tag = r_tmp3;
 			asm.movq_r_m(r_scratch, r_instance.plus(offsets.Instance_tags));
 			asm.movq_r_m(r_tag, r_scratch.plusR(tag_index, offsets.REF_SIZE, offsets.Array_contents));
@@ -2268,7 +2469,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.bind(resumeStub); { genResumeStub(r_cont, r_tmp0, r_tmp3, true); }
 		}
 		bindHandler(Opcode.SUSPEND); {
-			var tag_index = r_tmp0;
+			var tag_index = r_tmp0, r_cont = r_tmp1;
 			var suspendStub = X86_64Label.new();
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
@@ -2293,6 +2494,34 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				endHandler();
 			}
     }
+		bindHandler(Opcode.SWITCH); {
+			var target_cont_id = r_tmp0, tag_id = r_tmp1;
+			var switchStub = X86_64Label.new();
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			genReadUleb32(target_cont_id); // read cont index
+			genReadUleb32(tag_id); // read tag index
+
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.runtime_handle_switch), [r_instance, target_cont_id, tag_id], true);
+			asm.call_rel_far(switchStub);
+
+			/* === OTHER STACK RUNNING === */
+
+			restoreCallerIVars();
+			restoreDispatchTableReg();
+			endHandler();
+
+			asm.bind(switchStub); {
+				asm.movq_r_m(r_scratch, m_curStack);
+				asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
+				asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
+				restoreCallerIVars();
+				restoreDispatchTableReg();
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				masm.emit_jump_r(xenv.scratch);
+			}
+		}
 		writeDispatchEntry(dispatchTables[0].1, InternalOpcode.PROBE.code, w.atEnd().pos); {
 			computeCurIpFromIp(-1);
 			computePcFromCurIp();
@@ -2550,10 +2779,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def genRuntimeCallOps() {
 		// generate code for runtime calls with 1 LEB that cannot trap.
-		var call_irt = asm.newLabel();
 		for (t in [
-			(Opcode.GLOBAL_GET, refRuntimeCall(RT.runtime_GLOBAL_GET)),
-			(Opcode.GLOBAL_SET, refRuntimeCall(RT.runtime_GLOBAL_SET)),
 			(Opcode.MEMORY_GROW, refRuntimeCall(RT.runtime_MEMORY_GROW)),
 			(Opcode.TABLE_GROW, refRuntimeCall(RT.runtime_TABLE_GROW)),
 			(Opcode.STRUCT_NEW, refRuntimeCall(RT.runtime_STRUCT_NEW)),
@@ -2566,10 +2792,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 
 		// generate code for runtime calls with 1 LEB that can trap.
-		call_irt = asm.newLabel();
 		for (t in [
 			(Opcode.TABLE_GET, refRuntimeCall(RT.runtime_TABLE_GET)),
 			(Opcode.TABLE_SET, refRuntimeCall(RT.runtime_TABLE_SET)),
@@ -2592,10 +2816,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 
 		// generate code for runtime calls with 2 LEBS that can trap.
-		call_irt = asm.newLabel();
 		for (t in [
 			(Opcode.TABLE_INIT, refRuntimeCall(RT.runtime_TABLE_INIT)),
 			(Opcode.MEMORY_INIT, refRuntimeCall(RT.runtime_MEMORY_INIT)),
@@ -2621,7 +2843,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		asm.bind(call_irt);
 	}
 
 	// helper method to move values from vsp to registers
@@ -2646,8 +2867,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		load_v128_s_r(r_xmm0, r_tmp0);
 	}
 	def load_imm8(r: X86_64Gpr) {
-		asm.movb_r_m(r, ip_ptr);
-		asm.q.add_r_i(r_ip, 1);
+		asm.movbzx_r_m(r, ip_ptr);
+		asm.q.inc_r(r_ip);
 	}
 	def decode_memarg(src: X86_64Addr, scratch1: X86_64Gpr, scratch2: X86_64Gpr) -> X86_64Addr{
 		asm.q.inc_r(r_ip);			// skip flags byte
@@ -2680,7 +2901,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		def addr = decode_memarg(src, scratch1, scratch2);
 		asm.movdqu_m_s(addr, data);
 	}
-	def genExtractLane<T>(opcode: Opcode, tag: byte, size: byte,
+	def genExtract_lane<T>(opcode: Opcode, tag: byte, size: byte,
 		asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> T,
 		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> T,
 		signExt: bool) {
@@ -2703,7 +2924,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm_mov_m_r(dst, src);
 		endHandler();
 	}
-	def genReplaceLane<T>(opcode: Opcode, size: byte,
+	def genReplace_lane<T>(opcode: Opcode, size: byte,
 		asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> T,
 		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> T) {
 		bindHandler(opcode);
@@ -2837,12 +3058,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genLoadSplat(Opcode.V128_LOAD_32_SPLAT, load_memarg32, masm.emit_i32x4_splat);
 		genLoadSplat(Opcode.V128_LOAD_64_SPLAT, load_memarg64, masm.emit_i64x2_splat);
 		// V128 lane replacement
-		genReplaceLane(Opcode.I8X16_REPLACELANE, 1, asm.movb_r_m, asm.movb_m_r);
-		genReplaceLane(Opcode.I16X8_REPLACELANE, 2, asm.movw_r_m, asm.movw_m_r);
-		genReplaceLane(Opcode.I32X4_REPLACELANE, 4, asm.movd_r_m, asm.movd_m_r);
-		genReplaceLane(Opcode.I64X2_REPLACELANE, 8, asm.movq_r_m, asm.movq_m_r);
-		genReplaceLane(Opcode.F32X4_REPLACELANE, 4, asm.movd_r_m, asm.movd_m_r);
-		genReplaceLane(Opcode.F64X2_REPLACELANE, 8, asm.movq_r_m, asm.movq_m_r);
+		genReplace_lane(Opcode.I8X16_REPLACE_LANE, 1, asm.movb_r_m, asm.movb_m_r);
+		genReplace_lane(Opcode.I16X8_REPLACE_LANE, 2, asm.movw_r_m, asm.movw_m_r);
+		genReplace_lane(Opcode.I32X4_REPLACE_LANE, 4, asm.movd_r_m, asm.movd_m_r);
+		genReplace_lane(Opcode.I64X2_REPLACE_LANE, 8, asm.movq_r_m, asm.movq_m_r);
+		genReplace_lane(Opcode.F32X4_REPLACE_LANE, 4, asm.movd_r_m, asm.movd_m_r);
+		genReplace_lane(Opcode.F64X2_REPLACE_LANE, 8, asm.movq_r_m, asm.movq_m_r);
 		// V128 store
 		bindHandler(Opcode.V128_STORE); {
 			computeCurIpForTrap(-1);
@@ -2857,14 +3078,14 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genStoreLane(Opcode.V128_STORE_32_LANE, 4, asm.q.movd_r_m, asm.q.movd_m_r);
 		genStoreLane(Opcode.V128_STORE_64_LANE, 8, asm.q.movq_r_m, asm.q.movq_m_r);
 		// V128 extract_lane
-		genExtractLane(Opcode.I8X16_EXTRACTLANE_U, BpTypeCode.I32.code, 1, asm.movb_r_m, asm.movb_m_r, false);
-		genExtractLane(Opcode.I16X8_EXTRACTLANE_U, BpTypeCode.I32.code, 2, asm.movw_r_m, asm.movw_m_r, false);
-		genExtractLane(Opcode.I8X16_EXTRACTLANE_S, BpTypeCode.I32.code, 1, asm.movb_r_m, asm.movd_m_r, true);
-		genExtractLane(Opcode.I16X8_EXTRACTLANE_S, BpTypeCode.I32.code, 2, asm.movw_r_m, asm.movd_m_r, true);
-		genExtractLane(Opcode.I32X4_EXTRACTLANE, BpTypeCode.I32.code, 4, asm.movd_r_m, asm.movd_m_r, false);
-		genExtractLane(Opcode.I64X2_EXTRACTLANE, BpTypeCode.I64.code, 8, asm.movq_r_m, asm.movq_m_r, false);
-		genExtractLane(Opcode.F32X4_EXTRACTLANE, BpTypeCode.F32.code, 4, asm.movd_r_m, asm.movd_m_r, false);
-		genExtractLane(Opcode.F64X2_EXTRACTLANE, BpTypeCode.F64.code, 8, asm.movq_r_m, asm.movq_m_r, false);
+		genExtract_lane(Opcode.I8X16_EXTRACT_LANE_U, BpTypeCode.I32.code, 1, asm.movb_r_m, asm.movb_m_r, false);
+		genExtract_lane(Opcode.I16X8_EXTRACT_LANE_U, BpTypeCode.I32.code, 2, asm.movw_r_m, asm.movw_m_r, false);
+		genExtract_lane(Opcode.I8X16_EXTRACT_LANE_S, BpTypeCode.I32.code, 1, asm.movb_r_m, asm.movd_m_r, true);
+		genExtract_lane(Opcode.I16X8_EXTRACT_LANE_S, BpTypeCode.I32.code, 2, asm.movw_r_m, asm.movd_m_r, true);
+		genExtract_lane(Opcode.I32X4_EXTRACT_LANE, BpTypeCode.I32.code, 4, asm.movd_r_m, asm.movd_m_r, false);
+		genExtract_lane(Opcode.I64X2_EXTRACT_LANE, BpTypeCode.I64.code, 8, asm.movq_r_m, asm.movq_m_r, false);
+		genExtract_lane(Opcode.F32X4_EXTRACT_LANE, BpTypeCode.F32.code, 4, asm.movd_r_m, asm.movd_m_r, false);
+		genExtract_lane(Opcode.F64X2_EXTRACT_LANE, BpTypeCode.F64.code, 8, asm.movq_r_m, asm.movq_m_r, false);
 
 		// V128 boolean instructions
 		genSimdBinop(Opcode.V128_AND, asm.andps_s_s);
@@ -3337,7 +3558,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
-			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
+			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
 		} else {
 			asm.q.inc_r(r_ip);				// skip flags byte
@@ -3370,7 +3592,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
 			asm.q.inc_r(r_ip);				// skip flags byte
-			asm.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
+			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
 		} else {
 			asm.q.inc_r(r_ip);				// skip flags byte
@@ -3409,6 +3632,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 	// Generate a read of a 32-bit unsigned LEB.
 	def genReadUleb32(dest: X86_64Gpr) {
+		// TODO: fix reading of LEBs
+		if (dest == r_scratch) System.error("X86_64InterpreterError", "cannot use r_scratch as an LEB destination");
+		if (dest == r_tmp3) System.error("X86_64InterpreterError", "cannot use r_tmp3 as an LEB destination");
 		var ool_leb: OutOfLineLEB;
 		if (!FastIntTuning.inlineAllLEBs) {
 			ool_leb = OutOfLineLEB.new(dest);
@@ -3417,7 +3643,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var asm = this.asm.d;
 		asm.movbzx_r_m(dest, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
-		asm.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
+		// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+		asm.d.test_r_i(dest, LEB_UPPER_BIT);	// test most-significant bit
 		if (FastIntTuning.inlineAllLEBs) {
 			var leb_done = X86_64Label.new();
 			asm.jc_rel_near(C.Z, leb_done);
@@ -3519,7 +3746,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.bind(more);
 		asm.movbzx_r_m(scratch, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
-		asm.test_r_i(scratch, LEB_UPPER_BIT);	// test most-significant bit
+		// this instruction is tricky: it considers 32 bits, but looks only in the low byte
+		asm.d.test_r_i(scratch, LEB_UPPER_BIT);	// test most-significant bit
 		asm.jc_rel_near(C.NZ, more);
 	}
 	// End the handler for the current bytecode
@@ -3583,16 +3811,77 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// Patch the dispatch table for the given opcode to go to the given position.
 	def patchDispatchTable(opcode: Opcode, pos: int) {
-		for (t in dispatchTables) {
-			if (t.0 != opcode.prefix) continue;
-			var ref1 = t.1;
-			if (opcode.prefix == 0 || opcode.code < 128) writeDispatchEntry(ref1, opcode.code, pos);
-			var ref2 = t.2;
-			if (ref2 != null) writeDispatchEntry(ref2, opcode.code, pos);
+		if (opcode.prefix == 0) {
+			if (opcode.code > 255) {
+				fatal("prefix 0 opcode > 255");
+			}
+			var ref0 = dispatchTables[0].1;		// main dispatch table
+			if (Debug.interpreter) {
+				Trace.OUT.put3("\t\tpatch main table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			}
+			writeDispatchEntry(ref0, opcode.code, pos);
 			w.atEnd();
 			return;
 		}
-		fatal("no dispatch table found for prefix");
+		// find closest matching info
+		var refsndary: IcCodeRef;
+		var refleb: IcCodeRef;
+		if (opcode.code > 0x3FFF) {
+			fatal("opcode > 0x3FFF");
+		}
+		var lower = opcode.code & 0x7F;		// subpage number when appropriate
+		var upper = opcode.code >> 7;
+		for (t in dispatchTables) {
+			var prefix = t.0;
+			if (prefix != opcode.prefix) continue;
+			refsndary = t.1;	// secondary table for this prefix
+			refleb = t.2;		// LEB table for this prefix
+			if (t.3 == lower) {
+				// code is in this subpage
+				var refsub = t.4;	// subpage table for this prefix and subpage
+				if (refsub == null) continue;
+				// if upper is 0, can encode as just lower, so put there as well
+				if (upper == 0) {
+					if (Debug.interpreter)
+						Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
+							       lower, opcode.prefix, opcode.code);
+					writeDispatchEntry(refsndary, lower, pos);
+				}
+				// write subpage entry at upper
+				// also covers case of non-minimal encoding of upper == 0
+				if (Debug.interpreter) {
+					Trace.OUT.put2("\t\tpatch subpage table %x at %x", lower, upper);
+					Trace.OUT.put2(" for prefix %x code %x\n", opcode.prefix, opcode.code);
+				}
+				writeDispatchEntry(refsub, upper, pos);
+				w.atEnd();
+				return;
+			}
+		}
+		if (refsndary == null) {
+			fatal("no dispatch table found for prefix");
+		}
+		if (opcode.code > 255) {
+			fatal("opcode > 255 but no matching subpage");
+		}
+		// here if prefix and not a subpage
+		if (opcode.code < 128) {
+			// minimal encoding goes to secondary
+			// other encodings will redirect here
+			if (Debug.interpreter)
+				Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			writeDispatchEntry(refsndary, opcode.code, pos);
+		} else {
+			// all encodings go to LEB table
+			if (Debug.interpreter)
+				Trace.OUT.put3("\t\tpatch LEB table at %x for prefix %x code %x\n",
+					       opcode.code, opcode.prefix, opcode.code);
+			writeDispatchEntry(refleb, opcode.code, pos);
+		}
+		w.atEnd();
+		return;
 	}
 	// Generate the out-of-line LEB decoding code.
 	def genOutOfLineLEBs() { // XXX: use a separate out-of-line assembler on the end of the buffer
@@ -3789,8 +4078,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// goto read_done
 		asm.jc_rel_near(C.S, read_done);
 		// read handler type
-		genReadUleb32(r_scratch);
-		asm.q.cmp_r_i(r_scratch, 0);
+		genReadUleb32(r_tmp4);
+		asm.q.cmp_r_i(r_tmp4, 0);
 		// if {handler_type} is 0x01, read switch handler
 		asm.jc_rel_near(X86_64Conds.NZ, read_switch);
 		// read normal handler

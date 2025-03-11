@@ -9,7 +9,7 @@ Built with the future in mind, it is written in a fast and lightweight, safe, ga
 ## Feature Support ##
 
 Wizard supports most Wasm standard features, including all of Wasm 2.0.
-Never features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
+Newer features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
 
 | Feature / Proposal | load | v3-int | fast-int | spc |
 | ------------------ | ------ | ------ | -------- | --- |
@@ -28,7 +28,8 @@ Never features are under development and vary in their support in the different 
 | stack-switching  | &#x2705;| &#x2705; | &#x2705; |  |
 | threads  | &#x2705;| &#9745; | &#9745; |  |
 | memory64 | &#x2705;| &#x2705; | | |
-| relaxed-simd | | | | |
+| extended-const  | &#9745; | &#9745; | &#9745; | &#9745; |
+| relaxed-simd | &#9745; | | | |
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.

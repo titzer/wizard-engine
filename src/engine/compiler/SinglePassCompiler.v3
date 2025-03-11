@@ -414,9 +414,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			// overwrite mem0_base with whamm instance's memory base, restore from frame slot later
 			if (inline_config.swap_membase) {
-				var memobj_addr = Pointer.atObject(callee_func.instance.memories[0]) - Pointer.NULL;
-				masm.emit_mov_r_l(regs.mem0_base, i64.view(memobj_addr));
-				masm.emit_read_v3_mem_base(regs.mem0_base, regs.mem0_base);
+				var membase = callee_func.instance.memories[0].getMemBase64();
+				masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
 				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
 			}
 		}
@@ -1034,12 +1033,36 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var global = module.globals[index];
 		if (!global.mutable && global.imp == null && InitExpr.I32.?(global.init)) {
 			state.push(KIND_I32 | IS_CONST, NO_REG, InitExpr.I32.!(global.init).val);
+			return;
+		}
+		var kind = ValueTypes.kind(global.valtype);
+		if (SpcTuning.inlineGlobalAccess && kind != ValueKind.REF) {
+			var offsets = masm.getOffsets();
+			var tmp = allocTmp(ValueKind.REF);
+			emit_load_instance(tmp);
+			masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Instance_globals));
+			masm.emit_read_v3_array_r_i(ValueKind.REF, tmp, tmp, int.!(index));
+			var result = allocRegTos(kind);
+			masm.emit_mov_r_m(kind, result, MasmAddr(tmp, offsets.Global_low));
+			state.push(SpcConsts.kindToFlags(kind) | IN_REG, result, 0);
 		} else {
 			emit_call_runtime_op1n(Opcode.GLOBAL_GET, index, 0, [global.valtype], false);
 		}
 	}
 	def visit_GLOBAL_SET(index: u31) {
-		emit_call_runtime_op1n(Opcode.GLOBAL_SET, index, 1, ValueTypes.NONE, false);
+		var global = module.globals[index];
+		var kind = ValueTypes.kind(global.valtype);
+		if (SpcTuning.inlineGlobalAccess && kind != ValueKind.REF) {
+			var offsets = masm.getOffsets();
+			var tmp = allocTmp(ValueKind.REF);
+			emit_load_instance(tmp);
+			masm.emit_mov_r_m(ValueKind.REF, tmp, MasmAddr(tmp, offsets.Instance_globals));
+			masm.emit_read_v3_array_r_i(ValueKind.REF, tmp, tmp, int.!(index));
+			var reg = popReg().reg; // XXX: improve global.set for constants
+			masm.emit_mov_m_r(kind, MasmAddr(tmp, offsets.Global_low), reg);
+		} else {
+			emit_call_runtime_op1n(Opcode.GLOBAL_SET, index, 1, ValueTypes.NONE, false);
+		}
 	}
 	def visit_TABLE_GET(index: u31) {
 		var table = module.tables[index];
@@ -1995,7 +2018,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 
 // An entry in the abstract control stack.
 class SpcControl {
-	var opcode: byte;
+	var opcode: u16;
 	var params: Array<ValueType>;
 	var results: Array<ValueType>;
 	var reachable = true;
@@ -2190,7 +2213,7 @@ class SpcState(regAlloc: RegAlloc) {
 		}
 		sp = max;
 	}
-	private def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
+	private def pushControl(opcode: u16, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
 		var ctl = ctl_stack.next();
 		var reachable = if(ctl_stack.top > 0, ctl_stack.peek().reachable, true);
 		if (ctl != null) { // FAST: reuse previous SpcControl object
