@@ -70,14 +70,16 @@ function run_test() {
 
         $WIZENG_CMD $wasm_file 2>&1 | tee "$wasm_file.wizeng.out"
         WIZENG_OUT_STATUS=$?
+        echo $WIZENG_OUT_STATUS > $wasm_file.exit
 
-        if [ $WIZENG_OUT_STATUS -ne 0 ]; then
+        echo "$TEST_DIR/$wasm_file.exit"
+        if ! diff $wasm_file.exit $TEST_DIR/$wasm_file.exit; then
             echo "##-fail:wizeng $wasm_file exit with code $WIZENG_OUT_STATUS"
-            break
+            continue
         fi
         if ! diff "$wasm_file.wizeng.out" "$wasm_file.out" > /dev/null; then
             echo "##-fail:$wasm_file invalid output, does not match $wasm_file.out"
-            break
+            continue
         fi
 
         if [ $TEST_WITH_IWASM -eq 1 ]; then
@@ -85,11 +87,11 @@ function run_test() {
         IWASM_OUT_STATUS=$?
         if [ $IWASM_OUT_STATUS -ne 0 ]; then
             echo "##-fail:iwasm $wasm_file exit with code $IWASM_OUT_STATUS"
-            break
+            continue
         fi
         if ! diff "$wasm_file.wizeng.out" "$wasm_file.iwasm.out" > /dev/null; then
             echo "##-fail:$wasm_file iwasm and wizeng output different"
-            break
+            continue
         fi
         fi
 
