@@ -8,8 +8,6 @@ while [ -h "$SOURCE" ]; do
 done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
-cd $HERE
-
 export WIZENG_LOC=$(cd $HERE/../../../ && pwd)
 export SPEC_LOC=${SPEC_LOC:=$(cd $WIZENG_LOC/wasm-spec/repos/gc && pwd)}
 
@@ -18,4 +16,4 @@ if [ ! -d $SPEC_LOC ]; then
     exit 1
 fi
 
-../build.sh "$@"
+exec $HERE/../build.sh "$@"
