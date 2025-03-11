@@ -9,7 +9,7 @@ Built with the future in mind, it is written in a fast and lightweight, safe, ga
 ## Feature Support ##
 
 Wizard supports most Wasm standard features, including all of Wasm 2.0.
-Never features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
+Newer features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
 
 | Feature / Proposal | load | v3-int | fast-int | spc |
 | ------------------ | ------ | ------ | -------- | --- |
