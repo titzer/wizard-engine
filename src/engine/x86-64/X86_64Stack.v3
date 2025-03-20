@@ -48,8 +48,14 @@ class X86_64Stack extends WasmStack {
 		return_results = func.sig.results;
 		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
 		parent_rsp_ptr = pushRspPointer(Pointer.NULL); // placeholder for parent pointer
-		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
-		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
+		var ret_parent_ptr = pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
+		var stk_enter_ptr = pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
+		if (Trace.stack && Debug.stack) {
+			Trace.OUT.puts("stack reset:").ln();
+			Trace.OUT.put1("\tparent_rsp_ptr = 0x%x", parent_rsp_ptr - Pointer.NULL).ln();
+			Trace.OUT.put1("\treturn_parent_ptr = 0x%x", ret_parent_ptr - Pointer.NULL).ln();
+			Trace.OUT.put1("\tstack_enter_ptr = 0x%x", stk_enter_ptr - Pointer.NULL).ln();
+		}
 	}
 	// Requires {state == SUSPENDED}.
 	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
@@ -93,8 +99,8 @@ class X86_64Stack extends WasmStack {
 		var prev_sp = this.rsp;
 		if (Exception.?(thrown)) {
 			var ex = Exception.!(thrown);
-			var new_sp = walk(findExHandler, ex, prev_sp);
-			unwind(prev_sp + -RETADDR_SIZE, new_sp);
+			var new_pos = walk(findExHandler, ex, prev_sp);
+			unwind(prev_sp + -RETADDR_SIZE, new_pos);
 			return ex;
 		}
 
@@ -113,9 +119,11 @@ class X86_64Stack extends WasmStack {
 	// stop the stackwalk. Otherwise stop at the return-parent stub. In any case, return the last
 	// valid stack pointer.
 	// (XXX: takes a function {f} with an additional parameter, and the parameter, to avoid a closure).
-	private def walk<P>(f: (TargetFrame, P) -> bool, param: P, start_sp: Pointer) -> Pointer {
+	// (XXX: existence of {start_sp} assumes stack walk begins on this stack, may be confusing?)
+	private def walk<P>(f: (StackFramePos, P) -> bool, param: P, start_sp: Pointer) -> StackFramePos {
+		var stk = this;
 		var sp = start_sp;
-		while (sp < mapping.range.end) {
+		while (sp < stk.mapping.range.end) {
 			var retip = (sp + -RETADDR_SIZE).load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			var accessor: FrameAccessor;
@@ -124,17 +132,29 @@ class X86_64Stack extends WasmStack {
 				if (code != null) code.describeFrame(retip, sp, Trace.OUT.putr_void);
 				else Trace.OUT.ln();
 			}
+			var pos = StackFramePos(stk, TargetFrame(sp)); // TODO: change stack;
 			match (code) {
 				null => break;
-				x: X86_64InterpreterCode => if (f != null && !f(TargetFrame(sp), param)) return sp;
-				x: X86_64SpcModuleCode => if (f != null && !f(TargetFrame(sp), param)) return sp;
-				x: X86_64SpcTrapsStub => if (f != null && !f(TargetFrame(sp), param)) return sp;
-				x: X86_64ReturnParentStub => return sp;
+				x: X86_64InterpreterCode => if (f != null && !f(pos, param)) return pos;
+				x: X86_64SpcModuleCode => if (f != null && !f(pos, param)) return pos;
+				x: X86_64SpcTrapsStub => if (f != null && !f(pos, param)) return pos;
+				x: X86_64ReturnParentStub => {
+					if (stk.parent == null) {
+						if (Trace.stack && Debug.stack) Trace.OUT.puts("\tend of walk chain, returning to host").ln();
+						return pos; // no parent stack, return to host
+					}
+					stk = X86_64Stack.!(stk.parent);
+					sp = stk.rsp + RETADDR_SIZE;
+					if (Trace.stack && Debug.stack) {
+						Trace.OUT.put1("\twalk to parent stack @[sp=0x%x]", sp - Pointer.NULL).ln();
+					}
+					continue;
+				}
 			}
 			var t = code.nextFrame(retip, sp);
 			sp = t.1;
 		}
-		return Pointer.NULL;
+		return StackFramePos(stk, TargetFrame(Pointer.NULL));
 	}
 	def traceFrames(when: string, sp: Pointer) {
 		Trace.OUT.puts(when);
@@ -189,8 +209,8 @@ class X86_64Stack extends WasmStack {
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
 		return handler;
 	}
-	private def findExHandler(frame: TargetFrame, ex: Exception) -> bool {
-		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
+	private def findExHandler(pos: StackFramePos, ex: Exception) -> bool {
+		var accessor = pos.frame.getFrameAccessor(); // XXX: don't materialize accessor
 		var func = accessor.func();
 		var handler = func.decl.findExHandler(func.instance, ex.tag, accessor.pc());
 		if (handler.handler_pc >= 0) {
@@ -200,32 +220,36 @@ class X86_64Stack extends WasmStack {
 			var vfp: Pointer = accessor.vfp();
 			var slot_num = (handler.val_stack_top + func.decl.num_slots());
 			var vsp = vfp + (slot_num * valuerep.slot_size);
-			this.vsp = vsp;
+			X86_64Runtime.curStack = pos.stack;
+			pos.stack.vsp = vsp;
 			if (Trace.exception) Trace.OUT.put3("  push %d vfp=0x%x, vsp=0x%x", ex.vals.length, vfp - Pointer.NULL, vsp - Pointer.NULL).ln();
-			for (v in ex.vals) this.push(v);
+			for (v in ex.vals) pos.stack.push(v);
 			if (handler.ex_slot >= 0) {
 				if (Trace.exception) Trace.OUT.put2("  set_ex_slot vfp=0x%x, ex_slot=%d", vfp - Pointer.NULL, handler.ex_slot).ln();
 				var ptr = vfp + (func.decl.num_locals + handler.ex_slot) * valuerep.slot_size;
-				this.storeValue(ptr, Value.Ref(ex));
+				pos.stack.storeValue(ptr, Value.Ref(ex));
 			}
 			if (handler.push_exnref) {
 				if (Trace.exception) Trace.OUT.puts("  push_exnref").ln();
-				this.push(Value.Ref(ex));
+				pos.stack.push(Value.Ref(ex));
 			}
-			accessor.set_vsp(this.vsp);
+			accessor.set_vsp(pos.stack.vsp);
 			return false; // terminate stackwalk
 		}
 		if (Trace.exception) Trace.OUT.puts("  walk found no handler").ln();
 		return true;
 	}
-	private def addFrameToTrace(frame: TargetFrame, trace: Vector<(WasmFunction, int)>) -> bool {
-		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
+	private def addFrameToTrace(pos: StackFramePos, trace: Vector<(WasmFunction, int)>) -> bool {
+		var accessor = pos.frame.getFrameAccessor(); // XXX: don't materialize accessor
 		trace.put(accessor.func(), accessor.pc());
 		return true;
 	}
-	private def unwind(p_retaddr: Pointer, new_sp: Pointer) {
-		if (new_sp != this.rsp) {
-			this.rsp = (new_sp + -RETADDR_SIZE);
+	private def unwind(p_retaddr: Pointer, new_loc: StackFramePos) {
+		var new_stk = new_loc.stack;
+		var new_sp = new_loc.frame.sp;
+		X86_64Runtime.curStack = new_stk;
+		if (new_sp != new_stk.rsp) {
+			new_stk.rsp = (new_sp + -RETADDR_SIZE);
 			if (p_retaddr != Pointer.NULL) p_retaddr.store<Pointer>(STACK_UNWIND_STUB.getEntry() + NOP_ENTRY);
 		}
 	}
@@ -1076,3 +1100,5 @@ component X86_64StackManager {
 		return result;
 	}
 }
+
+type StackFramePos(stack: X86_64Stack, frame: TargetFrame) #unboxed;
