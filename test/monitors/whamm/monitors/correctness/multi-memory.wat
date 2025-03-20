@@ -50,4 +50,11 @@
         )
         unreachable
     )
+    (func $local_probe (export "wasm:opcode:local.get")
+       ;; reads/writes to mem1
+       (i32.store $mem1 (i32.const 4)
+          (i32.add
+            (i32.load $mem1 (i32.const 4))
+            (i32.const 1)))
+    )
 )
