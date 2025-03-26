@@ -1,4 +1,12 @@
 component WaliImpl {
+	def X86_PAGE_SIZE = 4096u64;
+	// from BpConstants:
+	def WASM_PAGE_SIZE = 65536u64;
+	def WASM_TO_X86_PAGE = WASM_PAGE_SIZE / X86_PAGE_SIZE;
+	// TODO: lookup where to instantiate this!
+	var mmap_pagelen = 0u64;
+	var wasm_pagelen = 0u64;
+
 	def passthrough<T>(num: int, args: T, fdmap: FileDescriptorMap, memory: Memory) -> HostResult {
 		var r = Linux.syscall(num, args);
 		return HostResult.Value1(Values.box_l(r.0));
@@ -38,5 +46,64 @@ component WaliImpl {
 		var r = Linux.syscall(num, args);
 		fdmap.free(args);
 		return HostResult.Value1(Values.box_l(args));
+	}
+	def getPalignMmapAddr(memory: Memory) -> u64 {
+		var base_addr = memory.getMemBase64();
+		var punalign = base_addr + memory.num_pages * memory.num_bytes;
+		var palign = ((punalign + (X86_PAGE_SIZE-1)) * X86_PAGE_SIZE)/X86_PAGE_SIZE;
+		return palign;
+	}
+	def mmap(num: int, args: (Pointer, i32, i32, i32, i32, i64), fdmap: FileDescriptorMap, memory: Memory) -> HostResult {
+		//FIXME: casting madness
+		var pa_aligned_addr = getPalignMmapAddr(memory);
+		var mmap_addr = pa_aligned_addr + mmap_pagelen * X86_PAGE_SIZE;
+
+		var inc_wasm_pages = 0u64;
+		var num_pages = (u64.!(args.1) + X86_PAGE_SIZE - 1) / X86_PAGE_SIZE;
+		var extended_mmap_pagelen = mmap_pagelen + num_pages;
+
+		if (extended_mmap_pagelen > wasm_pagelen * WASM_TO_X86_PAGE) {
+			var new_wasm_pagelen = (extended_mmap_pagelen + WASM_TO_X86_PAGE - 1) / WASM_TO_X86_PAGE;
+			inc_wasm_pages = new_wasm_pagelen - wasm_pagelen;
+			// TODO: implement check if wasm memory needs to be expanded and it is safe
+		}
+		var new_args = (Pointer.NULL + long.view(mmap_addr), args.1, args.2, args.3 | LinuxConst.MAP_FIXED, args.4, args.5);
+		var sb = StringBuilder.new();
+
+		System.puts("mmap_addr: ");
+		System.puts(StringBuilder.new()
+		    .putd_u64(mmap_addr)
+		    .puts("\n")
+		    .toString());
+		System.puts("\n");
+
+		// TODO: Doesnt work with new args...
+		var r = Linux.syscall(num, new_args);
+		System.puts("MMAP ADDR: ");System.puti(int.view(r.0));System.puts("\n");
+		if (r.0 != -1) {
+			System.puts("Growing the mem\n");
+			mmap_pagelen += num_pages;
+			System.puts("num_pages: ");System.puti(int.view(num_pages));System.puts("\n");
+			// Expand wasm memory if needed 
+			if (inc_wasm_pages > 0) {
+				memory.grow(u64.!(inc_wasm_pages));
+				wasm_pagelen += inc_wasm_pages;
+			}
+		}
+		var mem_range = memory.range_ol_64(mmap_addr, u64.!(args.1));
+		var retval = Pointer.atContents(mem_range.result);
+		return HostResult.Value1(Values.box_l(long.view(retval - Pointer.NULL)));
+	}
+	def munmap(num: int, args: (Pointer, i32), fdmap: FileDescriptorMap, memory: Memory) -> HostResult {
+		// TODO: pointer arithmetic does not work?
+		var pa2 = (Pointer.NULL + args.1);
+		var mmap_addr_end: u64 = u64.view((args.0 + long.!(args.1)) - Pointer.NULL);
+		var pa_aligned_addr = getPalignMmapAddr(memory);
+		var end_page = (mmap_addr_end - pa_aligned_addr + X86_PAGE_SIZE - 1) / X86_PAGE_SIZE;
+		if (end_page == mmap_pagelen) {
+			mmap_pagelen -= ((u64.!(args.1) + X86_PAGE_SIZE - 1) / X86_PAGE_SIZE);
+		}
+		var r = Linux.syscall(num, args);
+		return HostResult.Value1(Values.box_l(r.0));
 	}
 }
