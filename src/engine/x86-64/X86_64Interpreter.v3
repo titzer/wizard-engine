@@ -2458,38 +2458,47 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.bind(resumeStub); {
 				// load new stack pointers
 				masm.emit_get_rsp_vsp(xenv.scratch, xenv.sp, xenv.vsp);
+				asm.movq_r_i(r_ret_throw, 1);
 				// pop address from new stack and go to it
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 				masm.emit_jump_r(xenv.scratch);
 			}
 		}
-		// bindHandler(Opcode.RESUME_THROW); {
-		// 	var resumeStub = X86_64Label.new();
-		// 	var cont_id = r_tmp0, ip_store = r_tmp1, tag_index = r_tmp4;
-		// 	computeCurIpForTrap(-1);
-		// 	computePcFromCurIp();
-		// 	// read info and rewind %ip (need %ip at start of opcode during call)
-		// 	asm.movq_r_r(ip_store, r_ip);
-		// 	genReadUleb32(cont_id); // read signature index
-		// 	genReadUleb32(tag_index); // read tag index
-		// 	asm.movq_r_r(r_ip, ip_store);
-		// 	saveCallerIVars();
-		// 	var r_cont = r_tmp1;
-		// 	genResume(cont_id, r_cont, r_tmp3);
-		// 	var r_tag = r_tmp3;
-		// 	asm.movq_r_m(r_scratch, r_instance.plus(offsets.Instance_tags));
-		// 	asm.movq_r_m(r_tag, r_scratch.plusR(tag_index, offsets.REF_SIZE, offsets.Array_contents));
-		// 	saveCallerIVars();
-		// 	callRuntime(refRuntimeCall(RT.runtime_process_resume_throw), [r_instance, r_cont, r_tag], false);
-		// 	asm.movq_r_r(r_cont, r_runtime_ret0);
-		// 	restoreCallerIVars();
-		// 	asm.call_rel_far(resumeStub);
-		// 	/* === CHILD STACK RUNNING === */
-		// 	genOnResumeFinish(true);
-		// 	endHandler();
+		bindHandler(Opcode.RESUME_THROW); {
+			var m_curStack = MasmAddr(Reg(0), int.!(offsets.X86_64Runtime_curStack - Pointer.NULL));
+			// NOTE: if {tag_index = xenv.tmp3} then the following error occur during
+			// compilation:
+			// error: running bin/wizeng.x86-64-linux.pregen failed
+			// make: *** [Makefile:83: bin/wizeng.x86-64-linux] Error 254
+			var cont_id = xenv.tmp0, ip_store = xenv.tmp1, tag_index = xenv.tmp4;
+			computeCurIpForTrap(-1);
+			computePcFromCurIp();
+			// read info and rewind %ip (need %ip at start of opcode during call)
+			masm.emit_mov_r_r(ValueKind.REF, ip_store, xenv.ip);
+			genReadUleb32(G(cont_id)); // read signature index
+			genReadUleb32(G(tag_index)); // read tag index
+			masm.emit_mov_r_r(ValueKind.REF, xenv.ip, ip_store);
+			saveCallerIVars();
 
-		// 	asm.bind(resumeStub); { genResumeStub(xenv.tmp1, xenv.tmp0, xenv.tmp3, true); }
-		// }
+			var cont = xenv.tmp1; // reuse due to non-overlapping live ranges
+			genPopInto(G(cont));
+			masm.emit_validate_and_consume_cont(xenv.tmp1);
+
+			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
+			var curStack = xenv.tmp3;
+			masm.emit_get_curstack(curStack);
+			masm.emit_set_rsp_vsp(curStack, xenv.sp, xenv.vsp);
+			// reserve space for call addr
+			asm.sub_m_i(G(curStack).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
+			masm.emit_chain_cont_to_parent(curStack, cont);
+			masm.emit_switch_curStack_to_cont(cont);
+
+			// load only {rsp} from child stack's context (for stack unwinding)
+			masm.emit_mov_r_m(ValueKind.REF, xenv.sp, MasmAddr(xenv.scratch, offsets.X86_64Stack_rsp));
+			callRuntimeDirect(refRuntimeCall(RT.runtime_THROW_RAW), [r_instance, G(tag_index)]);
+			// should not return
+			asm.invalid();
+		}
 		bindHandler(Opcode.SUSPEND); {
 			var tag_index = r_tmp0, r_cont = r_tmp1;
 			var suspendStub = X86_64Label.new();
@@ -3507,11 +3516,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_m(r_dispatch, masm.absPointer(offsets.Interpreter_dispatchTable));
 		}
 	}
-	def callRuntime(abs: Pointer, args: Array<X86_64Gpr>, canTrap: bool) {
-		saveIVar(r_vsp);
-		// save a copy of VSP into valueStack.sp
-		asm.movq_r_m(r_scratch, masm.absPointer(offsets.X86_64Runtime_curStack));
-		asm.movq_m_r(r_scratch.plus(offsets.X86_64Stack_vsp), r_vsp);
+	// Emits a runtime call without saving stack pointers or restoring registers.
+	def callRuntimeDirect(abs: Pointer, args: Array<X86_64Gpr>) {
 		// Generate parallel moves from args into param gprs; assume each src register used only once
 		var dst = Array<X86_64Gpr>.new(GPRs.length);
 		for (i < args.length) {
@@ -3523,6 +3529,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		for (i < dst.length) orderMoves(dst, stk, i);
 		// emit actual call
 		asm.callr(int.!((abs - (ic.start + w.pos + 5)))); // TODO: handle 64-bit {abs} with movq_r_l
+	}
+	def callRuntime(abs: Pointer, args: Array<X86_64Gpr>, canTrap: bool) {
+		saveIVar(r_vsp);
+		// save a copy of VSP into valueStack.sp
+		asm.movq_r_m(r_scratch, masm.absPointer(offsets.X86_64Runtime_curStack));
+		asm.movq_m_r(r_scratch.plus(offsets.X86_64Stack_vsp), r_vsp);
+		callRuntimeDirect(abs, args);
 		restoreDispatchTableReg();
 		// restore VSP from valueStack.sp
 		asm.movq_r_m(r_vsp, masm.absPointer(offsets.X86_64Runtime_curStack));
