@@ -9,17 +9,16 @@
     (import "wizeng" "puts" (func $puts (param i32 i32)))
 
     (memory (export "mem") 2)   ;; no expansion checks
-    (global $last_entry (mut i32) (i32.const 0))
+    (global $first_entry (mut i32) (i32.const 14))
+    (global $last_entry (mut i32) (i32.const 14))
 
-    (data (i32.const 0xd00) ", pc=")
-    (data (i32.const 0xe00) "\n")
-    (data (i32.const 0xf00) ", [")
-    (data (i32.const 0xf10) ",")
-    (data (i32.const 0xf20) "]")
+    (data (i32.const 0) "fid=")
+    (data (i32.const 4) ", pc=")
+    (data (i32.const 9) ", [")
+    (data (i32.const 12) "]\n")
 
+    ;; check whether we should grow memory based on the needed amount
     (func $check_memsize (param $bytes_needed i32)
-        (local $entry i32)
-
         (local $bytes_per_page i32)
         (local $curr_pages i32)
         (local $max_needed_addr i32)
@@ -40,7 +39,7 @@
     (func (export "$alloc") (param $func i32) (param $pc i32) (result i32)
         (local $entry i32)
 
-        (call $check_memsize (i32.const 20))
+        (call $check_memsize (i32.const 16))
 
         global.get $last_entry
         local.set $entry
@@ -54,11 +53,7 @@
         i32.store offset=4
 
         local.get $entry
-        i32.const 1
-        i32.store offset=8
-
-        local.get $entry
-        i32.const 20
+        i32.const 16
         i32.add
         global.set $last_entry
 
@@ -67,14 +62,16 @@
     (func $count_probe (param $entry i32)
         local.get $entry
         local.get $entry
-        i64.load offset=12  ;; count number of times fired
+        i64.load offset=8  ;; count number of times fired
         i64.const 1
         i64.add
-        i64.store offset=12
+        i64.store offset=8
     )
     (func $flush (export "wasm:exit")
         (local $entry i32)
-        (local $options i32)
+
+        (call $puts (i32.const 13) (i32.const 1))
+        (local.set $entry (global.get $first_entry))
         (block $end_loop
             (loop $loop_entry
                 ;; check at the end of memory
@@ -83,7 +80,7 @@
                 i32.eq
                 br_if $end_loop
 
-                (call $puts (i32.const 0xc00) (i32.const 5))
+                (call $puts (i32.const 0) (i32.const 4))
                 local.get $entry
                 i32.load ;; func
                 call $puti
@@ -92,7 +89,7 @@
                 i32.add
                 local.set $entry
 
-                (call $puts (i32.const 0xd00) (i32.const 5))
+                (call $puts (i32.const 4) (i32.const 5))
                 local.get $entry
                 i32.load ;; pc
                 call $puti
@@ -101,46 +98,17 @@
                 i32.add
                 local.set $entry
 
+                (call $puts (i32.const 9) (i32.const 3))
+
                 local.get $entry
-                i32.load ;; number of options
+                i32.load
+                call $puti
+
                 local.get $entry
-                i32.const 4
+                i32.const 8
                 i32.add
                 local.set $entry
-
-                local.set $options
-
-                (call $puts (i32.const 0xf00) (i32.const 3))
-
-                (loop $loop_options
-                    local.get $entry
-                    i32.load
-                    call $puti
-
-                    local.get $entry
-                    i32.const 8
-                    i32.add
-                    local.set $entry
-
-                    local.get $options
-                    i32.const -1
-                    i32.add
-
-                    local.tee $options
-
-                    i32.eqz
-                    (if
-                        (then
-                            (call $puts (i32.const 0xf20) (i32.const 1))
-                        )
-                        (else
-                            (call $puts (i32.const 0xf10) (i32.const 1))
-                            br $loop_options
-                        )
-                    )
-                )
-
-                (call $puts (i32.const 0xe00) (i32.const 1))
+                (call $puts (i32.const 12) (i32.const 2))
                 br $loop_entry
             )
         )
@@ -958,46 +926,46 @@
     (func (export "wasm:opcode:i8x16.shuffle ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i8x16.extractlane_s ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i8x16.extract_lane_s ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i8x16.extractlane_u ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i8x16.extract_lane_u ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i8x16.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i8x16.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i16x8.extractlane_s ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i16x8.extract_lane_s ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i16x8.extractlane_u ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i16x8.extract_lane_u ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i16x8.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i16x8.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i32x4.extractlane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i32x4.extract_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i32x4.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i32x4.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i64x2.extractlane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i64x2.extract_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:i64x2.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i64x2.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f32x4.extractlane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:f32x4.extract_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f32x4.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:f32x4.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f64x2.extractlane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:f64x2.extract_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f64x2.replacelane ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:f64x2.replace_lane ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
     (func (export "wasm:opcode:i8x16.swizzle ($alloc(fid, pc))") (param $entry i32)
@@ -1184,6 +1152,12 @@
         (call $count_probe (local.get $entry))
     )
     (func (export "wasm:opcode:v128.anytrue ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f32x4.demote_f64x2_zero ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f64x2.promote_low_f32x4 ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
     (func (export "wasm:opcode:i8x16.abs ($alloc(fid, pc))") (param $entry i32)
@@ -1588,10 +1562,64 @@
     (func (export "wasm:opcode:f64x2.convert_low_i32x4_u ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f32x4.demote_f64x2_zero ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i8x16.relaxed_swizzle ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
-    (func (export "wasm:opcode:f64x2.promote_low_f32x4 ($alloc(fid, pc))") (param $entry i32)
+    (func (export "wasm:opcode:i32x4.relaxed_trunc_f32x4_s ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i32x4.relaxed_trunc_f32x4_u ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i32x4.relaxed_trunc_f64x2_s_zero ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i32x4.relaxed_trunc_f64x2_u_zero ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f32x4.relaxed_madd ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f32x4.relaxed_nmadd ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f64x2.relaxed_madd ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f64x2.relaxed_nmadd ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i8x16.relaxed_laneselect ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i16x8.relaxed_laneselect ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i32x4.relaxed_laneselect ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i64x2.relaxed_laneselect ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f32x4.relaxed_min ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f32x4.relaxed_max ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f64x2.relaxed_min ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:f64x2.relaxed_max ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i16x8.relaxed_q15mulr_s ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i16x8.relaxed_dot_i8x16_i7x16_s ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:i32x4.relaxed_dot_i8x16_i7x16_add_s ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
     (func (export "wasm:opcode:memory.atomic.notify ($alloc(fid, pc))") (param $entry i32)
@@ -1808,6 +1836,9 @@
         (call $count_probe (local.get $entry))
     )
     (func (export "wasm:opcode:resume.throw ($alloc(fid, pc))") (param $entry i32)
+        (call $count_probe (local.get $entry))
+    )
+    (func (export "wasm:opcode:switch ($alloc(fid, pc))") (param $entry i32)
         (call $count_probe (local.get $entry))
     )
 )
