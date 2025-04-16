@@ -74,7 +74,7 @@ while (( min < max )); do
     FILTER="-jit-filter=#${min}...${mid}"
     printf "Testing %s " "$FILTER"
 
-    F="$T/jit-#${min}...${max}"
+    F="$T/jit-#${min}...${mid}"
     wizeng -mode=jit $FILTER "$@" > $F.out 2>$F.err
     echo $? > $F.exit
 
