@@ -1,29 +1,20 @@
+;; --> Output format: <fid>, pc=<pc>, [<counter>*]
+
 (module
   (import "wizeng" "puti" (func $puti (param i32)))
   (import "wizeng" "puts" (func $puts (param i32 i32)))
 
   (memory (export "mem") 2)   ;; no expansion checks
-  (global $last_entry (mut i32) (i32.const 0))
+  (global $first_entry (mut i32) (i32.const 14))
+  (global $last_entry (mut i32) (i32.const 14))
 
-  (export "$alloc_br" (func $alloc_br))
-  (export "$alloc_br_if" (func $alloc_br_if))
-  (export "$alloc_br_table" (func $alloc_br_table))
-  (export "wasm:opcode:br($alloc_br(fid, pc))" (func $probe_br))
-  (export "wasm:opcode:br_if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
-  (export "wasm:opcode:if($alloc_br_if(fid, pc), arg0)" (func $probe_br_if))
-  (export "wasm:opcode:br_table($alloc_br_table(fid, pc, imm0), arg0)" (func $probe_br_table))
-  (export "wasm:exit" (func $print_entries))
+  (data (i32.const 0) "fid=")
+  (data (i32.const 4) ", pc=")
+  (data (i32.const 9) ", [")
+  (data (i32.const 12) "]\n")
 
-  (data (i32.const 0xc00) "func=")
-  (data (i32.const 0xd00) ", pc=")
-  (data (i32.const 0xe00) "\n")
-  (data (i32.const 0xf00) ", [")
-  (data (i32.const 0xf10) ",")
-  (data (i32.const 0xf20) "]")
-
+  ;; check whether we should grow memory based on the needed amount
   (func $check_memsize (param $bytes_needed i32)
-      (local $entry i32)
-
       (local $bytes_per_page i32)
       (local $curr_pages i32)
       (local $max_needed_addr i32)
@@ -45,7 +36,7 @@
   ;; Table entry
   ;; 0      4      8      12         20
   ;; | func |  pc  |   1  |  # taken |
-  (func $alloc_br (param $func i32) (param $pc i32) (result i32)
+  (func $alloc_br (export "$alloc_br") (param $func i32) (param $pc i32) (result i32)
     (local $entry i32)
 
     (call $check_memsize (i32.const 20))
@@ -76,7 +67,7 @@
   ;; Table entry
   ;; 0      4      8      12         20         28
   ;; | func |  pc  |   2  |  # taken | # !taken |
-  (func $alloc_br_if (param $func i32) (param $pc i32) (result i32)
+  (func $alloc_br_if (export "$alloc_br_if") (param $func i32) (param $pc i32) (result i32)
     (local $entry i32)
 
     (call $check_memsize (i32.const 28))
@@ -108,7 +99,7 @@
   ;; n is the number of entries in the table including the default target
   ;; 0      4      8      12
   ;; | func |  pc  |   n  |  0 taken |   ...  | n taken |
-  (func $alloc_br_table (param $func i32) (param $pc i32) (param $count i32) (result i32)
+  (func $alloc_br_table (export "$alloc_br_table") (param $func i32) (param $pc i32) (param $count i32) (result i32)
     (local $entry i32)
     (local $needed_bytes i32)
 
@@ -149,7 +140,7 @@
     local.get $entry
   )
 
-  (func $probe_br (param $entry i32)
+  (func $probe_br (export "wasm:opcode:br($alloc_br(fid, pc))") (param $entry i32)
     local.get $entry
     local.get $entry
     i64.load offset=12  ;; count of branches taken
@@ -158,7 +149,7 @@
     i64.store offset=12
   )
 
-  (func $probe_br_if (param $entry i32) (param $arg0 i32)
+  (func $probe_br_if (export "wasm:opcode:br_if($alloc_br_if(fid, pc), arg0)") (param $entry i32) (param $arg0 i32)
     (local $offset i32)
     (local.set $offset (i32.add (local.get $entry) (select (i32.const 20) (i32.const 12) (local.get $arg0))))
     local.get $offset
@@ -169,24 +160,27 @@
     i64.store
   )
 
-  (func $probe_br_table (param $entry i32) (param $arg0 i32)
+  (func $probe_br_table (export "wasm:opcode:br_table($alloc_br_table(fid, pc, num_targets), arg0)") (param $entry i32) (param $arg0 i32)
     (local $max i32)
     (local $addr i32)
+
     local.get $arg0
     local.get $entry
     i32.load offset=8
-    local.tee $max
+    i32.const 1
+    i32.sub
+    local.tee $max ;; max = `num_targets` - 1
 
     i32.ge_u
     (if
       (then
+        ;; if arg0 >= `num_targets` - 1 --> arg0 = `num_targets` - 1
         local.get $max
-        i32.const -1
-        i32.add
         local.set $arg0
       )
     )
 
+    ;; account for number of bits used to store each count (8 bits per u64)
     local.get $arg0
     i32.const 3
     i32.shl
@@ -202,9 +196,12 @@
     i64.store offset=12
   )
 
-  (func $print_entries
+  (func $print_entries (export "wasm:exit")
     (local $entry i32)
     (local $options i32)
+
+    (call $puts (i32.const 13) (i32.const 1))
+    (local.set $entry (global.get $first_entry))
     (block $end_loop
       (loop $loop_entry
         ;; check at the end of memory
@@ -213,7 +210,7 @@
         i32.eq
         br_if $end_loop
 
-        (call $puts (i32.const 0xc00) (i32.const 5))
+        (call $puts (i32.const 0) (i32.const 4))
         local.get $entry
         i32.load ;; func
         call $puti
@@ -222,7 +219,7 @@
         i32.add
         local.set $entry
 
-        (call $puts (i32.const 0xd00) (i32.const 5))
+        (call $puts (i32.const 4) (i32.const 5))
         local.get $entry
         i32.load ;; pc
         call $puti
@@ -231,16 +228,15 @@
         i32.add
         local.set $entry
 
+        (call $puts (i32.const 9) (i32.const 3))
+
         local.get $entry
-        i32.load ;; number of options
+        i32.load ;; load the print option
+        local.set $options
         local.get $entry
         i32.const 4
         i32.add
         local.set $entry
-
-        local.set $options
-
-        (call $puts (i32.const 0xf00) (i32.const 3))
 
         (loop $loop_options
 
@@ -262,17 +258,15 @@
           i32.eqz
           (if
             (then
-              (call $puts (i32.const 0xf20) (i32.const 1))
+              (call $puts (i32.const 12) (i32.const 2))
+              br $loop_entry
             )
             (else
-              (call $puts (i32.const 0xf10) (i32.const 1))
+              (call $puts (i32.const 9) (i32.const 1))
               br $loop_options
             )
           )
         )
-
-        (call $puts (i32.const 0xe00) (i32.const 1))
-        br $loop_entry
       )
     )
   )
