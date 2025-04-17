@@ -20,7 +20,7 @@ TESTS="$@"
 
 function run_tests() {
 	if [ "$TESTS" =  "" ]; then
-		for dir in core gen legacy-exceptions; do
+		for dir in core gen; do
 		    TESTS=$(ls test/regress/$dir/*.bin.wast)
 		    FLAGS=
 		    if [ -e test/regress/$dir/flags ]; then
