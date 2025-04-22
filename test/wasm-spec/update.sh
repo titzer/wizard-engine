@@ -15,9 +15,18 @@ if [ "$PROPOSALS" = "" ]; then
     PROPOSALS=spec
 fi
 
-for p in $PROPOSALS; do
+if [ $PROGRESS_PIPE = 1 ]; then
+  for p in $PROPOSALS; do
     printf "Updating proposal ${CYAN}%-22s${NORM} " $p
     update_proposal_repo $p | $PROGRESS || exit $?
     printf "Building tests    ${CYAN}%-22s${NORM} " $p
     make_proposal_tests $p | $PROGRESS || exit $?
-done
+  done
+else
+  for p in $PROPOSALS; do
+    printf "Updating proposal ${CYAN}%-22s${NORM} " $p
+    update_proposal_repo $p || exit $?
+    printf "Building tests    ${CYAN}%-22s${NORM} " $p
+    make_proposal_tests $p || exit $?
+  done
+fi
