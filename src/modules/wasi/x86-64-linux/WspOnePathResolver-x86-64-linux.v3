@@ -1,163 +1,29 @@
 // Copyright 2023 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
+def LOOKUP_SYMLINK_FOLLOW = 1;	// flag indicating should follow symlinks
+
 component WasiPathUtil {
-	def normalize_path = normalize_path0;
-	def resolve_path = resolve_path0;
+	def normalize_path = PathResolver.normalize_path;
+	def resolve_path(fdinfo: WasiFd, path: string, flags: i32) -> (string, int) {
+		var read_symlink = if((flags & LOOKUP_SYMLINK_FOLLOW) == LOOKUP_SYMLINK_FOLLOW, read_linux_symlink);
+		return PathResolver.resolve_path(fdinfo, path, read_symlink);
+	}
 }
 
-def LOOKUP_SYMLINK_FOLLOW = 1;	// flag indicating should follow symlinks
 def SYS_readlink = 0x59;	// Linux system call to read a symlink
 def PATH_MAX = 4096;		// maximum length of a path
 def PATH_BUF = Array<byte>.new(PATH_MAX + 1);
 def EINVAL = 22;		// errno for invalid argument
 def ENOENT = 2;			// errno for no entry
 
-// Checks if a given path is absolute by looking for a leading slash.
-def is_absolute_path(path: string) -> bool {
-	return (path.length > 0) && (path[0] == '/');
-}
-
-// Function to find the first occurrence of a slash in a string
-def find_next_slash(s: string, start_pt: i32) -> int {
-	var i = start_pt;
-	while (i < s.length) {
-		var currentChar = s[i];
-		if (currentChar == 0) return -1; // null-terminated string
-		if (currentChar == '/') return i;
-		i += 1;
-	}
-	return -1;
-}
-
-// Internal function to normalize paths by removing redundant segments.
-def normalize_path0(path: string) -> (string) {
-	var cur = 0;
-	var normalized = StringBuilder.new();
-	var nextSlash = 0;
-	var last = 0;
-	var isAbsPath = is_absolute_path(path);
-
-	for (cur = 0; cur < path.length; cur = nextSlash + 1) {
-		nextSlash = find_next_slash(path, cur);
-		var curSegmentLength = if (nextSlash == -1, path.length - cur, nextSlash - cur);
-		if (curSegmentLength == 0) {
-			if (normalized.length == 0 && nextSlash != -1 && isAbsPath) {
-				normalized.putc('/');
-			}
-		} else if (curSegmentLength == 1 && path[cur] == '.') {
-			// No-op. Just consume the '.'
-		} else if (curSegmentLength == 2 && path[cur] == '.' && path[cur + 1] == '.') {
-
-			var tmpResult = normalized.toString();
-			normalized = StringBuilder.new();
-			last = tmpResult.length - 1;
-			var tmpLen = tmpResult.length;
-			while (last >= 0) {
-				var lastC = tmpResult[last];
-				if (lastC == '/')break;
-				last -= 1;
-			}
-
-			// If the result is currently empty, or the last prior path is also '..'
-			// then output '..'. Otherwise, remove the last path segment.
-			if (tmpLen == 0) {
-				normalized.puts("..");
-			} else if ((last == tmpLen - 3 || last == tmpLen - 4 && tmpResult[tmpLen - 3] == '/')
-					&& tmpResult[tmpLen - 2] == '.'
-					&& tmpResult[tmpLen - 1] == '.') {
-				normalized.puts(tmpResult);
-				normalized.puts("/..");
-			} else {
-				// Strip the last segment, but make sure not to strip the '/' if that
-				// is the entire path.
-				if (last == 0 && tmpResult[last] == '/') {
-					last++;
-				}
-				normalized = StringBuilder.new();
-				for (i < last) {
-					normalized.putc(tmpResult[i]);// not good here
-				}
-			}
-		} else {
-			if (normalized.length > 0) {
-				var normalizedStr = normalized.toString();
-				if (normalizedStr[normalizedStr.length - 1] != '/' ) {
-					normalized = StringBuilder.new()
-						.puts(normalizedStr)
-						.putc('/');
-				} else if(normalizedStr.length == 1 && isAbsPath) {
-					normalized = StringBuilder.new()
-						.putc('/');
-				}
-			}
-			for (i = cur; i < cur + curSegmentLength; i++) {
-				normalized.putc(path[i]);
-			}
-		}
-
-		if (nextSlash < 0) break;
-	}
-
-	if (normalized.length == 0) normalized.putc(if(isAbsPath, '/', '.'));
-
-	return normalized.toString();
-}
-
-// Checks if an absolute path remains within the sandboxed environment defined by fd_path.
-def is_abspath_sandboxed(abspath: string, fd_path: string) -> bool {
-	var abspath_len = abspath.length;
-	var fd_path_len = fd_path.length;
-	if (is_absolute_path(fd_path)) {
-		if (abspath_len < fd_path_len) return false;
-		for (i < fd_path_len) {
-			if (abspath[i] != fd_path[i]) return false;
-		}
-		return true;
-	}
-	// Handle relative fds that normalized to '.'
-	if (fd_path_len == 1 && fd_path[0] == '.') {
-		// If the fd's path is '.', then any path does not begin with '..' is OK.
-		if ((abspath_len == 2 && abspath[0] == '.' && abspath[1] == '.')
-				|| (abspath_len > 2 && abspath[0] == '.' && abspath[1] == '.' && abspath[2] == '/')) {
-			return false;
-		}
-		return true;
-	}
-
-	return true;
-
-}
-
-// Resolves a path without following symlinks, ensuring it stays within the sandbox.
-def resolve_path_without_link(fdinfo: WasiFd, path: string) -> (string, WspOneErrno) {
-	if (!is_absolute_path(path)) {
-		path = StringBuilder.new()
-		  .puts(fdinfo.path)
-		  .putc('/')
-		  .puts(path)
-		  .toString();
-	}
-	var normalized = normalize_path0(path);
-	if (!is_abspath_sandboxed(normalized, fdinfo.path)) {
-		return (normalized, WspOneErrno.NOTCAPABLE);
-	}
-	return (normalized, WspOneErrno.SUCCESS);
-}
-
 // Main function to resolve a path with an option to follow symlinks, ensuring it stays within the sandbox.
-def resolve_path0(fdinfo: WasiFd, path: string, flags: i32) -> (string, int) {
-	var result = resolve_path_without_link(fdinfo, path);
-	if (result.1 != WspOneErrno.SUCCESS) return (result.0, result.1.code);
-	var normalized = result.0;
+def read_linux_symlink(path: string) -> string {
+	var buf = PATH_BUF;
+	var t = Linux.syscall(SYS_readlink, (Pointer.atContents(path), Pointer.atContents(buf), PATH_MAX));
 
-	if ((flags & LOOKUP_SYMLINK_FOLLOW) == LOOKUP_SYMLINK_FOLLOW) {
-		var buf = PATH_BUF;
-		var t = Linux.syscall(SYS_readlink, (Pointer.atContents(normalized), Pointer.atContents(buf), PATH_MAX));
-
-		if (t.0 < 0 && t.0 != -EINVAL && t.0 != -ENOENT) return (normalized, int.!(t.0));
-		for (i < buf.length) {
-			if (buf[i] == 0) normalized = Ranges.dup(buf[0 ... i]); // result returned by the kernel is zero-terminated
-		}
+	if (t.0 < 0 && t.0 != -EINVAL && t.0 != -ENOENT) return path;
+	for (i < buf.length) {
+		if (buf[i] == 0) path = Ranges.dup(buf[0 ... i]); // result returned by the kernel is zero-terminated
 	}
-	return (normalized, 0);
+	return path;
 }
