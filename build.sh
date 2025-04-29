@@ -93,14 +93,16 @@ BUILD_FILE=$(make_build_file)
 
 PREGEN=${PREGEN:=1}
 
+LANG_OPTS="-fun-exprs -simple-bodies"
+
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-darwin" || "$TARGET" = "x86_64_darwin" ]]; then
-    exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
+    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
     STATUS=$?
     if [ $STATUS != 0 ]; then
 	exit $STATUS
@@ -122,7 +124,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	fi
     fi
 elif [ "$TARGET" = "jvm" ]; then
-    v3c-jar $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" == wasm-* ]]; then
     # Compile to a wasm target
     V3C_PATH=$(which v3c)
@@ -132,10 +134,10 @@ elif [[ "$TARGET" == wasm-* ]]; then
 	ls -a ${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-*} | cat
 	exit 1
     fi
-    exec $V3C_WASM_TARGET -symbols -heap-size=200m $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec $V3C_WASM_TARGET -symbols -heap-size=200m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM} -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [ "$TARGET" = "v3i" ]; then
     # check that the sources typecheck
-    $V3C $SOURCES $TARGET_V3
+    $V3C $LANG_OPTS $V3C_OPTS $SOURCES $TARGET_V3
     RET=$?
     if [ $RET != 0 ]; then
 	exit $RET
@@ -149,10 +151,10 @@ elif [ "$TARGET" = "v3i" ]; then
 	LIST="$LIST $(ls $f)"
     done
     echo '#!/bin/bash' > bin/$PROGRAM.v3i
-    echo "v3i \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
+    echo "v3i $LANG_OPTS \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
     chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors
-    exec $V3C $LIST
+    exec $V3C $LANG_OPTS $V3C_OPTS $LIST
 else
     exit_usage
 fi
