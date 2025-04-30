@@ -20,7 +20,7 @@
         (call $print_call)
         (block $error
             (br_if $error (i32.ne (i32.const 1) (local.get $imm0)))
-            (br_if $error (i32.ne (i32.const 2) (local.get $arg1)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $arg1)))
             (br_if $error (i32.ne (i32.const 2) (local.get $local1)))
             return
         )

@@ -20,8 +20,8 @@
     (func $simple_probe (export "wasm:opcode:call(arg1, arg0)") (param $arg1 i32) (param $arg0 i32)
         (call $puts (i32.const 0xc00) (i32.const 13))
         (block $error
-            (br_if $error (i32.ne (i32.const 1) (local.get $arg0)))
-            (br_if $error (i32.ne (i32.const 2) (local.get $arg1)))
+            (br_if $error (i32.ne (i32.const 2) (local.get $arg0)))
+            (br_if $error (i32.ne (i32.const 1) (local.get $arg1)))
             return
         )
         unreachable
