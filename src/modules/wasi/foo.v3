@@ -114,31 +114,173 @@ component WspOneRegistration2 {
 
 // Contains state and logic for a WASI instance.
 class WasiInstance2(isTargetSpecific: bool) {
-	def args_get(argv: int, argvbuf: int) -> int;
-	def args_sizes_get(argc: int, argv_buf_size: int) -> int;
-	def environ_get(environ: int, environ_buf: int) -> int;
-	def environ_sizes_get(environ_count: int, environ_buf_size: int) -> int;
+	var fdmap: WasiFdMap;
+	var memory: Memory;
+	var cmdline_args: Array<string>;
+
+	// Utility functions for subclasses.
+	def getRegion(idx: u32, size: u32) -> i64 {
+		if (memory == null) return -1;
+		return memory.boundsCheck(0, idx, size);
+	}
+
+	def args_get(argv: int, argvbuf: int) -> int {
+		var arg = getRegion(u32.view(argv), u32.view(cmdline_args.length) * 4);
+		if (arg < 0) return WspOneErrno.INVAL.code;
+		var size = 0u;
+		for (a in cmdline_args) size += (1u + u32.view(a.length));
+		var argbuf = getRegion(u32.view(argvbuf), size);
+		if (argbuf < 0) return WspOneErrno.INVAL.code;
+		for (i < cmdline_args.length) {
+			// write a pointer to a null-terminated string into a arg buffer
+			memory.write_u32(u32.view(arg), 0, u32.view(argbuf));
+			arg += 4;
+			// write a null-terminated string into argvbuf buffer
+			var a = cmdline_args[i];
+			memory.copyIn(u32.view(argbuf), a, 0, u32.view(a.length));
+			argbuf += u32.view(a.length);
+			memory.write_u8(u32.view(argbuf), 0, 0);
+			argbuf++;
+		}
+		return WspOneErrno.SUCCESS.code;
+	}
+	def args_sizes_get(argc: int, argv_buf_size: int) -> int {
+		var argptr = getRegion(u32.view(argc), 4);
+		if (argptr < 0) return WspOneErrno.INVAL.code;
+		var size = 0;
+		for (a in cmdline_args) size += (1 + a.length);
+		var bufptr = getRegion(u32.view(argv_buf_size), 4);
+		if (bufptr < 0) return WspOneErrno.INVAL.code;
+		memory.write_u32(u32.view(argptr), 0, u32.view(cmdline_args.length));
+		memory.write_u32(u32.view(bufptr), 0, u32.view(size));
+		return WspOneErrno.SUCCESS.code;
+	}
+	def environ_get(environ: int, environ_buf: int) -> int {
+		def envs = WasiOptions.envs;
+		var environ = getRegion(u32.view(environ), u32.view(envs.length) * 4);
+		if (environ < 0) return WspOneErrno.INVAL.code;
+		var size = 0u;
+		for (i < envs.length) size += (1u + u32.view(envs[i].length));
+		var environ_buf = getRegion(u32.view(environ_buf), size);
+		if (environ_buf < 0) return WspOneErrno.INVAL.code;
+		for (i < envs.length) {
+			// write a pointer to a null-terminated string into an environ buffer
+			memory.write_u32(u32.view(environ), 0, u32.view(environ_buf));
+			environ += 4;
+			// write a null-terminated string into a environ_buf buffer
+			var e = envs[i];
+			memory.copyIn(u32.view(environ_buf), e, 0, u32.view(e.length));
+			environ_buf += u32.view(e.length);
+			memory.write_u8(u32.view(environ_buf), 0, 0);
+			environ_buf++;
+		}
+
+		return WspOneErrno.SUCCESS.code;
+	 }
+	def environ_sizes_get(environ_count: int, environ_buf_size: int) -> int {
+		def envs = WasiOptions.envs;
+		var argptr = getRegion(u32.view(environ_count), 4);
+		if (argptr < 0) return WspOneErrno.INVAL.code;
+		var size = 0;
+		for (i < envs.length) size += (1 + envs[i].length);
+		var bufptr = getRegion(u32.view(environ_buf_size), 4);
+		if (bufptr < 0) return WspOneErrno.INVAL.code;
+		memory.write_u32(u32.view(argptr), 0, u32.view(envs.length));
+		memory.write_u32(u32.view(bufptr), 0, u32.view(size));
+
+		return WspOneErrno.SUCCESS.code;
+	 }
 	def fd_advise(fd: int, offset: long, len: long, advice: int) -> int;
 	def fd_allocate(fd: int, offset: long, len: long) -> int;
-	def fd_close(fd: int) -> int;
+	def fd_close(fd: int) -> int {
+		var wfd = fdmap.get(fd);
+		if (wfd != null) System.fileClose(wfd.sysfd);
+		var r = fdmap.free(fd);
+		return if(r >= 0, 0, WspOneErrno.INVAL.code);
+	}
 	def fd_datasync(fd: int) -> int;
-	def fd_fdstat_get(fd: int, buf_ptr: int) -> int;
+	def fd_fdstat_get(fd: int, buf_ptr: int) -> int { return 0; }
 	def fd_fdstat_set_flags(fd: int, flags: int) -> int;
 	def fd_fdstat_set_rights(fd: int, fs_rights_base: long, fs_rights_inheriting: long) -> int;
 	def fd_filestat_get(fd: int, buf: int) -> int;
 	def fd_filestat_set_size(fd: int, st_size: long) -> int;
 	def fd_filestat_set_times(fd: int, st_atim: long, st_mtim: long, fst_flags: int) -> int;
 	def fd_pread(fd: int, iovs: int, iovs_len: int, offset: long, nread: int) -> int;
-	def fd_prestat_get(fd: int, buf: int) -> int;
-	def fd_prestat_dir_name(fd: int, path: int, path_len: int) -> int;
+	def fd_prestat_get(fd: int, buf: int) -> int {
+		def wfd = fdmap.get(fd);
+		if (wfd == null || !wfd.preopen) return WspOneErrno.BADF.code;
+		
+		def bufptr = getRegion(u32.view(buf), 4);
+		if (bufptr < 0) return WspOneErrno.INVAL.code;
+		memory.write_u32(u32.view(bufptr), 0, u32.view(PreopenType.Dir.code));
+		memory.write_u32(u32.view(bufptr), 4, u32.view(wfd.path.length));
+
+		return WspOneErrno.SUCCESS.code;
+	}
+	def fd_prestat_dir_name(fd: int, path: int, path_len: int) -> int {
+		def wfd = fdmap.get(fd);
+		if (wfd == null || !wfd.preopen) return WspOneErrno.BADF.code;
+
+		def pathptr = getRegion(u32.view(path), u32.view(path_len));
+		if (pathptr < 0) return WspOneErrno.INVAL.code;
+
+		// write a directory name into a buffer
+		memory.copyIn(u32.view(pathptr), wfd.path, 0, u32.!(wfd.path.length));
+
+		return WspOneErrno.SUCCESS.code;
+	}
 	def fd_pwrite(fd: int, iovs: int, iovs_len: int, offset: long, nwritten: int) -> int;
-	def fd_read(fd: int, iovs: int, iovs_len: int, nread: int) -> int;
+	def fd_read(fd: int, iovs_ptr: int, iovs_len: int, outsize_ptr: int) -> int {
+		var wfd = fdmap.get(fd);
+		if (wfd == null) return WspOneErrno.BADF.code;
+		var iovbuf = getRegion(u32.view(iovs_ptr), u32.view(iovs_len * 8));
+		if (iovbuf < 0) return WspOneErrno.INVAL.code; // Invalid memory
+
+		var outsize_buf = getRegion(u32.view(outsize_ptr), 4);
+		if (outsize_buf < 0) return WspOneErrno.INVAL.code; // Invalid memory
+		
+		var total = 0;
+		for (j < iovs_len) {
+			var iov_ptr = memory.read_u32(0, u32.view(iovbuf)).result;
+			var iov_len = memory.read_u32(0, u32.view(iovbuf + 4)).result;
+			var iobuf = getRegion(iov_ptr, iov_len);
+			if (iobuf < 0) return WspOneErrno.INVAL.code; // Invalid memory
+			var out = memory.readIn(wfd.sysfd, u32.view(iobuf), iov_len);
+			if (out < 0) return WspOneErrno.IO.code;
+			total += out;
+			iovbuf += 8;
+		}
+
+		memory.write_u32(u32.view(outsize_ptr), 0, u32.view(total));
+		return WspOneErrno.SUCCESS.code;
+	}
 	def fd_readdir(fd: int, buf: int, buf_len: int, cookie: long, bufused: int) -> int;
 	def fd_renumber(from: int, to: int) -> int;
 	def fd_seek(fd: int, offset: long, whence: int, newoffset: int) -> int;
 	def fd_sync(fd: int) -> int;
 	def fd_tell(fd: int, offset: int) -> int;
-	def fd_write(fd: int, iovs: int, iovs_len: int, nwritten: int) -> int;
+	def fd_write(fd: int, iovs_ptr: int, iovs_len: int, outsize_ptr: int) -> int {
+		var wfd = fdmap.get(fd);
+		if (wfd == null) return WspOneErrno.BADF.code;
+		var iovbuf = getRegion(u32.view(iovs_ptr), u32.view(iovs_len * 8));
+		if (iovbuf < 0) return WspOneErrno.INVAL.code; // Invalid memory
+		var outsize_buf = getRegion(u32.view(outsize_ptr), 4);
+		if (outsize_buf < 0) return WspOneErrno.INVAL.code;
+
+		var total = 0;
+		for (j < iovs_len) {
+			var iov_ptr = memory.read_u32(0, u32.view(iovbuf)).result;
+			var iov_len = memory.read_u32(0, u32.view(iovbuf + 4)).result;
+			var iobuf = getRegion(u32.view(iov_ptr), iov_len);
+			if (iobuf < 0) return WspOneErrno.INVAL.code; // Invalid memory
+			var out = memory.writeOut(wfd.sysfd, u32.view(iobuf), iov_len);
+			if (out < 0) return WspOneErrno.IO.code;
+			total += out;
+			iovbuf += 8;
+		}
+		memory.write_u32(u32.view(outsize_ptr), 0, u32.view(total));
+		return WspOneErrno.SUCCESS.code;
+	}
 	def path_create_directory(fd: int, path: int, path_len: int) -> int;
 	def path_filestat_get(fd: int, flags: int, path: int, path_len: int, buf: int) -> int;
 	def path_filestat_set_times(fd: int, flags: int, path: int, path_len: int, st_atim: long, st_mtim: long, fst_flags: int) -> int;
@@ -152,12 +294,27 @@ class WasiInstance2(isTargetSpecific: bool) {
 	def clock_res_get(clock_id: int, resolution: int) -> int;
 	def clock_time_get(clock_id: int, precision: long, time: int) -> int;
 	def sched_yield() -> int;
+	// TODO: handle proc_exit
+	// def proc_exit(code: int) {
+	// 	return HostResult.Throw(Exit.new(Values.unbox_u(args[0])));
+	// }
 	def proc_exit(code: int);
 	def proc_raise(sig: int) -> int;
 	def poll_oneoff(in_: int, out_: int, nsubscriptions: int, nevents: int) -> int;
-	def random_get(buf: int, buf_len: int) -> int;
+	// TODO: handle random_get
+	// def random_get(ptr: int, len: int) -> int {
+	// 	var range = memory.range_ol_32(ptr, len);
+	// 	if (range.reason != TrapReason.NONE) return HostResult.Throw(Trap.new(range.reason, null, null));
+	// 	if (WasiOptions.random_seed != 0) return prng_random_get(range.result);
+	// 	else return host_random_get(range.result);
+	// }
+	def random_get(ptr: int, len: int) -> int;
 	def sock_recv(sock: int, ri_data: int, ri_data_len: int, ri_flags: int, ro_data_len: int, ro_flags: int) -> int;
 	def sock_send(sock: int, si_data: int, si_data_len: int, si_flags: int, ret_data_len: int) -> int;
 	def sock_shutdown(sock: int, how: int) -> int;
 	def sock_accept(sock: int, fd_flags: int, ro_fd: int) -> int;
+}
+// Identifiers for preopened capabilities.
+private enum PreopenType(code: byte) {
+	Dir(0),
 }
