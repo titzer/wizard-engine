@@ -1,0 +1,606 @@
+// Copyright 2021 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def OUT = Trace.OUT;
+def X_ = WspOneRegistration.register(X86_64Linux_WspOneModule.new());
+// Linux system call numbers
+def SYS_openat = 257;
+def SYS_mkdirat = 258;
+def SYS_unlinkat = 263;
+def SYS_renameat = 264;
+def SYS_linkat = 265;
+def SYS_symlinkat = 266;
+def SYS_readlinkat = 267;
+def SYS_utimensat = 280;
+def SYS_clock_get_time = 228;
+def SYS_clock_get_res = 229;
+def SYS_getrandom = 318;
+def SYS_fdatasync = 75;
+def SYS_fsync = 118;
+def SYS_lseek = 8;
+def SYS_readv = 19;
+def SYS_writev = 20;
+def SYS_sched_yield = 24;
+def SYS_kill = 37;
+def SYS_getpid = 39;
+def SYS_statx = 332;
+def SYS_ftruncate = 77;
+def SYS_getdents64 = 217;
+
+def STATX_ALL = 0x00000FFF; // all currently-supported flags
+def AT_SYMLINK_NOFOLLOW = 0x100;
+def AT_SYMLINK_FOLLOW = 0x400;
+def AT_EMPTY_PATH = 0x1000;
+def AT_REMOVEDIR = 0x200;
+
+// Linux lseek whence values
+def WHENCE_SET = 0;
+def WHENCE_CUR = 1;
+def WHENCE_END = 2;
+
+// openat flags
+def O_CLOEXEC = 0x80000;
+def O_PATH = 0x200000;
+def O_DIRECTORY = 0x10000;
+
+def S_IFMT   = 0xF000; // bit mask for the file type bit field
+def S_IFSOCK = 0xC000; // socket
+def S_IFLNK  = 0xA000; // symbolic link
+def S_IFREG  = 0x8000; // regular file
+def S_IFBLK  = 0x6000; // block device
+def S_IFDIR  = 0x4000; // directory
+def S_IFCHR  = 0x2000; // character device
+def S_IFIFO  = 0x1000; // FIFO
+
+// utimensat flags
+def UTIME_NOW = (1L << 30) - 1L;
+def UTIME_OMIT = (1L << 30) - 2L;
+
+// Linux readv/writev limit
+def IOV_MAX = 1024;
+
+// IO buffers
+def timespec = Array<long>.new(4);
+def statxbuf = Ref<statx>.of(Array<byte>.new(statx.size));
+def emptystring = Array<byte>.new(1);
+def direntbuf = Array<byte>.new(1024);
+def wasidirentbuf = Array<byte>.new(Wasi_dirent.size);
+
+// A special value, which tells the fd of the current working directory used in openat
+def AT_FDCWD = -100;
+
+// Common return values
+def SUCCESS = HostResult.Value1(Value.I32(WspOneErrno.SUCCESS.code));
+def BADF = HostResult.Value1(Value.I32(WspOneErrno.BADF.code));
+def INVAL = HostResult.Value1(Value.I32(WspOneErrno.INVAL.code));
+
+// Platform-specific implementation of "wasi_snapshot_preview1" module.
+class X86_64Linux_WspOneModule extends WspOneModule {
+	def init_p(err: ErrorGen) {
+		def dirs = WasiOptions.dirs;
+		// execute openat syscall for every given directory
+		for (ii < dirs.length) {
+			var dir = dirs[ii];
+			// call openat system call
+			var fd = Linux.syscall(SYS_openat,
+				(AT_FDCWD,
+				 Pointer.atContents(dir),
+				 LinuxConst.O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY
+				)
+			).0;
+			if (fd < 0) {
+				err.abs(0).InvalidPreopenPath(dir);
+			}
+			var wasi_fd = fdmap.alloc();
+			fdmap.set(wasi_fd, WasiFd.new(int.view(fd), wasi_filetype.DIRECTORY, true, dir));
+		}
+	}
+
+	def host_random_get(region: Range<byte>) -> HostResult {
+		var t = Linux.syscall(SYS_getrandom, (Pointer.atContents(region), region.length, 0));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def clock_res_get(args: Range<Value>) -> HostResult {
+		var clock_id = mapClockId(Values.unbox_u(args[0]));
+		if (clock_id < 0) return INVAL;
+		var ptr = Values.unbox_u(args[1]);
+		var range = memory.range_ol_32(ptr, 8);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var t = Linux.syscall(SYS_clock_get_res, (clock_id, Pointer.atContents(timespec)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		DataWriters.write_range_i64(range.result, timespec[0] * 1000000000L + timespec[1]);
+		return SUCCESS;
+	}
+	def clock_time_get(args: Range<Value>) -> HostResult {
+		var clock_id = mapClockId(Values.unbox_u(args[0]));
+		if (clock_id < 0) return INVAL;
+		var lag = Values.unbox_l(args[1]);
+		var ptr = Values.unbox_u(args[2]);
+		var range = memory.range_ol_32(ptr, 8);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var t = Linux.syscall(SYS_clock_get_time, (clock_id, Pointer.atContents(timespec)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		DataWriters.write_range_i64(range.result, timespec[0] * 1000000000L + timespec[1]);
+		return SUCCESS;
+	}
+	def fd_read(args: Range<Value>) -> HostResult {
+		return fd_read_write(SYS_readv, args);
+	}
+	def fd_write(args: Range<Value>) -> HostResult {
+		return fd_read_write(SYS_writev, args);
+	}
+	def fd_read_write(syscall: int, args: Range<Value>) -> HostResult {
+		var fd = Values.unbox_i(args[0]);
+		var iovs_ptr = Values.unbox_u(args[1]);
+		var iovs_len = Values.unbox_u(args[2]);
+		var size = Values.unbox_u(args[3]);
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+
+		var iovRange = memory.range_ol_32(iovs_ptr, iovs_len * 8);
+		if (!iovRange.ok()) return iovRange.toHostResultThrow();
+
+		var sizeRange = memory.range_ol_32(size, 4);
+ 		if (!sizeRange.ok()) return sizeRange.toHostResultThrow();
+
+		if (iovs_len > IOV_MAX) return INVAL;
+
+		var iov = Array<byte>.new(int.!(iovs_len * 16));
+
+		for (j < int.!(iovs_len)) {
+			var v = Ref<Wasi_iovec>.of(iovRange.result[Wasi_iovec.size * j ...]);
+			var range = memory.range_ol_32(v.buf, v.buf_len);
+			if (!range.ok()) return range.toHostResultThrow();
+			var w = Ref<iovec>.at(iov, iovec.size * j);
+			w.iov_base = u64.!(Pointer.atContents(range.result) - Pointer.NULL);
+			w.iov_len = v.buf_len;
+		}
+
+		var t = Linux.syscall(syscall, (wasi_fd.sysfd, Pointer.atContents(iov), iovs_len));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		DataWriters.write_range_i32(sizeRange.result, i32.!(t.0));
+		return SUCCESS;
+	}
+	def fd_datasync(args: Range<Value>) -> HostResult {
+		var fd = Values.unbox_i(args[0]);
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+		var t = Linux.syscall(SYS_fdatasync, (wasi_fd.sysfd));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def fd_seek(args: Range<Value>) -> HostResult {
+		// TODO: question: whence is a u32, but in preview1 it is defined as struct
+
+		var fd = Values.unbox_i(args[0]);
+		var offset = Values.unbox_l(args[1]);
+		var whence = Values.unbox_u(args[2]);
+		// allocate a range for the result
+		var ptr = Values.unbox_u(args[3]);
+		var range = memory.range_ol_32(ptr, 8);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+		if (whence > 2) return INVAL;
+		var t = Linux.syscall(SYS_lseek, (wasi_fd.sysfd, offset, whence));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		// write the result to the memory
+		DataWriters.write_range_i64(range.result, t.0);
+		return SUCCESS;
+	}
+	def fd_sync(args: Range<Value>) -> HostResult {
+		var fd = Values.unbox_i(args[0]);
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+		var t = Linux.syscall(SYS_fsync, (wasi_fd.sysfd));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def fd_tell(args: Range<Value>) -> HostResult {
+		var fd = Values.unbox_i(args[0]);
+		var ptr = Values.unbox_u(args[1]);
+		var range = memory.range_ol_32(ptr, 8);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+		var t = Linux.syscall(SYS_lseek, (wasi_fd.sysfd, 0, WHENCE_CUR));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		DataWriters.write_range_i64(range.result, t.0);
+		return SUCCESS;
+	}
+	def fd_readdir(args: Range<Value>) -> HostResult {
+		// 0=fd 1=ptr 2=len 3=cookie 4=size
+		var fd		= Values.unbox_i(args[0]);
+		var ptr		= Values.unbox_u(args[1]);
+		var len		= Values.unbox_u(args[2]);
+		var cookie	= Values.unbox_l(args[3]);
+		var size	= Values.unbox_u(args[4]);
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+		var range = memory.range_ol_32(ptr, len);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var sizeRange = memory.range_ol_32(size, 4);
+		if (!sizeRange.ok()) return sizeRange.toHostResultThrow();
+
+		var t = Linux.syscall(SYS_lseek, (wasi_fd.sysfd, cookie, 0));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		// Output buffer
+		var buf = range.result;
+		var used = 0;
+		// Input buffer (direntbuf, statically allocated)
+		var pos = 0;
+		var avail = 0;
+		while (used < len) {
+			if (pos == avail) {
+				// Note that SYS_getdents does not use the same dirent layout
+				t = Linux.syscall(SYS_getdents64, (wasi_fd.sysfd, Pointer.atContents(direntbuf), direntbuf.length));
+				if (t.0 < 0) return i(mapErrno(t.0));
+				pos = 0;
+				avail = int.!(t.0);
+				if (avail == 0) break;
+			}
+			var d = Ref<dirent>.of(direntbuf[pos ...]);
+			var wd = Ref<Wasi_dirent>.of(wasidirentbuf);
+			wd.d_next = d.d_off;
+			wd.d_ino = d.d_ino;
+			var name = direntbuf[pos + dirent.size - 1 ...];
+			var namelen = 0;
+			while (name[namelen] != 0) namelen++;
+			wd.d_namelen = u32.!(namelen);
+			var typ : Wasi_filetype;
+			match (int.!(d.d_type)) {
+				LinuxConst.DT_CHR => typ = Wasi_filetype.CHARACTER_DEVICE;
+				LinuxConst.DT_DIR => typ = Wasi_filetype.DIRECTORY;
+				LinuxConst.DT_BLK => typ = Wasi_filetype.BLOCK_DEVICE;
+				LinuxConst.DT_REG => typ = Wasi_filetype.REGULAR_FILE;
+				LinuxConst.DT_LNK => typ = Wasi_filetype.SYMBOLIC_LINK;
+				LinuxConst.DT_SOCK => typ = Wasi_filetype.SOCKET_STREAM;
+				_ => typ = Wasi_filetype.UNKNOWN;
+			}
+			wd.d_type = typ;
+			copyBytes(wasidirentbuf, buf[used ...]);
+			used += Wasi_dirent.size;
+			if (used >= len) break;
+			copyBytes(name[0 ..+ namelen], buf[used ...]);
+			used += namelen;
+			if (used >= len) break;
+			pos += d.d_reclen;
+		}
+		if (used > len) used = int.!(len);
+		DataWriters.write_range_i32(sizeRange.result, used);
+		return SUCCESS;
+	}
+	def path_unlink_file(args: Range<Value>) -> HostResult {
+		// 0=fd 1=pathptr 2=length
+		var fd		= Values.unbox_i(args[0]);
+		var pathptr	= args[1];
+		var pathlen	= args[2];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+		var t = Linux.syscall(SYS_unlinkat, (dir_fd.sysfd, Pointer.atContents(pathz.result), 0));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_remove_directory(args: Range<Value>) -> HostResult {
+		// 0=fd 1=pathptr 2=length
+		var fd		= Values.unbox_i(args[0]);
+		var pathptr	= args[1];
+		var pathlen	= args[2];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+		var t = Linux.syscall(SYS_unlinkat, (dir_fd.sysfd, Pointer.atContents(pathz.result), AT_REMOVEDIR));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_rename(args: Range<Value>) -> HostResult {
+		// 0=fd1 1=pathptr1 2=length1 3=fd2 4=pathptr2 5=length2
+		var fd1		= Values.unbox_i(args[0]);
+		var pathptr1	= args[1];
+		var pathlen1	= args[2];
+		var fd2		= Values.unbox_i(args[3]);
+		var pathptr2	= args[4];
+		var pathlen2	= args[5];
+
+		var dir_fd1 = fdmap.get(fd1);
+		if (dir_fd1 == null) return BADF;
+		def pathz1 = copyStringZ(memory, pathptr1, pathlen1); // TODO: maxpath
+		if (pathz1.trapped()) return INVAL;
+		var dir_fd2 = fdmap.get(fd2);
+		if (dir_fd2 == null) return BADF;
+		def pathz2 = copyStringZ(memory, pathptr2, pathlen2); // TODO: maxpath
+		if (pathz2.trapped()) return INVAL;
+		var t = Linux.syscall(SYS_renameat, (dir_fd1.sysfd, Pointer.atContents(pathz1.result), dir_fd2.sysfd, Pointer.atContents(pathz2.result)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_symlink(args: Range<Value>) -> HostResult {
+		// 0=pathptr1 1=length1 2=fd 3=pathptr2 4=length2
+		var pathptr1	= args[0];
+		var pathlen1	= args[1];
+		var fd		= Values.unbox_i(args[2]);
+		var pathptr2	= args[3];
+		var pathlen2	= args[4];
+
+		def pathz1 = copyStringZ(memory, pathptr1, pathlen1); // TODO: maxpath
+		if (pathz1.trapped()) return INVAL;
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz2 = copyStringZ(memory, pathptr2, pathlen2); // TODO: maxpath
+		if (pathz2.trapped()) return INVAL;
+		var t = Linux.syscall(SYS_symlinkat, (Pointer.atContents(pathz1.result), dir_fd.sysfd, Pointer.atContents(pathz2.result)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_readlink(args: Range<Value>) -> HostResult {
+		// 0=fd 1=pathptr 2=pathlen 3=ptr 4=len 5=size
+		var fd		= Values.unbox_i(args[0]);
+		var pathptr	= args[1];
+		var pathlen	= args[2];
+		var ptr		= Values.unbox_u(args[3]);
+		var len		= Values.unbox_u(args[4]);
+		var size	= Values.unbox_u(args[5]);
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+		var range = memory.range_ol_32(ptr, len);
+		if (!range.ok()) return range.toHostResultThrow();;
+		var sizeRange = memory.range_ol_32(size, 4);
+		if (!sizeRange.ok()) return sizeRange.toHostResultThrow();
+
+		var t = Linux.syscall(SYS_readlinkat, (dir_fd.sysfd, Pointer.atContents(pathz.result), Pointer.atContents(range.result), len));
+
+		if (t.0 < 0) return i(mapErrno(t.0));
+		DataWriters.write_range_i32(sizeRange.result, i32.!(t.0));
+		return SUCCESS;
+	}
+	def path_link(args: Range<Value>) -> HostResult {
+		// 0=fd1 1=pathptr1 2=length1 3=fd2 4=pathptr2 5=length2
+		var fd1		= Values.unbox_i(args[0]);
+		var flags	= Values.unbox_i(args[1]);
+		var pathptr1	= args[2];
+		var pathlen1	= args[3];
+		var fd2		= Values.unbox_i(args[4]);
+		var pathptr2	= args[5];
+		var pathlen2	= args[6];
+
+		var dir_fd1 = fdmap.get(fd1);
+		if (dir_fd1 == null) return BADF;
+		def pathz1 = copyStringZ(memory, pathptr1, pathlen1); // TODO: maxpath
+		if (pathz1.trapped()) return INVAL;
+		var dir_fd2 = fdmap.get(fd2);
+		if (dir_fd2 == null) return BADF;
+		def pathz2 = copyStringZ(memory, pathptr2, pathlen2); // TODO: maxpath
+		if (pathz2.trapped()) return INVAL;
+
+		var sysflags = if((flags & 1) == 1, AT_SYMLINK_FOLLOW);
+
+		var t = Linux.syscall(SYS_linkat, (dir_fd1.sysfd, Pointer.atContents(pathz1.result), dir_fd2.sysfd, Pointer.atContents(pathz2.result), sysflags));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_create_directory(args: Range<Value>) -> HostResult {
+		// 0=fd 1=pathptr 2=length
+		var fd		= Values.unbox_i(args[0]);
+		var pathptr	= args[1];
+		var pathlen	= args[2];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+		var t = Linux.syscall(SYS_mkdirat, (dir_fd.sysfd, Pointer.atContents(pathz.result), 511));
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	def path_open(args: Range<Value>) -> HostResult {
+		// 0=fd 1=flags 2=pathptr 3=length 4=oflags 5=base_rights 6=inh_rights 7=fdflags 8=fdptr
+		var fd		= Values.unbox_i(args[0]);
+		var dflags	= Values.unbox_u(args[1]);
+		var pathptr	= args[2];
+		var pathlen	= args[3];
+		var oflags	= Values.unbox_u(args[4]);
+		var base_rights	= Values.unbox_l(args[5]);
+		var inh_rights	= Values.unbox_l(args[6]);
+		var fflags	= Values.unbox_u(args[7]);
+		var fdptr	= args[8];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+
+		def fdregion = getRegion3(memory, fdptr, Value.I32(4));
+		if (fdregion.trapped()) return INVAL;
+
+		var flag_r = (base_rights & (1 << WspOneRights.fd_read.tag)) != 0;
+		var flag_w = (base_rights & (1 << WspOneRights.fd_write.tag)) != 0;
+		flag_w |= (base_rights & (1 << WspOneRights.fd_filestat_set_size.tag)) != 0;
+		flag_w |= (base_rights & (1 << WspOneRights.fd_allocate.tag)) != 0;
+		var sysflags = if(flag_w, if(flag_r, LinuxConst.O_RDWR, LinuxConst.O_WRONLY), LinuxConst.O_RDONLY);
+
+		if ((oflags & (1u << WspOneOFlags.creat.tag)) != 0) sysflags |= LinuxConst.O_CREAT;
+		if ((oflags & (1u << WspOneOFlags.directory.tag)) != 0) sysflags |= LinuxConst.O_DIRECTORY;
+		if ((oflags & (1u << WspOneOFlags.excl.tag)) != 0) sysflags |= LinuxConst.O_EXCL;
+		if ((oflags & (1u << WspOneOFlags.trunc.tag)) != 0) sysflags |= LinuxConst.O_TRUNC;
+		if ((fflags & (1u << WspOneFdFlags.append.tag)) != 0) sysflags |= LinuxConst.O_APPEND;
+		if ((fflags & (1u << WspOneFdFlags.dsync.tag)) != 0) sysflags |= LinuxConst.O_DSYNC;
+		if ((fflags & (1u << WspOneFdFlags.nonblock.tag)) != 0) sysflags |= LinuxConst.O_NONBLOCK;
+		if ((fflags & (1u << WspOneFdFlags.rsync.tag)) != 0) sysflags |= LinuxConst.O_SYNC; // Linux does not implement O_RSYNC
+		if ((fflags & (1u << WspOneFdFlags.sync.tag)) != 0) sysflags |= LinuxConst.O_SYNC;
+
+		var t = Linux.syscall(SYS_openat, (dir_fd.sysfd, Pointer.atContents(pathz.result), sysflags, 0x1B6));
+		var result_fd = t.0;
+		if (result_fd < 0) return i(mapErrno(result_fd));
+		var wasi_fd = fdmap.alloc();
+		DataWriters.write_range_u32(fdregion.result, u32.!(wasi_fd));
+		fdmap.set(wasi_fd, WasiFd.new(int.view(result_fd), wasi_filetype.CHARACTER_DEVICE, false, Ranges.dup(pathz.result)));
+		return SUCCESS;
+	}
+	def path_filestat_get(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var flags	= Values.unbox_i(args[1]);
+		var pathptr	= args[2];
+		var pathlen	= args[3];
+		var filestatptr = args[4];
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+
+		def filestat = getRegion3(memory, filestatptr, Values.box_i(Wasi_filestat.size));
+		if (filestat.trapped()) return INVAL;
+
+		var sysflags = if((flags & 1) == 0, AT_SYMLINK_NOFOLLOW);
+		var sysmask = STATX_ALL;
+
+		var t = Linux.syscall(SYS_statx, (dir_fd.sysfd, Pointer.atContents(pathz.result), sysflags, sysmask, Pointer.atRef(statxbuf)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		fillFilestat(filestat.result);
+		return SUCCESS;
+	}
+	def fd_filestat_get(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var filestatptr = args[1];
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+
+		def filestat = getRegion3(memory, filestatptr, Values.box_i(Wasi_filestat.size));
+		if (filestat.trapped()) return INVAL;
+
+		var sysflags = AT_EMPTY_PATH;
+		var sysmask = STATX_ALL;
+
+		var t = Linux.syscall(SYS_statx, (wasi_fd.sysfd, Pointer.atContents(emptystring), sysflags, sysmask, Pointer.atRef(statxbuf)));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		fillFilestat(filestat.result);
+		return SUCCESS;
+	}
+	def path_filestat_set_times(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var flags	= Values.unbox_i(args[1]);
+		var pathptr	= args[2];
+		var pathlen	= args[3];
+		var atim	= Values.unbox_l(args[4]);
+		var mtim	= Values.unbox_l(args[5]);
+		var fst_flags	= Values.unbox_u(args[6]);
+
+		var dir_fd = fdmap.get(fd);
+		if (dir_fd == null) return BADF;
+		def pathz = copyStringZ(memory, pathptr, pathlen); // TODO: maxpath
+		if (pathz.trapped()) return INVAL;
+
+		fillTimespecs(atim, mtim, fst_flags);
+
+		var sysflags = if((flags & 1) == 0, AT_SYMLINK_NOFOLLOW);
+
+		var t = Linux.syscall(SYS_utimensat, (dir_fd.sysfd, Pointer.atContents(pathz.result), Pointer.atContents(timespec), sysflags));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		return SUCCESS;
+	}
+	def fd_filestat_set_times(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var atim	= Values.unbox_l(args[1]);
+		var mtim	= Values.unbox_l(args[2]);
+		var fst_flags	= Values.unbox_u(args[3]);
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+
+		fillTimespecs(atim, mtim, fst_flags);
+
+		var sysflags = AT_EMPTY_PATH;
+
+		var t = Linux.syscall(SYS_utimensat, (wasi_fd.sysfd, Pointer.atContents(emptystring), Pointer.atContents(timespec), sysflags));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		return SUCCESS;
+	}
+	def fd_filestat_set_size(args: Range<Value>) -> HostResult {
+		var fd		= Values.unbox_i(args[0]);
+		var size	= Values.unbox_l(args[1]);
+
+		var wasi_fd = fdmap.get(fd);
+		if (wasi_fd == null) return BADF;
+
+		var t = Linux.syscall(SYS_ftruncate, (wasi_fd.sysfd, size));
+		if (t.0 < 0) return i(mapErrno(t.0));
+
+		return SUCCESS;
+	}
+	def sched_yield(args: Range<Value>) -> HostResult {
+		var t = Linux.syscall(SYS_sched_yield, ());
+		if (t.0 < 0) return i(mapErrno(t.0));
+		return SUCCESS;
+	}
+	// Helper functions
+	def mapClockId(clock_id: u32) -> int {
+		if (clock_id > 3) return -1;
+		return int.view(clock_id); // WASI clock ids map directly onto Linux clock IDs
+	}
+	def mapErrno(errno: i64) -> int {
+		return int.!(WspOneErrors.errnoToWasiError(errno).code);
+	}
+	def fillFilestat(filestat: Range<byte>) {
+		var result = Ref<Wasi_filestat>.of(filestat);
+		result.dev = 		u64.view(statxbuf.stx_dev_major) << 32 | statxbuf.stx_dev_minor;
+		result.ino = 		statxbuf.stx_ino;
+		result.nlink = 	statxbuf.stx_nlink;
+		result.size = 	statxbuf.stx_size;
+		result.atim = 	statxbuf.stx_atime.tv_sec * 1000000000 + statxbuf.stx_atime.tv_nsec;
+		result.mtim = 	statxbuf.stx_mtime.tv_sec * 1000000000 + statxbuf.stx_mtime.tv_nsec;
+		result.ctim = 	statxbuf.stx_ctime.tv_sec * 1000000000 + statxbuf.stx_ctime.tv_nsec;
+
+		var ftype: Wasi_filetype;
+		match (statxbuf.stx_mode & S_IFMT) {
+			S_IFSOCK => ftype = Wasi_filetype.SOCKET_DGRAM; // TODO: mode?
+			S_IFLNK  => ftype = Wasi_filetype.SYMBOLIC_LINK;
+			S_IFREG  => ftype = Wasi_filetype.REGULAR_FILE;
+			S_IFBLK  => ftype = Wasi_filetype.BLOCK_DEVICE;
+			S_IFDIR  => ftype = Wasi_filetype.DIRECTORY;
+			S_IFCHR  => ftype = Wasi_filetype.CHARACTER_DEVICE;
+			S_IFIFO  => ftype = Wasi_filetype.SOCKET_STREAM;
+		}
+
+		result.filetype = ftype;
+	}
+	def fillTimespecs(atim: i64, mtim: i64, fst_flags: u32) {
+		if ((fst_flags & (1u << WspOneFstFlags.atim.tag)) != 0) {
+			timespec[0] = atim / 1000000000L;
+			timespec[1] = atim % 1000000000L;
+		} else if ((fst_flags & (1u << WspOneFstFlags.atim_now.tag)) != 0) {
+			timespec[1] = UTIME_NOW;
+		} else {
+			timespec[1] = UTIME_OMIT;
+		}
+		if ((fst_flags & (1u << WspOneFstFlags.mtim.tag)) != 0) {
+			timespec[2] = mtim / 1000000000L;
+			timespec[3] = mtim % 1000000000L;
+		} else if ((fst_flags & (1u << WspOneFstFlags.mtim_now.tag)) != 0) {
+			timespec[3] = UTIME_NOW;
+		} else {
+			timespec[3] = UTIME_OMIT;
+		}
+	}
+	def copyBytes(src : Range<byte>, dst : Range<byte>) {
+		var len = src.length;
+		if (len >= dst.length) len = dst.length;
+		for (i < len) dst[i] = src[i];
+	}
+}
