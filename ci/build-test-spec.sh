@@ -17,6 +17,7 @@ shift
 export PROPOSAL=$1
 shift
 
+#############################################################################
 # Set up latest version of virgil
 T=/tmp/$USER/wizard-engine/build-test-spec/
 mkdir -p $T
@@ -37,6 +38,7 @@ make
 # remaining arguments are appended to V3C_OPTS
 export V3C_OPTS="$V3C_OPTS $@"
 popd 
+#############################################################################
 
 # Set up wizard
 make -j $TEST_TARGET

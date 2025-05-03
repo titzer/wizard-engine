@@ -14,22 +14,30 @@ shift
 # for CI, use line-by-line test output
 export PROGRESS_ARGS=l
 
-# Clone virgil
-cd ..
-git clone --depth 1 https://github.com/titzer/virgil
+#############################################################################
+# Set up latest version of virgil
+T=/tmp/$USER/wizard-engine/build-test-spec/
+mkdir -p $T
+pushd $T
+
+# Clone virgil if necessary
+if [ ! -d virgil ]; then
+    git clone --depth 1 https://github.com/titzer/virgil
+fi
+
 cd virgil
 
-# Set up latest version of virgil
-export PATH=$PATH:"$PWD/bin:$PWD/bin/dev:$PWD/test/config"
+export PATH="$PWD/bin:$PWD/bin/dev:$PWD/test/config":$PATH
 # TODO: test configure is only needed for progress, get elsewhere?
 ./test/configure
 make
 
 # remaining arguments are appended to V3C_OPTS
 export V3C_OPTS="$V3C_OPTS $@"
+popd
+#############################################################################
 
 # Set up wizard
-cd ../wizard-engine
 make -j $TEST_TARGET
 
 # Install Opam for specification tests
@@ -39,6 +47,7 @@ opam init
 # Install spec test dependencies
 opam install dune
 opam install menhir -y
+opam install ocamlbuild
 # Make dune available in PATH
 eval $(opam config env)
 
