@@ -1,0 +1,23 @@
+(module
+  (type $f1 (func (result i32)))
+  (type $c1 (cont $f1))
+  (tag $e)
+  (tag $f (param i32))
+  (func $s (result i32)
+    (block $h
+      (try_table (catch $e $h) (suspend $f (i32.const 78)))
+    )
+    (i32.const 12)
+  )
+  (elem declare func $s)
+  (func (export "main") (result i32)
+    (block (result i32 (ref null $c1))
+      (resume $c1 (on $f 0) (cont.new $c1 (ref.func $s)))
+      (ref.null $c1)
+    )
+    (resume_throw $c1 $e)
+    (return)
+  )
+)
+
+(assert_return (invoke "main") (i32.const 12))
