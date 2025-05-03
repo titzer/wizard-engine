@@ -16,7 +16,7 @@ export PROGRESS_ARGS=l
 
 # Clone virgil
 cd ..
-git clone https://github.com/titzer/virgil
+git clone --depth 1 https://github.com/titzer/virgil
 cd virgil
 
 # Set up latest version of virgil
