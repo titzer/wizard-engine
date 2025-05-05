@@ -15,6 +15,12 @@ class V3Interpreter extends WasmStack {
 	private var params_arity = -1;
 	private var return_arity = -1;
 
+	// XXX: remove this
+	// This flag is used for incrementing past a {resume} or {switch} opcode after
+	// being resumed. Suspending/switching shouldn't increment {frame.pc} until
+	// {resume} as {resume_throw} uses the old {pc} for error handling.
+	private var was_suspended = false;
+
 	// WasmStack interface
 	// ===================================================================================
 	def state() -> StackState {
@@ -26,6 +32,7 @@ class V3Interpreter extends WasmStack {
 		params_arity = func.sig.params.length;
 		return_arity = func.sig.results.length;
 		thrown = null;
+		was_suspended = false;
 		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
 	}
 	def bind(args: Range<Value>) -> this {
@@ -39,6 +46,24 @@ class V3Interpreter extends WasmStack {
 	def resume() -> Result {
 		checkState("resume()", StackState.RESUMABLE);
 		thrown = null;
+
+		if (was_suspended) {
+			if (Trace.stack) {
+				Trace.OUT.puts("skipping past suspend/switch opcode in suspended stack:").ln();
+				Trace.OUT.put1("  old=%d, ", frame.pc);
+			}
+			was_suspended = false;
+			// advance past suspend instruction
+			var code = frame.func.decl.cur_bytecode;
+			codeptr.reset(code, frame.pc, code.length);
+			var opcode = codeptr.read_opcode_and_skip(frame.func.decl);
+			frame.pc = codeptr.pos;
+			if (Trace.stack) Trace.OUT.put1("new=%d", frame.pc).ln();
+			match (opcode) {
+				SUSPEND, SWITCH => ;
+				_ => fail(Strings.format1("expected suspend/switch instruction, got %s", opcode.name));
+			}
+		}
 
 		// Set the initial state to running and loop until return, throw, or suspend.
 		state_ = StackState.RUNNING;
@@ -1211,12 +1236,30 @@ class V3Interpreter extends WasmStack {
 				cont.used = true;
 
 				var tag = frame.func.instance.tags[tag_idx];
+				var ex: Throwable = Exception.new(tag, popN(tag.sig.params), null);
 				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
-				cont.top.throw(Exception.new(tag, popN(tag.sig.params), null));
-				state_ = StackState.CALL_CHILD;
-				cont.bottom.parent = this;
-				goto_stack = V3Interpreter.!(cont.top);
-				return; // skip setting frame.pc = codeptr.pos
+
+				// search for handler in continuation first
+				var handler_in_cont: V3Interpreter = null;
+				for (curr = V3Interpreter.!(cont.top); curr != null; curr = V3Interpreter.!(curr.parent)) {
+					ex = curr.throw(ex);
+					if (ex == null) { // handled
+						handler_in_cont = curr;
+						handler_in_cont.was_suspended = false;
+						break;
+					}
+				}
+
+				if (handler_in_cont == null) {
+					if (Trace.stack) Trace.OUT.put1("tag %q not handled in continuation, throwing", tag.render).ln();
+					throw(ex);
+				} else {
+					if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
+					handler_in_cont.state_ = StackState.RESUMABLE;
+					cont.top = handler_in_cont;
+					resumeContinuation(cont);
+					return; // skip setting frame.pc = codeptr.pos
+				}
 			}
 			SUSPEND => {
 				var tag_idx = codeptr.read_uleb31();
@@ -1228,9 +1271,12 @@ class V3Interpreter extends WasmStack {
 				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSuspension);
 				if (cont == null) return void(trap(TrapReason.INVALID_SUSPEND));
 				var handler = V3Interpreter.!(cont.bottom.parent);
+				cont.bottom.parent = null;
 				handler.pushN(popN(tag.sig.params));
 				handler.push(Value.Ref(cont));
 				goto_stack = handler;
+				was_suspended = true;
+				return; // skip setting frame.pc = codeptr.pos
 			}
 			SWITCH => {
 				// `target_cont`: the continuation to switch to
@@ -1265,6 +1311,8 @@ class V3Interpreter extends WasmStack {
 				target_cont.top.bind(vals);
 				target_cont.top.bind([Value.Ref(cont)]);
 				goto_stack = V3Interpreter.!(target_cont.top);
+				was_suspended = true;
+				return; // skip setting frame.pc = codeptr.pos
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
 			_ => {
