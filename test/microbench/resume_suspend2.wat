@@ -1,0 +1,44 @@
+;; INNER_CALIBRATION = 4800
+(module
+  (type $fb (func (param i32)))
+  (type $cb (cont $fb))
+  (type $f1 (func))
+  (type $c1 (cont $f1))
+  (tag $e)
+  (func $inner
+    (local $i i32)
+    (local.set $i (i32.const 1 (;$INNER_ITERATIONS;)))
+    (loop $t
+      (local.tee $i (i32.sub (local.get $i) (i32.const 1)))
+      (br_if $t)
+    )
+  )
+  (elem declare func $inner)
+  (func $middle (param $length i32)
+    (i32.eqz (local.get $length))
+    (if (result (ref null $c1))
+      (then (cont.new $c1 (ref.func $inner)))
+      (else
+        (i32.sub (local.get $length) (i32.const 1))
+        (cont.new $cb (ref.func $middle))
+        (cont.bind $cb $c1)
+      )
+    )
+    (resume $c1)
+  )
+  (elem declare func $middle)
+  (func $main (export "main")
+    ;; TODO: this bench should test repeated suspend/resume on a stack chain of
+    ;; arbitrary length, maybe REPEAT isn;t suitable for this?
+    (i32.const 1 (;$REPEAT;))
+    (cont.new $cb (ref.func $middle))
+    (cont.bind $cb $c1)
+    (loop $l (param (ref null $c1))
+      (resume $c1 (on $e $l))
+    )
+  )
+
+  (func $start (export "_start")
+    (call $main)
+  )
+)
