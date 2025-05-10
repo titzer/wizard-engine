@@ -90,17 +90,24 @@ class X86_64Stack extends WasmStack {
 		var prev_sp = this.rsp;
 		if (Exception.?(thrown)) {
 			var ex = Exception.!(thrown);
-			var new_sp = walk(findExHandler, ex, prev_sp);
-			unwind(prev_sp, new_sp);
-			return ThrowResult.Unhandled(ex); // TODO: implement proper return results
+			var result = walk(findExHandler, ex, prev_sp, true);
+			var pos = result.1;
+			var new_sp = pos.frame.sp + -RETADDR_SIZE;
+			if (Trace.stack) {
+				if (result.0) Trace.OUT.put1("walk found handler at frame[sp=0x%x]", pos.frame.sp - Pointer.NULL).ln();
+				else Trace.OUT.puts("walk found no handler");
+			}
+			if (new_sp != prev_sp) unwind(prev_sp, new_sp);
+			return if(result.0, ThrowResult.Handled(pos.stack), ThrowResult.Unhandled(ex));
 		}
 
 		var gatherTrace = !FeatureDisable.stacktraces;
 		var trace = if (gatherTrace, Vector<(WasmFunction, int)>.new());
-		var return_parent_sp = walk(if(gatherTrace, addFrameToTrace), trace, prev_sp);
+		var result = walk(if(gatherTrace, addFrameToTrace), trace, prev_sp, true);
+		var new_sp = result.1.frame.sp + -RETADDR_SIZE;
 		// Unwind this stack to the return parent stub and overwrite the caller's return IP.
 		this.vsp = mapping.range.start; // clear value stack
-		unwind(prev_sp, return_parent_sp);
+		if (new_sp != prev_sp) unwind(prev_sp, new_sp);
 
 		// Append the (reversed) stacktrace to the throwable.
 		if (trace != null) thrown.prependFrames(ArrayUtil.copyReverse(trace));
@@ -108,11 +115,17 @@ class X86_64Stack extends WasmStack {
 	}
 	// Walk the stack, applying {f} to every target frame (i.e. no stubs). If {f} returns {false},
 	// stop the stackwalk. Otherwise stop at the return-parent stub. In any case, return the last
-	// valid stack pointer.
+	// valid stack pointer, and a boolean indicating if the walk stopped early (due to {f} returning {false}).
 	// (XXX: takes a function {f} with an additional parameter, and the parameter, to avoid a closure).
-	private def walk<P>(f: (Pointer, RiUserCode, TargetFrame, P) -> bool, param: P, start_sp: Pointer) -> Pointer {
+	private def walk<P>(f: (Pointer, RiUserCode, StackFramePos, P) -> bool, param: P, start_sp: Pointer, continue_to_parent: bool) -> (bool, StackFramePos) {
+		var stack = this;
 		var sp = start_sp;
-		while (sp < mapping.range.end) {
+		if (Trace.stack && Debug.stack) {
+			Trace.OUT.put1("walk started on stack[rsp=0x%x] (", this.rsp - Pointer.NULL);
+			Trace.OUT.put1("start_sp=0x%x, ", start_sp - Pointer.NULL);
+			Trace.OUT.put1("continue_to_parent=%s)", if(continue_to_parent, "true", "false")).ln();
+		}
+		while (sp < stack.mapping.range.end) {
 			var retip = sp.load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			var accessor: FrameAccessor;
@@ -121,18 +134,31 @@ class X86_64Stack extends WasmStack {
 				// TODO: unify {sp} convention
  				if (code != null) code.describeFrame(retip, sp + RETADDR_SIZE, Trace.OUT.putr_void);
 				else Trace.OUT.ln();
+				Trace.OUT.flush();
 			}
+			var pos = StackFramePos(stack, TargetFrame(sp + RETADDR_SIZE));
 			match (code) {
 				null => break;
-				x: X86_64InterpreterCode => if (f != null && !f(retip, code, TargetFrame(sp + RETADDR_SIZE), param)) return sp;
-				x: X86_64SpcModuleCode => if (f != null && !f(retip, code, TargetFrame(sp + RETADDR_SIZE), param)) return sp;
-				x: X86_64SpcTrapsStub => if (f != null && !f(retip, code, TargetFrame(sp + RETADDR_SIZE), param)) return sp;
-				x: X86_64ReturnParentStub => return sp;
+				x: X86_64InterpreterCode => if (f != null && !f(retip, code, pos, param)) return (true, pos);
+				x: X86_64SpcModuleCode => if (f != null && !f(retip, code, pos, param)) return (true, pos);
+				x: X86_64SpcTrapsStub => if (f != null && !f(retip, code, pos, param)) return (true, pos);
+				x: X86_64ReturnParentStub => {
+					if (stack.parent == null || !continue_to_parent) {
+						if (Trace.stack && Debug.stack) Trace.OUT.puts("walk finished").ln();
+						return (false, pos);
+					} else {
+						if (Trace.stack && Debug.stack) Trace.OUT.put1("walk to parent[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
+						stack = X86_64Stack.!(stack.parent);
+						sp = stack.rsp;
+						continue;
+					}
+				}
 			}
 			var t = code.nextFrame(retip, sp);
 			sp = t.1;
 		}
-		return Pointer.NULL;
+		// XXX: only reachable through an invalid stack structure, maybe trap here?
+		return (false, StackFramePos(null, TargetFrame(Pointer.NULL)));
 	}
 	def traceFrames(when: string, sp: Pointer) {
 		Trace.OUT.puts(when);
@@ -190,7 +216,9 @@ class X86_64Stack extends WasmStack {
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
 		return handler;
 	}
-	private def findExHandler(ip: Pointer, code: RiUserCode, frame: TargetFrame, ex: Exception) -> bool {
+	private def findExHandler(ip: Pointer, code: RiUserCode, pos: StackFramePos, ex: Exception) -> bool {
+		var stack = pos.stack;
+		var frame = pos.frame;
 		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
 		var func = accessor.func();
 		var handler = func.decl.findExHandler(func.instance, ex.tag, accessor.pc());
@@ -201,26 +229,26 @@ class X86_64Stack extends WasmStack {
 			var vfp: Pointer = accessor.vfp();
 			var slot_num = (handler.val_stack_top + func.decl.num_slots());
 			var vsp = vfp + (slot_num * valuerep.slot_size);
-			this.vsp = vsp;
+			stack.vsp = vsp;
 			if (Trace.exception) Trace.OUT.put3("  push %d vfp=0x%x, vsp=0x%x", ex.vals.length, vfp - Pointer.NULL, vsp - Pointer.NULL).ln();
-			for (v in ex.vals) this.push(v);
+			for (v in ex.vals) stack.push(v);
 			if (handler.ex_slot >= 0) {
 				if (Trace.exception) Trace.OUT.put2("  set_ex_slot vfp=0x%x, ex_slot=%d", vfp - Pointer.NULL, handler.ex_slot).ln();
 				var ptr = vfp + (func.decl.num_locals + handler.ex_slot) * valuerep.slot_size;
-				this.storeValue(ptr, Value.Ref(ex));
+				stack.storeValue(ptr, Value.Ref(ex));
 			}
 			if (handler.push_exnref) {
 				if (Trace.exception) Trace.OUT.puts("  push_exnref").ln();
-				this.push(Value.Ref(ex));
+				stack.push(Value.Ref(ex));
 			}
-			accessor.set_vsp(this.vsp);
+			accessor.set_vsp(stack.vsp);
 			return false; // terminate stackwalk
 		}
 		if (Trace.exception) Trace.OUT.puts("  walk found no handler").ln();
 		return true;
 	}
-	private def addFrameToTrace(ip: Pointer, code: RiUserCode, frame: TargetFrame, trace: Vector<(WasmFunction, int)>) -> bool {
-		var accessor = frame.getFrameAccessor(); // XXX: don't materialize accessor
+	private def addFrameToTrace(ip: Pointer, code: RiUserCode, pos: StackFramePos, trace: Vector<(WasmFunction, int)>) -> bool {
+		var accessor = pos.frame.getFrameAccessor(); // XXX: don't materialize accessor
 		trace.put(accessor.func(), accessor.pc());
 		return true;
 	}
@@ -234,10 +262,11 @@ class X86_64Stack extends WasmStack {
 		if (Trace.stack) traceFrames("stack.overflow (before)", sp);
 		// Unwind the stack, skipping the top frame (which might have triggered the overflow)
 		// XXX: change the %sp convention from the caller instead of doing {+ -RETADDR_SIZE}
-		var return_parent_sp = walk<void>(null, (), sp + -RETADDR_SIZE);
+		var result = walk<void>(null, (), sp + -RETADDR_SIZE, true);
+		var new_sp = result.1.frame.sp + -RETADDR_SIZE;
 		// Unwind without updating any return addresses.
 		this.vsp = mapping.range.start; // clear value stack
-		unwind(Pointer.NULL, return_parent_sp);
+		if (new_sp != this.rsp) unwind(Pointer.NULL, new_sp);
 		// Instead, return from the signal to the stack overflow stub, which will unwind with a Trap.STACK_OVERFLOW throwable.
 		if (Trace.stack) traceFrames("stack.overflow (after)", this.rsp + RETADDR_SIZE);
 		return STACK_OVERFLOW_STUB.getEntry() + NOP_ENTRY;
@@ -396,10 +425,10 @@ class X86_64Stack extends WasmStack {
 			}
 		}
 		// Walk Wasm execution frames to scan their roots.
-		walk<void>(scanFrame, (), rsp);
+		walk<void>(scanFrame, (), rsp, false);
 	}
-	private def scanFrame(ip: Pointer, code: RiUserCode, frame: TargetFrame, v: void) -> bool {
-		code.scanFrame(ip, frame.sp);
+	private def scanFrame(ip: Pointer, code: RiUserCode, pos: StackFramePos, v: void) -> bool {
+		code.scanFrame(ip, pos.frame.sp);
 		return true;
 	}
 	def readValue(base: Pointer, offset: int) -> Value {
@@ -1084,3 +1113,5 @@ component X86_64StackManager {
 		return result;
 	}
 }
+
+type StackFramePos(stack: X86_64Stack, frame: TargetFrame) #unboxed;
