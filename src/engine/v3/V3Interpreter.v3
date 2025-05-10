@@ -5,7 +5,7 @@ class V3Interpreter extends WasmStack {
 	private var instrTracer: InstrTracer;
 	private def values = ArrayStack<Value>.new();	// storage of all WasmValues
 	private var state_: StackState;
-	private var goto_stack: V3Interpreter; // set when state_ == {CALL_CHILD|SUSPENDED}
+	private var goto_stack: V3Interpreter; // set when state_ == {CALL_CHILD|SUSPENDED|THROWING}
 	private var cache: V3Frame;			// cache of all V3Frame objects (bottom of stack)
 	private var frame: V3Frame;
 	private var host_frame: HostFrame;
@@ -46,6 +46,7 @@ class V3Interpreter extends WasmStack {
 	def resume() -> Result {
 		checkState("resume()", StackState.RESUMABLE);
 		thrown = null;
+		goto_stack = null;
 
 		if (was_suspended) {
 			if (Trace.stack) {
@@ -76,7 +77,11 @@ class V3Interpreter extends WasmStack {
 
 		// Return the appropriate result.
 		match (state_) {
-			THROWING => return clearAndThrow();
+			THROWING => {
+				// If {goto_stack} is set, then a handler is found.
+				var t = clearAndThrow();
+				return if(goto_stack == null, t, Result.Switch(goto_stack));
+			}
 			RETURNING => return clearAndReturn();
 			SUSPENDED, CALL_CHILD => return Result.Switch(goto_stack);
 			_ => {
@@ -1219,7 +1224,6 @@ class V3Interpreter extends WasmStack {
 				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
 				cont.used = true;
 
-				if (Trace.stack) Trace.OUT.put1("resume %q", cont.render).ln();
 				cont.top.bind(popN(cont_type.sig.params));
 				resumeContinuation(cont);
 				return; // skip setting frame.pc = codeptr.pos
@@ -1239,28 +1243,21 @@ class V3Interpreter extends WasmStack {
 				var ex: Throwable = Exception.new(tag, popN(tag.sig.params), null);
 				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
 
-				// search for handler in continuation first
-				var handler_in_cont: V3Interpreter = null;
-				for (curr = V3Interpreter.!(cont.top); curr != null; curr = V3Interpreter.!(curr.parent)) {
-					match (curr.throw(ex)) {
-						Handled => {
-							handler_in_cont = curr;
-							handler_in_cont.was_suspended = false;
-							break;
-						}
-						Unhandled(thrown) => ex = thrown;
+				// search for handler in continuation
+				match (cont.top.throw(ex)) {
+					Handled(stack) => {
+						if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
+						var handler = V3Interpreter.!(stack);
+						handler.state_ = StackState.RESUMABLE;
+						handler.was_suspended = false;
+						cont.top = handler;
+						resumeContinuation(cont);
+						return; // skip setting frame.pc = codeptr.pos
 					}
-				}
-
-				if (handler_in_cont == null) {
-					if (Trace.stack) Trace.OUT.put1("tag %q not handled in continuation, throwing", tag.render).ln();
-					throw(ex);
-				} else {
-					if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
-					handler_in_cont.state_ = StackState.RESUMABLE;
-					cont.top = handler_in_cont;
-					resumeContinuation(cont);
-					return; // skip setting frame.pc = codeptr.pos
+					Unhandled => {
+						if (Trace.stack) Trace.OUT.put1("tag %q not handled in continuation, throwing", tag.render).ln();
+						throw(ex);
+					}
 				}
 			}
 			SUSPEND => {
@@ -1663,38 +1660,63 @@ class V3Interpreter extends WasmStack {
 		goto_stack = V3Interpreter.!(cont.top);
 	}
 	def throw(t: Throwable) -> ThrowResult {
+		if (Trace.stack) Trace.OUT.put1("throw on stack: %q", t.render).ln();
 		if (Exception.?(t)) {
 			var ex = Exception.!(t);
-			for (f = frame; f != null && f.func != null; f = f.prev) {
-				var handler = f.func.decl.findExHandler(f.func.instance, ex.tag, f.pc);
-				if (handler.handler_pc >= 0) {
-					frame = f;
-					var code = f.func.decl.cur_bytecode;
-					f.pc = handler.handler_pc;
-					f.stp = handler.sidetable_pos;
-					codeptr.reset(code, f.pc, code.length);
-					// TODO: clean up frame math here
-					values.top = f.fp + handler.val_stack_top + f.func.decl.num_slots();
-					for (v in ex.vals) values.push(v);
-					if (handler.ex_slot >= 0) {
-						if (Trace.exception) Trace.OUT.put2("  set_ex_slot fp=%d, ex_slot=%d", f.fp, handler.ex_slot).ln();
-						values.elems[f.fp + f.func.decl.num_locals + handler.ex_slot] = Value.Ref(ex);
+			for (stack = this; stack != null; stack = V3Interpreter.!(stack.parent)) {
+				for (f = stack.frame; f != null && f.func != null; f = f.prev) {
+					if (stack.tryHandleEx(ex, f)) {
+						if (stack == this) { // don't transfer
+							return ThrowResult.Handled(this);
+						} else { // go to handler stack
+							state_ = StackState.THROWING;
+							goto_stack = stack;
+							goto_stack.state_ = StackState.RESUMABLE;
+							return ThrowResult.Handled(stack);
+						}
 					}
-					if (handler.push_exnref) {
-						if (Trace.exception) Trace.OUT.puts("  push_exnref").ln();
-						values.push(Value.Ref(ex));
-					}
-					frame = f;
-					return ThrowResult.Handled(this);
 				}
+				stack.trapWith(ex);
 			}
+			return ThrowResult.Unhandled(thrown);
 		}
+
+		trapWith(t);
+		return ThrowResult.Unhandled(thrown);
+	}
+	// Returns whether the given exception can be handled by the given frame.
+	private def tryHandleEx(ex: Exception, f: V3Frame) -> bool {
+		var handler = f.func.decl.findExHandler(f.func.instance, ex.tag, f.pc);
+		if (handler.handler_pc >= 0) {
+			frame = f;
+			var code = f.func.decl.cur_bytecode;
+			f.pc = handler.handler_pc;
+			f.stp = handler.sidetable_pos;
+			codeptr.reset(code, f.pc, code.length);
+			// TODO: clean up frame math here
+			values.top = f.fp + handler.val_stack_top + f.func.decl.num_slots();
+			for (v in ex.vals) values.push(v);
+			if (handler.ex_slot >= 0) {
+				if (Trace.exception) Trace.OUT.put2("  set_ex_slot fp=%d, ex_slot=%d", f.fp, handler.ex_slot).ln();
+				values.elems[f.fp + f.func.decl.num_locals + handler.ex_slot] = Value.Ref(ex);
+			}
+			if (handler.push_exnref) {
+				if (Trace.exception) Trace.OUT.puts("  push_exnref").ln();
+				values.push(Value.Ref(ex));
+			}
+			frame = f;
+			return true;
+		}
+		return false;
+	}
+	// Marks this stack as throwing with {t}.
+	private def trapWith(t: Throwable) {
 		var segment = popAllFrames(true);
 		if (segment != null) t = t.prependFrames(segment.frames).prependHostFunction(segment.host);
 		state_ = StackState.THROWING;
 		thrown = t; // unhandled exception
-		return ThrowResult.Unhandled(thrown);
 	}
+
 	def trap(reason: TrapReason) -> Throwable {
 		var stacktrace = popAllFrames(true);
 		thrown = Trap.new(reason, null, stacktrace);
