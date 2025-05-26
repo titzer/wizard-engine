@@ -15,11 +15,7 @@ class V3Interpreter extends WasmStack {
 	private var params_arity = -1;
 	private var return_arity = -1;
 
-	// XXX: remove this
-	// This flag is used for incrementing past a {resume} or {switch} opcode after
-	// being resumed. Suspending/switching shouldn't increment {frame.pc} until
-	// {resume} as {resume_throw} uses the old {pc} for error handling.
-	private var was_suspended = false; // TODO: change to {suspend_pc}
+	private var suspend_pc: int = -1;
 
 	// WasmStack interface
 	// ===================================================================================
@@ -31,6 +27,7 @@ class V3Interpreter extends WasmStack {
 		pushFrame(func, 0);
 		params_arity = func.sig.params.length;
 		return_arity = func.sig.results.length;
+		suspend_pc = -1;
 		thrown = null;
 		parent = null;
 		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
@@ -47,24 +44,6 @@ class V3Interpreter extends WasmStack {
 		checkState("resume()", StackState.RESUMABLE);
 		thrown = null;
 		goto_stack = null;
-
-		if (was_suspended) {
-			if (Trace.stack) {
-				Trace.OUT.puts("skipping past suspend/switch opcode in suspended stack:").ln();
-				Trace.OUT.put1("  old=%d, ", frame.pc);
-			}
-			was_suspended = false;
-			// advance past suspend instruction
-			var code = frame.func.decl.cur_bytecode;
-			codeptr.reset(code, frame.pc, code.length);
-			var opcode = codeptr.read_opcode_and_skip(frame.func.decl);
-			frame.pc = codeptr.pos;
-			if (Trace.stack) Trace.OUT.put1("new=%d", frame.pc).ln();
-			match (opcode) {
-				SUSPEND, SWITCH => ;
-				_ => fail(Strings.format1("expected suspend/switch instruction, got %s", opcode.name));
-			}
-		}
 
 		// Set the initial state to running and loop until return, throw, or suspend.
 		state_ = StackState.RUNNING;
@@ -127,8 +106,7 @@ class V3Interpreter extends WasmStack {
 		return_arity = -1;
 		params_arity = -1;
 		codeptr.reset(null, 0, 0);
-
-		was_suspended = false;
+		suspend_pc = -1;
 	}
 
 	// Internal implementation: nominally private
@@ -243,7 +221,7 @@ class V3Interpreter extends WasmStack {
 			} else {
 				opcode = codeptr.read_opcode();
 			}
-			execOp(pc, opcode);
+			execOp(pc, opcode); // TODO: make this return a value or smth
 		}
 	}
 	def runHostCall() {
@@ -1246,12 +1224,13 @@ class V3Interpreter extends WasmStack {
 				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
 
 				// search for handler in continuation
+				var top = V3Interpreter.!(cont.top);
+				top.frame.pc = top.suspend_pc;
 				match (cont.top.throw(ex)) {
 					Handled(stack) => {
 						if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
 						var handler = V3Interpreter.!(stack);
 						handler.state_ = StackState.RESUMABLE;
-						handler.was_suspended = false;
 						cont.top = handler;
 						resumeContinuation(cont);
 						return; // skip setting frame.pc = codeptr.pos
@@ -1276,8 +1255,7 @@ class V3Interpreter extends WasmStack {
 				handler.pushN(popN(tag.sig.params));
 				handler.push(Value.Ref(cont));
 				goto_stack = handler;
-				was_suspended = true;
-				return; // skip setting frame.pc = codeptr.pos
+				suspend_pc = frame.pc;
 			}
 			SWITCH => {
 				// `target_cont`: the continuation to switch to
@@ -1312,8 +1290,7 @@ class V3Interpreter extends WasmStack {
 				target_cont.top.bind(vals);
 				target_cont.top.bind([Value.Ref(cont)]);
 				goto_stack = V3Interpreter.!(target_cont.top);
-				was_suspended = true;
-				return; // skip setting frame.pc = codeptr.pos
+				suspend_pc = frame.pc;
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
 			_ => {
