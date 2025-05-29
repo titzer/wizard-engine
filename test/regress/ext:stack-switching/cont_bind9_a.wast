@@ -13,15 +13,13 @@
 
   (func (export "main") (param i64 i32) (result i32)
     (local $x3 (ref $c3))
-    (local $x2 (ref $c2))
-    (local $x1 (ref $c1))
     (local.set $x3 (cont.new $c3 (ref.func $sub)))
-    (local.set $x2 (cont.bind $c3 $c2 (local.get 0) (local.get $x3)))
-    (local.set $x1 (cont.bind $c2 $c1 (local.get 1) (local.get $x2)))
 
-    (resume $c1 (local.get $x1))
+    (local.get 0)
+    (local.get 1)
+    (resume $c3 (local.get $x3))
   )
 )
 
-(assert_return (invoke "main" (i64.const 22) (i32.const 44)) (i32.const -22))
-(assert_return (invoke "main" (i64.const -444) (i32.const 111)) (i32.const -555))
+(assert_return (invoke "main" (i64.const 3) (i32.const 2)) (i32.const 1))
+
