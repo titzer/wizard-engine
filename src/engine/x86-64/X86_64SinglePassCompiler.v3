@@ -785,6 +785,78 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		state.push(a.kindFlagsMatching(ValueKind.V128, IN_REG), a.reg, 0);
 	}
 
+	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		var offsets = V3Offsets.new();
+		var stub_resume = X86_64Label.new(), end = X86_64Label.new();
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var top = popReg();
+		var cont = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF, cont, top.reg);
+		masm.emit_validate_and_consume_cont(cont);
+
+		// transfer params to child stack
+		// XXX: not necessary to store the entire value stack to memory
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		var curStack = allocTmp(ValueKind.REF);
+		var nvals = allocTmp(ValueKind.REF);
+		var tmp0 = allocTmp(ValueKind.REF);
+		var tmp1 = allocTmp(ValueKind.REF);
+		var tmp2 = allocTmp(ValueKind.V128);
+
+		// call to transfer
+		emit_compute_vsp(regs.vsp, state.sp);
+		masm.emit_mov_r_i(nvals, cont_decl.sig.params.length);
+		masm.emit_cont_mv(vsp, cont, nvals, tmp0, tmp1, tmp2);
+		dropN(u32.!(cont_decl.sig.params.length));
+		state.emitRestoreAll(resolver);
+
+		// context switch: store to old stack
+		masm.emit_get_curstack(curStack);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+ 
+		// reserve space for call addr
+		asm.sub_m_i(G(curStack).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
+		masm.emit_chain_cont_to_parent(curStack, cont);
+		masm.emit_switch_curStack_to_cont(cont);
+
+		asm.call_rel_far(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		masm.recordRetSourceLoc();
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		asm.jmp_rel_near(end);
+		asm.bind(stub_resume); {
+			// load new stack pointers
+			masm.emit_get_curstack(curStack);
+			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
+			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
+			// pop address from new stack and go to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		asm.bind(end);
+	}
+
+	private def checkForConstNull(sv: SpcVal) -> bool {
+		if (sv.isConst() && sv.const == 0) {
+			emitTrap(TrapReason.NULL_DEREF);
+			setUnreachable();
+			return true;
+		}
+		return false;
+	}
+
 	private def visit_V128_SHIFT1<T>(masm_shift: (X86_64Xmmr, X86_64Gpr, X86_64Gpr, X86_64Xmmr, X86_64Xmmr) -> T) {
 		var b = popReg();
 		var a = popRegToOverwrite();
