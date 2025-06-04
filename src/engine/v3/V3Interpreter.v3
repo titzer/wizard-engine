@@ -36,7 +36,7 @@ class V3Interpreter extends WasmStack {
 		if (args.length == 0 && state_ == StackState.RESUMABLE) return;
 		checkState("bind()", StackState.SUSPENDED);
 		if (params_arity < args.length) fatal(Strings.format2("bind() expected %d arguments, got %d", params_arity, args.length));
-		for (v in args) values.push(v); // XXX: ArrayStack.pushr
+		values.pushr(args);
 		params_arity -= args.length;
 		if (params_arity == 0) state_ = StackState.RESUMABLE;
 	}
@@ -57,29 +57,26 @@ class V3Interpreter extends WasmStack {
 		// Return the appropriate result.
 		match (state_) {
 			THROWING => {
-				// If {goto_stack} is set, then a handler is found.
-				var t = clearAndThrow();
-				return if(goto_stack == null, t, Result.Switch(goto_stack));
+				var t = thrown, cont = goto_stack;
+				clear();
+				if (cont == null) return Result.Throw(t);
+				else return Result.Switch(cont); // handler found on parent stack
 			}
-			RETURNING => return clearAndReturn();
-			SUSPENDED, CALL_CHILD => return Result.Switch(goto_stack);
+			RETURNING => {
+				var top = values.top;
+				var vals = Ranges.dup(values.peekn(return_arity));
+				clear();
+				return Result.Value(vals);
+			}
+			SUSPENDED, CALL_CHILD => {
+				return Result.Switch(goto_stack);
+			}
 			_ => {
 				clear();
 				var trap = Trap.new(TrapReason.ERROR, Strings.format1("invalid interpreter state: %s", state_.name), null);
 				return Result.Throw(trap);
 			}
 		}
-	}
-	def clearAndThrow() -> Result.Throw {
-		var t = thrown;
-		clear();
-		return Result.Throw(t);
-	}
-	def clearAndReturn() -> Result.Value {
-		var top = values.top;
-		var vals = Ranges.dup(values.elems[(top - return_arity) ... top]);
-		clear();
-		return Result.Value(vals);
 	}
 	def popAllFrames(stacktrace: bool) -> StackSegment {
 		var result: StackSegment;
@@ -107,6 +104,8 @@ class V3Interpreter extends WasmStack {
 		params_arity = -1;
 		codeptr.reset(null, 0, 0);
 		suspend_pc = -1;
+		goto_stack = null;
+		thrown = null;
 	}
 
 	// Internal implementation: nominally private
@@ -184,7 +183,7 @@ class V3Interpreter extends WasmStack {
 			if (frame == null || host_outcall != null) return;
 			var func = frame.func, pc = frame.pc;
 			if (pc == 0) {
-				// Entering the function; initialize locals.
+				// Enter the function and initialize locals.
 				codeptr.iterate_local_codes(pushLocals);
 				var tags = func.decl.frame_var_tags;
 				if (tags != null) for (t in tags) values.push(tagToValue(t));
@@ -199,7 +198,7 @@ class V3Interpreter extends WasmStack {
 				}
 			}
 
-			// Fire global probes.
+			// Fire global probe(s).
 			if (Instrumentation.probes != null) {
 				var throwable = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, TargetFrame(frame)));
 				if (throwable != null) {
@@ -211,7 +210,7 @@ class V3Interpreter extends WasmStack {
 			var b = codeptr.peek1();
 			var opcode: Opcode;
 			if (b == InternalOpcode.PROBE.code || b == InternalOpcode.WHAMM_PROBE.code) {
-				// First local probes.
+				// Fire local probe(s).
 				var throwable = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, TargetFrame(frame)));
 				if (throwable != null) {
 					throw(throwable);
@@ -221,7 +220,7 @@ class V3Interpreter extends WasmStack {
 			} else {
 				opcode = codeptr.read_opcode();
 			}
-			execOp(pc, opcode); // TODO: make this return a value or smth
+			execOp(pc, opcode);
 		}
 	}
 	def runHostCall() {
@@ -231,10 +230,12 @@ class V3Interpreter extends WasmStack {
 			var sig = hf.sig, arity = sig.params.length;
 			var oldVsp = values.top;
 			var result = hf.invoke(values.peekn(arity));
+			host_outcall = null;
 			var newVsp = oldVsp - arity;
 			values.top = newVsp;
 			match (result) {
 				Throw(thrown) => {
+					host_outcall = hf; // needed for stacktrace
 					return void(throw(thrown));
 				}
 				Value0 => {
@@ -245,19 +246,17 @@ class V3Interpreter extends WasmStack {
 					return doHostReturn(newVsp, sig);
 				}
 				ValueN(vals) => {
-					for (v in vals) values.push(v);
+					values.pusha(vals);
 					return doHostReturn(newVsp, sig);
 				}
 				TailCall(f, args) => {
-					host_outcall = null;
-					for (v in args) values.push(v);
+					values.pusha(args);
 					pushFrame(f, args.length);
 				}
 			}
 		}
 	}
 	def doHostReturn(fp: int, sig: SigDecl) {
-		host_outcall = null;
 		if (frame == null) doReturn(fp, sig);
 		else advanceCaller();
 	}
