@@ -46,6 +46,11 @@ WALI="src/modules/wali/*.v3"
 WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
 
+if [ "$1" = "-nojit" ]; then
+    REDEFS="SpcTuning.disable=true"
+    shift
+fi
+
 PROGRAM=$1
 TARGET=$2
 
@@ -94,6 +99,9 @@ BUILD_FILE=$(make_build_file)
 PREGEN=${PREGEN:=1}
 
 LANG_OPTS="-fun-exprs -simple-bodies"
+if [ "$REDEFS" != "" ]; then
+    V3C_OPTS=-redef-field=$REDEFS
+fi
 
 # build
 exe=${PROGRAM}.${TARGET}
