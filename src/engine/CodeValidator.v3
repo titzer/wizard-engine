@@ -21,10 +21,13 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	var validatingInitExpr = false;
 	var init_stack: ArrayStack<InitExpr>;
 	var probe: (CodeValidator, int, Opcode) -> void;
-	var n_handlers: int;
+	// XXX: better organization?
 	def ex_handlers = Vector<ExHandlerEntry>.new();
 	def suspend_handlers = Vector<ExHandlerEntry>.new();
 	def switch_handlers = Vector<ExHandlerEntry>.new();
+	var handler_dest_map = Vector<int>.new();
+	// Vector of (start_pos, handler_dest_info), {start_pos} is used for identification.
+	var handler_dests = Vector<(int, TargetHandlerDest)>.new();
 
 	// Used for code validator callbacks that inspect immediates
 	private var imm_codeptr: CodePtr;
@@ -50,7 +53,6 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		this.func = func;
 		resetSig(func.sig);
 		resetCode(d);
-		n_handlers = 0;
 
 		// Read and initialize locals.
 		if (!readLocals(locals)) return reterr();
@@ -75,6 +77,12 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			traceHandlers("ex", ex_handlers);
 			traceHandlers("suspend", suspend_handlers);
 			traceHandlers("switch", switch_handlers);
+			if (handler_dests.length > 0) {
+				OUT.puts("    Reachable handlers:").ln();
+				for (i < handler_dests.length) {
+					OUT.put2("        #%d: ctl_pos=+%d", i, handler_dests[i].0).ln();
+				}
+			}
 		}
 
 		// Extract sidetable.
@@ -84,6 +92,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		if (ex_handlers.length > 0) func.handlers = ex_handlers.extract();
 		if (suspend_handlers.length > 0) func.suspend_handlers = suspend_handlers.extract();
 		if (switch_handlers.length > 0) func.switch_handlers = switch_handlers.extract();
+		if (handler_dest_map.length > 0) func.handler_dest_map = handler_dest_map.extract();
+		if (handler_dests.length > 0) func.handler_dests = Arrays.map(handler_dests.extract(), extractDest);
 		if (frame_var_tags.length > 0) func.frame_var_tags = frame_var_tags.extract();
 
 		// Report metrics and return success.
@@ -101,10 +111,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		for (i < handlers.length) {
 			var handler = handlers[i];
 			OUT.puts("        ");
-			OUT.put2("index=%d, tag=%d, ", handler.index, handler.tag);
+			OUT.put3("index=%d, tag=#%d, dest=#%d, ", handler.index, handler.tag, handler_dest_map[handler.index]);
 			OUT.put2("range=[%d, %d)", handler.start, handler.end).ln();
 		}
 	}
+	private def extractDest(dest: (int, TargetHandlerDest)) -> TargetHandlerDest { return dest.1; } 
 	private def validateExpr0(sig: SigDecl, d: DataReader) -> CodeValidatorResult {
 		if (Trace.validation) OUT.put1("validate(expr: %q)", sig.render).ln();
 		resetSig(sig);
@@ -146,6 +157,24 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		ex_handlers.resize(0);
 		suspend_handlers.resize(0);
 		frame_var_tags.resize(0);
+	}
+	// Allocate a new handler index and bind it to the given ControlEntry. Returns the new index.
+	private def allocAndBindHandlerToDest(ctl: ControlEntry) -> int {
+		var index = handler_dest_map.length;
+		var start_pos = ctl.start_pos;
+		var	dest = -1;
+		for (i < handler_dests.length) {
+			if (handler_dests[i].0 == start_pos) {
+				dest = i;
+				break;
+			}
+		}
+		if (dest == -1) {
+			dest = handler_dests.length;
+			handler_dests.put(start_pos - func_start_pos, TargetHandlerDest.new());
+		}
+		handler_dest_map.put(dest);
+		return index;
 	}
 	def readLocals(vec: Vector<ValueType>) -> bool {
 		var start = vec.length, max = limits.max_num_locals;
@@ -262,7 +291,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.ref0(ctl_top, opcode_pos);  // implicit jump to end of try block
 					var ex_slot = findExSlot(null).0;
 					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					ex_handlers.put(ExHandlerEntry(n_handlers++, tag.tag_index, range.0, range.1, info));
+					var index = allocAndBindHandlerToDest(ctl_top);
+					ex_handlers.put(ExHandlerEntry(index, tag.tag_index, range.0, range.1, info));
 					checkArgsAndTransfer();
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
@@ -319,7 +349,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 								var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
 								var info = ExHandlerInfo.Sidetable(c.exnref, sidetable_entry);
 								var tag_index = if(c.tag != null, c.tag.tag_index, Modules.EX_TAG_ALL);
-								ex_handlers.put(ExHandlerEntry(n_handlers++, tag_index, ctl.start_pos - func_start_pos, opcode_pos - func_start_pos, info));
+								var index = allocAndBindHandlerToDest(ctl_top);
+								ex_handlers.put(ExHandlerEntry(index, tag_index, ctl.start_pos - func_start_pos, opcode_pos - func_start_pos, info));
 							}
 						}
 						_ => {
@@ -433,7 +464,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					if (target == null) return;
 					checkArgsAndTransfer();
 					var info = ExHandlerInfo.Direct(target.delegate_pos - func_start_pos, 0, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					ex_handlers.put(ExHandlerEntry(n_handlers++, Modules.EX_TAG_DELEGATE, range.0, range.1, info));
+					var index = allocAndBindHandlerToDest(ctl_top);
+					ex_handlers.put(ExHandlerEntry(index, Modules.EX_TAG_DELEGATE, range.0, range.1, info));
 					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.sidetable.length);
 					resetInit();
 					ctl_stack.pop();
@@ -451,7 +483,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.ref0(ctl_top, opcode_pos); // implicit jump to end of try block
 					var ex_slot = findExSlot(null).0;
 					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					ex_handlers.put(ExHandlerEntry(n_handlers++, Modules.EX_TAG_ALL, range.0, range.1, info));
+					var index = allocAndBindHandlerToDest(ctl_top);
+					ex_handlers.put(ExHandlerEntry(index, Modules.EX_TAG_ALL, range.0, range.1, info));
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
 				}
@@ -1459,7 +1492,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					if (target == null) return;
 					checkContHandle(i, tag, cont, target);
 					ctlxfer.refC(target, tag, false, "refH[suspend]");
-					suspend_handlers.put(ExHandlerEntry(n_handlers++, tag.tag_index, resume_pos, resume_pos + 1, info));
+					var index = allocAndBindHandlerToDest(ctl_top);
+					suspend_handlers.put(ExHandlerEntry(index, tag.tag_index, resume_pos, resume_pos + 1, info));
 				}
 				Switch(tag) => {
 					var expected = cont.sig.results;
@@ -1476,7 +1510,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 						}
 					}
 					ctlxfer.refC(null, tag, false, "refH[switch]");
-					switch_handlers.put(ExHandlerEntry(n_handlers++, tag.tag_index, resume_pos, resume_pos + 1, info));
+					var index = allocAndBindHandlerToDest(ctl_top);
+					switch_handlers.put(ExHandlerEntry(index, tag.tag_index, resume_pos, resume_pos + 1, info));
 				}
 			}
 		}
