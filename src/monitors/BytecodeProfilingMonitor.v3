@@ -19,6 +19,9 @@ def E = MonitorRegistry.add(
 def output_folder_opt = E.options.newStringOption("output_folder", null, "output folder for profiling results");
 def switch_size_opt = E.options.newIntOption("switch_size", MIN_DISPATCH_CASE_COUNT, "minimum number opcode switch targets to be considered a dispatch function");
 def operand_len_opt = E.options.newIntOption("operand_len", MAX_OPERAND_LEN, "maximum number of bytes for immediates between consecutive opcodes");
+def use_abstract_interp = E.options.newBoolOption("abstract_interpreter", false, "use abstract interpreter to determine opcode reads");
+
+def traceHeuristics = true;
 
 class BytecodeProfilingMonitor extends Monitor {
 	var visitor: DispatchFunctionBytecodeVisitor;
@@ -53,7 +56,14 @@ class BytecodeProfilingMonitor extends Monitor {
 	private def instrumentFunc(mi: ModuleInstrumenter, func: FuncDecl) {
 		visitor.reset();
 		visitor.bi.reset(func).dispatchAll(visitor);
+
 		if (visitor.is_dispatch_func) { // save the profile state and insert memory probes 
+			var opcode_read_pc: int = if(use_abstract_interp.val,
+					findDispatchSource(mi.module, func),
+					visitor.opcode_read_pc);
+			if (traceHeuristics) {
+				System.puts(Strings.format2("found load func=%d, pc=%d\n", func.func_index, opcode_read_pc));
+			}
 			var state = GuestProfileState.new(fuel_counter, func.func_index,
 				func.render(mi.module.names, StringBuilder.new()).toString());
 			potential_dispatch_functions = List.new(state, potential_dispatch_functions);
@@ -117,6 +127,9 @@ private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterat
 		visitOp(Opcode.BR_TABLE);
 		if (!is_dispatch_func && labels.length >= MIN_DISPATCH_CASE_COUNT && opcode_read_pc >= 0) {
 			is_dispatch_func = true;
+			if (traceHeuristics) {
+				System.puts(Strings.format2("found dispatch func=%d, pc=%d \n", bi.func.func_index, bi.pc));
+			}
 		}
 	}
 	def visit_I32_LOAD8_U(imm: MemArg) {
@@ -430,4 +443,155 @@ private type ProbeEvent {
 	case GUEST_OPCODE_READ(bytecode: u8, offset: u32);
 	case CALL;
 	case RETURN;
+}
+
+def findDispatchSource(module: Module, func: FuncDecl) -> int {
+	// create a mapping for pc -> StackDelta
+	def map: HashMap<int, (int, int)> = HashMap.new(hash, int.==);
+	def extensions = Extension.set.all;
+	def cv = CodeValidator.new(extensions, Limits.new().set(extensions), module, ErrorGen.new(null));
+	cv.probe = callback(map, _, _, _); // validator callback populates `map`
+	cv.validateFunc(func);
+
+	// iterate over basic blocks
+	def it = BasicBlockIterator.new();
+	it.reset(func);
+	// map of block start -> block end
+	def blocks: HashMap<int, int> = HashMap.new(hash, int.==);
+	var fst = int.max;
+	while (it.more()) {
+		def p = it.current();
+		if (p.0 < fst) fst = p.0;
+		blocks[p.0] = p.1;
+
+		it.next();
+	}
+	blocks[0] = blocks[fst]; // XXX hackfix for pc start of function
+
+	def cfg = CfgBuilder.new();
+	def blk = cfg.build(func);
+
+	var label: int;
+	def poss = Vector<int>.new();
+	for (path in paths(blk, null)) {
+		label = 0;
+
+		def stack: ArrayStack<int> = ArrayStack.new();
+		def locals: Array<int> = Array.new(func.num_locals);
+		def source: Vector<int> = Vector.new();
+		source.put(-2); // value 0 = not generated from wasm code
+
+		for (list = path; list != null; list = list.tail) {
+			def block = list.head;
+			def end = blocks[block.bind_pos];
+
+			def bi = BytecodeIterator.new();
+			bi.reset(func);
+
+			if (block.bind_pos < 0) continue;
+			bi.at(block.bind_pos);
+
+			while (bi.pc < end) {
+				def op = bi.current();
+				def d = map[bi.pc];
+
+				// d.0 = consume these values
+				for (i < d.0) {
+					def val = stack.pop();
+					// local?
+					match (op) {
+						LOCAL_SET, LOCAL_TEE => {
+							def imm = bi.immptr().read_uleb31();
+							locals[imm] = val;
+						}
+						/* this is the opcode we care about dispatch on */
+						BR_TABLE => {
+							def src = source[val];
+							poss.put(src);
+						}
+						_ => ;
+					}
+				}
+				// d.1 = generate these values
+				for (i < d.1) {
+					var val: int;
+					// local?
+					match (op) {
+						LOCAL_GET, LOCAL_TEE => {
+							def imm = bi.immptr().read_uleb31();
+							val = locals[imm];
+						}
+						_ => {
+							// generate fresh value and push to vector
+							val = ++label;
+							source.put(bi.pc); // XXX assumption is that labels counts up by 1
+						}
+					}
+					stack.push(val);
+				}
+				bi.next();
+			}
+		}
+	}
+
+	// FIXME don't need to collect all possibilities if we're just going to
+	// return the first one in the list anyway
+	def bi = BytecodeIterator.new();
+	bi.reset(func);
+	for (i < poss.length) {
+		def pc = poss[i];
+		bi.at(pc);
+		def op = bi.current();
+		if (op == Opcode.I32_LOAD8_U) {
+			return pc;
+		}
+	}
+
+	// error
+	return -1;
+}
+
+def callback(map: HashMap<int, (int, int)>, cv: CodeValidator, pc: int, op: Opcode) {
+	map[pc] = Opcodes.stackDelta(cv.sig, op, dupParser(cv));
+}
+
+def dupParser(cv: CodeValidator) -> WasmParser {
+	def decoder = cv.parser.decoder;
+	def newDecoder = CodePtr.new(null);
+	newDecoder.reset(Ranges.dup(decoder.data), decoder.pos, decoder.limit);
+	return WasmParser.new(cv.parser.extensions, cv.parser.limits, cv.parser.module, cv.parser.err, newDecoder);
+}
+
+def hash(x: int) -> int {
+	return x;
+}
+
+// construct all possible control flow paths from this block.
+// obviously susceptible to state space explosion
+// this function will create longest paths but not cycles
+def paths(block: CfgBlock, visited: List<CfgBlock>) -> Array<List<CfgBlock>> {
+	def vec = Vector<List<CfgBlock>>.new();
+
+	for (list = block.outgoing; list != null; list = list.tail) {
+	    def head = list.head.1;
+		
+		// if head is already visited skip
+		var found: bool;
+		for (l = visited; l != null; l = l.tail) {
+			if (l.head == head) {
+				found = true;
+				break;
+			}
+		}
+		if (found) continue;
+
+		for (path in paths(head, List.new(block, visited))) {
+			vec.put(List.new(block, path));
+		}
+	}
+	if (vec.length == 0) {
+		vec.put(Lists.cons1(block));
+	}
+
+	return vec.extract();
 }
