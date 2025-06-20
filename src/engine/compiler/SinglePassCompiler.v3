@@ -106,7 +106,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var skip_to_end: bool;
 	// XXX: hack
 	var visited_handlers = 0;
-	var handler_info: Array<SpcHandlerInfo>;
+	var handler_dest_info: Array<SpcHandlerInfo>;
 
 	// when function is inlined, we continue using caller's abstract state, and
 	// push callee's params/locals as needed, thus we need to track the base sp of the locals
@@ -149,7 +149,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		success = true;
 		osr_offset = -1;
 		osr_state = null;
-		handler_info = Array.new(func.handler_dests.length);
+		handler_dest_info = Array.new(func.handler_dests.length);
 		visited_handlers = 0;
 
 		// Initialize parameters, locals, and first control stack entry.
@@ -179,13 +179,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			last_probe = 0;
 			masm.source_loc = it.pc;
 			it.dispatch(this);
+			unrefRegs();
 			if (Trace.compiler && Trace.asm) {
 				OUT.puts("JIT code: ");
 				masm.printCodeBytes(OUT, before_code_bytes, masm.curCodeBytes());
 				before_code_bytes = masm.curCodeBytes();
 				OUT.ln();
 			}
-			unrefRegs();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
 			if (skip_to_end) doSkipToEndOfBlock();
@@ -199,11 +199,34 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_jump_to_trap_at(e.0);
 		}
 
+		// Emit handler stubs.
+		for (i < handler_dest_info.length) {
+			var info = handler_dest_info[i];
+			if (Trace.compiler) Trace.OUT.put1("  handler stub #%d:", i).ln();
+			func.handler_dests[i].dest_label = info.dest_label;
+			func.handler_dests[i].stub_label = info.stub_label;
+
+			masm.bindLabel(info.stub_label);
+
+			if (Trace.compiler) OUT.puts("    restore all").ln();
+			for (slot < u32.!(info.control.merge_state.length)) {
+				var sv = info.control.merge_state[slot];
+				if (!sv.inReg()) continue;
+				var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+				var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
+				resolver.addMove((slot, tv), (slot, fv));
+			}
+			resolver.emitMoves();
+
+			masm.emit_br(info.dest_label);
+		}
+
 		// Emit OSR entry.
 		if (osr_state != null) {
 			osr_entry_label = masm.newLabel(osr_pc);
 			emitOsrEntry(osr_entry_label, osr_state);
 		}
+
 		if (success) {
 			// Metric collection
 			Metrics.spc_in_bytes.val += u32.view(func.orig_bytecode.length);
@@ -917,23 +940,23 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emitSelect(u32.!(val_types.length));
 	}
 	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
-		var pr = btc.toAbstractBlockType(module);
-		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
-
 		// record reachable label positions for handler stub
 		for (i < catches.length) {
-			var catch = catches[i];
-			var control = state.getControl(getCatchCodeLabel(catch));
+			var depth = getCatchCodeLabel(catches[i]);
+			var control = state.getControl(depth);
 			var handler_id = visited_handlers++;
 			var dest_id = func.handler_dest_map[handler_id];
-			var info = handler_info[dest_id];
-			if (info.handler_label == null) {
+			var info = handler_dest_info[dest_id];
+			if (info.dest_label == null) {
 				if (Trace.compiler) {
 					Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 				}
-				handler_info[dest_id] = SpcHandlerInfo(control.label, masm.newLabel(it.pc), control.merge_state);
+				handler_dest_info[dest_id] = SpcHandlerInfo(control.label, masm.newLabel(it.pc), control);
 			}
 		}
+
+		var pr = btc.toAbstractBlockType(module);
+		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
 	}
 	private def getCatchCodeLabel(catch: BpCatchCode) -> u31 {
 		match (catch) {
@@ -2267,17 +2290,20 @@ class SpcState(regAlloc: RegAlloc) {
 		sp = max;
 	}
 	private def pushControl(opcode: u16, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
-		var ctl = ctl_stack.next();
+		// var ctl = ctl_stack.next();
+		// // XXX: reimplement cache without breaking the handler linking
+		// if (ctl != null) { // FAST: reuse previous SpcControl object
+		// 	ctl_stack.top++;
+		// 	ctl.clearMerge();
+		// 	ctl.clearReset();
+		// 	ctl.else_label = null;
+		// } else { // allocate and cache new SpcControl object
+		// 	ctl = SpcControl.new();
+		// 	ctl_stack.push(ctl);
+		// }
 		var reachable = if(ctl_stack.top > 0, ctl_stack.peek().reachable, true);
-		if (ctl != null) { // FAST: reuse previous SpcControl object
-			ctl_stack.top++;
-			ctl.clearMerge();
-			ctl.clearReset();
-			ctl.else_label = null;
-		} else { // allocate and cache new SpcControl object
-			ctl = SpcControl.new();
-			ctl_stack.push(ctl);
-		}
+		var ctl = SpcControl.new();
+		ctl_stack.push(ctl);
 		ctl.opcode = opcode;
 		ctl.label = label;
 		ctl.params = params;
@@ -2665,5 +2691,5 @@ type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
 // control transfer to its corresponding handler without falling back to fast-int.
 //  
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
-// expected state of the environment, then jumps to {handler_label} to continue execution at handler.
-type SpcHandlerInfo(handler_label: MasmLabel, stub_label: MasmLabel, state: Array<SpcVal>);
+// expected state of the environment, then jumps to {dest_label} to continue execution at handler.
+type SpcHandlerInfo(dest_label: MasmLabel, stub_label: MasmLabel, control: SpcControl);
