@@ -207,6 +207,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			func.handler_dests[i].stub_label = info.stub_label;
 
 			// TODO: impl this; this is only null when not implemented on SPC side
+			// - catch
+			// - catch_all
+			// - delegate
+			// - suspend
+			// - switch
 			if (info.stub_label == null) continue;
 			masm.bindLabel(info.stub_label);
 			X86_64MasmLabel.!(info.stub_label).label.pos -= int.view(before_code_bytes);
@@ -215,8 +220,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				Trace.OUT.put1("    stub offset=+%d", X86_64MasmLabel.!(info.stub_label).label.pos).ln();
 			}
 
-			for (slot < u32.!(info.control.merge_state.length)) {
-				var sv = info.control.merge_state[slot];
+			for (slot < u32.!(info.merge_state.length)) {
+				var sv = info.merge_state[slot];
 				if (!sv.inReg()) continue;
 				var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
 				var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
@@ -708,6 +713,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_TRY(btc: BlockTypeCode) {
 		var pr = btc.toAbstractBlockType(module);
 		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
+		var ctl_top = state.ctl_stack.peek();
+		ctl_top.catch_reset_state = Arrays.range(state.state, 0, int.view(state.sp));
 	}
 	def visit_THROW(tag_index: u31) {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
@@ -946,43 +953,87 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_SELECT_T(val_types: Range<ValueTypeCode>) {
 		emitSelect(u32.!(val_types.length));
 	}
+	def visit_CATCH(tag_code: u31) {
+		var tag = module.tags[tag_code];
+		setupCatchBlock(Strings.format1("#%d", tag.tag_index), tag.fields);
+	}
+	def visit_CATCH_ALL() {
+		setupCatchBlock("all", []);
+	}
+	private def setupCatchBlock(tag_display: string, tag_fields: Array<ValueType>) {
+		var handler_id = visited_handlers++;
+		var dest_id = func.handler_dest_map[handler_id];
+		var dest_label = masm.newLabel(it.pc);
+		var ctl_top = state.ctl_stack.peek();
+		// End the try or previous catch block with a xfer to the end.
+		if (Trace.compiler) Trace.OUT.puts("    xfer to try end").ln();
+		state.emitTransfer(ctl_top, resolver);
+		masm.emit_br(ctl_top.label);
+		// Load reset state from {try} block.
+		var new_sp = int.view(ctl_top.val_stack_top) + tag_fields.length;
+		var reset_state = Array<SpcVal>.new(new_sp);
+		Arrays.copyInto(ctl_top.catch_reset_state, reset_state, 0);
+		// Push tag fields onto stack.
+		for (i < tag_fields.length) {
+			var slot = int.view(ctl_top.val_stack_top) + i;
+			reset_state[slot] = SpcVal(typeToKindFlags(tag_fields[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+		state.resetTo(u32.view(new_sp), reset_state);
+		masm.bindLabel(dest_label);
+		if (Trace.compiler) {
+			Trace.OUT.put1("    catch tag[%s]", tag_display).ln();
+			Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+		}
+		handler_dest_info[dest_id] = SpcHandlerInfo(dest_label, masm.newLabel(it.pc), reset_state);
+		// Reset reachability.
+		ctl_top.reachable = true;
+	}
 	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
 		// record reachable label positions for handler stub
 		for (i < catches.length) {
 			var depth = getCatchCodeLabel(catches[i]);
 			var control = state.getControl(depth);
-			var handler_id = visited_handlers++;
-			var dest_id = func.handler_dest_map[handler_id];
-			var info = handler_dest_info[dest_id];
-			if (info.dest_label == null) {
-				if (Trace.compiler) {
-					Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
-				}
-				handler_dest_info[dest_id] = SpcHandlerInfo(control.label, masm.newLabel(it.pc), control);
-			}
-
-			// If target has not been reached via merge, populate with stack state which has everything
-			// in memory. Otherwise, there will be a processed {merge_state} that we can use directly.
-			if (control.merge_count == 0) {
-				var label_args = labelArgs(control);
-				var label_stack = Array<SpcVal>.new(int.view(control.val_stack_top) + label_args.length);
-				// frozen stack values
-				for (slot < control.val_stack_top) {
-					var sv = state.state[slot].withoutReg().notConst();
-					label_stack[slot] = SpcVal(sv.flags | IS_STORED | TAG_STORED, NO_REG, 0);
-				}
-				// new in-memory values
-				for (i < label_args.length) {
-					var slot = int.view(control.val_stack_top) + i;
-					label_stack[slot] = SpcVal(typeToKindFlags(label_args[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
-				}
-				control.merge_state = label_stack;
-			}
-			control.merge_count++;
+			buildHandlerDest(control);
 		}
 
 		var pr = btc.toAbstractBlockType(module);
 		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
+	}
+	// Given a control to xfer to, set up the {SpcHandlerInfo} and the merge.
+	private def buildHandlerDest(control: SpcControl) {
+		var handler_id = visited_handlers++;
+		var dest_id = func.handler_dest_map[handler_id];
+		var info = handler_dest_info[dest_id];
+
+		// If target has not been reached via merge, populate with stack state which has everything
+		// in memory. Otherwise, there will be a processed {merge_state} that we can use directly.
+		if (control.merge_count == 0) {
+			control.merge_state = buildInMemoryState(int.view(control.val_stack_top), labelArgs(control));
+		}
+		control.merge_count++;
+
+		if (info.dest_label == null) {
+			if (Trace.compiler) {
+				Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+			}
+			handler_dest_info[dest_id] = SpcHandlerInfo(control.label, masm.newLabel(it.pc), control.merge_state);
+		}
+	}
+	// Build a {merge_state} that contains the current stack truncated to {val_stack_top} plus
+	// {args}, all stored in memory.
+	private def buildInMemoryState(val_stack_top: int, args: Array<ValueType>) -> Array<SpcVal> {
+		var stack = Array<SpcVal>.new(val_stack_top + args.length);
+		// frozen stack values
+		for (slot < val_stack_top) {
+			var sv = state.state[slot].withoutReg().notConst();
+			stack[slot] = SpcVal(sv.flags | IS_STORED | TAG_STORED, NO_REG, 0);
+		}
+		// new in-memory values
+		for (i < args.length) {
+			var slot = val_stack_top + i;
+			stack[slot] = SpcVal(typeToKindFlags(args[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+		return stack;
 	}
 	private def getCatchCodeLabel(catch: BpCatchCode) -> u31 {
 		match (catch) {
@@ -1604,11 +1655,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			for (i < results.length) {
 				var rtag = ValueTypes.kind(results[i]);
 				if (i < params.length && rtag == ValueTypes.kind(params[i])) continue; // tag already correct
-				masm.emit_mov_m_i(masm.tagAddr(u32.view(i)), rtag.code);
+				masm.emit_mov_m_i(masm.tagAddr(state.sp - u32.view(results.length) + u32.view(i)), rtag.code);
 			}
 		}
-		// Compute VSP = VFP + sig.results.length
-		emit_compute_vsp(regs.vsp, u32.view(results.length));
+		// Compute VSP = VFP + state.sp
+		emit_compute_vsp(regs.vsp, state.sp);
 		// Return to caller
 		masm.emit_mov_r_i(regs.ret_throw, 0);
 		// Deallocate stack frame
@@ -2132,6 +2183,11 @@ class SpcControl {
 	var merge_state: Array<SpcVal>;
 	// the state used to reset back to before the true branch of an if
 	var reset_state: Array<SpcVal>;
+	// number of catches in a try block
+	var num_catches: int;
+	// the state (up to val_stack_top, excluding tag fields) to reset back to before catch
+	// XXX: merge with {reset_state}?
+	var catch_reset_state: Array<SpcVal>;
 
 	def clearMerge() {
 		merge_count = 0;
@@ -2237,7 +2293,6 @@ class SpcState(regAlloc: RegAlloc) {
 			for (r in ctl.results) {
 				push(typeToKindFlags(r) | IS_STORED | TAG_STORED | IS_CONST, NO_REG, 0);
 			}
-
 		}
 	}
 	def isTransferEmpty(target: SpcControl) -> bool {
@@ -2268,7 +2323,8 @@ class SpcState(regAlloc: RegAlloc) {
 			}
 			for (i < valcount) {
 				var f = (sp - valcount + i), t = top + i;
-				var from = state[f], to = target.merge_state[t];
+				var from = state[f];
+				var to = target.merge_state[t];
 				resolver.addMove((t, to), (f, from));
 			}
 		}
@@ -2718,4 +2774,4 @@ type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
 //  
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
-type SpcHandlerInfo(dest_label: MasmLabel, stub_label: MasmLabel, control: SpcControl);
+type SpcHandlerInfo(dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
