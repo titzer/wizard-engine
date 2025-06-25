@@ -24,7 +24,7 @@ function run {
     TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast')
 
     if [[ "$p" != "spec" && "$p" != "" ]]; then
-	EXT_OPTS="-ext:$p"
+	EXT_OPTS="--ext:$p"
     fi
 
     run_batched $BATCHING "$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS $EXT_OPTS" $TESTS
