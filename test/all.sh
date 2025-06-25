@@ -26,7 +26,7 @@ function print_testing() {
 #TODO    printf "%-13s " $ARG
     printf "%-13s "  $TEST_TARGET
     if [ "$TEST_MODE" != "" ]; then
-	mode="-mode=$TEST_MODE"
+	mode="--mode=$TEST_MODE"
     else
         mode=""
     fi

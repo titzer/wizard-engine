@@ -12,7 +12,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 make_wizeng || exit $?
 
-CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS -colors=false"
+CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS --colors=false"
 
 target=$TEST_TARGET
 

@@ -121,7 +121,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	if [[ "$PREGEN" != 0 && "$HOSTS" =~ "x86-64-linux" ]]; then
 	    # try running pregen if the host platform can run the pregen binary
             cp $E $E.pregen
-            $E.pregen -pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
+            $E.pregen --pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
 	    STATUS=$?
 	    if [ $STATUS != 0 ]; then
 		echo "error: running $E.pregen failed"
