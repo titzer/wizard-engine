@@ -2,16 +2,16 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // An iterator for bytecodes in a function.
-// A {BytecodeIterator} initializes itself to point to the start of a function, before
-// the local declarations. Clients that wish to parse the local declarations can do so
-// through {parseLocalTypes} which requires a {WasmParser} (for parsing possibly-erroneous
-// {ValueTypes} and other error handling. Otherwise, the locals are automatically skipped
-// upon the first call to {more(), current(), or next()}.
-// The iterator does not automatically advance itself--clients must call {next()}--thus,
-// {pc} is always the current program counter.
+// A {BytecodeIterator} is initially empty and must be {reset()} to a function before use,
+// after which a client may use {iterate()} to automatically iterate through all bytecodes,
+// invoking a {BytecodeVisitor}, or may manually iterate using {more()}, {current()}, and
+// {next()}. With manual iteration, clients can reset the program counter with {at()}.
+// The iterator can also optionally track the current *sidetable pointer* if {stp} is set
+// to {0} upon reset, which adds a small constant cost to advancing past each bytecode.
 class BytecodeIterator {
-	def var func: FuncDecl;
-	def var pc: int;
+	def var func: FuncDecl;				// current function
+	def var pc: int;				// current program counter
+	def var stp: int = -1;				// current sidetable pointer; < 0 if not tracked
 	private def codeptr = CodePtr.new(null);
 	private def origptr = CodePtr.new(null);
 	private def imm = CodePtr.new(null);
@@ -19,14 +19,15 @@ class BytecodeIterator {
 
 	// Resets the internal code pointer to the code in the given function.
 	def reset(func: FuncDecl) -> this {
-		this.pc = 0;
 		this.func = func;
+		this.pc = 0;
+		this.stp = if(this.stp >= 0, 0, -1);
 		this.codeptr.reset(func.cur_bytecode, 0, func.cur_bytecode.length);
 		this.origptr.reset(func.orig_bytecode, 0, func.orig_bytecode.length);
 		this.imm.reset(null, 0, 0);
-		this.imm_pos = 0;
+		this.imm_pos = -1;
 	}
-
+	// Iterate all of the bytecodes of {func} in order, dispatching to the visitor {v}.
 	def iterate(func: FuncDecl, v: BytecodeVisitor) {
 		reset(func);
 		while (this.more()) {
@@ -34,11 +35,16 @@ class BytecodeIterator {
 			this.next();
 		}
 	}
-
-	// Returns the current opcode without advancing. If the local declarations have
-	// not been decoded, they will be skipped, returning the first bytecode.
+	// Sets the current {pc} in the current function and sidetable pointer.
+	def at(pc: int, stp: int) -> this {
+		this.pc = pc;
+		this.stp = stp;
+	}
+	// Returns the current opcode, without advancing past it. If the local declarations have
+	// not been decoded, they will be skipped, returning the first opcode. If there are no
+	// more opcodes, {Opcode.INVALID} is returned.
 	def current() -> Opcode {
-		// reset code pointer to current pc
+		// Reset code pointer to current pc.
 		codeptr.at(pc);
 		if (codeptr.done()) return Opcode.INVALID;
 
@@ -48,22 +54,22 @@ class BytecodeIterator {
 			pc = codeptr.pos;
 		}
 
-		// Read the first byte of the code
+		// Read the first byte of the code.
 		var b = codeptr.read1();
 		if (b == InternalOpcode.PROBE.code || b == InternalOpcode.WHAMM_PROBE.code) { // probe is inserted here
 			b = origptr.reset(func.orig_bytecode, pc, func.orig_bytecode.length).read1();
 		}
-		// Query opcode attributes array
+		// Query opcode attributes array.
 		var opcode: Opcode;
 		if (Opcodes.isPrefix(b)) {
-			// prefixed opcode, read LEB
+			// Prefixed opcode, read LEB.
 			opcode = Opcodes.find(b, codeptr.read_uleb32());
 		} else {
-			// single byte opcode
+			// Single byte opcode, done.
 			opcode = Opcodes.opcodes_no_prefix[b];
 		}
 
-		// Check for decode errors
+		// Check for decode errors.
 		if (!codeptr.ok) return Opcode.INVALID;
 
 		// Remember the immediate position, in case it is requested by immptr().
@@ -73,7 +79,6 @@ class BytecodeIterator {
 		codeptr.skip_immediates(opcode.imms);
 		return opcode;
 	}
-
 	// Dispatches on the local declarations, if at the start of the function.
 	def dispatchLocalDecls(v: BytecodeVisitor) {
 		// Visit local declarations at the start of the function.
@@ -81,10 +86,10 @@ class BytecodeIterator {
 			codeptr.at(pc);
 			if (codeptr.done()) return;
 			codeptr.iterate_local_codes(v.visitLocalDecl);
-			imm_pos = pc = codeptr.pos;
+			pc = codeptr.pos;
+			imm_pos = -1;
 		}
 	}
-
 	// Dispatches on the current bytecode, decoding immediates and calling the appropriate
 	// {visit_OP()} method on the visitor.
 	def dispatch(v: BytecodeVisitor) {
@@ -124,31 +129,36 @@ class BytecodeIterator {
 		// Perform dispatch to visitor
 		dispatch0(opcode, v);
 	}
-
-	// Advances the iterator to the next bytecode.
+	// Advances the iterator to the next bytecode and, if tracked, sidetable pointer.
 	def next() -> this {
-		if (codeptr.pos > pc) pc = codeptr.pos;
-		else if (more()) current();
-		if (codeptr.pos > pc) pc = codeptr.pos;
+		if (pc >= codeptr.limit) return; // already finished.
+		if (stp >= 0) {
+			// Sidetable pointer is being tracked, so back up and decode the instruction again,
+			// because the opcode determines the sidetable entry size.
+			codeptr.at(pc);
+			var opcode = current(), immptr = imm.reset(codeptr.data, imm_pos, codeptr.pos);
+			stp += Sidetables.computeEntrySize(opcode, immptr);
+		} else {
+			// Sidetable pointer not being tracked; instruction may already have been decoded.
+			if (codeptr.pos == pc) current(); // not decoded yet; decode next instruction
+		}
+		pc = codeptr.pos;
+		imm_pos = -1;
 	}
-
 	// Returns the pc of the next instruction.
 	def nextPc() -> int {
 		return codeptr.pos;
 	}
-
 	// Returns a "pointer" to the immediates for the current bytecode. This pointer does
 	// not alias the code pointer, so it does not affect iteration.
 	def immptr() -> CodePtr {
 		if (codeptr.pos <= pc) current();
 		return imm.reset(codeptr.data, imm_pos, codeptr.pos);
 	}
-
 	// Returns {true} if there are more bytecodes remaining.
 	def more() -> bool {
 		return pc < codeptr.limit;
 	}
-
 	// Utility method to iterate all (remaining) bytecodes and call the visitor {v}.
 	def dispatchAll(v: BytecodeVisitor) {
 		current(); // skip to first bytecode if needed
@@ -190,8 +200,6 @@ class BytecodeIterator {
 		// XXX: generate match on operator and read of immediates from Opcodes table.
 		match (opcode) {
 			INVALID =>			v.visit_INVALID(0, 0); // TODO: pass correct prefix and opcode
-//TODO			CRASH_EXEC =>			v.visit_CRASH_EXEC();
-//TODO			CRASH_COMPILER =>		v.visit_CRASH_COMPILER();
 			UNREACHABLE =>			v.visit_UNREACHABLE();
 			NOP =>				v.visit_NOP();
 			BLOCK =>			v.visit_BLOCK(read_BLOCKT());
@@ -777,8 +785,5 @@ class BytecodeIterator {
 	}
 	def traceOrig(out: StringBuilder, module: Module, tracer: InstrTracer) {
 		tracer.putInstr(out, module, origptr.at(pc));
-	}
-	def at(pc: int) -> this {
-		this.pc = pc;
 	}
 }
