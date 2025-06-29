@@ -16,7 +16,7 @@ wasm-wave: bin/spectest.wasm bin/wizeng.wasm bin/unittest.wasm
 v3i: bin/spectest.v3i bin/wizeng.v3i bin/unittest.v3i
 
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
-MONITORS=src/monitors/*.v3
+MONITORS=src/monitors/*.v3 src/monitors/test/*.v3
 JIT=src/engine/compiler/*.v3
 X86_64=src/engine/x86-64/*.v3
 WAVE=src/modules/wave/*.v3
