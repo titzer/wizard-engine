@@ -13,7 +13,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 make_wizeng || exit $?
 
 cd $HERE
-CMD="$WIZENG_LOC/$BINARY -colors=false"
+CMD="$WIZENG_LOC/$BINARY --colors=false"
 
 if [ $# -gt 0 ]; then
     MONITORS=($@)

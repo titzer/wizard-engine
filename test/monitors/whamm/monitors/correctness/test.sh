@@ -54,9 +54,9 @@ function run_test() {
 
 	echo "$WIZENG $flags --monitors=$test$imports $app"
     if [ -f $test.in ]; then
-		$WIZENG_CMD -colors=false $flags --monitors=$test$imports $app < $test.in > $P.out 2> $P.err
+		$WIZENG_CMD --colors=false $flags --monitors=$test$imports $app < $test.in > $P.out 2> $P.err
     else
-		$WIZENG_CMD -colors=false $flags --monitors=$test$imports $app > $P.out 2> $P.err
+		$WIZENG_CMD --colors=false $flags --monitors=$test$imports $app > $P.out 2> $P.err
     fi
     echo $? > $P.exit
 

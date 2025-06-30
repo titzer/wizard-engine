@@ -37,7 +37,7 @@ function run_tests {
             fi
         done
         options="--expose=wizeng"
-        $WIZENG_CMD -colors=false $options $combined_files main.wasm > $T/$testcase.out
+        $WIZENG_CMD --colors=false $options $combined_files main.wasm > $T/$testcase.out
         diff ../$testcase.out $T/$testcase.out | tee $T/$testcase.out.diff
         DIFF=${PIPESTATUS[0]}
         if [ "$DIFF" != 0  ]; then

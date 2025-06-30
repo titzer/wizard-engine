@@ -33,6 +33,7 @@ fi
     
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 MONITORS="src/monitors/*.v3"
+TEST_MONITORS="src/monitors/test/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
@@ -48,6 +49,11 @@ MODULES="src/modules/*.v3"
 
 if [ "$1" = "-nojit" ]; then
     REDEFS="SpcTuning.disable=true"
+    shift
+fi
+
+if [ "$1" = "-test" ]; then
+    MONITORS="$MONITORS $TEST_MONITORS"
     shift
 fi
 
@@ -121,7 +127,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	if [[ "$PREGEN" != 0 && "$HOSTS" =~ "x86-64-linux" ]]; then
 	    # try running pregen if the host platform can run the pregen binary
             cp $E $E.pregen
-            $E.pregen -pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
+            $E.pregen --pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
 	    STATUS=$?
 	    if [ $STATUS != 0 ]; then
 		echo "error: running $E.pregen failed"
@@ -132,7 +138,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	fi
     fi
 elif [ "$TARGET" = "jvm" ]; then
-    v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" == wasm-* ]]; then
     # Compile to a wasm target
     V3C_PATH=$(which v3c)
