@@ -12,10 +12,11 @@
 // TODO:
 //  - define frame accessor methods
 //  - externref in Virgil
+//  - allow bind-time callbacks to return void (or multivalue?)
 class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 	def whamm = named_modules[0].module; // whamm monitor module is first in group
 	var opcodePatterns: Array<List<(Opcode, Array<WhammParam>, FuncDecl, WhammPredicate)>>;
-	var whammInstances: List<(Module, Instance)>; // XXX: leaky
+	var whammInstances: List<WhammInstance>; // XXX: leaky
 	var err: ErrorGen;
 
 	new() {
@@ -74,15 +75,17 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		Metrics.whamm_bind_time_us.updateDiff(before_us);
 	}
 
-	def bytecodeProbe(module: Module, wi: Instance, func: FuncDecl, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
+	def bytecodeProbe(module: Module, wi: WhammInstance, func: FuncDecl, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
 		var bp = opcodePatterns[opcode.tag];
+		var binder = WhammVarBinder.new(wi);
 
 		for (l = bp; l != null; l = l.tail) { // for every probe
 			if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), opcode_pos, opcode.mnemonic);
-			def wf = wi.functions[l.head.2.func_index];
+			binder.probe_id = -1;
+			def wf = wi.instance.functions[l.head.2.func_index];
 			// check static predicate
 			if (l.head.3 != null) {
-				match (Whamm.evalCall(l.head.3.call.target, l.head.3.call.params, cv, wi, opcode, err)) {
+				match (binder.evalCall(l.head.3.call.target, l.head.3.call.params, cv, opcode, err)) {
 					OK(t, v) => {
 						match (v) {
 							I32(i) => if (i == 0) {
@@ -98,23 +101,26 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 					Fail => continue;
 				}
 			}
-			def args = WhammVarBinder.bindParams(cv, wf, wi, l.head.1, opcode, false, err);
+			def args = binder.bindParams(cv, wf, l.head.1, opcode, false, err);
 			if (args != null) {
-				Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, WhammProbe.new(wf, args));
+				var probe = WhammProbe.new(wf, args);
+				Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, probe);
+				if (binder.probe_id >= 0) wi.app.dyn_probes.set(binder.probe_id, (func.func_index, opcode_pos, probe));
 				if (Trace.whamm) Trace.OUT.ln();
 			} else {
 				if (Trace.whamm) Trace.OUT.puts("    => probe not inserted (no match error)").ln();
 			}
 		}
 	}
-	private def getWhammInstance(module: Module) -> Instance {
+	private def getWhammInstance(module: Module) -> WhammInstance {
 		for (l = whammInstances; l != null; l = l.tail) {
-			if (l.head.0 == module) return l.head.1;
+			if (l.head.app == module) return l.head;
 		}
 
 		if (Trace.whamm) Trace.OUT.put2("Instantiating whamm module %s for %s", whamm.filename, module.filename).ln();
 		var err = ErrorGen.new(whamm.filename);
-		var reflector = if(module.outline != null, ReflectorModule.new("whamm:comodule", module));
+		var instrumentor = if(module.outline != null, DynInstrModule.new("whamm:dyninstr", module));
+		var reflector = if(module.outline != null, ReflectorModule.new("whamm:reflect", module));
 
 		// Perform the linking for Whamm monitor support libraries.
 		var engine = Engine.new();
@@ -127,6 +133,7 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		linker.lookup.put(ModuleRegistry.get);					// Expose entire module registry
 		linker.addImportProcessor(ModuleRegistry.getUnexposed("wizeng"));	// Expose wizeng explicitly
 		linker.addImportProcessor(reflector);					// Expose the reflector module
+		linker.addImportProcessor(instrumentor);				// Expose the instrumentor module
 		var all_instantiators = linker.link();
 		if (!err.ok()) {
 			var index = Ints.max(err.index, named_modules.length - 1);
@@ -147,23 +154,28 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		if (!err.ok()) return ErrorBuilder.new()
 			.render(err.error_code, whamm.filename, err.section, err.error_index, err.error_pos, err.error_msg)
 			.exit(null);
-		whammInstances = List.new((module, instance), whammInstances);
-		return instance;
+		var wi = WhammInstance.new(module, instance);
+		whammInstances = List.new(wi, whammInstances);
+		return wi;
 	}
 
 	def onFinish(i: Instance, r: Result) {
 		def wi = getWhammInstance(i.module);
 		if (wi == null) return;
-		def exports = wi.module.exports;
+		def exports = wi.instance.exports;
 		// TODO make wasm:exit part of parsing whamm module
-		def lookupR = FuncDecl.!(Whamm.lookup(exports, "wasm:exit", Strings.equal, null));
-		if (lookupR == null) return;
+		for (i < exports.length) {
+			var export_name = wi.instance.module.exports[i].0;
+			if (Strings.equal("wasm:exit", export_name)) {
+				var lookupR = wi.instance.exports[i];
+				if (Function.?(lookupR)) return invokeWasmExit(wi, Function.!(lookupR));
+			}
+		}
+	}
+	def invokeWasmExit(wi: WhammInstance, func: Function) {
 		// Record the time taken executing the reporting logic.
-		var before_us = Metrics.whamm_report_time_us.ticks();
-		def index = lookupR.func_index;
-		def func = wi.functions[index];
 		if (Trace.whamm) Trace.OUT.puts("wasm:exit call!").ln();
-
+		var before_us = Metrics.whamm_report_time_us.ticks();
 		def result = Execute.call(func, Values.NONE); // XXX: runs on a new stack
 		match (result) {
 			Throw(thrown) => {
@@ -175,3 +187,4 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		Metrics.whamm_report_time_us.updateDiff(before_us);
 	}
 }
+
