@@ -39,6 +39,7 @@ test/regress/ext:stack-switching/cont_table1.bin.wast
 test/regress/ext:stack-switching/coret1.bin.wast
 test/regress/ext:stack-switching/coret1_f.bin.wast
 test/regress/ext:stack-switching/coret1_i.bin.wast
+test/regress/ext:stack-switching/many_stacks_dyn2.bin.wast
 test/regress/ext:stack-switching/resume0.bin.wast
 test/regress/ext:stack-switching/resume0_d_d.bin.wast
 test/regress/ext:stack-switching/resume0_f_f.bin.wast
@@ -150,18 +151,7 @@ test/regress/ext:stack-switching/switch13.bin.wast
 test/regress/ext:stack-switching/switch14.bin.wast
 
 test/regress/ext:legacy-eh/rethrow0.bin.wast
-test/regress/ext:legacy-eh/throw3.bin.wast
-test/regress/ext:legacy-eh/throw4.bin.wast
-test/regress/ext:legacy-eh/throw_catch0.bin.wast
-test/regress/ext:legacy-eh/throw_catch1.bin.wast
-test/regress/ext:legacy-eh/throw_catch2.bin.wast
-test/regress/ext:legacy-eh/throw_catch3.bin.wast
-test/regress/ext:legacy-eh/throw_catch4.bin.wast
-test/regress/ext:legacy-eh/throw_catch5.bin.wast
-test/regress/ext:legacy-eh/throw_catch6.bin.wast
-test/regress/ext:legacy-eh/throw_catch7.bin.wast
 test/regress/ext:legacy-eh/throw_delegate1.bin.wast
-test/regress/ext:legacy-eh/try_catch0.bin.wast
 test/regress/ext:legacy-eh/try_delegate0.bin.wast
 test/regress/ext:legacy-eh/try_delegate1.bin.wast
 test/regress/ext:legacy-eh/try_delegate3.bin.wast
