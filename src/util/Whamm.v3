@@ -7,6 +7,7 @@ type WhammParam {
 	case FrameAccessor;
 	case Pc;
 	case Func;
+	case ProbeId;
 	case NumTargets;
 	case Offset;
 	case Imm(orig: Token, i: u31);
@@ -20,6 +21,7 @@ type WhammParam {
 			FrameAccessor => return buf.puts("frame");
 			Pc => return buf.puts("pc");
 			Func => return buf.puts("fid");
+			ProbeId => return buf.puts("probe_id");
 			NumTargets => return buf.puts("num_targets");
 			Offset => return buf.puts("offset");
 			Imm(orig, i) => return buf.put1("imm%d", i);
@@ -50,9 +52,18 @@ type WhammArg {
 
 class WhammPredicate(call: WhammParam.Call) { }
 
+// Represents an instance of a Whamm monitor attached to an application module.
+class WhammInstance {
+	def app: Module;			// application module
+	def instance: Instance;			// instance of the whamm monitor
+
+	new(app, instance) { }
+}
+
 // Utilities associated with Whamm probes.
 component Whamm {
 	def NO_PARAMS: Array<WhammParam> = [];
+	def NO_ARGS: Array<WhammArg> = [];
 
 	// Parse a string representing an opcode match with optional parameters.
 	def parseOpcodePattern(r: TextReader) -> (Opcode, Array<WhammParam>, WhammPredicate) {
@@ -103,55 +114,6 @@ component Whamm {
 				return null;
 			}
 		}
-	}
-
-	def evalCall(target: Token, params: Array<WhammParam>, cv: CodeValidator, wi: Instance, op: Opcode, err: ErrorGen) -> CallResult {
-		def exports = wi.module.exports;
-		def lookupR = FuncDecl.!(lookup(exports, target.image, Strings.equal, null));
-		if (lookupR == null) {
-			err.at(cv.parser.decoder).WhammProbeError("whamm probe", Strings.format1("static function %s not found", target.image));
-			return CallResult.Fail;
-		}
-
-		def index = lookupR.func_index;
-		def func = wi.functions[index];
-
-		def whammArgs = WhammVarBinder.bindParams(cv, WasmFunction.!(func), wi, params, op, true, err);
-		if (whammArgs == null) return CallResult.Fail;	// propagating error, not a good idea
-		def args = if(whammArgs.length == 0, Values.NONE, Array<Value>.new(whammArgs.length));
-
-		for (i < whammArgs.length) {
-			// this cast should always succeed, as a dynamic parameter will
-			// cause  `bindParams` to fail
-			args[i] = WhammArg.Val.!(whammArgs[i]).v;
-		}
-		// typecheck before execute
-		def result = Execute.call(func, args); // XXX: runs on a new stack
-		match (result) {
-			Value(vals) => {
-				if (vals.length != 1) {
-					err.at(cv.parser.decoder).WhammProbeError("whamm probe", "incorrect function return arity");
-					return CallResult.Fail;
-				}
-				return CallResult.OK(func.sig.results[0], vals[0]);
-			}
-			Throw(thrown) => {
-				err.at(cv.parser.decoder).WhammProbeError("whamm probe", "static function threw exception");
-				TraceUtil.renderThrowable(Trace.OUT, thrown);
-				return CallResult.Fail;
-			}
-			Switch => {
-				err.at(cv.parser.decoder).WhammProbeError("whamm probe", "attempted stack switch");
-				return CallResult.Fail;
-			}
-		}
-	}
-
-	def lookup<K, V>(v: Vector<(K, V)>, key: K, eq: (K, K) -> bool, default: V) -> V {
-		for (i < v.length) {
-			if (eq(key, v[i].0)) return v[i].1;
-		}
-		return default;
 	}
 }
 
@@ -211,6 +173,7 @@ def parseParam0(r: TextReader) -> WhammParam {
 
 	if (Strings.equal("pc", token.image)) return WhammParam.Pc;
 	if (Strings.equal("fid", token.image)) return WhammParam.Func;
+	if (Strings.equal("probe_id", token.image)) return WhammParam.ProbeId;
 	if (Strings.equal("frame", token.image)) return WhammParam.FrameAccessor;
 	if (Strings.equal("num_targets", token.image)) return WhammParam.NumTargets;
 	if (Strings.equal("offset", token.image)) return WhammParam.Offset;
@@ -246,8 +209,53 @@ def debug(r: TextReader, where: string) {
 	Trace.OUT.ln();
 }
 
-component WhammVarBinder {
-	def bindParams(cv: CodeValidator, func: Function, wi: Instance,
+class WhammVarBinder(wi: WhammInstance) {
+	var probe_id = -1;
+
+	def evalCall(target: Token, params: Array<WhammParam>, cv: CodeValidator, op: Opcode, err: ErrorGen) -> CallResult {
+		def exports = wi.instance.module.exports;
+		def lookupR = FuncDecl.!(lookup(exports, target.image, Strings.equal, null));
+		if (lookupR == null) {
+			err.at(cv.parser.decoder).WhammProbeError("whamm probe", Strings.format1("static function %s not found", target.image));
+			return CallResult.Fail;
+		}
+
+		def index = lookupR.func_index;
+		def func = wi.instance.functions[index];
+		def binder = WhammVarBinder.new(wi);
+
+		def whammArgs = binder.bindParams(cv, WasmFunction.!(func), params, op, true, err);
+		if (whammArgs == null) return CallResult.Fail;	// propagating error, not a good idea
+		def args = if(whammArgs.length == 0, Values.NONE, Array<Value>.new(whammArgs.length));
+
+		for (i < whammArgs.length) {
+			// this cast should always succeed, as a dynamic parameter will
+			// cause  `bindParams` to fail
+			args[i] = WhammArg.Val.!(whammArgs[i]).v;
+		}
+		// typecheck before execute
+		def result = Execute.call(func, args); // XXX: runs on a new stack
+		match (result) {
+			Value(vals) => {
+				if (vals.length != 1) {
+					err.at(cv.parser.decoder).WhammProbeError("whamm probe", "incorrect function return arity");
+					return CallResult.Fail;
+				}
+				return CallResult.OK(func.sig.results[0], vals[0]);
+			}
+			Throw(thrown) => {
+				err.at(cv.parser.decoder).WhammProbeError("whamm probe", "static function threw exception");
+				TraceUtil.renderThrowable(Trace.OUT, thrown);
+				return CallResult.Fail;
+			}
+			Switch => {
+				err.at(cv.parser.decoder).WhammProbeError("whamm probe", "attempted stack switch");
+				return CallResult.Fail;
+			}
+		}
+	}
+
+	def bindParams(cv: CodeValidator, func: Function,
 			params: Array<WhammParam>, op: Opcode, nested: bool, err: ErrorGen) -> Array<WhammArg> {
 		var args = Array<WhammArg>.new(params.length);
 		// calls to lazily perform (only if we have a match)
@@ -262,30 +270,33 @@ component WhammVarBinder {
 		for (i < args.length) {
 			var arg: WhammArg;
 			match (params[i]) {
-				DynamicLoc     => ; // TODO
-				FrameAccessor  => {
+				DynamicLoc => ; // TODO
+				FrameAccessor => {
 					if (nested) {
 						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "cannot use dynamic data in static context (FrameAccessor)");
 						return null;
 					}
 					arg = bindFrameAccessor(op, expParams[i], cv, err);
 			  	}
-				Pc             => {
+				Pc => {
 					arg = bindPc(op, expParams[i], cv, err);
 				}
-				Func           => {
+				Func => {
 					arg = bindFunc(op, expParams[i], cv, err);
 				}
-				NumTargets     => {
+				ProbeId => {
+					arg = bindProbeId(op, expParams[i], cv, err);
+				}
+				NumTargets => {
 					arg = bindNumTargets(op, expParams[i], cv, err);
 				}
-				Offset 	       => {
+				Offset => {
 					arg = bindOffset(op, expParams[i], cv, err);
 				}
-				Imm(orig, j)   => {
+				Imm(orig, j) => {
 					arg = bindImm(j, op, expParams[i], cv, err);
 				}
-				Arg(orig, j)   => {  // arg0 = first arg to bytecode
+				Arg(orig, j) => {  // arg0 = first arg to bytecode
 					if (nested) {
 						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "cannot use dynamic data in static context (arg)");
 						return null;
@@ -305,7 +316,7 @@ component WhammVarBinder {
 						return null;
 					}
 					// Call this function only if we have a match!
-					callsToEval = List.new((fun => args[i] = bindCallResult(target, params, wi, op, expParams[i], cv, err)),
+					callsToEval = List.new((fun => args[i] = bindCallResult(target, params, op, expParams[i], cv, err)),
 						callsToEval);
 					continue;
 				}
@@ -342,6 +353,19 @@ component WhammVarBinder {
 			return WhammArg.Null;
 		}
 		return WhammArg.Val(Values.box_i(cv.func.func_index));
+	}
+
+	private def bindProbeId(op: Opcode, expType: ValueType, cv: CodeValidator, err: ErrorGen) -> WhammArg {
+		if (expType != ValueType.I32) {
+			err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on probe ID argument");
+			return WhammArg.Null;
+		}
+		if (probe_id < 0) {
+			if (wi.app.dyn_probes == null) wi.app.dyn_probes = Vector.new();
+			probe_id = wi.app.dyn_probes.length;
+			wi.app.dyn_probes.put(0, 0, null);
+		}
+		return WhammArg.Val(Values.box_i(probe_id));
 	}
 
 	private def bindNumTargets(op: Opcode, expType: ValueType, cv: CodeValidator, err: ErrorGen) -> WhammArg {
@@ -522,9 +546,9 @@ component WhammVarBinder {
 		return WhammArg.Local(t, n);
 	}
 
-	private def bindCallResult(target: Token, params: Array<WhammParam>, wi: Instance, op: Opcode, expType: ValueType, cv: CodeValidator, err: ErrorGen) -> WhammArg {
+	private def bindCallResult(target: Token, params: Array<WhammParam>, op: Opcode, expType: ValueType, cv: CodeValidator, err: ErrorGen) -> WhammArg {
 		var arg: WhammArg;
-		match (Whamm.evalCall(target, params, cv, wi, op, err)) {
+		match (evalCall(target, params, cv, op, err)) {
 			Fail => {
 				if (Trace.whamm) Trace.OUT.ln().puts("    no match: failure during static call invocation").ln();
 				return WhammArg.Null;
@@ -539,6 +563,12 @@ component WhammVarBinder {
 			}
 		}
 		return arg;
+	}
+	def lookup<K, V>(v: Vector<(K, V)>, key: K, eq: (K, K) -> bool, default: V) -> V {
+		for (i < v.length) {
+			if (eq(key, v[i].0)) return v[i].1;
+		}
+		return default;
 	}
 }
 

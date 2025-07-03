@@ -1,0 +1,65 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Provides dynamic instrumentation for a comodule, allowing probes to be dynamically
+// added and removed.
+class DynInstrModule extends HostModule {
+	def module: Module;
+	private var memory: Memory;
+	private var map: HashMap<string, HostFunction>;
+
+	new(name: string, module) super(name) { }
+	// Called by the instantiator to lookup a function by its name.
+	def processFunction(error: ErrorGen, name: string, decl: FuncDecl) -> Exportable {
+		if (map != null) return map[name];
+		// lazy initialize the internal map to avoid linear search
+		map = Strings.newMap();
+		for (t in [
+			("insert_new_probe", SigCache.iig_i, insert_new_probe),
+			("remove_probe", SigCache.i_v, remove_probe)
+		]) {
+			map[t.0] = HostFunction.new(t.0, t.1, t.2);
+		}
+		return map[name];
+	}
+	// After the importer of this module is instantiated, bind to its memory in order to copy out data.
+	def postprocess(error: ErrorGen, instance: Instance) {
+		this.memory = instance.findExportOfType<Memory>(null);
+	}
+
+	// ===== Exported functions ==========================================================
+	def insert_new_probe(args: Range<Value>) -> HostResult {
+		def fid = Values.unbox_u(args[0]);
+		def pc = Values.unbox_u(args[1]);
+		def func = Function.!(Value.Ref.!(args[2]).val);
+		if (Trace.whamm) Trace.OUT.put3("whamm.insert_new_probe(fid=%d, pc=%d, func=%q)",
+			fid, pc, func.render).ln();
+		// Check the function id is in range.
+		if (fid >= module.functions.length) return HostResult.Value1(Values.box_i(-1));
+		// Check the function is a Wasm function (i.e. not imported)
+		var appf = module.functions[int.!(fid)];
+		if (appf.imp != null) return HostResult.Value1(Values.box_i(-2));
+		// Check the PC is in range of the code (TODO: and is a valid instruction boundary)
+		if (pc >= appf.orig_bytecode.length) return HostResult.Value1(Values.box_i(-3));
+		// TODO: support dynamic probes that have WhammParams
+		if (func.sig.params.length > 0) return HostResult.Value1(Values.box_i(-4));
+		if (func.sig.results.length > 0) return HostResult.Value1(Values.box_i(-5));
+		if (module.dyn_probes == null) module.dyn_probes = Vector.new();
+		// Allocate a probe id
+		var probe_id = module.dyn_probes.length;
+		var probe = WhammProbe.new(func, Whamm.NO_ARGS);
+		Instrumentation.insertLocalProbe(module, appf.func_index, int.!(pc), probe);
+		module.dyn_probes.put(appf.func_index, int.!(pc), probe);
+		return HostResult.Value1(Values.box_i(probe_id));
+	}
+	def remove_probe(args: Range<Value>) -> HostResult {
+		def probe_id = Values.unbox_u(args[0]);
+		if (Trace.whamm) Trace.OUT.put1("whamm.remove_probe(probe_id=%d)", probe_id).ln();
+		var probes = module.dyn_probes;
+		if (probes != null && probe_id < probes.length) {
+			var e = probes[int.view(probe_id)];
+			Instrumentation.removeLocalProbe(module, e.0, e.1, e.2);
+		}
+		return HostResult.Value0;
+	}
+}
