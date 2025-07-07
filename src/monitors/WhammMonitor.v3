@@ -16,6 +16,7 @@
 class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 	def whamm = named_modules[0].module; // whamm monitor module is first in group
 	var opcodePatterns: Array<List<(Opcode, Array<WhammParam>, FuncDecl, WhammPredicate)>>;
+	var funcPatterns: Array<List<(FuncMode, Array<WhammParam>, FuncDecl, WhammPredicate)>>;
 	var whammInstances: List<WhammInstance>; // XXX: leaky
 	var err: ErrorGen;
 
@@ -24,33 +25,55 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		for (i < whamm.exports.length) {
 			var e = whamm.exports[i], name = e.0, decl = e.1;
 			if (!FuncDecl.?(decl)) continue;
-			if (Trace.whamm) Trace.OUT.put2("  export %d: \"%s\" = ", i, name);
 			var func = FuncDecl.!(decl);
+			if (Trace.whamm) {
+				Trace.OUT.put2("export %d: \"%s\" = ", i, name).ln();
+				Trace.OUT.puts("\twith func sig: ");
+				func.sig.render(Trace.OUT).ln();
+			}
+
 			var r = TextReader.new(whamm.filename, name);
-			var t = Whamm.parseOpcodePattern(r), op = t.0, params = t.1, pred = t.2;
+			var t = Whamm.parseProbePattern(r), evt = t.0, params = t.1, pred = t.2;
 			if (!r.ok) {
 				// parse error
-				Trace.OUT.put1("whamm warning: export[%d] function name is invalid opcode pattern", i).ln();
+				Trace.OUT.put1("whamm warning: export[%d] function name is invalid rule pattern", i).ln();
 				r.renderCurrentLineWithCaret(Trace.OUT, r.error_column);
 				Trace.OUT.sp().puts(r.error_msg);
 				Trace.OUT.ln();
 				if (Trace.fatal) System.error("MonitorError", "failed parsing whamm monitor");
-			} else if (t.0 == Opcode.INVALID) {
+			} else if (t.0 == WhammEvent.NULL) {
 				// no events matched
-				if (Trace.whamm) Trace.OUT.puts("no events matched").ln();
+				if (Trace.whamm) Trace.OUT.puts("\tno events matched").ln();
 			} else {
-				// ok, add opcode pattern to table
+				// ok, add pattern to table
 				if (Trace.whamm) {
-					Trace.OUT.ln().put1("    matched event: opcode %s", op.mnemonic);
+					Trace.OUT.puts("\tmatched event: \n\t\t");
+					evt.render(Trace.OUT);
+					Trace.OUT.puts(", with params: ");
 					if (params.length > 0) Trace.OUT.putTuple(params, WhammParam.render).ln();
 				}
-				if (opcodePatterns == null) opcodePatterns = Array.new(Opcode.count);
-				opcodePatterns[op.tag] = List.new((op, params, func, pred), opcodePatterns[op.tag]); // XXX: probes added in reverse order
+
+				match (evt) {
+					Opcode(op) => {
+						if (opcodePatterns == null) opcodePatterns = Array.new(Opcode.count);
+						opcodePatterns[op.tag] = List.new((op, params, func, pred), opcodePatterns[op.tag]); // XXX: probes added in reverse order
+					}
+					Func(mode) => {
+						if (funcPatterns == null) funcPatterns = Array.new(FuncMode.count);
+						funcPatterns[mode.tag] = List.new((mode, params, func, pred), funcPatterns[mode.tag]); // XXX: probes added in reverse order
+					}
+					_ => {}
+				}
 			}
 		}
 		if (opcodePatterns != null) {
 			for (i < opcodePatterns.length) {
 				opcodePatterns[i] = Lists.reverse(opcodePatterns[i]);
+			}
+		}
+		if (funcPatterns != null) {
+			for (i < funcPatterns.length) {
+				funcPatterns[i] = Lists.reverse(funcPatterns[i]);
 			}
 		}
 	}
@@ -61,7 +84,7 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		// What extensions?
 		var wi = getWhammInstance(module);
 		if (wi == null) return;
-		if (opcodePatterns == null) return;
+		if (opcodePatterns == null && funcPatterns == null) return;
 		// iterate over the functions in the module
 		for (i < module.functions.length) {
 			var func = module.functions[i];
@@ -69,48 +92,83 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 
 			var extensions = Extension.set.all;
 			var cv = CodeValidator.new(extensions, Limits.new().set(extensions), module, err);
-			cv.probe = bytecodeProbe(module, wi, func, _, _, _);
+			cv.probe = bytecodeProbe(module, wi, func, _, _, _, _);
 			cv.validateFunc(func);
 		}
 		Metrics.whamm_bind_time_us.updateDiff(before_us);
 	}
-
-	def bytecodeProbe(module: Module, wi: WhammInstance, func: FuncDecl, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
-		var bp = opcodePatterns[opcode.tag];
+	def bytecodeProbe(module: Module, wi: WhammInstance, func: FuncDecl, cv: CodeValidator, opcode_idx: int, opcode_pos: int, opcode: Opcode) {
 		var binder = WhammVarBinder.new(wi);
+		def handler = handleProbe(binder, _, _, _, module, wi, func, cv, opcode_pos, opcode);
 
-		for (l = bp; l != null; l = l.tail) { // for every probe
-			if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(module.names, _), opcode_pos, opcode.mnemonic);
-			binder.probe_id = -1;
-			def wf = wi.instance.functions[l.head.2.func_index];
-			// check static predicate
-			if (l.head.3 != null) {
-				match (binder.evalCall(l.head.3.call.target, l.head.3.call.params, cv, opcode, err)) {
-					OK(t, v) => {
-						match (v) {
-							I32(i) => if (i == 0) {
-								if (Trace.whamm) Trace.OUT.puts(" => probe not inserted (predicate)").ln();
-								continue;
-							}
-							_ => {
-								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type error in predicate return value");
-								continue;
-							}
-						}
+		if (funcPatterns != null) {
+			if (opcode_idx == 0) {
+				// for every function ENTRY probe
+				for (probes = funcPatterns[FuncMode.Entry.tag]; probes != null; probes = probes.tail) {
+					for (p = probes; p != null; p = p.tail) {
+						if (Trace.whamm) Trace.OUT.put2("Func: %s, %d", p.head.0.mnemonic, p.head.0.tag).ln();
+						handler(p.head.1, p.head.2, p.head.3);
 					}
-					Fail => continue;
 				}
 			}
-			def args = binder.bindParams(cv, wf, l.head.1, opcode, false, err);
-			if (args != null) {
-				var probe = WhammProbe.new(wf, args);
-				Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, probe);
-				if (binder.probe_id >= 0) wi.app.dyn_probes.set(binder.probe_id, (func.func_index, opcode_pos, probe));
-				if (Trace.whamm) Trace.OUT.ln();
-			} else {
-				if (Trace.whamm) Trace.OUT.puts("    => probe not inserted (no match error)").ln();
+
+			if (isFuncExit()) {
+				// for every function EXIT probe
+				for (probes = funcPatterns[FuncMode.Exit.tag]; probes != null; probes = probes.tail) {
+					for (p = probes; p != null; p = p.tail) {
+						if (Trace.whamm) Trace.OUT.put2("Func: %s, %d", p.head.0.mnemonic, p.head.0.tag).ln();
+						handler(p.head.1, p.head.2, p.head.3);
+					}
+				}
 			}
 		}
+
+		if (opcodePatterns != null) {
+			// for every matched OPCODE probe
+			for (probes = opcodePatterns[opcode.tag]; probes != null; probes = probes.tail) {
+				for (p = probes; p != null; p = p.tail) {
+					if (Trace.whamm) Trace.OUT.put2("Opcode: %s, %d", p.head.0.mnemonic, p.head.0.tag).ln();
+					handler(p.head.1, p.head.2, p.head.3);
+				}
+			}
+		}
+	}
+	private def handleProbe(binder: WhammVarBinder, params: Array<WhammParam>, callback: FuncDecl, pred: WhammPredicate, module: Module, wi: WhammInstance, func: FuncDecl, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
+		if (Trace.whamm) Trace.OUT.put3("\tmatch func %q+%d: %s", func.render(module.names, _), opcode_pos, opcode.mnemonic).ln();
+	
+		binder.probe_id = -1;
+		def wf = wi.instance.functions[callback.func_index];
+
+		// check static predicate
+		if (pred != null) {
+			match (binder.evalCall(pred.call.target, pred.call.params, cv, opcode, err)) {
+				OK(t, v) => {
+					match (v) {
+						I32(i) => if (i == 0) {
+							if (Trace.whamm) Trace.OUT.puts(" => probe not inserted (predicate)").ln();
+							return;
+						}
+						_ => {
+							err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type error in predicate return value");
+							return;
+						}
+					}
+				}
+				Fail => return;
+			}
+		}
+		def args = binder.bindParams(cv, wf, params, opcode, false, err);
+		if (args != null) {
+			var probe = WhammProbe.new(wf, args);
+			Instrumentation.insertLocalProbe(module, func.func_index, opcode_pos, probe);
+			if (binder.probe_id >= 0) wi.app.dyn_probes.set(binder.probe_id, (func.func_index, opcode_pos, probe));
+		} else {
+			if (Trace.whamm) Trace.OUT.puts("\t\t=> probe not inserted (no match error)").ln();
+		}
+	}
+	private def isFuncExit() -> bool {
+		// not implemented yet!!
+		return false;
 	}
 	private def getWhammInstance(module: Module) -> WhammInstance {
 		for (l = whammInstances; l != null; l = l.tail) {
@@ -187,4 +245,3 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 		Metrics.whamm_report_time_us.updateDiff(before_us);
 	}
 }
-
