@@ -15,7 +15,7 @@
   (func $foo (param $n i32)
     (suspend $t (local.get $n))
   )
-  
+  ;; TODO: make only lots of suspend, no resume
   (elem declare func $foo)
   (func (export "main") (param $i i32) (result i32)
     (call $start_conts (local.get $i))
@@ -31,7 +31,7 @@
       (table.set $used (local.get $i) (local.get $L))
       (block (result i32 (ref null $c_v_v))
         (resume $c_i_v (on $t 0) (local.get $i) (local.get $L))
-	(br 1)
+        (br 1)
       )
       table.set $conts ;; simply record the suspended continuation in the table
       (br_if 0 (local.tee $i (i32.sub (local.get $i) (i32.const 1))))
