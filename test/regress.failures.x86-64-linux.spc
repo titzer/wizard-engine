@@ -86,6 +86,8 @@ test/regress/ext:stack-switching/switch8_f.bin.wast
 test/regress/ext:stack-switching/switch8_l.bin.wast
 test/regress/ext:stack-switching/switch9.bin.wast
 test/regress/ext:stack-switching/switch9_arr.bin.wast
+test/regress/ext:stack-switching/many_stacks_dyn.bin.wast
+test/regress/ext:stack-switching/many_stacks_dyn_1.bin.wast
 
 test/regress/ext:legacy-eh/rethrow0.bin.wast
 test/regress/ext:legacy-eh/throw_delegate1.bin.wast
