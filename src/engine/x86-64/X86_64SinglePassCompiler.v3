@@ -950,6 +950,86 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		asm.bind(end);
 	}
 
+	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
+				Switch(tag_index) => buildHandlerDest(null);
+			}
+		}
+
+		var offsets = V3Offsets.new();
+		var stub_resume = X86_64Label.new(), end = X86_64Label.new();
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		var tag = module.tags[tag_id];
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var cont = allocTmp(ValueKind.REF);
+		var curStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(cont);
+
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, cont);
+		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
+		masm.emit_call_runtime_RESUME_THROW();
+		dropN(u32.!(tag.fields.length));
+		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
+		// XXX: make RT function return {Continuation} directly
+		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+
+		/* === only reachable when continuation handles the error === */
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+
+		// save %vsp to frame
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+
+		// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+ 
+		// reserve space for call addr
+		asm.sub_m_i(G(curStack).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
+		masm.emit_chain_cont_to_parent(curStack, cont);
+		masm.emit_switch_curStack_to_cont(cont);
+
+		asm.call_rel_far(stub_resume);
+		masm.recordRetSourceLoc();
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		asm.jmp_rel_near(end);
+		asm.bind(stub_resume); {
+			// load new stack pointers
+			masm.emit_get_curstack(curStack);
+			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
+			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
+			// pop address from new stack and go to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		asm.bind(end);
+	}
+
 	private def checkForConstNull(sv: SpcVal) -> bool {
 		if (sv.isConst() && sv.const == 0) {
 			emitTrap(TrapReason.NULL_DEREF);
