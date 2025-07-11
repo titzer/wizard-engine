@@ -16,6 +16,8 @@
 class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 	def whamm = named_modules[0].module; // whamm monitor module is first in group
 	var opcodePatterns: Array<List<(Opcode, Array<WhammParam>, FuncDecl, WhammPredicate)>>;
+	var funcEntries: List<(Array<WhammParam>, FuncDecl, WhammPredicate)>;
+	var funcExits: List<(Array<WhammParam>, FuncDecl, WhammPredicate)>;
 	var whammInstances: List<WhammInstance>; // XXX: leaky
 	var err: ErrorGen;
 
@@ -37,17 +39,22 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 				if (Trace.fatal) System.error("MonitorError", "failed parsing whamm monitor");
 				continue;
 			}
+			if (Trace.whamm) {
+				Trace.OUT.put1("matched: %q", t.0.render);
+				if (params.length > 0) Trace.OUT.putTuple(params, WhammParam.render);
+				Trace.OUT.ln();
+			}
 			match (t.0) {
-				Null => if (Trace.whamm) Trace.OUT.puts("no events matched").ln();
-				Func => ; // TODO
+				Null => ; // do nothing
+				FuncEntry => {
+					funcEntries = List.new((params, func, pred), funcEntries);
+				}
+				FuncExit => {
+					funcExits = List.new((params, func, pred), funcExits);
+					addOpcodePattern(Opcode.RETURN, params, func, pred);
+				}
 				Opcode(op) => {
-					// ok, add opcode pattern to table
-					if (Trace.whamm) {
-						Trace.OUT.ln().put1("    matched event: opcode %s", op.mnemonic);
-						if (params.length > 0) Trace.OUT.putTuple(params, WhammParam.render).ln();
-					}
-					if (opcodePatterns == null) opcodePatterns = Array.new(Opcode.count);
-					opcodePatterns[op.tag] = List.new((op, params, func, pred), opcodePatterns[op.tag]); // XXX: probes added in reverse order
+					addOpcodePattern(op, params, func, pred);
 				}
 			}
 		}
@@ -56,59 +63,85 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 				opcodePatterns[i] = Lists.reverse(opcodePatterns[i]);
 			}
 		}
+		funcEntries = Lists.reverse(funcEntries);
+		funcExits = Lists.reverse(funcExits);
+	}
+	private def addOpcodePattern(op: Opcode, params: Array<WhammParam>, func: FuncDecl, pred: WhammPredicate) {
+		if (opcodePatterns == null) opcodePatterns = Array.new(Opcode.count);
+		opcodePatterns[op.tag] = List.new((op, params, func, pred), opcodePatterns[op.tag]); // XXX: probes added in reverse order
 	}
 	// monitors called on parsed modules
 	def onParse(module: Module, err: ErrorGen) {
+		if (opcodePatterns == null && funcEntries == null && funcExits == null) return; // nothing to do
+
 		var before_us = Metrics.whamm_bind_time_us.ticks();
 		this.err = err;
 		var wi = getWhammInstance(module);
-		if (wi == null) return;
-		if (opcodePatterns == null) return;
+		if (wi == null) return; // an error occurred
+
 		var extensions = Extension.set.all;
 		var cv = CodeValidator.new(extensions, Limits.new().set(extensions), module, err);
-		cv.probe = validatorCallback(wi, WhammVarBinder.new(wi, err), _, _, _, _);
+		var binder = WhammVarBinder.new(wi, err);
+		cv.probe = validatorCallback(binder, _, _, _);
 		// Iterate over the (non-imported) functions in the module.
 		for (i < module.functions.length) {
 			var func = module.functions[i];
-			if (func.imp == null) cv.validateFunc(func);
+			if (func.imp != null) continue;
+			// If there are any opcode patterns to bind, validate the function using the validator callback.
+			if (opcodePatterns != null) cv.validateFunc(func);
+			cv.opcode_pos = 0;
+			// If there are any function entries to bind, do them explicitly.
+			for (l = funcEntries; l != null; l = l.tail) {
+				def wf = binder.wi.instance.functions[l.head.1.func_index];
+				matchProbe(binder, cv, 0, Opcode.INVALID, l.head.0, wf, l.head.2);
+			}
+			// If there are any function exits to bind, handle the function end bytecode explicitly.
+			var last_pc = func.orig_bytecode.length - 1;
+			cv.opcode_pos = last_pc;
+			for (l = funcExits; l != null; l = l.tail) {
+				def wf = binder.wi.instance.functions[l.head.1.func_index];
+				matchProbe(binder, cv, last_pc, Opcode.INVALID, l.head.0, wf, l.head.2);
+			}
 		}
 		Metrics.whamm_bind_time_us.updateDiff(before_us);
 	}
-	def validatorCallback(wi: WhammInstance, binder: WhammVarBinder, cv: CodeValidator, opcode_idx: int, opcode_pos: int, opcode: Opcode) {
+	private def validatorCallback(binder: WhammVarBinder, cv: CodeValidator, opcode_pos: int, opcode: Opcode) {
 		var bp = opcodePatterns[opcode.tag];
+		for (l = bp; l != null; l = l.tail) {
+			def wf = binder.wi.instance.functions[l.head.2.func_index];
+			matchProbe(binder, cv, opcode_pos, opcode, l.head.1, wf, l.head.3);
+		}
+	}
+	private def matchProbe(binder: WhammVarBinder, cv: CodeValidator, opcode_pos: int, opcode: Opcode, params: Array<WhammParam>, wf: Function, pred: WhammPredicate) {
 		var func = cv.func;
-
-		for (l = bp; l != null; l = l.tail) { // for every probe
-			if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(cv.module.names, _), opcode_pos, opcode.mnemonic);
-			binder.probe_id = -1;
-			def wf = wi.instance.functions[l.head.2.func_index];
-			// check static predicate
-			if (l.head.3 != null) {
-				match (binder.evalCall(l.head.3.call.target, l.head.3.call.params, cv, opcode)) {
-					OK(t, v) => {
-						match (v) {
-							I32(i) => if (i == 0) {
-								if (Trace.whamm) Trace.OUT.puts(" => probe not inserted (predicate)").ln();
-								continue;
-							}
-							_ => {
-								err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type error in predicate return value");
-								continue;
-							}
+		if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(cv.module.names, _), opcode_pos, opcode.mnemonic);
+		binder.probe_id = -1;
+		// check static predicate
+		if (pred != null) {
+			match (binder.evalCall(pred.call.target, pred.call.params, cv, opcode)) {
+				OK(t, v) => {
+					match (v) {
+						I32(i) => if (i == 0) {
+							if (Trace.whamm) Trace.OUT.puts(" => probe not inserted (predicate)").ln();
+							return;
+						}
+						_ => {
+							err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type error in predicate return value");
+							return;
 						}
 					}
-					Fail => continue;
 				}
+				Fail => return;
 			}
-			def args = binder.bindParams(cv, wf.sig.params, l.head.1, opcode, false);
-			if (args != null) {
-				var probe = WhammProbe.new(wf, args);
-				Instrumentation.insertLocalProbe(cv.module, func.func_index, opcode_pos, probe);
-				if (binder.probe_id >= 0) wi.app.dyn_probes.set(binder.probe_id, (func.func_index, opcode_pos, probe));
-				if (Trace.whamm) Trace.OUT.ln();
-			} else {
-				if (Trace.whamm) Trace.OUT.puts("    => probe not inserted (no match error)").ln();
-			}
+		}
+		def args = binder.bindParams(cv, wf.sig.params, params, opcode, false);
+		if (args != null) {
+			var probe = WhammProbe.new(wf, args);
+			Instrumentation.insertLocalProbe(cv.module, func.func_index, opcode_pos, probe);
+			if (binder.probe_id >= 0) binder.wi.app.dyn_probes.set(binder.probe_id, (func.func_index, opcode_pos, probe));
+			if (Trace.whamm) Trace.OUT.ln();
+		} else {
+			if (Trace.whamm) Trace.OUT.puts("    => probe not inserted (no match error)").ln();
 		}
 	}
 	private def getWhammInstance(module: Module) -> WhammInstance {
