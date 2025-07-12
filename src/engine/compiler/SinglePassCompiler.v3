@@ -1353,6 +1353,251 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var n_binds = u32.!(in_cont.sig.params.length - out_cont.sig.params.length);
 		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
 	}
+	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
+				Switch(tag_index) => buildHandlerDest(null);
+			}
+		}
+
+		var offsets = V3Offsets.new();
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var top = popReg();
+		var cont = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF, cont, top.reg);
+		masm.emit_validate_and_consume_cont(cont);
+
+		// transfer params to child stack
+		// XXX: not necessary to store the entire value stack to memory
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		var curStack = allocTmp(ValueKind.REF);
+		var nvals = allocTmp(ValueKind.REF);
+		var tmp0 = allocTmp(ValueKind.REF);
+		var tmp1 = allocTmp(ValueKind.REF);
+		var tmp2 = allocTmp(ValueKind.V128);
+
+		// call to transfer
+		emit_compute_vsp(regs.vsp, state.sp);
+		masm.emit_mov_r_i(nvals, cont_decl.sig.params.length);
+		masm.emit_cont_mv(vsp, cont, nvals, tmp0, tmp1, tmp2);
+		dropN(u32.!(cont_decl.sig.params.length));
+		state.emitRestoreAll(resolver);
+
+		// context switch: store to old stack
+		masm.emit_get_curstack(curStack);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+ 
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, cont);
+		masm.emit_switch_curStack_to_cont(cont);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume); {
+			// load new stack pointers
+			masm.emit_get_curstack(curStack);
+			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
+			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
+			// pop address from new stack and go to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	def visit_SUSPEND(tag_index: u31) {
+		var offsets = V3Offsets.new();
+		var stub_suspend = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
+		masm.emit_call_runtime_SUSPEND();
+
+		var sig_index = module.tags[tag_index].sig_index;
+		state.popArgsAndPushResults(SigDecl.!(module.heaptypes[sig_index]));
+		masm.emit_call_label(stub_suspend);
+
+		/* === PARENT STACK RUNNING === */
+
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_suspend}
+		masm.emit_br(end);
+		masm.bindLabel(stub_suspend); {
+			// load new stack pointers
+			masm.emit_get_curstack(regs.scratch);
+			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
+			// shorthands, so manually popping %rsp is needed
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			// pop and go to handler stack's stub
+			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
+		var offsets = V3Offsets.new();
+		var stub_switch = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
+		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
+		masm.emit_call_runtime_SWITCH();
+
+		// unraveling all relevant signatures
+		var target_cont_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
+		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
+		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
+
+		state.pop(); // target_cont
+		state.sp -= u32.view(target_cont_decl.sig.params.length - 1); // params to target_cont
+		state.pushResults(this_cont_decl.sig.params); // params to this_cont
+		masm.emit_call_label(stub_switch);
+
+		// /* === SUSPENDED === */
+
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_switch}
+		masm.emit_br(end);
+		masm.bindLabel(stub_switch); {
+			// load new stack pointers
+			masm.emit_get_curstack(regs.scratch);
+			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
+			// shorthands, so manually popping %rsp is needed
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			// pop and go to handler stack's stub
+			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
+				Switch(tag_index) => buildHandlerDest(null);
+			}
+		}
+
+		var offsets = V3Offsets.new();
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		var tag = module.tags[tag_id];
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var cont = allocTmp(ValueKind.REF);
+		var curStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(cont);
+
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, cont);
+		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
+		masm.emit_call_runtime_RESUME_THROW();
+		dropN(u32.!(tag.fields.length));
+		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
+		// XXX: make RT function return {Continuation} directly
+		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+
+		/* === only reachable when continuation handles the error === */
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+
+		// save %vsp to frame
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+
+		// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+ 
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, cont);
+		masm.emit_switch_curStack_to_cont(cont);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume); {
+			// load new stack pointers
+			masm.emit_get_curstack(curStack);
+			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
+			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
+			// pop address from new stack and go to it
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	private def checkForConstNull(sv: SpcVal) -> bool {
+		if (sv.isConst() && sv.const == 0) {
+			emitTrap(TrapReason.NULL_DEREF);
+			setUnreachable();
+			return true;
+		}
+		return false;
+	}
 	def visit_STRUCT_NEW(struct_index: u31) {
 		var decl = StructDecl.!(module.heaptypes[struct_index]);
 		emit_call_runtime_op1n(Opcode.STRUCT_NEW, struct_index, u32.!(decl.field_types.length), ValueTypes.ONE_STRUCTREF_TYPE, true);
