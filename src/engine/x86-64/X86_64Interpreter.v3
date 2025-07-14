@@ -569,6 +569,19 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.jmp_rel_near(shared_entry);
 		}
 
+		{ // Entry for the interpreter to handle a suspension from a child stack
+			ic.header.intSuspendEntryOffset = w.pos;
+			// Load runtime %sp and %vsp from the handling stack
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
+			// Restore interpreter registers
+			restoreCallerIVars();
+			restoreDispatchTableReg();
+			// Continue to dispatch table
+			endHandler();
+		}
+
 		{ // Re-entry for calls within the interpreter itself
 			asm.bind(callReentryLabel);
 			ic.header.intIntEntryOffset = w.pos;
@@ -647,7 +660,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
 		genConditionalJumpDeferred(C.NZ, genComplexTypeDecode(_, typeGpr));
-
+		
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
 		asm.d.cmp_r_i(numGpr, 0);
@@ -677,7 +690,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.test_m_i(r_func_decl.plus(offsets.FuncDecl_entry_probed), 1);
 			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
 		}
-
 		// Dispatch to first instruction.
 		genDispatchOrJumpToDispatch();
 
@@ -2457,9 +2469,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genOnResumeFinish(false);
 			endHandler();
 			asm.bind(stub_resume); {
-				// load new stack pointers
+				// load new stack pointer
 				masm.emit_get_curstack(curStack);
-				masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
 				masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
 				// pop address from new stack and go to it
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
@@ -2489,7 +2500,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			/* === only reachable when continuation handles the error === */
 			genPopInto(G(cont)); // XXX: make RT function return {Continuation} directly
 
-			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
+			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
 			masm.emit_get_curstack(curStack);
 			masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
@@ -2505,7 +2516,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.bind(stub_resume); {
 				// load new stack pointers
 				masm.emit_get_curstack(curStack);
-				masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
 				masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
 				// pop address from new stack and go to it
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
@@ -2521,21 +2531,28 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(tag_index); // read tag index
 			masm.emit_get_curstack(xenv.tmp1);
 			callRuntime(refRuntimeCall(X86_64RT.runtime_handle_suspend), [r_tmp1, r_instance, tag_index], true);
+			// NOTE: at this point, %sp should be one address below the frame as {runtime_handle_suspend}
+			// is the only RT call that modifies {curStack} and pushes a dummy address so that the stored
+			// return address isn't popped off in {callRuntime}
 			asm.call_rel_far(suspendStub);
 			/* === PARENT STACK RUNNING === */
-			// skip pass {suspend} instruction after begin resumed
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
 			restoreCallerIVars();
+			// skip pass {suspend} instruction after restoring pc
 			genSkipLeb();
 			restoreDispatchTableReg();
 			endHandler();
 
 			asm.bind(suspendStub); {
+				// Load handler stack %sp and return to its suspension entry stub
 				asm.movq_r_m(r_scratch, m_curStack);
 				asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
-				asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
-				restoreCallerIVars();
-				restoreDispatchTableReg();
-				endHandler();
+				// Pop off the ret address as we are in fast-int mode and not RT calls anymore
+				masm.emit_pop_X86_64Stack_rsp_r_r(xenv.scratch);
+				// Pop address from parent stack and go to it
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				masm.emit_jump_r(xenv.scratch);
 			}
 		}
 		bindHandler(Opcode.SWITCH); {
@@ -2553,6 +2570,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			/* === OTHER STACK RUNNING === */
 
 			// skip pass {switch} instruction after begin resumed
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
 			restoreCallerIVars();
 			genSkipLeb();
 			genSkipLeb();
@@ -4092,15 +4111,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// generates cleanup code for after a child stack returns
 	private def genOnResumeFinish(skip_tag: bool) {
-		// check for error (in %rax)
-		var done = X86_64Label.new();
-		asm.q.cmp_r_i(r_ret_throw, 0);
-		asm.jc_rel_near(X86_64Conds.Z, done);
-		masm.emit_get_curstack(xenv.tmp0);
-		masm.emit_mov_r_r(ValueKind.REF, xenv.tmp1, xenv.ret_throw);
-		callRuntime(refRuntimeCall(X86_64RT.runtime_THROW_REF), [r_tmp0, r_tmp1], true);
-
-		asm.bind(done);
 		restoreCallerIVars();
 		restoreDispatchTableReg();
 		var r_stack = r_tmp1;
