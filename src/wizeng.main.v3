@@ -2,7 +2,6 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Parses and runs binary .wasm files.
-var print_result = false;
 def main(args: Array<string>) -> int {
 	var engine = Engine.new();
 	var wasmFiles: Range<string>;
@@ -67,10 +66,6 @@ def main(args: Array<string>) -> int {
 
 	// Expose the wizeng HostModule if it's an activated extension
 	if (engine.extensions.WIZENG) ModuleRegistry.expose("wizeng");
-	err = ErrorGen.new(wasmFiles[wasmFiles.length - 1]);
-	var linker = ModuleLinker.new(engine, programArgs, err);
-	linker.lookup.put(ModuleRegistry.get);
-	linker.binder = if(BasicTracing.moduleFilter != null, ImportTracer.new(BasicTracing.moduleFilter).wrap);
 
 	for (i < wasmFiles.length) {
 		var path = wasmFiles[i];
@@ -84,55 +79,80 @@ def main(args: Array<string>) -> int {
 
 	if (hasMonitors) Execute.tiering.onMonitorsStart();
 
-	// If any of the monitors is a Whamm module, an outline may be needed for reflection.
-	var makeOutline = false;
+	// Load an instrument all modules.
+	var t = loadAndInstrumentModules(engine, monitors, wasmFiles);
+	if (t.0 != null) return ErrorBuilder.new()
+		.render(t.0.error_code, t.0.filename, t.0.section, t.0.error_index, t.0.error_pos, t.0.error_msg)
+		.exit(3);
+
+	// Loading succeeded. Link modules and execute (potentially repeatedly).
+	var exit_code = 0;
+	for (i < WizengOptions.REPEAT.val) {
+		exit_code = linkAndExecuteMain(engine, monitors, t.1, programArgs);
+		if (exit_code != 0) break;
+	}
+
+	MonitorRegistry.runReports();
+	Metrics.report();
+	return exit_code;
+}
+
+def putWizeng(out: StringBuilder) -> StringBuilder {
+	return out.puts("Wizard Engine ").puts(Version.version).putc('.').putd(Version.minorVersion);
+}
+
+// Load and instrument all Wasm modules.
+def loadAndInstrumentModules(engine: Engine, monitors: Range<Monitor>, wasmFiles: Range<string>) -> (ErrorGen, Array<NamedModule>) {
+	var makeOutline = false, hasMonitors = monitors.length > 0 || BasicTracing.requiresInstrumentation();
 	for (m in monitors) makeOutline |= WhammMonitor.?(m);
 
+	var result = Array<NamedModule>.new(wasmFiles.length);
 	for (i < wasmFiles.length) {
 		var path = wasmFiles[i];
-		// Parse the binary module
+		// Parse the binary module.
 		var err = ErrorGen.new(path);
 		var outline = if(makeOutline, ModuleOutline.new());
 		var module = engine.loadWasmFile(path, err, null, outline);
-		if (err.error()) return ErrorBuilder.new()
-			.render(err.error_code, path, err.section, err.error_index, err.error_pos, err.error_msg)
-			.exit(3);
+		if (err.error()) return (err, null);
 		BasicTracing.instrumentModule(module);
 		var nm = NamedModule(PathUtil.extractName(path, false), module);
-		linker.named_modules.put(nm);
-	}
-	// Call monitors for all modules
-	for (i < linker.named_modules.length) {
-		var nm = linker.named_modules[i];
+		result[i] = nm;
+		// Call all monitors for the module.
 		for (i < monitors.length) {
-			def gen = ErrorGen.new("monitor");
-			monitors[i].onParse(nm.module, gen);
-			if (gen.error()) {  // error in monitor run on parsed module
-				return ErrorBuilder.new()
-					.render(gen.error_code, gen.filename, gen.error_section, gen.error_index, gen.error_pos, gen.error_msg)
-					.exit(3);
-			}
+			def mon_err = ErrorGen.new("monitor");
+			monitors[i].onParse(nm.module, mon_err);
+			
+			if (mon_err.error()) return (mon_err, null);  // error in monitor run on parsed module
 		}
 		if (hasMonitors) Execute.tiering.onMonitorsFinish(nm.module, err);
 	}
+	return (null, result);
+}
+// Link and execute a program.
+def linkAndExecuteMain(engine: Engine, monitors: Array<Monitor>, nm: Array<NamedModule>, programArgs: Array<string>) -> int {
+	var err = ErrorGen.new(nm[nm.length - 1].name);
+	var linker = ModuleLinker.new(engine, programArgs, err);
+	linker.lookup.put(ModuleRegistry.get);
+	linker.binder = if(BasicTracing.moduleFilter != null, ImportTracer.new(BasicTracing.moduleFilter).wrap);
 
+	linker.named_modules.putr(nm);
 	var all_instantiators = linker.link();
 	if (!err.ok()) return ErrorBuilder.new()
 		.render(err.error_code,
-			if(u32.view(err.index) < wasmFiles.length, wasmFiles[err.index], wasmFiles[wasmFiles.length - 1]),
+			if(u32.view(err.index) < nm.length, nm[err.index], nm[nm.length - 1]).name,
 			err.section,
 			err.error_index,
 			err.error_pos,
 			err.error_msg)
 		.exit(6);
 
-	// Call monitors for all instances on instantiate
+	// Instantiation succeeded. Call monitors for all instances on instantiate.
 	for (instantiator in all_instantiators) for (monitor in monitors) monitor.onInstantiate(instantiator.instance);
 
-	// Try to find the main entrypoint for all modules.
 	var exit_code = 0;
 	for (i < all_instantiators.length) {
-		var path = wasmFiles[i];
+		// Try to find the main entrypoint for all modules.
+		var path = nm[i].name;
 		var instantiator = all_instantiators[i];
 		var ins = instantiator.instance;
 		var module = ins.module;
@@ -147,7 +167,7 @@ def main(args: Array<string>) -> int {
 		}
 
 		if (entry.0 == null || invokeName != null) {
-			entry = findEntrypoint(ins);
+			entry = findMain(ins);
 		}
 
 		if (i == all_instantiators.length - 1 && entry.0 == null) return ErrorBuilder.new()
@@ -159,99 +179,36 @@ def main(args: Array<string>) -> int {
 		if (module.start_function >= 0) {
 			var start = ins.functions[module.start_function];
 			for (monitor in monitors) monitor.onStart(start);
-			var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
-			match (r) {
-				Throw(thrown) => {
-					// Start function trapped or exited, return
-					TraceUtil.renderThrowable(Trace.OUT, thrown);
-					MonitorRegistry.runReports();
-					Metrics.report();
-					return -1;
-				}
-				_ => ; // ignore return value and break
-			}
+			exit_code = executeStartFunction(start);
 		}
 
 		// Execute the main entrypoint.
-		if (entry.0 != null) {
+		if (exit_code == 0 && entry.0 != null) {
 			for (monitor in monitors) monitor.onMain(entry.0, entry.1);
-			var before_us = Metrics.main_time_us.ticks();
-			var before_cycles = Metrics.main_time_cycles.ticks();
-			var r = Execute.call(entry.0, entry.1);
-			Metrics.main_time_cycles.updateDiff(before_cycles);
-			Metrics.main_time_us.updateDiff(before_us);
-
-			match (r) {
-				Value(vals) => {
-					if (vals.length == 1) {
-						match (vals[0]) {
-							I32(val) => exit_code = int.view(val);
-							I64(val) => exit_code = int.view(val);
-							_ => ;
-						}
-					}
-					if (print_result) {
-						for (i < vals.length) {
-							if (i > 0) Trace.OUT.sp();
-							Trace.OUT.putv(vals[i]);
-						}
-						Trace.OUT.ln();
-					}
-				}
-				Throw(thrown) => match (thrown) {
-					x: Exit => {
-						exit_code = int.view(x.code);
-					}
-					_ => {
-						TraceUtil.renderThrowable(Trace.OUT, thrown);
-						exit_code = -1;
-					}
-				}
-				Switch => {
-					// TraceUtil.renderThrowable(Trace.OUT, info.parent.trap(TrapReason.INVALID_SUSPEND));
-					// UNREACHABLE as far as V3Interpreter is concerned.
-					// TODO[ss]: check how to make this better
-					exit_code = -1;
-				}
-			}
-			// Call monitors on finish
-			for (monitor in monitors) monitor.onFinish(ins, r);
-			MonitorRegistry.runReports();
-			Metrics.report();
+			var t = executeMainFunction(entry.0, entry.1);
+			exit_code = t.1;
+			for (monitor in monitors) monitor.onFinish(ins, t.0);
 		}
 	}
 	return exit_code;
 }
-
-def putWizeng(out: StringBuilder) -> StringBuilder {
-	return out.puts("Wizard Engine ").puts(Version.version).putc('.').putd(Version.minorVersion);
-}
-
-// Options specific to the "wizeng" executable.
-component WizengOptions {
-	def group = OptionsRegistry.newGroup("WIZENG", null);
-	def HELP = group.newFlag("help", printHelp, "Print command-line help.");
-	def VERSION = group.newFlag("version", printVersion, "Print build version.");
-	def PREGEN_FILE = group.newPathOption("pregen", null, "Pre-generate assembly interpreter and stubs into the given file.");
-	def EXPOSE = group.newStringOption("expose", null, "Expose the given host module's functionality to programs.")
-		.onSet(ModuleRegistry.expose);
-	def PRINT_RESULT = group.newBoolOption("print-result", false, "Print the result of the main function upon exit.");
-	def ENTRYPOINT = group.newStringOption("invoke", null, "Invoke the given function.");
-	var helped = false;
-
-	def printVersion(str: string) {
-		putWizeng(Trace.OUT).ln();
-		if (Version.buildData != null) Trace.OUT.puts("Build data: ").puts(Version.buildData).ln();
-		Trace.OUT.flush();
+// Execute the given start function.
+def executeStartFunction(start: Function) -> int {
+	var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
+	match (r) {
+		Throw(thrown) => {
+			// Start function trapped or exited, return
+			TraceUtil.renderThrowable(Trace.OUT, thrown);
+			MonitorRegistry.runReports();
+			Metrics.report();
+			return -1;
+		}
+		_ => ; // ignore return value and break
 	}
-	def printHelp(str: string) {
-		helped = true;
-		putWizeng(Trace.OUT).ln();
-		Trace.OUT.puts("Usage: wizeng [options] <wasm files>\n\n");
-		OptionsRegistry.print();
-	}
+	return 0;
 }
-def findEntrypoint(instance: Instance) -> (Function, Array<Value>) {
+// Find the main function in an instance.
+def findMain(instance: Instance) -> (Function, Array<Value>) {
 	var module = instance.module;
 	var exports = module.exports;
 	var found: Function;
@@ -265,4 +222,73 @@ def findEntrypoint(instance: Instance) -> (Function, Array<Value>) {
 		}
 	}
 	return (null, null);
+}
+// Execute the main function.
+def executeMainFunction(f: Function, args: Range<Value>) -> (Result, int) {
+	var before_us = Metrics.main_time_us.ticks();
+	var before_cycles = Metrics.main_time_cycles.ticks();
+	var r = Execute.call(f, args);
+	Metrics.main_time_cycles.updateDiff(before_cycles);
+	Metrics.main_time_us.updateDiff(before_us);
+
+	match (r) {
+		Value(vals) => {
+			if (vals.length == 1) {
+				match (vals[0]) {
+					I32(val) => return (r, int.view(val));
+					I64(val) => return (r, int.view(val));
+					_ => ;
+				}
+			}
+			if (WizengOptions.PRINT_RESULT.val) {
+				for (i < vals.length) {
+					if (i > 0) Trace.OUT.sp();
+					Trace.OUT.putv(vals[i]);
+				}
+				Trace.OUT.ln();
+			}
+		}
+		Throw(thrown) => match (thrown) {
+			x: Exit => {
+				return (r, int.view(x.code));
+			}
+			_ => {
+				TraceUtil.renderThrowable(Trace.OUT, thrown);
+				return (r, -1);
+			}
+		}
+		Switch => {
+			// TraceUtil.renderThrowable(Trace.OUT, info.parent.trap(TrapReason.INVALID_SUSPEND));
+			// UNREACHABLE as far as V3Interpreter is concerned.
+			// TODO[ss]: check how to make this better
+			return (r, -1);
+		}
+	}
+	return (r, 0);
+}
+
+// Options specific to the "wizeng" executable.
+component WizengOptions {
+	def group = OptionsRegistry.newGroup("WIZENG", null);
+	def HELP = group.newFlag("help", printHelp, "Print command-line help.");
+	def VERSION = group.newFlag("version", printVersion, "Print build version.");
+	def PREGEN_FILE = group.newPathOption("pregen", null, "Pre-generate assembly interpreter and stubs into the given file.");
+	def EXPOSE = group.newStringOption("expose", null, "Expose the given host module's functionality to programs.")
+		.onSet(ModuleRegistry.expose);
+	def PRINT_RESULT = group.newBoolOption("print-result", false, "Print the result of the main function upon exit.");
+	def ENTRYPOINT = group.newStringOption("invoke", null, "Invoke the given function.");
+	def REPEAT = group.newIntOption("repeat", 1, "Execute the program the given number of times.");
+	var helped = false;
+
+	def printVersion(str: string) {
+		putWizeng(Trace.OUT).ln();
+		if (Version.buildData != null) Trace.OUT.puts("Build data: ").puts(Version.buildData).ln();
+		Trace.OUT.flush();
+	}
+	def printHelp(str: string) {
+		helped = true;
+		putWizeng(Trace.OUT).ln();
+		Trace.OUT.puts("Usage: wizeng [options] <wasm files>\n\n");
+		OptionsRegistry.print();
+	}
 }
