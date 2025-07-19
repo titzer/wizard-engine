@@ -22,6 +22,7 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 	var blockEnds: List<WhammRule>;
 	var whammInstances: List<WhammInstance>; // XXX: leaky
 	var err: ErrorGen;
+	var haveProbes = false;
 
 	new() {
 		if (Trace.whamm) Trace.OUT.put1("parsing whamm monitor: %s", whamm.filename).ln();
@@ -52,22 +53,28 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 					for (op in Opcode) {
 						if (op != Opcode.INVALID) addOpcodePattern(op, params, func, pred);
 					}
+					haveProbes = true;
 				}
 				FuncEntry => {
 					funcEntries = List.new(WhammRule(params, func, pred), funcEntries);
+					haveProbes = true;
 				}
 				FuncExit => {
 					funcExits = List.new(WhammRule(params, func, pred), funcExits);
 					addOpcodePattern(Opcode.RETURN, params, func, pred);
+					haveProbes = true;
 				}
 				BlockStart => {
 					blockStarts = List.new(WhammRule(params, func, pred), blockStarts);
+					haveProbes = true;
 				}
 				BlockEnd => {
 					blockEnds = List.new(WhammRule(params, func, pred), blockEnds);
+					haveProbes = true;
 				}
 				Opcode(op) => {
 					addOpcodePattern(op, params, func, pred);
+					haveProbes = true;
 				}
 			}
 		}
@@ -87,7 +94,7 @@ class WhammMonitor(named_modules: Array<NamedModule>) extends Monitor {
 	}
 	// monitors called on parsed modules
 	def onParse(module: Module, err: ErrorGen) {
-		if (opcodePatterns == null && funcEntries == null && funcExits == null) return; // nothing to do
+		if (!haveProbes) return; // nothing to do
 
 		var before_us = Metrics.whamm_bind_time_us.ticks();
 		this.err = err;
@@ -194,10 +201,12 @@ private class WhammInstrumenter(wm: WhammMonitor, wi: WhammInstance, err: ErrorG
 	def instrument(func: FuncDecl) {
 		this.func = func;
 		next_bi.reset(func);
+		instrCount = 0;
+		if (Trace.whamm) Trace.OUT.put1("match %q", func.render(cv.module.names, _)).ln();
 		cv.validateFunc(func); // XXX: can we avoid running full code validation just for func entry?
 	}
 	def validatorCallback(cv: CodeValidator, pc: int, opcode: Opcode) {
-		if (Trace.whamm) Trace.OUT.put3("  match func %q+%d: %s", func.render(cv.module.names, _), pc, opcode.mnemonic);
+		if (Trace.whamm) Trace.OUT.put2(" +%d: %s", pc, opcode.mnemonic).ln();
 		binder.instr_count = -1;
 		binder.probe_id = -1;
 		// Apply function entry rules if necessary.
@@ -208,7 +217,9 @@ private class WhammInstrumenter(wm: WhammMonitor, wi: WhammInstance, err: ErrorG
 		// Handle ending a previous block and/or starting a new block.
 		if (matchBlocks) matchBlockStartAndEnd(pc, opcode);
 		// Apply opcode patterns for this opcode.
-		for (l = wm.opcodePatterns[opcode.tag]; l != null; l = l.tail) matchRule(pc, opcode, l.head.1);
+		if (wm.opcodePatterns != null) {
+			for (l = wm.opcodePatterns[opcode.tag]; l != null; l = l.tail) matchRule(pc, opcode, l.head.1);
+		}
 		// Apply function exit rules if necessary.
 		if (pc == func.orig_bytecode.length - 1) {
 			for (l = wm.funcExits; l != null; l = l.tail) matchRule(pc, Opcode.INVALID, l.head);
@@ -249,13 +260,14 @@ private class WhammInstrumenter(wm: WhammMonitor, wi: WhammInstance, err: ErrorG
 		var probe = WhammProbe.new(wf, args);
 		Instrumentation.insertLocalProbe(cv.module, func.func_index, pc, probe);
 		if (binder.probe_id >= 0) binder.wi.app.dyn_probes.set(binder.probe_id, (func.func_index, pc, probe));
-		if (Trace.whamm) Trace.OUT.ln();
 	}
 	def matchBlockStartAndEnd(pc: int, op: Opcode) {
 		match (op) {
 			LOOP => {
 				// Loop always starts a new basic block.
 				matchBlockStart(pc);
+				instrCount = 1;
+				return;
 			}
 			SUSPEND,
 			IF,
@@ -270,6 +282,7 @@ private class WhammInstrumenter(wm: WhammMonitor, wi: WhammInstance, err: ErrorG
 				// These always end the current block; the next instruction will start a basic block.
 				matchBlockEnd(pc);
 				isBlockStart = true;
+				return;
 			}
 			UNREACHABLE,
 			THROW,
@@ -282,40 +295,50 @@ private class WhammInstrumenter(wm: WhammMonitor, wi: WhammInstance, err: ErrorG
 			BR_TABLE => {
 				// These always end the current block; the next instruction is unreachable.
 				matchBlockEnd(pc);
+				return;
 			}
 			END => {
 				// An end starts a new block if it is a label that has been explicitly branched to.
-				if (cv.topEndLabelIsReferenced()) matchBlockStart(pc);
-			}
-			// Other instructions don't do control flow, but could be the start of a new block
-			// (e.g. because the previous instruction has conditional control flow like br_if).
-			// After dealing with a possible block start, look ahead to the next instruction
-			// to determine if it is a block start, and end this block here if so.
-			_ => {
-				if (isBlockStart) matchBlockStart(pc);
-				if (nextIsBlockStart(pc)) {
-					matchBlockEnd(pc);
-				} else {
-					isBlockStart = false;
-					instrCount++;
+				if (cv.topEndLabelIsReferenced()) {
+					matchBlockStart(pc);
+					instrCount = 1;
+					return;
 				}
 			}
+			_ => ;
 		}
-		
+		// Other instructions don't do control flow, but could be the start of a new block
+		// (e.g. because the previous instruction has conditional control flow like br_if).
+		// After dealing with a possible block start, look ahead to the next instruction
+		// to determine if it is a block start, and end this block here if so.
+		if (isBlockStart) matchBlockStart(pc);
+		if (nextIsBlockStart(pc)) {
+			matchBlockEnd(pc);
+		} else {
+			isBlockStart = false;
+			instrCount++;
+		}
 	}
 	def matchBlockStart(pc: int) {
+		if (Trace.whamm) Trace.OUT.put2("    block:start %q+%d", func.render(cv.module.names, _), pc).ln();
 		for (l = wm.blockStarts; l != null; l = l.tail) matchRule(pc, Opcode.INVALID, l.head);
 		isBlockStart = false;
 		instrCount = 0;
 	}
 	def matchBlockEnd(pc: int) {
 		binder.instr_count = ++instrCount;
-		for (l = wm.blockStarts; l != null; l = l.tail) matchRule(pc, Opcode.INVALID, l.head);
+		if (Trace.whamm) Trace.OUT.put3("    block:end %q+%d (instr_count=%d)", func.render(cv.module.names, _), pc, instrCount).ln();
+		for (l = wm.blockEnds; l != null; l = l.tail) matchRule(pc, Opcode.INVALID, l.head);
 		binder.instr_count = -1;
 	}
 	def nextIsBlockStart(pc: int) -> bool {
-		var next = next_bi.at(pc, -1).next().current(); // use an auxilliary bytecode iterator to look at the next bytecode.
+		// Use an auxilliary bytecode iterator to look at the next bytecode.
+		next_bi.at(pc, -1);
+		if (pc > 0) next_bi.next();
+		var next = next_bi.current();
+		if (Trace.whamm) Trace.OUT.put1("    next=%s", next.mnemonic).ln();
 		match (next) {
+			INVALID => return true; // off the end
 			LOOP => return true;
 			END => return cv.topEndLabelIsReferenced();
 			_ => return false;
