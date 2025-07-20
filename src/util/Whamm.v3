@@ -6,19 +6,27 @@ def ENGINE_MEM = "engine:data";
 // Represents an event that is instrumentable in Whamm.
 type WhammEvent {
 	case Null;
+	case AllOpcodes;
 	case FuncEntry;
 	case FuncExit;
+	case BlockStart;
+	case BlockEnd;
 	case Opcode(op: Opcode);
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		match (this) {
+			Null => return buf.puts("<null>");
+			AllOpcodes => return buf.puts("opcode:*");
 			FuncEntry => return buf.puts("func:entry");
 			FuncExit => return buf.puts("func:exit");
+			BlockStart => return buf.puts("block:start");
+			BlockEnd => return buf.puts("block:end");
 			Opcode(op) => return buf.puts("opcode:").puts(op.mnemonic);
-			Null => return buf.puts("<null>");
 		}
 	}
 }
+
+type WhammRule(params: Array<WhammParam>, func: FuncDecl, pred: WhammPredicate) #unboxed;
 
 // Represents a declared parameter to a Whamm probe call.
 type WhammParam {
@@ -32,6 +40,7 @@ type WhammParam {
 	case OpName;
 	case NumTargets;
 	case Offset;
+	case InstrCount;
 	case Imm(orig: Token, i: u31);
 	case Arg(orig: Token, i: u31);
 	case Local(orig: Token, i: u31);
@@ -49,6 +58,7 @@ type WhammParam {
 			OpName => return buf.puts("op_name");
 			NumTargets => return buf.puts("num_targets");
 			Offset => return buf.puts("offset");
+			InstrCount => return buf.puts("instr_count");
 			Imm(orig, i) => return buf.put1("imm%d", i);
 			Arg(orig, i) => return buf.put1("arg%d", i);
 			Local(orig, i) => return buf.put1("local%d", i);
@@ -94,7 +104,10 @@ component Whamm {
 	def parseProbePattern(r: TextReader) -> (WhammEvent, Array<WhammParam>, WhammPredicate) {		
 		var event: WhammEvent = WhammEvent.Null;
 		if (r.optN("wasm:") >= 0) {
-			if (r.optN("opcode:") >= 0) {
+			if (r.optN("opcode:*") >= 0) {
+				// TODO: handle all possible opcode globs?
+				event = WhammEvent.AllOpcodes;
+			} else if (r.optN("opcode:") >= 0) {
 				var op = Opcodes.parseName(r.data[r.pos ...]);
 				if (op != Opcode.INVALID) {
 					event = WhammEvent.Opcode(op);
@@ -105,6 +118,10 @@ component Whamm {
 				event = WhammEvent.FuncEntry;
 			} else if (r.optN("func:exit") >= 0) {
 				event = WhammEvent.FuncExit;
+			} else if (r.optN("block:start") >= 0) {
+				event = WhammEvent.BlockStart;
+			} else if (r.optN("block:end") >= 0) {
+				event = WhammEvent.BlockEnd;
 			}
 		}
 
@@ -215,6 +232,7 @@ def parseParam0(r: TextReader) -> WhammParam {
 	if (Strings.equal("frame", token.image)) return WhammParam.FrameAccessor;
 	if (Strings.equal("num_targets", token.image)) return WhammParam.NumTargets;
 	if (Strings.equal("offset", token.image)) return WhammParam.Offset;
+	if (Strings.equal("instr_count", token.image)) return WhammParam.InstrCount;
 
 	r.setFirstError(token.beginLine, token.beginColumn, Strings.format1("unresolved identifier: \"%s\"", token.image));
 	return WhammParam.DynamicLoc;
@@ -249,6 +267,7 @@ def debug(r: TextReader, where: string) {
 
 class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 	var probe_id = -1;
+	var instr_count = -1;
 	var func_cache: HashMap<string, Function>;
 	var engine_memory: Memory;
 
@@ -314,10 +333,10 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 					}
 					arg = bindFrameAccessor(op, expParams[k], cv);
 			  	}
-				Pc => {
+				Pc => { // func scope
 					arg = bindPc(op, expParams[k], cv);
 				}
-				Func => {
+				Func => { // func scope
 					arg = bindFunc(op, expParams[k], cv);
 				}
 				IsFuncEnd => {
@@ -355,13 +374,16 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 				ProbeId => {
 					arg = bindProbeId(op, expParams[k], cv);
 				}
-				NumTargets => {
+				NumTargets => { // br_table
 					arg = bindNumTargets(op, expParams[k], cv);
 				}
-				Offset => {
+				Offset => { // load/store
 					arg = bindOffset(op, expParams[k], cv);
 				}
-				Imm(orig, j) => {
+				InstrCount => { // block:end
+					arg = bindInstrCount(op, expParams[k], cv);
+				}
+				Imm(orig, j) => { // opcodes
 					arg = bindImm(j, op, expParams[k], cv);
 				}
 				Arg(orig, j) => {  // arg0 = first arg to bytecode
@@ -371,7 +393,7 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 					}
 					arg = bindArg(j, op, expParams[k], cv);
 				}
-				Local(orig, j) => {
+				Local(orig, j) => { // func scope
 					if (nested) {
 						err.at(cv.parser.decoder).WhammProbeError("whamm probe", "cannot use dynamic data in static context (local)");
 						return null;
@@ -552,6 +574,18 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 		}
 		err.at(cv.parser.decoder).WhammProbeError("whamm probe", "offset variable not available for opcode.");
 		return WhammArg.Null;
+	}
+
+	private def bindInstrCount(op: Opcode, expType: ValueType, cv: CodeValidator) -> WhammArg {
+		if (instr_count < 0) {
+			err.at(cv.parser.decoder).WhammProbeError("whamm probe", "instr_count only in scope for block:end");
+			return WhammArg.Null;
+		}
+		if (expType != ValueType.I32) {
+			err.at(cv.parser.decoder).WhammProbeError("whamm probe", "type mismatch on instr_count argument");
+			return WhammArg.Null;
+		}
+		return WhammArg.Val(Values.box_i(instr_count));
 	}
 
 	private def bindImm(n: int, op: Opcode, expType: ValueType, cv: CodeValidator) -> WhammArg {
