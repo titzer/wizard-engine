@@ -30,7 +30,7 @@ if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
     echo "  VIRGIL_LIB, to point directly to root of the library"
     exit 1
 fi
-    
+
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 MONITORS="src/monitors/*.v3"
 TEST_MONITORS="src/monitors/test/*.v3"
@@ -47,18 +47,27 @@ WALI="src/modules/wali/*.v3"
 WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
 
-if [ "$1" = "-nojit" ]; then
+if [ "$1" = "--nojit" ]; then
     REDEFS="SpcTuning.disable=true"
     shift
 fi
 
-if [ "$1" = "-test" ]; then
+if [ "$1" = "--test-monitors" ]; then
     MONITORS="$MONITORS $TEST_MONITORS"
+    shift
+fi
+
+if [ "$1" = "--debug-gc" ]; then
+    DEBUG_GC=1
     shift
 fi
 
 PROGRAM=$1
 TARGET=$2
+
+if [[ "$TARGET" =~ x86 && $DEBUG_GC = 1 ]]; then
+    V3C_OPTS="$V3C_OPTS -redef-field=RiGc.debug=true"
+fi
 
 function make_build_file() {
 	local target=$TARGET
