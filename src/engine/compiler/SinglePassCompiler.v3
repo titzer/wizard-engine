@@ -324,6 +324,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
 		// Clear FrameAccessor
 		masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
+		// Clear inlined whamm instance
+		if (SpcTuning.inlineSmallFunc && SpcTuning.intrinsifyWhammProbe) {
+			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+		}
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
@@ -454,7 +458,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var callee_func = WasmFunction.!(probe.func);
 
 		if (SpcTuning.inlineSmallFunc) {
-			// TODO: can reuse when implementing inlining for SPC
 			inline_config = InlineConfig(probe.spc_swap_membase, probe.spc_swap_instance, probe.spc_inline_func);
 			if (!probe.inline_heuristic_checked) {
 				inline_config = funcCanInline(callee_func.decl);
@@ -465,8 +468,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 
 			if (inline_config.swap_instance) { // push whamm instance onto abstract stack directly
-				var whamm_instance_addr = Pointer.atObject(callee_func.instance) - Pointer.NULL;
-				masm.emit_mov_m_l(frame.inlined_instance_slot, whamm_instance_addr);
+				masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, regs.scratch);
 			}
 
 			// overwrite mem0_base with whamm instance's memory base, restore from frame slot later
@@ -505,75 +508,76 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					kind = ValueKind.REF.code;
 				}
 				Val(val) => {
-					var is_v128 = false;
-					var low: u64, high: u64;
 					match (val) {
 						I31(v) => {
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.REF);
-								masm.emit_mov_r_i(reg, i32.view(v));
+								masm.emit_mov_r_i(reg, i32.view(v) << 1);
 								state.push(KIND_REF | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, u64.view(v) << 1);
 							}
-							low = v;
 							kind = ValueKind.REF.code;
 						}
 						I32(v) => {
-							low = v;
-							if (inline_config.can_inline) state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
+							if (inline_config.can_inline) {
+								state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
+							}
 							kind = ValueKind.I32.code;
 						}
 						I64(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.I64);
 								masm.emit_mov_r_l(reg, i64.view(v));
 								state.push(KIND_I64 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.I64.code;
 						}
 						F32(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.F32);
 								masm.emit_mov_r_f32(reg, v);
 								state.push(KIND_F32 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.F32.code;
 						}
 						F64(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.F64);
 								masm.emit_mov_r_d64(reg, v);
 								state.push(KIND_F64 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.F64.code;
 						}
 						V128(l, h) => {
-							low = l;
-							high = h;
-							is_v128 = true;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.V128);
-								masm.emit_mov_r_q(reg, low, high);
+								masm.emit_mov_r_q(reg, l, h);
 								state.push(KIND_V128 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, l);
+								masm.emit_mov_m_d(slot_addr.plus(8), h);
 							}
 							kind = ValueKind.V128.code;
 						}
 						Ref(v) => {
-							low = u64.view(Pointer.atObject(v) - Pointer.NULL);
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.REF);
-								masm.emit_mov_r_l(reg, i64.view(low));
+								masm.emit_mov_r_Object(reg, v);
 								state.push(KIND_REF | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_r_Object(regs.scratch, v);
+								masm.emit_mov_m_r(ValueKind.REF, slot_addr, regs.scratch);
 							}
 							kind = ValueKind.REF.code;
-						}
-					}
-					if (!inline_config.can_inline) {
-						masm.emit_mov_m_d(slot_addr, low);
-						if (is_v128) {
-							masm.emit_mov_m_d(slot_addr.plus(8), high);
 						}
 					}
 				}
@@ -653,7 +657,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var tmp = allocTmp(ValueKind.REF);
 
 			// Load the target code/entrypoint.
-			masm.emit_mov_r_l(func_reg, Pointer.atObject(whamm_instance.functions[func_id]) - Pointer.NULL);
+			masm.emit_mov_r_Function(func_reg, whamm_instance.functions[func_id]);
 			masm.emit_v3_WasmFunction_decl_r_r(tmp, func_reg);
 			masm.emit_v3_FuncDecl_target_code_r_r(tmp, tmp);
 			// adjust vsp_reg to compute the "true" VSP, accounting for args to WhammProbe's WasmFunction
