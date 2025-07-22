@@ -1,0 +1,295 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def monitor_ = MonitorRegistry.add(
+    "cache-sim", "Simulates a cache for a simple memory model.",
+    CacheSimulationMonitor.new());
+def inDebugMode_ = monitor_.options.addAlias(
+		monitor_.options.newFlag("debug", null, "emit debug output"), "d");
+
+var inDebugMode = false;
+
+def ASSOCIATIVITY = 4;
+def INDEX_BITS: byte = 11;
+def BLOCK_BITS: byte = 7;
+def TAG_BITS: byte = 14;
+//def CACHE_SIZE = u20.max;
+
+type CacheStat(hits: u64, misses: u64);
+
+type StaticLoc(func: WasmFunction, pc: int);
+def locationEquals(a: StaticLoc, b: StaticLoc) -> bool {
+    return (a.func.decl.func_index == b.func.decl.func_index) && (a.pc == b.pc);
+}
+def locationHash(a: StaticLoc) -> int {
+    return a.pc;
+}
+
+def locationCompare(a: StaticLoc, b: StaticLoc) -> bool {
+    var a_int: u64 = (u64.!(a.func.decl.func_index) << 32) + u64.!(a.pc);
+    var b_int: u64 = (u64.!(b.func.decl.func_index) << 32) + u64.!(b.pc);
+    if (a_int < b_int) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+class CacheSimulationMonitor extends Monitor {
+    // TODO: Monitor Implementation
+
+
+    var Cache: CacheInstance;
+    var statistics = HashMap<StaticLoc, CacheStat>.new(locationHash, locationEquals);
+
+    def configure(args: string) -> string {
+        def argMap = MonitorUtil.argMapFrom(args);
+        if (argMap.has("debug") || argMap.has("d")) {
+            System.puts("Debug mode enabled\n");
+            inDebugMode = true;
+            return null;
+        }
+        def buf = StringBuilder.new();
+        buf.put1("invalid arguments(s) \"%s\"", args);
+        return buf.toString();
+    }
+
+    def onReset() {
+    }
+
+    def onParse(m: Module, e: ErrorGen) {
+        if (inDebugMode) {
+            System.puts("Initializing Cache...\n");
+        }
+        Cache = CacheInstance.new(ASSOCIATIVITY, BLOCK_BITS, INDEX_BITS, TAG_BITS);
+
+        var mm = ModuleInstrumenter.new(m);
+        mm.beforeMemRead(memaccessProbe);
+        mm.beforeMemWrite(memaccessProbe);
+    }
+
+    private def memaccessProbe(dynamicLoc: DynamicLoc, mem: Memory, address: u64, size: u64) -> Resumption {
+        if (address > u32.max) {
+            return Resumption.Continue;
+        }
+        var addr32 = u32.!(address);
+        if (inDebugMode) {
+            System.puts("Address: ");
+            System.puti(int.!(addr32));
+            System.puts(" | ");
+        }
+        var result = Cache.access(addr32);
+        var location = StaticLoc(dynamicLoc.func, dynamicLoc.pc);
+        match (result) {
+            Hit(t) => {
+                statistics[location] = CacheStat(statistics[location].hits + 1, statistics[location].misses);
+            }
+            Miss(t, is_evict, evict) => {
+                statistics[location] = CacheStat(statistics[location].hits, statistics[location].misses + 1);
+                if (inDebugMode) {
+                    if (is_evict) {
+                        System.puts("Miss (evict)\n");
+                    } else {
+                        System.puts("Miss (cold)\n");
+                    }
+                }
+            }
+        }
+        return Resumption.Continue;
+    }
+
+    def onFinish(i: Instance, r: Result) {
+        reportCacheStats(statistics);
+    }
+
+    def reportCacheStats(stats: HashMap<StaticLoc, CacheStat>) {    
+        var locs = Lists.toArray(Maps.keyList(stats));
+        var sorted_locs = Arrays.sort(locs, 0, locs.length, locationCompare);
+
+        var prev: FuncDecl;
+        var bc_iter = BytecodeIterator.new();
+        for (i < sorted_locs.length) {
+            var curr_loc = sorted_locs[i];
+            var module = curr_loc.func.instance.module;
+            var func_decl = curr_loc.func.decl;
+            if (prev != func_decl) {
+                prev = func_decl;
+                output_func_header(module, func_decl);
+            }
+
+            var mnemonic = bc_iter.reset(func_decl).at(curr_loc.pc, -1).current().mnemonic;
+            var curr_stat = stats[curr_loc];
+            output_cache_stat(curr_loc.pc, mnemonic, curr_stat);
+        }
+    }
+}
+
+/***** OUTPUT FORMATTING HELPER METHODS (Do not modify) *****/
+/*
+ * ***Output Format for Grading:***
+ *
+ * 1. **Function Header Output:**
+ *    - Use the helper method `output_func_header()` to print each function's header.
+ *    - The **function headers must be printed in increasing order of function index** 
+ *      (e.g., Func[0], Func[1], Func[2], ...).
+ *    - **Ensure** that the function header is printed **before** the corresponding cache statistics.
+ *
+ * 2. **CacheStat Output:**
+ *    - After printing each function header, use the helper method `output_cache_stat()` 
+ *      to print the cache statistics.
+ *    - The **cache statistics must be printed in increasing order of the program counter (pc)** 
+ *      for each function.
+ *
+ * ***Important Notes:***
+ * - The **correct order of output** is essential for grading. 
+ * - Output **must follow** the specified structure of increasing function index and program counter.
+ * - Do not invoke any output functions other than the methods specified above 
+ * - **Double-check your output** to ensure it matches the expected format, as incorrect output will result in lost points.
+ */
+
+// Method to output function name
+def output_func_header(module: Module, func: FuncDecl) {
+    Trace.OUT.beginColor(Color.FUNC)
+        .put1("func %q:", func.render(module.names, _))
+        .endColors().ln();
+
+}
+// Method to output a single CacheStat
+def output_cache_stat(pc: int, op_mnemonic: string, stat: CacheStat) {
+    Trace.OUT.beginColor(Color.INACTIVE)
+        .mark()
+        .put1("+%d", pc)
+        .rjustify_mark(5)
+        .endColors()
+        .putc(' ');
+
+    Trace.OUT.beginColor(Color.SOURCE)
+        .mark()
+        .puts(op_mnemonic)
+        .rjustify_mark(16)
+        .putc(':')
+        .putc(' ')
+        .endColors();
+
+
+    Trace.OUT.beginColor(Color.SUCCESS)
+        .mark()
+        .put1("%d", stat.hits)
+        .rjustify_mark(6)
+        .endColors()
+        .putc(' ');
+    Trace.OUT.beginColor(Color.HIGH)
+        .mark()
+        .put1("%d", stat.misses)
+        .rjustify_mark(6)
+        .endColors()
+        .putc(' ')
+        .ln();
+}
+/******************/
+
+
+type TagElement(valid: bool, tag: u14, age: u64);
+
+type LRUResult {
+    case Hit(t: u14);
+    case Miss(t: u14, is_evict: bool, evict: u14);
+}
+
+
+class TagStoreEntry(assoc: int) {
+    def elems = Array<TagElement>.new(assoc);
+
+    def is_elem_valid(t: TagElement) -> bool {
+        return t.valid;
+    }
+
+    def access_update(tag: u14) ->  LRUResult {
+        var rep_idx = -1;
+        var is_hit = false;
+        var rep_invalid = false;
+        var max_age: u64 = 0;
+
+        var result: LRUResult;
+        for (i < assoc) {
+            if (elems[i].valid) {
+                if (elems[i].tag == tag) {
+                    // Check for Hit; reset age
+                    is_hit = true;
+                    elems[i] = TagElement(true, tag, 0);
+                }
+                else {
+                    if (!rep_invalid && (elems[i].age >= max_age)) {
+                        // Track oldest element for eviction as long as
+                        // there is no invalid element to replace
+                        max_age = elems[i].age;
+                        rep_idx = i;
+                    }
+                    // Increment age of all valid elements besides hit 
+                    elems[i] = TagElement(elems[i].valid, elems[i].tag, elems[i].age + 1);
+                }
+            } else {
+                // There exists an invalid element to fill for miss
+                rep_invalid = true;
+                rep_idx = i;
+            }
+        }
+
+        if (is_hit) {
+            return LRUResult.Hit(tag);
+        } 
+        else if (rep_invalid) {
+            elems[rep_idx] = TagElement(true, tag, 0);
+            return LRUResult.Miss(tag, false, 0);
+        } else {
+            // All elements are valid and no hit; evict with LRU
+            var evict_tag = elems[rep_idx].tag;
+            elems[rep_idx] = TagElement(true, tag, 0);
+            return LRUResult.Miss(tag, true, evict_tag);
+        }
+
+    }
+}
+
+class CacheInstance {
+    var tag_store: Array<TagStoreEntry>;
+
+    var assoc: int;
+    var tag_bits: byte;
+    var block_bits: byte;
+    var index_bits: byte;
+
+    var block_size: int;
+    var index_size: int;
+
+    new (assoc: int, block_bits: byte, index_bits: byte, tag_bits: byte) {
+        this.tag_bits = tag_bits;
+        this.block_bits = block_bits;
+        this.index_bits = index_bits;
+
+        if ((tag_bits + index_bits + block_bits) != 32) {
+            System.puts("Cache parameters do not add up to 32 bits.\n");
+        }
+
+        this.assoc = assoc;
+        this.index_size = (1 << index_bits);
+        this.block_size = (1 << block_bits);
+
+        tag_store = Array<TagStoreEntry>.new(this.index_size);
+        for (i < this.index_size) {
+            tag_store[i] = TagStoreEntry.new(assoc);
+        }
+    }
+
+    def access(addr: u32) -> LRUResult {
+        var offset = u7.!(addr & ((1u << this.block_bits) - 1));
+        addr >>= this.block_bits;
+        var index = u11.!(addr & ((1u << this.index_bits) - 1));
+        addr >>= this.index_bits;
+        var tag_val = u14.!(addr & ((1u << this.tag_bits) - 1));
+
+        var lru_result = tag_store[index].access_update(tag_val);
+        return lru_result;
+    }
+
+}
