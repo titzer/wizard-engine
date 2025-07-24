@@ -800,6 +800,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var sv = pop();
 		emitBrIf(sv, MasmBrCond.I32_NONZERO, target.label, target, state.isTransferEmpty(target), BrRepush.NONE);
 	}
+	// TODO[ss]: make typed-ref proposal work with CONT storage kind
 	def visit_BR_ON_NULL(depth: u31) {
 		var target = state.getControl(depth);
 		var sv = pop();
@@ -1325,7 +1326,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 
 	def visit_REF_NULL(ht_val: int) {
-		state.push(KIND_REF | IS_CONST, NO_REG, 0);
+		if (ht_val >= 0 && ContDecl.?(module.heaptypes[ht_val])) state.push(KIND_CONT | IS_CONST, NO_REG, 0);
+		else state.push(KIND_REF | IS_CONST, NO_REG, 0);
 	}
 	def visit_REF_FUNC(func_index: u31) {
 		var reg = allocRegTos(ValueKind.REF);
@@ -1336,6 +1338,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.push(KIND_REF | IN_REG, reg, 0);
 	}
 	def visit_REF_AS_NON_NULL() {
+		// TODO[ss]: Cont ref type
 		var sv = state.peek();
 		if (sv.isConst()) {
 			if (sv.const == 0) {
@@ -1356,13 +1359,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// ext: stack-switching
 	def visit_CONT_NEW(cont_index: u31) {
 		var decl = ContDecl.!(module.heaptypes[cont_index]);
-		emit_call_runtime_op1n(Opcode.CONT_NEW, cont_index, 1, [ValueType.V128], true);
+		emit_call_runtime_op1n(Opcode.CONT_NEW, cont_index, 1, [ValueTypes.CONTREF], true);
 	}
 	def visit_CONT_BIND(in_cont_id: u31, out_cont_id: u31) {
 		var in_cont = ContDecl.!(module.heaptypes[in_cont_id]);
 		var out_cont = ContDecl.!(module.heaptypes[out_cont_id]);
 		var n_binds = u32.!(in_cont.sig.params.length - out_cont.sig.params.length);
-		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, [ValueType.V128], true);
+		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, [ValueTypes.CONTREF], true);
 	}
 	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
 		// record reachable label positions for handler stub
@@ -1383,7 +1386,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var top_v128 = popReg();
 		var cont = allocTmp(ValueKind.REF);
 		var version = allocTmp(ValueKind.I32);
-		Trace.OUT.put1("top_v128: %q", top_v128.render(_, X86_64MasmRegs.SET)).ln();
 		masm.emit_unpack_v128(cont, version, top_v128.reg);
 		masm.emit_validate_and_consume_cont(cont, version);
 		freeReg(version);
@@ -1565,11 +1567,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(u32.!(tag.fields.length));
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
-		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+		state.push(KIND_CONT | TAG_STORED | IS_STORED, NO_REG, 0);
 
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
+		top_v128 = popReg();
+		masm.emit_unpack_v128(cont, regs.scratch, top_v128.reg);
 		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
 
 		// save %vsp to frame
@@ -2402,6 +2406,8 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 		return (flags & IS_STORED) != 0;
 	}
 	def isConst() -> bool {
+		// XXX: remove this restriction; as of now {CONT} cannot be const due to size
+		if (kind() == ValueKind.CONT) return false;
 		return (flags & IS_CONST) != 0;
 	}
 	def inReg() -> bool {
@@ -2760,6 +2766,10 @@ def typeToKindFlags(vt: ValueType) -> byte {
 		F32 => return KIND_F32;
 		F64 => return KIND_F64;
 		V128 => return KIND_V128;
+		Ref(_, ht) => {
+			if (HeapType.Cont.?(ht)) return KIND_CONT;
+			return KIND_REF;
+		}
 		_ => return KIND_REF;
 	}
 }
