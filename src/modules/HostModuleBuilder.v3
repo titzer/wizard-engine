@@ -5,24 +5,22 @@
 // Simplifies the more complicated interface of the superclass {HostModuleBuilderOf}, so that
 // a user can simply instantiate this class without type parameters.
 class HostModuleBuilder extends HostModuleBuilderOf<void> {
-	new(name: string) super(name, void.!<void>) { }
+	new(name: string) super(name, void.!<void>, null) { }
 }
 
 // Builds more complex modules that have instance state in the form of the <C> type parameter.
 // The {tnew} function should create the state object <C>.
-class HostModuleBuilderOf<C>(name: string, tnew: void -> C) {
-	private var module = HostModuleOf<C>.new(name, tnew);
+class HostModuleBuilderOf<C>(name: string, tnew: void -> C, tbind: (C, Instance) -> void) {
+	private var module = HostModuleOf<C>.new(name, tnew, tbind);
 
 	// Adds a global exportable to the host module.
 	def global(name: string, obj: Global) -> this {
 		module.map[name] = obj;
 	}
-
 	// Adds a memory exportable to the host module.
 	def memory(name: string, obj: Memory) -> this {
 		module.map[name] = obj;
 	}
-
 	// Adds a simple named function with a static signature.
 	def func(name: string, sig: SigDecl, hf: Range<Value> -> HostResult) -> this {
 		module.map[name] = HostFunction.new(name, sig, hf);
@@ -33,22 +31,33 @@ class HostModuleBuilderOf<C>(name: string, tnew: void -> C) {
 	}
 	// Adds a simple named function with a static signature, but the function is created from a <C>.
 	def func_C(name: string, sig: SigDecl, hfp: C -> (Range<Value> -> HostResult)) -> this {
-		module.closures[name] = ClosureEntry<C>(name, sig, hfp);
+		module.adapters[name] = fun c => HostFunc(sig, hfp(c));
 	}
 	// Adds a simple named function with a static signature, but the function is a "member" of <C>.
 	def func_M(name: string, sig: SigDecl, hfp: (C, Range<Value>) -> HostResult) -> this {
-		module.closures[name] = ClosureEntry<C>(name, sig, closeOver<C, Range<Value>, HostResult>(_, hfp));
+		module.adapters[name] = fun c => HostFunc(sig, hfp(c, _));
 	}
+	// Adds typed functions to the host module.
+	def func_iii_l(name: string, hfp: C -> (int, int, int) -> long) -> this	{ module.adapters[name] = fun c => HostAdapters.iii_l(hfp(c)); }
+	def func_i_i(name: string, hfp: C -> int -> int) -> this		{ module.adapters[name] = fun c => HostAdapters.i_i(hfp(c)); }
+	def func_i_v(name: string, hfp: C -> int -> void) -> this		{ module.adapters[name] = fun c => HostAdapters.i_v(hfp(c)); }
+	def func_iii_i(name: string, hfp: C -> (int, int, int) -> int) -> this	{ module.adapters[name] = fun c => HostAdapters.iii_i(hfp(c)); }
+	def func_uuu_r(name: string, hfp: C -> (u32, u32, u32) -> HostResult) -> this;
+	def func_iuu_r(name: string, hfp: C -> (int, u32, u32) -> HostResult) -> this;
+	def func_uu_r(name: string, hfp: C -> (u32, u32) -> HostResult) -> this;
+	def func_uuuu_r(name: string, hfp: C -> (u32, u32, u32, u32) -> HostResult) -> this;
+	def func_v_i(name: string, hfp: C -> void -> int) -> this		{ module.adapters[name] = fun c => HostAdapters.v_i(hfp(c)); }
+	
 	// Adds a post-processing function for an instance, e.g. to examine its exports.
 	def postprocess(f: (C, ErrorGen, Instance) -> void) -> this {
 		module.postprocess_f = f;
 	}
-	// Adds a function that implements {HostModule.getMain()}.
-	def getMain(f: Instance -> (Function, Array<Value>)) -> this {
+	// Adds a function that implements {HostInstance.getMain()}.
+	def getMain(f: (C, Instance) -> (Function, Array<Value>)) -> this {
 		module.getMain_f = f;
 	}
-	// Adds a function that implements {HostModule.init()}.
-	def init(f: (Array<string>, bool, ErrorGen) -> void) -> this {
+	// Adds a function that implements {HostInstance.init()}.
+	def init(f: (C, Array<string>, bool, ErrorGen) -> void) -> this {
 		module.init_f = f;
 	}
 	// Finishes a module and registers it in the host module registry.
@@ -63,10 +72,6 @@ class HostModuleBuilderOf<C>(name: string, tnew: void -> C) {
 		return result;
 	}
 }
-// Needed to adapt a member function to a function that binds the receiver.
-def closeOver<C, P, R>(c: C, func: (C, P) -> R) -> P -> R {
-	return func(c, _);
-}
 
 // Implements a host module that has stateful bindings.
 // Will instantiate a new <C> for each module that imports from this host module, automatically.
@@ -74,13 +79,14 @@ private class HostModuleOf<C> extends HostModule {
 	def none: C;
 	var last: C;
 	def tnew: void -> C;
+	def tbind: (C, Instance) -> void;
 	def map = Strings.newMap<Exportable>();
-	def closures = Strings.newMap<ClosureEntry<C>>();
+	def adapters = Strings.newMap<C -> HostFunc>();
 	var postprocess_f: (C, ErrorGen, Instance) -> void;
-	var init_f: (Array<string>, bool, ErrorGen) -> void;
-	var getMain_f: Instance -> (Function, Array<Value>);
+	var init_f: (C, Array<string>, bool, ErrorGen) -> void;
+	var getMain_f: (C, Instance) -> (Function, Array<Value>);
 
-	new(name: string, tnew) super(name) { }
+	new(name: string, tnew, tbind) super(name) { }
 
 	def preprocess(error: ErrorGen, module: Module, result: Array<Exportable>) {
 		var imports = module.imports;
@@ -88,27 +94,30 @@ private class HostModuleOf<C> extends HostModule {
 			var i = imports[j];
 			if (result[j] != null) continue;                             // don't overwrite existing binding
 			if (!Strings.equal(this.name, i.imp.module_name)) continue;  // not this module
-			var simple = map[i.imp.field_name];                          // find simple binding
+			var func_name = i.imp.field_name;
+			var simple = map[func_name];                          // find simple binding
 			if (simple != null) {
 				result[j] = simple;
 				continue;
 			}
-			var closure = closures[i.imp.field_name];
-			if (closure.name != null) {
+			var adapter = adapters[i.imp.field_name];
+			if (adapter != null) {
 				if (last == none) last = tnew(); // lazily allocate a <C> object
-				result[j] = HostFunction.new(closure.name, closure.sig, closure.cnew(last));
+				var hf = adapter(last);
+				result[j] = HostFunction.new(name, hf.sig, hf.invoke);
 			}
 		}
 	}
 	def postprocess(error: ErrorGen, instance: Instance) {
+		if (tbind != null) tbind(last, instance);
 		if (postprocess_f != null) postprocess_f(last, error, instance);
 		last = none;
 	}
 	def init(args: Array<string>, trace: bool, err: ErrorGen) {
-		if (init_f != null) init_f(args, trace, err);
+		if (init_f != null) init_f(last, args, trace, err);
 	}
 	def getMain(instance: Instance) -> (Function, Array<Value>) {
-		if (getMain_f != null) return getMain_f(instance);
+		if (getMain_f != null) return getMain_f(last, instance);
 		return (null, null);
 	}
 }
