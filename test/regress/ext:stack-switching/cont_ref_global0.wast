@@ -6,7 +6,7 @@
   (type $c2 (cont $f2))
   (global $x (mut (ref null $c1)) (ref.null $c1))
   (func (export "main")
-    (cont.bind $c1 $c2 (i32.const 0) (globa.get $x))
+    (cont.bind $c1 $c2 (i32.const 0) (global.get $x))
     drop
   )
 )
