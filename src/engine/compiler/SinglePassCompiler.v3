@@ -1341,19 +1341,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.push(KIND_REF | IN_REG, reg, 0);
 	}
 	def visit_REF_AS_NON_NULL() {
-		var sv = state.peek();
+		var sv = unboxRef(state.peek());
 		if (sv.isConst()) {
 			if (sv.const == 0) {
 				emitTrap(TrapReason.NULL_DEREF); // statically null
 				setUnreachable();
 			}
 		} else if (sv.inReg()) {
-			var ref: Reg;
-			if (sv.kind() == ValueKind.REF_U64) {
-				ref = allocTmp(ValueKind.REF);
-				masm.emit_ref_from_ref_u64(ref, sv.reg);
-			} else ref = sv.reg;
-			masm.emit_br_r(ref, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 		} else {
 			// XXX: use masm.br_m if necessary?
 			// XXX: this "works" for REF_U64 "accidently", maybe improve?
@@ -1894,8 +1889,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
 	def emitBrIf(sv: SpcVal, cond: MasmBrCond, label: MasmLabel, target: SpcControl, emptyTransfer: bool, repush: BrRepush) {
-		if (sv.isConst()) {
-			var taken = (sv.const == 0) == cond.zero;
+		// Unboxed value is used for register moves so that {REF_U64} is compatible with this function.
+		// However due to repush the original {sv} is still needed and used when pushing back.
+		var unboxed = unboxRef(sv);
+		if (unboxed.isConst()) {
+			var taken = (unboxed.const == 0) == cond.zero;
 			if (taken) {
 				if (repush.taken) state.pushV(sv);
 				if (!emptyTransfer) state.emitTransfer(target, resolver);
@@ -1903,12 +1901,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				setUnreachable();
 			}
 		} else if (emptyTransfer) {
-			if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
+			if (unboxed.inReg()) masm.emit_br_r(unboxed.reg, cond, label);
 			else masm.emit_br_m(masm.slotAddr(state.sp), cond, label);
 			if (repush.not_taken) state.pushV(sv);
 		} else {
 			var skip = masm.newLabel(it.pc);
-			if (sv.inReg()) masm.emit_br_r(sv.reg, masm.negate(cond), skip);
+			if (unboxed.inReg()) masm.emit_br_r(unboxed.reg, masm.negate(cond), skip);
 			else masm.emit_br_m(masm.slotAddr(state.sp), masm.negate(cond), skip);
 			if (repush.taken) state.pushV(sv);
 			state.emitTransfer(target, resolver);
@@ -2376,6 +2374,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			OUT.ln();
 		}
 	}
+
+	// If {reg} is in register and of kind {REF_U64}, allocate a temporary {REF}
+	// register and move the reference into it.
+	def unboxRef(val: SpcVal) -> SpcVal {
+		if (val.kind() != ValueKind.REF_U64 || !val.inReg()) return val;
+		var tmp = allocTmp(ValueKind.REF);
+		masm.emit_ref_from_ref_u64(tmp, val.reg);
+		return SpcVal(val.flags, tmp, val.const); // XXX: change type flag to REF?
+	}
 }
 // Different branch instructions have different repush
 enum BrRepush(taken: bool, not_taken: bool) {
@@ -2416,8 +2423,8 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 		return (flags & IS_STORED) != 0;
 	}
 	def isConst() -> bool {
-		// XXX: remove this restriction; as of now {CONT} cannot be const due to size
-		if (kind() == ValueKind.REF_U64) return false;
+		// Only null `REF_U64` are considered to be costants.
+		if (kind() == ValueKind.REF_U64) return const == 0 && (flags & IS_CONST) != 0;
 		return (flags & IS_CONST) != 0;
 	}
 	def inReg() -> bool {
