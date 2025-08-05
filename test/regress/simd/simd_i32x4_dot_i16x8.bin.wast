@@ -187,6 +187,20 @@
   )
   (v128.const i32x4 0x2 0x2 0x2 0x2)
 )
+(assert_return
+  (invoke "i32x4.dot_i16x8_s"
+    (v128.const i32x4 0xffff_8000 0xffff_8000 0xffff_8000 0xffff_8000)
+    (v128.const i32x4 0x8001 0x8001 0x8001 0x8001)
+  )
+  (v128.const i32x4 0x3fff_8000 0x3fff_8000 0x3fff_8000 0x3fff_8000)
+)
+(assert_return
+  (invoke "i32x4.dot_i16x8_s"
+    (v128.const i32x4 0xde_006f 0x1bc_014d 0x29a_022b 0x378_0309)
+    (v128.const i32x4 0x8ae_0457 0x115c_0d05 0x1a0a_15b3 0x22b8_1e61)
+  )
+  (v128.const i32x4 0x9_689d 0x2f_0b11 0x72_c915 0xd4_a2a9)
+)
 (assert_invalid
   (module binary
     "\00\61\73\6d\01\00\00\00\01\85\80\80\80\00\01\60"
