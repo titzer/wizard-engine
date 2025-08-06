@@ -3,6 +3,7 @@
 
 // The "wave" module provides an execution environment for Virgil programs compiled to Wasm.
 def Y_ = HostModuleBuilderOf<WaveInstance>.new("wave", WaveInstance.new, WaveInstance.bind)
+	.func_iii_i("new_func", fun i => i.new_func)
 	.func_i_i("arg_len", fun i => i.arg_len)
 	.func_uuu_r("arg_copy", fun i => i.arg_copy)
 	.func_uu_r("fs_size", fun i => i.fs_size)
@@ -10,6 +11,7 @@ def Y_ = HostModuleBuilderOf<WaveInstance>.new("wave", WaveInstance.new, WaveIns
 	.func_uuu_r("fs_open", fun i => i.fs_open)
 	.func_iuu_r("fs_read", fun i => i.fs_read)
 	.func_iuu_r("fs_write", fun i => i.fs_write)
+	/* these unwrap wasm args to virgil args into method access */
 	.func_i_i("fs_avail", fun i => i.fs_avail)
 	.func_i_v("fs_close", fun i => i.fs_close)
 	.func_v_i("ticks_ms", fun i => System.ticksMs)
@@ -30,10 +32,15 @@ class WaveInstance {
 	def fdmap = FileDescriptorMap.new(MAX_FDS);
 	var cmdline_args: Array<string>;
 	var memory: Memory;
+	var table: Table;
+	var instance: Instance;
 
 	// Bind the WaveInstance to an instance of a module.
+	// !! have instance at bind time
 	def bind(instance: Instance) {
 		memory = instance.findExportOfType<Memory>(null);
+		table = instance.findExportOfType<Table>(null);
+		this.instance = instance;
 	}
 	// Initialize the WaveInstance with command-line arguments.
 	def init(args: Array<string>, trace: bool, err: ErrorGen) { // XXX: remove trace
@@ -62,6 +69,55 @@ class WaveInstance {
 	}
 
 	// ==={Provided functions}============================================
+	/* wizeng.new_func(typeid, addr, len)
+	 *   copy(addr, len)
+	 *   validate
+	 *   new func
+	 *   append table
+	 *   return index
+	 */
+	def new_func(sig_idx: i32, ptr: i32, len: i32) -> i32 {
+		/* get type signature */
+		def sig: SigDecl = SigDecl.!(instance.heaptypes[sig_idx]);
+		// def buf = StringBuilder.new();
+		// buf.put1("sig_idx: %d\n", sig_idx);
+		// sig.render(buf);
+		// buf.ln();
+		// System.puts(buf.extract());
+
+		/* copy from memory */
+		def code: Array<byte> = copyString(memory, u32.view(ptr), u32.view(len)).result;
+
+		var func: FuncDecl = FuncDecl.new(sig_idx);
+		func.setOrigCode(code);
+		func.sig = sig;
+		func.func_index = instance.functions.length; // but not yet added
+
+		/* validate */
+		var err: ErrorGen = ErrorGen.new(instance.module.filename);
+		Execute.tiering.onFuncBody(instance.module, u32.!(func.func_index), code, err);
+		var validator = CodeValidator.new(Extension.set.all, Limits.new(), instance.module, err);
+		match (validator.validateFunc(func)) {
+			Ok => ;
+			Error(error_code, error_pos, error_msg) => {
+				return -1;
+			}
+		}
+
+		/* new func */
+		var wf = WasmFunction.new(instance, func);
+		Execute.tiering.onNewFunction(wf, err);
+
+		/* append to instance */
+		// TODO is this needed?
+		instance.functions = Arrays.append(wf, instance.functions);
+
+		/* append to table */
+		def idx = table.grow(1, Value.Ref(wf));
+
+		return idx;
+
+	}
 	def arg_len(arg: int) -> int {
 		if (u32.view(arg) >= cmdline_args.length) return -1;
 		return cmdline_args[arg].length;
