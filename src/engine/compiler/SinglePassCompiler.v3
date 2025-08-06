@@ -2309,6 +2309,44 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		return SpcVal(sv.flags | IN_REG, reg, sv.const);
 	}
+	// Pop the top of stack into a register and prepare for it to be reused at {delta} slots.
+	def popRegToReuse(delta: int) -> SpcVal {
+		var sv = state.pop(), tos = int.!(state.sp);
+		if (regAlloc.frequency(sv.reg) == 1) {
+			regAlloc.reassign(sv.reg, tos, tos + delta);
+			return sv; // can reuse reg immediately
+		}
+		var kind = sv.kind();
+		var reg = allocReg(kind, u32.!(tos + delta));
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
+			regAlloc.unassign(sv.reg, tos);
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
+	// Pop the top of stack into a register, but only temporarily, as it will be clobbered.
+	def popTmpReg() -> SpcVal {
+		var sv = state.pop(), reg = sv.reg;
+		if (regAlloc.frequency(reg) == 1) { // can use register as a temporary
+			regAlloc.reassign(reg, int.!(state.sp), TMP_SLOT);
+			unrefLater(reg, TMP_SLOT);
+			return sv;
+		}
+		var kind = sv.kind();
+		reg = allocTmp(kind);
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
 	// Spill a register to its slot(s), if it has been allocated.
 	def spillRegAndFree(reg: Reg) {
 		regAlloc.forEachAssignment(reg, emitSpill); // XXX: iterate assignment list directly?
@@ -2560,7 +2598,12 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
+			regAlloc.clear();
 			sp = ctl.val_stack_top;
+			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
+				var sv = state[i];
+				if ((sv.flags & IN_REG) != 0) state[i] = SpcVal(sv.flags & ~IN_REG, NO_REG, 0);
+			}
 			for (r in ctl.results) {
 				push(typeToKindFlags(r) | IS_STORED | TAG_STORED | IS_CONST, NO_REG, 0);
 			}
@@ -2716,10 +2759,6 @@ class SpcState(regAlloc: RegAlloc) {
 	}
 	def setUnreachable() {
 		ctl_stack.peek().reachable = false;
-	}
-	def setNoReg(slot: u32) {
-		var b = state[slot];
-		state[slot] = SpcVal(b.flags & ~IN_REG, NO_REG, b.const);
 	}
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
