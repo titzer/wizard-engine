@@ -108,19 +108,19 @@ component X86_64Runtime {
 	// If the given continuation handles the thrown error, a modified {Continuation} is pushed
 	// onto the value stack. Otherwise, trap on the current stack.
 	// XXX: eliminate returning {Throwable}?
-	def runtime_handle_resume_throw(stack: X86_64Stack, instance: Instance, cont: Continuation, tag_index: u31) -> Throwable {
+	def runtime_handle_resume_throw(stack: X86_64Stack, instance: Instance, contStack: X86_64Stack, tag_index: u31) -> Throwable {
 		var tag = instance.tags[tag_index];
 		var ex: Throwable = Exception.new(tag, stack.popN(tag.sig.params), null);
 		if (Trace.stack) Trace.OUT
-			.put2("resume_throw %q %q ", tag.render, cont.render)
+			.put2("resume_throw %q @ contStack[addr=0x%x] ", tag.render, Pointer.atObject(contStack) - Pointer.NULL)
 			.put1("on stack[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
 
 		// search for handler in continuation
-		match (cont.top.throw(ex)) {
+		match (contStack.throw(ex)) {
 			Handled(handler) => {
 				X86_64Stack.!(handler).state_ = StackState.RESUMABLE;
-				cont.top = handler;
-				stack.push(Value.Ref(cont));
+				handler.cont_bottom = contStack.cont_bottom;
+				stack.push(Value.Ref(Continuation.new(handler)));
 				return null;
 			}
 			Unhandled(t) => return runtime_THROW_REF(stack, t);
@@ -142,11 +142,12 @@ component X86_64Runtime {
 
 		// set up new stack configuration
 		var old_stack = curStack;
-		curStack = X86_64Stack.!(cont.bottom.parent);
+		var bottom = cont.stack.cont_bottom;
+		curStack = X86_64Stack.!(bottom.parent);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
 		curStack.push(Value.Ref(cont));
-		cont.bottom.parent = null;
+		bottom.parent = null;
 		if (Trace.stack) {
 			var ip = curStack.rsp.load<Pointer>();
 			Trace.OUT.put1("suspend called on curStack=0x%x:", Pointer.atObject(old_stack) - Pointer.NULL).ln();
@@ -178,12 +179,13 @@ component X86_64Runtime {
 		var vals = stack.popN(target_params[0 ... target_params.length - 1]);
 
 		if (target_cont == null) return stack.trap(TrapReason.NULL_DEREF);
-		if (target_cont.used) return stack.trap(TrapReason.USED_CONTINUATION);
-		target_cont.used = true;
+		if (target_cont.stack == null) return stack.trap(TrapReason.USED_CONTINUATION);
+		var target_stack = target_cont.stack;
+		target_cont.stack = null;
 
 		var this_cont = Runtime.unwindStackChain(stack, instance, tag_id, WasmStack.tryHandleSwitch);
 		if (this_cont == null) return stack.trap(TrapReason.INVALID_SUSPEND);
-		var prev = X86_64Stack.!(this_cont.bottom);
+		var prev = X86_64Stack.!(this_cont.stack.cont_bottom);
 		// set stack params arity
 		stack.params_arity = this_cont_decl.sig.params.length;
 		stack.state_ = StackState.SUSPENDED;
@@ -191,13 +193,13 @@ component X86_64Runtime {
 		stack.bind([]);
 
 		// overwrite {parent_rsp_ptr}
-		var bottom = X86_64Stack.!(target_cont.bottom);
+		var bottom = X86_64Stack.!(target_stack.cont_bottom);
 		bottom.parent = prev.parent;
 		bottom.parent_rsp_ptr.store<Pointer>(prev.parent_rsp_ptr.load<Pointer>());
 		// set up new stack configuration
 		prev.parent = null;
 		prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
-		curStack = X86_64Stack.!(target_cont.top);
+		curStack = X86_64Stack.!(target_stack);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
 		curStack.push(Value.Ref(this_cont));
