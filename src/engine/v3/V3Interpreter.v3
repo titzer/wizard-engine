@@ -166,6 +166,7 @@ class V3Interpreter extends WasmStack {
 			F64 => val = Values.F64_0;
 			V128 => val = Values.V128_0;
 			REF => val = Values.REF_NULL;
+			REF_U64 => val = Values.CONT_NULL;
 		}
 		values.pushn(val, int.!(count));
 	}
@@ -711,7 +712,8 @@ class V3Interpreter extends WasmStack {
 
 			REF_NULL => {
 				var index = codeptr.read_sleb32();
-				push(Values.REF_NULL);
+				if (index >= 0 && ContDecl.?(frame.func.instance.heaptypes[index])) push(Values.CONT_NULL);
+				else push(Values.REF_NULL);
 			}
 			REF_IS_NULL => {
 				var v = pop();
@@ -1218,12 +1220,12 @@ class V3Interpreter extends WasmStack {
 				var handlers = codeptr.read_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
-				var cont = popContinuation();
-				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
-				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
-				cont.used = true;
+				var cont = popCont();
+				if (cont.isNull()) return void(trap(TrapReason.NULL_DEREF));
+				if (!cont.isValid()) return void(trap(TrapReason.USED_CONTINUATION));
+				cont.consume();
 
-				cont.top.bind(popN(cont_type.sig.params));
+				cont.stack.bind(popN(cont_type.sig.params));
 				resumeContinuation(cont);
 				return; // skip setting frame.pc = codeptr.pos
 			}
@@ -1233,25 +1235,25 @@ class V3Interpreter extends WasmStack {
 				var handlers = codeptr.read_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
-				var cont = popContinuation();
-				if (cont == null) return void(trap(TrapReason.NULL_DEREF));
-				if (cont.used) return void(trap(TrapReason.USED_CONTINUATION));
-				cont.used = true;
+				var cont = popCont();
+				if (cont.isNull()) return void(trap(TrapReason.NULL_DEREF));
+				if (!cont.isValid()) return void(trap(TrapReason.USED_CONTINUATION));
+				cont.consume();
 
 				var tag = frame.func.instance.tags[tag_idx];
 				var ex: Throwable = Exception.new(tag, popN(tag.sig.params), null);
 				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
 
 				// search for handler in continuation
-				var top = V3Interpreter.!(cont.top);
+				var top = V3Interpreter.!(cont.stack);
 				top.frame.pc = top.suspend_pc;
-				match (cont.top.throw(ex)) {
+				match (cont.stack.throw(ex)) {
 					Handled(stack) => {
 						if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
 						var handler = V3Interpreter.!(stack);
 						handler.state_ = StackState.RESUMABLE;
-						cont.top = handler;
-						resumeContinuation(cont);
+						handler.cont_bottom = cont.stack.cont_bottom;
+						resumeContinuation(Continuation(handler, handler.version));
 						return; // skip setting frame.pc = codeptr.pos
 					}
 					Unhandled => {
@@ -1268,11 +1270,12 @@ class V3Interpreter extends WasmStack {
 				params_arity = tag.sig.results.length;
 
 				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSuspension);
-				if (cont == null) return void(trap(TrapReason.INVALID_SUSPEND));
-				var handler = V3Interpreter.!(cont.bottom.parent);
-				cont.bottom.parent = null;
+				if (cont.isNull()) return void(trap(TrapReason.INVALID_SUSPEND));
+				var bottom = cont.stack.cont_bottom;
+				var handler = V3Interpreter.!(bottom.parent);
+				bottom.parent = null;
 				handler.pushN(popN(tag.sig.params));
-				handler.push(Value.Ref(cont));
+				handler.push(Value.Cont(cont));
 				goto_stack = handler;
 				suspend_pc = frame.pc;
 			}
@@ -1285,9 +1288,10 @@ class V3Interpreter extends WasmStack {
 
 				var tag = frame.func.instance.tags[tag_idx];
 				var target_cont_decl = ContDecl.!(frame.func.instance.heaptypes[target_cont_idx]);
-				var target_cont = popContinuation();
-				if (target_cont == null) return void(trap(TrapReason.NULL_DEREF));
-				if (target_cont.used) return void(trap(TrapReason.USED_CONTINUATION));
+				var target_cont = popCont();
+				if (target_cont.isNull()) return void(trap(TrapReason.NULL_DEREF));
+				if (!target_cont.isValid()) return void(trap(TrapReason.USED_CONTINUATION));
+				target_cont.consume();
 
 				// -1 to exclude continuation parameter
 				var target_params = target_cont_decl.sig.params;
@@ -1300,15 +1304,14 @@ class V3Interpreter extends WasmStack {
 				params_arity = this_cont_decl.sig.params.length;
 
 				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSwitch);
-				if (cont == null) return void(trap(TrapReason.INVALID_SUSPEND));
-				var handler = V3Interpreter.!(cont.bottom.parent);
-				cont.bottom.parent = null;
+				if (cont.isNull()) return void(trap(TrapReason.INVALID_SUSPEND));
+				var handler = V3Interpreter.!(cont.stack.cont_bottom.parent);
+				cont.stack.cont_bottom.parent = null;
 
-				target_cont.used = true;
-				target_cont.bottom.parent = handler;
-				target_cont.top.bind(vals);
-				target_cont.top.bind([Value.Ref(cont)]);
-				goto_stack = V3Interpreter.!(target_cont.top);
+				target_cont.stack.cont_bottom.parent = handler;
+				target_cont.stack.bind(vals);
+				target_cont.stack.bind([Value.Cont(cont)]);
+				goto_stack = V3Interpreter.!(target_cont.stack);
 				suspend_pc = frame.pc;
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
@@ -1655,8 +1658,9 @@ class V3Interpreter extends WasmStack {
 	}
 	def resumeContinuation(cont: Continuation) {
 		state_ = StackState.CALL_CHILD;
-		cont.bottom.parent = this;
-		goto_stack = V3Interpreter.!(cont.top);
+		cont.stack.cont_bottom.parent = this;
+		cont.stack.cont_bottom = null;
+		goto_stack = V3Interpreter.!(cont.stack);
 	}
 	def throw(t: Throwable) -> ThrowResult {
 		if (Trace.stack) Trace.OUT.put1("throw on stack: %q", t.render).ln();
@@ -1744,7 +1748,7 @@ class V3Interpreter extends WasmStack {
 	def popObject() -> Object { return Value.Ref.!(values.pop()).val; }
 	def popArray() -> HeapArray { return HeapArray.!(Value.Ref.!(values.pop()).val); }
 	def popStruct() -> HeapStruct { return HeapStruct.!(Value.Ref.!(values.pop()).val); }
-	def popContinuation() -> Continuation { return Continuation.!(Value.Ref.!(values.pop()).val); }
+	def popCont() -> Continuation { return Value.Cont.!(values.pop()).cont; }
 	def push(val: Value) { values.push(val); }
 	def pushi(val: i32) { values.push(Value.I32(u32.view(val))); }
 	def pushi8(val: i8) { values.push(Value.I32(u32.view(val))); }
@@ -1781,6 +1785,7 @@ class V3Interpreter extends WasmStack {
 			BpTypeCode.F32.code => return Values.F32_0;
 			BpTypeCode.F64.code => return Values.F64_0;
 			BpTypeCode.V128.code => return Values.V128_0;
+			BpTypeCode.CONTREF.code => return Values.CONT_NULL;
 			_ => return Values.REF_NULL;
 		}
 	}
