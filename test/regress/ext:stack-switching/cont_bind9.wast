@@ -25,4 +25,3 @@
 
 (assert_return (invoke "main" (i64.const 22) (i32.const 44)) (i32.const -22))
 (assert_return (invoke "main" (i64.const -444) (i32.const 111)) (i32.const -555))
-

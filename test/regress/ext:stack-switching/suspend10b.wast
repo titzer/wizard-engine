@@ -26,4 +26,3 @@
 )
 
 (assert_return (invoke "main" (f32.const 11)) (f64.const 11))
-;; (assert_return (invoke "main" (f32.const -1144)) (f64.const -1144))

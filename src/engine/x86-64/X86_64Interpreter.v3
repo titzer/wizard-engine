@@ -569,6 +569,19 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.jmp_rel_near(shared_entry);
 		}
 
+		{ // Entry for the interpreter to handle a suspension from a child stack
+			ic.header.intSuspendEntryOffset = w.pos;
+			// Load runtime %sp and %vsp from the handling stack
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
+			// Restore interpreter registers
+			restoreCallerIVars();
+			restoreDispatchTableReg();
+			// Continue to dispatch table
+			endHandler();
+		}
+
 		{ // Re-entry for calls within the interpreter itself
 			asm.bind(callReentryLabel);
 			ic.header.intIntEntryOffset = w.pos;
@@ -647,7 +660,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
 		genConditionalJumpDeferred(C.NZ, genComplexTypeDecode(_, typeGpr));
-
+		
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
 		asm.d.cmp_r_i(numGpr, 0);
@@ -677,7 +690,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.test_m_i(r_func_decl.plus(offsets.FuncDecl_entry_probed), 1);
 			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
 		}
-
 		// Dispatch to first instruction.
 		genDispatchOrJumpToDispatch();
 
@@ -2432,6 +2444,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var cont = xenv.tmp1;
 			genPopInto(G(cont));
 			masm.emit_validate_and_consume_cont(cont);
+			var contStack = cont;
 
 			// move parameter values from %curStack to %cont.top
 			var r_nvals = cont_id; // reuse due to non-overlapping live ranges
@@ -2440,7 +2453,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_v3_ContDecl_sig_r_r(xenv.scratch, xenv.scratch);
 			masm.emit_v3_SigDecl_params_r_r(xenv.scratch, xenv.scratch);
 			masm.emit_v3_Array_length_r_r(r_nvals, xenv.scratch);
-			masm.emit_cont_mv(xenv.vsp, cont, r_nvals, xenv.tmp3, xenv.tmp4, xenv.xmm0);
+			masm.emit_cont_mv(xenv.vsp, contStack, r_nvals, xenv.tmp3, xenv.tmp4, xenv.xmm0);
 
 			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
 			var curStack = xenv.tmp4;
@@ -2449,17 +2462,16 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
 			// reserve space for call addr
 			asm.sub_m_i(G(curStack).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
-			masm.emit_chain_cont_to_parent(curStack, cont);
-			masm.emit_switch_curStack_to_cont(cont);
+			masm.emit_chain_cont_to_parent(curStack, contStack);
+			masm.emit_switch_curStack_to_cont(contStack);
 
 			asm.call_rel_far(stub_resume);
 			/* === CHILD STACK RUNNING === */
 			genOnResumeFinish(false);
 			endHandler();
 			asm.bind(stub_resume); {
-				// load new stack pointers
+				// load new stack pointer
 				masm.emit_get_curstack(curStack);
-				masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
 				masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
 				// pop address from new stack and go to it
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
@@ -2478,25 +2490,27 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var cont = xenv.tmp1;
 			genPopInto(G(cont));
 			masm.emit_validate_and_consume_cont(cont);
+			var contStack = cont;
 
 			var curStack = xenv.tmp4;
 			masm.emit_get_curstack(curStack);
 			callRuntime(
 				refRuntimeCall(X86_64RT.runtime_handle_resume_throw),
-				[G(curStack), r_instance, G(cont), G(tag_id)], true
+				[G(curStack), r_instance, G(contStack), G(tag_id)], true
 			);
 			restoreCallerIVars();
 			/* === only reachable when continuation handles the error === */
 			genPopInto(G(cont)); // XXX: make RT function return {Continuation} directly
+			masm.emit_v3_Continuation_stack_r_r(contStack, cont); // [contStack == cont] = cont.stack
 
-			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
+			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
 			masm.emit_get_curstack(curStack);
 			masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
 			// reserve space for call addr
 			asm.sub_m_i(G(curStack).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
-			masm.emit_chain_cont_to_parent(curStack, cont);
-			masm.emit_switch_curStack_to_cont(cont);
+			masm.emit_chain_cont_to_parent(curStack, contStack);
+			masm.emit_switch_curStack_to_cont(contStack);
 
 			asm.call_rel_far(stub_resume);
 			/* === CHILD STACK RUNNING === */
@@ -2505,7 +2519,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.bind(stub_resume); {
 				// load new stack pointers
 				masm.emit_get_curstack(curStack);
-				masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
 				masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
 				// pop address from new stack and go to it
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
@@ -2521,21 +2534,28 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(tag_index); // read tag index
 			masm.emit_get_curstack(xenv.tmp1);
 			callRuntime(refRuntimeCall(X86_64RT.runtime_handle_suspend), [r_tmp1, r_instance, tag_index], true);
+			// NOTE: at this point, %sp should be one address below the frame as {runtime_handle_suspend}
+			// is the only RT call that modifies {curStack} and pushes a dummy address so that the stored
+			// return address isn't popped off in {callRuntime}
 			asm.call_rel_far(suspendStub);
 			/* === PARENT STACK RUNNING === */
-			// skip pass {suspend} instruction after begin resumed
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
 			restoreCallerIVars();
+			// skip pass {suspend} instruction after restoring pc
 			genSkipLeb();
 			restoreDispatchTableReg();
 			endHandler();
 
 			asm.bind(suspendStub); {
+				// Load handler stack %sp and return to its suspension entry stub
 				asm.movq_r_m(r_scratch, m_curStack);
 				asm.movq_r_m(r_sp, r_scratch.plus(offsets.X86_64Stack_rsp));
-				asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
-				restoreCallerIVars();
-				restoreDispatchTableReg();
-				endHandler();
+				// Pop off the ret address as we are in fast-int mode and not RT calls anymore
+				masm.emit_pop_X86_64Stack_rsp_r_r(xenv.scratch);
+				// Pop address from parent stack and go to it
+				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+				masm.emit_jump_r(xenv.scratch);
 			}
 		}
 		bindHandler(Opcode.SWITCH); {
@@ -2553,6 +2573,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			/* === OTHER STACK RUNNING === */
 
 			// skip pass {switch} instruction after begin resumed
+			asm.movq_r_m(r_scratch, m_curStack);
+			asm.movq_r_m(r_vsp, r_scratch.plus(offsets.X86_64Stack_vsp));
 			restoreCallerIVars();
 			genSkipLeb();
 			genSkipLeb();
@@ -2597,23 +2619,34 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 					.put1("break *0x%x", (ic.start + pos) - Pointer.NULL)
 					.ln();
 			}
-			// call runtime to get the WhammProbe object
+			// Call runtime to get the WhammProbe object.
 			computeCurIpFromIp(-1);
 			computePcFromCurIp();
 			saveCallerIVars();
 			asm.movq_r_m(r_tmp0, m_wasm_func);
-			callRuntime(refRuntimeCall(X86_64RT.runtime_GET_LOCAL_PROBE), [r_tmp0, r_curpc], false);
+			callRuntime(refRuntimeCall(X86_64RT.runtime_GET_LOCAL_PROBE), [r_tmp0, r_curpc], false); // XXX: do inline
 
-			// jump to the trampoline
+			// Jump to the probe's signature-specific trampoline, which pushes WhammArgs and jumps back.
 			asm.movq_r_m(r_vsp, m_vsp);
 			masm.emit_mov_r_m(ValueKind.REF, xenv.func_arg, MasmAddr(xenv.runtime_ret0, masm.offsets.WhammProbe_func));
 			masm.emit_mov_r_m(ValueKind.REF, xenv.runtime_ret0, MasmAddr(xenv.runtime_ret0, masm.offsets.WhammProbe_trampoline));
 			masm.emit_jump_r(xenv.runtime_ret0);
 
-			// reentry point from the trampoline
+			// Reentry point from the trampoline.
+			// XXX: point empty trampolines to this address.
 			ic.header.whammReentryOffset = w.atEnd().pos;
+			// Call either the interpreter entrypoint or the target function's entrypoint.
+			if (SpcTuning.disable) {
+				asm.call_rel_far(callReentryLabel);
+			} else {
+				masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(xenv.func_arg, masm.getOffsets().WasmFunction_decl));
+				masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(xenv.scratch, masm.getOffsets().FuncDecl_target_code));
+				masm.emit_call_r(xenv.scratch);
+			}
+
 			restoreCallerIVars();
-			// Compute a pointer to the original code at this pc offset
+			restoreDispatchTableReg();
+			// Compute a pointer to the original code at this pc offset.
 			var pc = r_tmp1; // = IP - CODE
 			asm.movq_r_r(pc, r_ip);
 			asm.sub_r_m(pc, m_code);
@@ -2622,6 +2655,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
+			// Dispatch to the original bytecode at this pc.
 			genDispatch0(origIp.indirect(), dispatchTables[0].1, false);
 		}
 		// Specialized handler for breakpoint probe, issues int(3), which gdb sees as a signal.
@@ -2722,11 +2756,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		endHandler();
 
 		asm.bind(is_nan32);
-		asm.movd_m_i(vsph[-2].value, int.view(Floats.f_nan));
+		asm.movd_m_i(vsph[-2].value, int.view(FloatUtils.f_nan));
 		asm.jmp_rel_near(ret_a);
 
 		asm.bind(is_nan64);
-		asm.movd_m_i(vsph[-2].upper, int.view(Floats.d_nan >> 32));
+		asm.movd_m_i(vsph[-2].upper, int.view(FloatUtils.d_nan >> 32));
 		asm.movd_m_i(vsph[-2].value, 0);
 		asm.jmp_rel_near(ret_a);
 	}
@@ -3161,6 +3195,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdUnop_xxtmp_x(Opcode.V128_NOT, masm.emit_v128_not);
 		genSimdBinopCommute(Opcode.V128_ANDNOT, asm.andnps_s_s);
 		genSimdUnop_x_x(Opcode.I8X16_POPCNT, masm.emit_i8x16_popcnt(_, r_tmp0, r_xmm1, r_xmm2, r_xmm3));
+		bindHandler(Opcode.I8X16_RELAXED_LANESELECT);
+		bindHandler(Opcode.I16X8_RELAXED_LANESELECT);
+		bindHandler(Opcode.I32X4_RELAXED_LANESELECT);
+		bindHandler(Opcode.I64X2_RELAXED_LANESELECT);
 		bindHandler(Opcode.V128_BITSELECT); {
 			// v128.bitselect(v1: v128, v2: v128, c: v128) -> v128
 			// Use the bits in the control mask c to select the corresponding bit
@@ -3256,8 +3294,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.I16X8_ADD_SAT_U, asm.paddusw_s_s);
 		genSimdBinop(Opcode.I16X8_SUB_SAT_S, asm.psubsw_s_s);
 		genSimdBinop(Opcode.I16X8_SUB_SAT_U, asm.psubusw_s_s);
-		genSimdBinop(Opcode.I16X8_Q15MULRSAT_S, masm.emit_i16x8_q15mulrsat_s(_, _, r_xmm2));
-		genSimdBinop(Opcode.I16X8_RELAXED_Q15MULR_S, masm.emit_i16x8_q15mulrsat_s(_, _, r_xmm2));
+		genSimdBinops([Opcode.I16X8_Q15MULRSAT_S, Opcode.I16X8_RELAXED_Q15MULR_S], masm.emit_i16x8_q15mulrsat_s(_, _, r_xmm2));
 		genSimdBinop(Opcode.I16X8_EXTMUL_LOW_I8X16_S, masm.emit_i16x8_extmul_low(_, _, r_xmm2, true));
 		genSimdBinop(Opcode.I16X8_EXTMUL_LOW_I8X16_U, masm.emit_i16x8_extmul_low(_, _, r_xmm2, false));
 		genSimdBinop(Opcode.I16X8_EXTMUL_HIGH_I8X16_S, masm.emit_i16x8_extmul_high_s(_, _, r_xmm2));
@@ -3311,10 +3348,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.F32X4_DIV, asm.divps_s_s);
 		genSimdBinop(Opcode.F32X4_EQ, asm.cmpeqps_s_s);
 		genSimdBinop(Opcode.F32X4_NE, asm.cmpneqps_s_s);
-		genSimdBinop(Opcode.F32X4_MIN, masm.emit_f32x4_min(_, _, r_xmm2));
-		genSimdBinop(Opcode.F32X4_RELAXED_MIN, masm.emit_f32x4_min(_, _, r_xmm2));
-		genSimdBinop(Opcode.F32X4_MAX, masm.emit_f32x4_max(_, _, r_xmm2));
-		genSimdBinop(Opcode.F32X4_RELAXED_MAX, masm.emit_f32x4_max(_, _, r_xmm2));
+		genSimdBinops([Opcode.F32X4_MIN, Opcode.F32X4_RELAXED_MIN], masm.emit_f32x4_min(_, _, r_xmm2));
+		genSimdBinops([Opcode.F32X4_MAX, Opcode.F32X4_RELAXED_MAX], masm.emit_f32x4_max(_, _, r_xmm2));
 		genSimdBinop(Opcode.F32X4_LT, asm.cmpltps_s_s);
 		genSimdBinop(Opcode.F32X4_LE, asm.cmpleps_s_s);
 		genSimdBinopCommute(Opcode.F32X4_PMIN, asm.minps_s_s);
@@ -3327,10 +3362,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.F64X2_DIV, asm.divpd_s_s);
 		genSimdBinop(Opcode.F64X2_EQ, asm.cmpeqpd_s_s);
 		genSimdBinop(Opcode.F64X2_NE, asm.cmpneqpd_s_s);
-		genSimdBinop(Opcode.F64X2_MIN, masm.emit_f64x2_min(_, _, r_xmm2));
-		genSimdBinop(Opcode.F64X2_RELAXED_MIN, masm.emit_f64x2_min(_, _, r_xmm2));
-		genSimdBinop(Opcode.F64X2_MAX, masm.emit_f64x2_max(_, _, r_xmm2));
-		genSimdBinop(Opcode.F64X2_RELAXED_MAX, masm.emit_f64x2_max(_, _, r_xmm2));
+		genSimdBinops([Opcode.F64X2_MIN, Opcode.F64X2_RELAXED_MIN], masm.emit_f64x2_min(_, _, r_xmm2));
+		genSimdBinops([Opcode.F64X2_MAX, Opcode.F64X2_RELAXED_MAX], masm.emit_f64x2_max(_, _, r_xmm2));
 		genSimdBinop(Opcode.F64X2_LT, asm.cmpltpd_s_s);
 		genSimdBinop(Opcode.F64X2_LE, asm.cmplepd_s_s);
 		genSimdBinopCommute(Opcode.F64X2_PMIN, asm.minpd_s_s);
@@ -3379,10 +3412,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdUnop_xx_x(Opcode.F64X2_CONVERT_LOW_I32X4_S, asm.cvtdq2pd_s_s);
 		genSimdUnop_xx_x(Opcode.F64X2_PROMOTE_LOW_F32X4, asm.cvtps2pd_s_s);
 		genSimdUnop_xx_x(Opcode.F32X4_DEMOTE_F64X2_ZERO, asm.cvtpd2ps_s_s);
-		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F32X4_S, masm.emit_i32x4_trunc_sat_f32x4_s(_, r_xmm1));
-		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F32X4_U, masm.emit_i32x4_trunc_sat_f32x4_u(_, r_xmm1, r_xmm2));
-		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F64X2_S_ZERO, masm.emit_i32x4_trunc_sat_f64x2_s_zero(_, r_tmp0, r_xmm1, r_xmm2));
-		genSimdUnop_x_x(Opcode.I32X4_TRUNC_SAT_F64X2_U_ZERO, masm.emit_i32x4_trunc_sat_f64x2_u_zero(_, r_tmp0, r_xmm1, r_xmm2));
+		genSimdUnops_x_x([Opcode.I32X4_RELAXED_TRUNC_F32X4_S, Opcode.I32X4_TRUNC_SAT_F32X4_S], masm.emit_i32x4_trunc_sat_f32x4_s(_, r_xmm1));
+		genSimdUnops_x_x([Opcode.I32X4_RELAXED_TRUNC_F32X4_U, Opcode.I32X4_TRUNC_SAT_F32X4_U], masm.emit_i32x4_trunc_sat_f32x4_u(_, r_xmm1, r_xmm2));
+		genSimdUnops_x_x([Opcode.I32X4_RELAXED_TRUNC_F64X2_S_ZERO, Opcode.I32X4_TRUNC_SAT_F64X2_S_ZERO], masm.emit_i32x4_trunc_sat_f64x2_s_zero(_, r_tmp0, r_xmm1, r_xmm2));
+		genSimdUnops_x_x([Opcode.I32X4_RELAXED_TRUNC_F64X2_U_ZERO, Opcode.I32X4_TRUNC_SAT_F64X2_U_ZERO], masm.emit_i32x4_trunc_sat_f64x2_u_zero(_, r_tmp0, r_xmm1, r_xmm2));
 		genSimdUnop_xxtmp_x(Opcode.F64X2_CONVERT_LOW_I32X4_U, masm.emit_f64x2_convert_low_i32x4_u(_, r_tmp0, _));
 		genSimdUnop_x_x(Opcode.I16X8_EXTEND_HIGH_I8X16_S, masm.emit_i16x8_s_convert_i8x16_high);
 		genSimdUnop_x_x(Opcode.I32X4_EXTEND_HIGH_I16X8_S, masm.emit_i32x4_s_convert_i16x8_high);
@@ -3441,9 +3474,49 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			decrementVsp();
 			endHandler();
 		}
+		// Relaxed multiply-add instructions.
+		genSimdMultiplyAdd(Opcode.F32X4_RELAXED_MADD, false, false);
+		genSimdMultiplyAdd(Opcode.F32X4_RELAXED_NMADD, false, true);
+		genSimdMultiplyAdd(Opcode.F64X2_RELAXED_MADD, true, false);
+		genSimdMultiplyAdd(Opcode.F64X2_RELAXED_NMADD, true, true);
+		// Relaxed dot products.
+		genSimdBinopCommute(Opcode.I16X8_RELAXED_DOT_I8X16_I7X16_S, asm.pmaddubsw_s_s);
+		bindHandler(Opcode.I32X4_RELAXED_DOT_I8X16_I7X16_ADD_S); {
+			asm.movdqu_s_m(r_xmm0, vsph[-3].value); // a
+			asm.movdqu_s_m(r_xmm1, vsph[-2].value); // b
+			asm.movdqu_s_m(r_xmm2, vsph[-1].value); // c
+			asm.pmaddubsw_s_s(r_xmm1, r_xmm0);
+			masm.load_v128_mask(r_xmm0, masm.mask_i16x8_splat_0x0001, r_tmp0);
+			asm.pmaddwd_s_s(r_xmm0, r_xmm1);
+			asm.paddd_s_s(r_xmm2, r_xmm0);
+			asm.movdqu_m_s(vsph[-3].value, r_xmm2);
+			adjustVsp(-2);
+			endHandler();
+		}
+	}
+	def genSimdMultiplyAdd(op: Opcode, is64: bool, isNeg: bool) {
+		bindHandler(op);
+		asm.movdqu_s_m(r_xmm0, vsph[-3].value); // a
+		asm.movdqu_s_m(r_xmm1, vsph[-2].value); // b
+		asm.movdqu_s_m(r_xmm2, vsph[-1].value); // c
+		if (is64) {
+			asm.mulpd_s_s(r_xmm0, r_xmm1);
+			if (isNeg) asm.subpd_s_s(r_xmm2, r_xmm0);
+			else asm.addpd_s_s(r_xmm2, r_xmm0);
+		} else {
+			asm.mulps_s_s(r_xmm0, r_xmm1);
+			if (isNeg) asm.subps_s_s(r_xmm2, r_xmm0);
+			else asm.addps_s_s(r_xmm2, r_xmm0);
+		}
+		asm.movdqu_m_s(vsph[-3].value, r_xmm2);
+		adjustVsp(-2);
+		endHandler();
 	}
 	def genSimdBinop<T>(opcode: Opcode, f: (X86_64Xmmr, X86_64Xmmr) -> T) {
-		bindHandler(opcode);
+		genSimdBinops([opcode], f);
+	}
+	def genSimdBinops<T>(opcodes: Array<Opcode>, f: (X86_64Xmmr, X86_64Xmmr) -> T) {
+		for (opcode in opcodes) bindHandler(opcode);
 		asm.movdqu_s_m(r_xmm0, vsph[-2].value);
 		asm.movdqu_s_m(r_xmm1, vsph[-1].value);
 		f(r_xmm0, r_xmm1);
@@ -3468,7 +3541,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		endHandler();
 	}
 	def genSimdUnop_x_x<T>(opcode: Opcode, f: (X86_64Xmmr) -> T) {
-		bindHandler(opcode);
+		genSimdUnops_x_x([opcode], f);
+	}
+	def genSimdUnops_x_x<T>(opcodes: Array<Opcode>, f: (X86_64Xmmr) -> T) {
+		for (opcode in opcodes) bindHandler(opcode);
 		asm.movdqu_s_m(r_xmm0, vsph[-1].value);
 		f(r_xmm0);
 		asm.movdqu_m_s(vsph[-1].value, r_xmm0);
@@ -4087,15 +4163,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	// generates cleanup code for after a child stack returns
 	private def genOnResumeFinish(skip_tag: bool) {
-		// check for error (in %rax)
-		var done = X86_64Label.new();
-		asm.q.cmp_r_i(r_ret_throw, 0);
-		asm.jc_rel_near(X86_64Conds.Z, done);
-		masm.emit_get_curstack(xenv.tmp0);
-		masm.emit_mov_r_r(ValueKind.REF, xenv.tmp1, xenv.ret_throw);
-		callRuntime(refRuntimeCall(X86_64RT.runtime_THROW_REF), [r_tmp0, r_tmp1], true);
-
-		asm.bind(done);
 		restoreCallerIVars();
 		restoreDispatchTableReg();
 		var r_stack = r_tmp1;

@@ -40,6 +40,7 @@ fi
 function run_test() {
     pushd $T >> /dev/null
 
+    # TODO: rely on .wasm files existing; don't compile
     if [ -z $TEST_FILE ]; then
         for file in "$TEST_DIR"/*.v3; do
           if [ -f "$file" ]; then

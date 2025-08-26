@@ -135,14 +135,14 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 		seen_sections[kind.code] = true;
 		seen_section = kind.tag;
 	}
-	def beginCodeSection(addr: u64, count: u32) {
+	def beginCodeSection(addr: u64, count: u32, size: u32) {
 		var kind = BpSection.Code;
 		enforceSectionOrder(kind, addr);
 		if (count != declared_func_count) {
 			// TODO: count >= remaining_func_count ?
 			err.abs(addr).FuncCountMismatch(declared_func_count, count);
 		}
-		if (tiering != null) tiering.onCodeSectionStart(module, count, 0); // TODO: size
+		if (tiering != null) tiering.onCodeSectionStart(module, count, size);
 	}
 	def readCustomSection(size: u32) {
 		var start = decoder.pos;
@@ -222,7 +222,7 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 		var r = validator.validateInitExpr(sig, decoder);
 		match (r) {
 			Ok => return validator.init_stack.pop();
-			_ => return InitExpr.I32(0); // TODO: return invalid initexpr?
+			_ => return InitExpr.I32(0);
 		}
 	}
 	def readTableDecl(index: int) {
@@ -471,7 +471,9 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 			BpImportExportKind.Tag.code => {
 				reserveOne(pt, "tags", module.tags, limits.max_num_tags);
 				var b = parser.readByte("attribute", BpConstants.renderAttribute);
+				var sig_pt = decoder.pos;
 				var sig_index = parser.readSigIndex();
+				checkTagResults(sig_pt, sig_index);
 				decl = TagDecl.new(sig_index);
 				if (outline != null) outline.tags.offsets.put(-1 - index);
 			}
@@ -503,6 +505,9 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 		var sig_index = parser.readSigIndex();
 		var decl = TagDecl.new(sig_index);
 		module.addDecl(decl);
+		checkTagResults(pt, sig_index);
+	}
+	def checkTagResults(pt: int, sig_index: int) {
 		if (u32.view(sig_index) < module.heaptypes.length) {
 			var sig = SigDecl.!(module.heaptypes[sig_index]);
 			if (sig.results.length > 0 && !extensions.STACK_SWITCHING) {
@@ -696,8 +701,8 @@ class BinParser(extensions: Extension.set, limits: Limits, err: ErrorGen, filena
 // module is finished.
 class BpFsm extends WasmParser {
 	def callback: BpFsmCallback;
-	var section_decoder: DataReader;
-	var function_decoder: DataReader;
+	def section_decoder = DataReader.new(null);
+	def function_decoder = DataReader.new(null);
 
 	// Internal state
 	var state: BpFsmState;
@@ -716,11 +721,12 @@ class BpFsm extends WasmParser {
 	new(extensions: Extension.set, limits: Limits, err: ErrorGen, callback: BpFsmCallback)
 			super(extensions, limits, callback.module,
 				err,
-				Decoder.new(null, err)) {
+				DataReader.new(null)) {
 		decoder.onEOF = eof_set_flag;
-		section_decoder = Decoder.new(null, err);
+		decoder.onError = err.onDataReaderError;
+		section_decoder.onError = err.onDataReaderError;
 		section_decoder.onEOF = eof_is_section_overflow;
-		function_decoder = Decoder.new(null, err);
+		function_decoder.onError = err.onDataReaderError;
 		function_decoder.onEOF = eof_is_function_overflow;
 	}
 
@@ -753,11 +759,6 @@ class BpFsm extends WasmParser {
 	}
 	private def advance() {
 		current_pos = decoder.pos;
-		if (Trace.binparse) {
-// TODO: this is debug code, not tracing code
-//			Trace.OUT.put3("@+%d [%d bytes] BpFsm.state=%s", decoder.addr(),
-//				decoder.available(), state.name).ln();
-		}
 		match (state) {
 			MAGIC => {
 				if (Trace.binparse) Trace.OUT.puts("======== begin module ========").ln();
@@ -801,7 +802,7 @@ class BpFsm extends WasmParser {
 						function_body_start = decoder.addr();
 						current_function_body = 0;
 						state = BpFsmState.BODY;
-						callback.beginCodeSection(function_body_start, function_body_count);
+						callback.beginCodeSection(function_body_start, function_body_count, section_size);
 					}
 					_ => {
 						decoder.sub_bytes(section_decoder, int.!(section_size));
@@ -871,7 +872,7 @@ class BpFsm extends WasmParser {
 // The callbacks for sections, function bodies, and finishing a module.
 class BpFsmCallback(module: Module) {
 	def decodeSection(kind: BpSection, size: u32, d: DataReader);
-	def beginCodeSection(addr: u64, count: u32) {}
+	def beginCodeSection(addr: u64, count: u32, size: u32) {}
 	def decodeFunctionBody(index: u32, size: u32, d: DataReader);
 }
 // The states for the module parser finite state machine.
@@ -914,6 +915,7 @@ type ValueTypeCode(code: i8, index: i32) #unboxed {
 			BpTypeCode.ARRAYREF.val => return ValueTypes.ARRAYREF;
 			BpTypeCode.EXNREF.val => return ValueTypes.EXNREF;
 			BpTypeCode.NULLREF.val => return ValueTypes.NULLREF;
+			BpTypeCode.CONTREF.val => return ValueTypes.CONTREF;
 			_ => return fail();
 		}
 	}
@@ -946,7 +948,23 @@ type ValueTypeCode(code: i8, index: i32) #unboxed {
 			_ => return fail();
 		}
 	}
-	def toAbstractValueKind() -> ValueKind {
+	def toHeapType() -> HeapType {
+		match (index) {
+			BpTypeCode.FUNCREF.val => return ValueTypes.FUNCREF.heap;
+			BpTypeCode.EXTERNREF.val => return ValueTypes.EXTERNREF.heap;
+			BpTypeCode.ANYREF.val => return ValueTypes.ANYREF.heap;
+			BpTypeCode.EQREF.val => return ValueTypes.EQREF.heap;
+			BpTypeCode.STRUCTREF.val => return ValueTypes.STRUCTREF.heap;
+			BpTypeCode.I31REF.val => return ValueTypes.I31REF.heap;
+			BpTypeCode.NULLFUNCREF.val => return ValueTypes.NULLFUNCREF.heap;
+			BpTypeCode.NULLEXTERNREF.val => return ValueTypes.NULLEXTERNREF.heap;
+			BpTypeCode.ARRAYREF.val => return ValueTypes.ARRAYREF.heap;
+			BpTypeCode.EXNREF.val => return ValueTypes.EXNREF.heap;
+			BpTypeCode.NULLREF.val => return ValueTypes.NULLREF.heap;
+			_ => return fail();
+		}
+	}
+	def toValueKind(instance: Instance) -> ValueKind {
 		match (code) {
 			BpTypeCode.I32.val => return ValueKind.I32;
 			BpTypeCode.I64.val => return ValueKind.I64;
@@ -968,25 +986,6 @@ type ValueTypeCode(code: i8, index: i32) #unboxed {
 			BpTypeCode.NULLREF.val => return ValueKind.REF;
 			_ => return fail();
 		}
-	}
-	def toHeapType() -> HeapType {
-		match (index) {
-			BpTypeCode.FUNCREF.val => return ValueTypes.FUNCREF.heap;
-			BpTypeCode.EXTERNREF.val => return ValueTypes.EXTERNREF.heap;
-			BpTypeCode.ANYREF.val => return ValueTypes.ANYREF.heap;
-			BpTypeCode.EQREF.val => return ValueTypes.EQREF.heap;
-			BpTypeCode.STRUCTREF.val => return ValueTypes.STRUCTREF.heap;
-			BpTypeCode.I31REF.val => return ValueTypes.I31REF.heap;
-			BpTypeCode.NULLFUNCREF.val => return ValueTypes.NULLFUNCREF.heap;
-			BpTypeCode.NULLEXTERNREF.val => return ValueTypes.NULLEXTERNREF.heap;
-			BpTypeCode.ARRAYREF.val => return ValueTypes.ARRAYREF.heap;
-			BpTypeCode.EXNREF.val => return ValueTypes.EXNREF.heap;
-			BpTypeCode.NULLREF.val => return ValueTypes.NULLREF.heap;
-			_ => return fail();
-		}
-	}
-	def toConcreteValueKind(instance: Instance) -> ValueKind {
-		return toAbstractValueKind();
 	}
 	def fail<T>() -> T {
 		var d: T;

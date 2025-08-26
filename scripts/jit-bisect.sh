@@ -66,12 +66,12 @@ count_funcs "$@"
 min=$MIN_FUNC
 max=$MAX_FUNC
 
-# TODO: -jit-filter is inclusive of the end. Fix.
+# TODO: --jit-filter is inclusive of the end. Fix.
 while (( min < max )); do
     mid=$(( (min + max) / 2 ))
 
     # Check lower half
-    FILTER="-jit-filter=#${min}...${mid}"
+    FILTER="--jit-filter=#${min}...${mid}"
     printf "Testing %s " "$FILTER"
 
     F="$T/jit-#${min}...${mid}"
