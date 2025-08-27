@@ -230,8 +230,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
 				resolver.addMove((slot, tv), (slot, fv));
 			}
-			resolver.emitMoves();
 			emit_reload_regs();
+			resolver.emitMoves();
 
 			masm.emit_br(info.dest_label);
 		}
@@ -1372,7 +1372,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var top = popReg();
 		var cont = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_r(ValueKind.REF, cont, top.reg);
-		masm.emit_validate_and_consume_cont(cont);
+		masm.emit_validate_and_consume_cont(cont); // [contStack == cont] = cont.stack
+		var contStack = cont;
 
 		// transfer params to child stack
 		// XXX: not necessary to store the entire value stack to memory
@@ -1386,7 +1387,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// call to transfer
 		emit_compute_vsp(regs.vsp, state.sp);
 		masm.emit_mov_r_i(nvals, cont_decl.sig.params.length);
-		masm.emit_cont_mv(vsp, cont, nvals, tmp0, tmp1, tmp2);
+		masm.emit_cont_mv(vsp, contStack, nvals, tmp0, tmp1, tmp2);
 		dropN(u32.!(cont_decl.sig.params.length));
 		state.emitRestoreAll(resolver);
 
@@ -1399,8 +1400,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
  
 		// reserve space for call addr
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-		masm.emit_chain_cont_to_parent(curStack, cont);
-		masm.emit_switch_curStack_to_cont(cont);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
 
 		masm.emit_call_label(stub_resume);
 		/* === CHILD STACK RUNNING === */
@@ -1412,15 +1412,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// skip {stub_resume}
 		masm.emit_br(end);
-		masm.bindLabel(stub_resume); {
-			// load new stack pointers
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
-			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
-			// pop address from new stack and go to it
-			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-			masm.emit_jump_r(xenv.scratch);
-		}
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
 		masm.bindLabel(end);
 	}
 	def visit_SUSPEND(tag_index: u31) {
@@ -1533,6 +1526,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var curStack = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
 		masm.emit_validate_and_consume_cont(cont);
+		var contStack = cont;
 
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1554,20 +1548,20 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
 		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+		masm.emit_v3_Continuation_stack_r_r(contStack, cont); // [contStack == cont] = cont.stack
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
 
-		// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
+		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
 		masm.emit_get_curstack(curStack);
 		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
  
 		// reserve space for call addr
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-		masm.emit_chain_cont_to_parent(curStack, cont);
-		masm.emit_switch_curStack_to_cont(cont);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
 
 		masm.emit_call_label(stub_resume);
 		/* === CHILD STACK RUNNING === */
@@ -1579,15 +1573,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// skip {stub_resume}
 		masm.emit_br(end);
-		masm.bindLabel(stub_resume); {
-			// load new stack pointers
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, curStack);
-			masm.emit_v3_X86_64Stack_rsp_r_r(xenv.sp, curStack);
-			// pop address from new stack and go to it
-			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-			masm.emit_jump_r(xenv.scratch);
-		}
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
 		masm.bindLabel(end);
 	}
 	private def checkForConstNull(sv: SpcVal) -> bool {
@@ -2309,6 +2296,44 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		return SpcVal(sv.flags | IN_REG, reg, sv.const);
 	}
+	// Pop the top of stack into a register and prepare for it to be reused at {delta} slots.
+	def popRegToReuse(delta: int) -> SpcVal {
+		var sv = state.pop(), tos = int.!(state.sp);
+		if (regAlloc.frequency(sv.reg) == 1) {
+			regAlloc.reassign(sv.reg, tos, tos + delta);
+			return sv; // can reuse reg immediately
+		}
+		var kind = sv.kind();
+		var reg = allocReg(kind, u32.!(tos + delta));
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
+			regAlloc.unassign(sv.reg, tos);
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
+	// Pop the top of stack into a register, but only temporarily, as it will be clobbered.
+	def popTmpReg() -> SpcVal {
+		var sv = state.pop(), reg = sv.reg;
+		if (regAlloc.frequency(reg) == 1) { // can use register as a temporary
+			regAlloc.reassign(reg, int.!(state.sp), TMP_SLOT);
+			unrefLater(reg, TMP_SLOT);
+			return sv;
+		}
+		var kind = sv.kind();
+		reg = allocTmp(kind);
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
 	// Spill a register to its slot(s), if it has been allocated.
 	def spillRegAndFree(reg: Reg) {
 		regAlloc.forEachAssignment(reg, emitSpill); // XXX: iterate assignment list directly?
@@ -2560,7 +2585,12 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
+			regAlloc.clear();
 			sp = ctl.val_stack_top;
+			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
+				var sv = state[i];
+				if ((sv.flags & IN_REG) != 0) state[i] = SpcVal(sv.flags & ~IN_REG, NO_REG, 0);
+			}
 			for (r in ctl.results) {
 				push(typeToKindFlags(r) | IS_STORED | TAG_STORED | IS_CONST, NO_REG, 0);
 			}
@@ -2670,6 +2700,8 @@ class SpcState(regAlloc: RegAlloc) {
 		if (sp >= state.length) grow(8 + state.length * 2);
 		state[sp] = v;
 		this.sp++;
+		// TODO: check that if .reg is non-zero, IN_REG is true
+		// TODO: check that if .reg is non-zero, regalloc assignment includes top of stack
 	}
 	def get(slot: u32) -> SpcVal {
 		return state[slot];
@@ -2714,10 +2746,6 @@ class SpcState(regAlloc: RegAlloc) {
 	}
 	def setUnreachable() {
 		ctl_stack.peek().reachable = false;
-	}
-	def setNoReg(slot: u32) {
-		var b = state[slot];
-		state[slot] = SpcVal(b.flags & ~IN_REG, NO_REG, b.const);
 	}
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);

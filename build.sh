@@ -115,7 +115,7 @@ PREGEN=${PREGEN:=1}
 
 LANG_OPTS="-fun-exprs -simple-bodies"
 if [ "$REDEFS" != "" ]; then
-    V3C_OPTS=-redef-field=$REDEFS
+    V3C_OPTS="$V3C_OPTS -redef-field=$REDEFS"
 fi
 
 # build

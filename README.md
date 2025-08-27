@@ -25,9 +25,9 @@ Newer features are under development and vary in their support in the different 
 | extended-const  | &#x2705; | &#x2705; | &#x2705; | &#x2705; |
 | legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
 | exception-handling  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
-| relaxed-simd |  &#x2705; |  &#x2705; | &#9745; | &#9745; |
+| relaxed-simd |  &#x2705; |  &#x2705; | &#x2705; | &#x2705; |
 | custom-page-sizes  | &#x2705;| &#x2705; |  |  |
-| stack-switching  | &#x2705;| &#x2705; | &#x2705; |  |
+| stack-switching  | &#x2705;| &#x2705; | &#x2705; |  &#x2705; |
 | threads  | &#x2705;| &#9745; | &#9745; |  |
 | memory64 | &#x2705;| &#x2705; | | |
 

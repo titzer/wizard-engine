@@ -1,0 +1,284 @@
+// Copyright 2024 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def unused_ = HostModuleBuilderOf<WaliInstance>.new("wali", WaliInstance.new, WaliInstance.bind)
+	.func_iii_l	("SYS_read", 			fun i => i.read)
+	.func_iii_l	("SYS_write", 			fun i => i.write)
+	.func_iii_l	("SYS_open", 			fun i => i.open)
+	.func_i_l	("SYS_close", 			fun i => i.close)
+	.func_i_l	("SYS_dup", 			fun i => i.dup)
+	.func_ii_l	("SYS_dup2",			fun i => i.dup2)
+	.func_iii_l	("SYS_dup3",			fun i => i.dup3)
+	.func_ii_l	("SYS_stat",			fun i => i.stat)
+	.func_ili_l	("SYS_lseek",			fun i => i.lseek)
+	.func_i_l	("SYS_exit",			fun i => i.exit)
+	.func_i_l	("SYS_exit_group",		fun i => i.exit_group)
+	.func_v_l	("SYS_fork",			fun i => i.fork)
+	.func_ii_l	("SYS_access",			fun i => i.access)
+	.func_iii_l	("SYS_sched_getaffinity",	fun i => i.sched_getaffinity)
+	.func_i_l	("SYS_set_tid_address",		fun i => i.set_tid_address)
+	.func_iiiiil_l	("SYS_mmap",			fun i => i.mmap)
+	.func_iii_l	("SYS_fcntl",			fun i => i.fcntl)
+	.func_i_l	("SYS_sysinfo",			fun i => i.sysinfo)
+	.func_i_l	("SYS_brk",			fun i => i.brk)
+	.func_iiii_l	("SYS_prlimit64",		fun i => i.prlimit64)
+	.func_ii_l	("SYS_getrlimit",		fun i => i.getrlimit)
+	.func_iii_l	("SYS_mprotect",		fun i => i.mprotect)
+	.func_iiiii_l	("SYS_mremap",			fun i => i.mremap)
+	.func_ii_l	("SYS_munmap",			fun i => i.munmap)
+	.func_ii_l	("SYS_fstat",			fun i => i.fstat)
+	.func_iiii_l	("SYS_fstatat",			fun i => i.fstatat)
+	.func_ii_l	("SYS_lstat",			fun i => i.lstat)
+	.func_iii_l	("SYS_writev",			fun i => i.writev)
+	.func_iii_l	("SYS_ioctl",			fun i => i.ioctl)
+	.func_iiiiii_l	("SYS_futex",			fun i => i.futex)
+	.func_iiii_l	("SYS_rt_sigprocmask",		fun i => i.rt_sigprocmask)
+	.func_ii_l	("SYS_tkill",			fun i => i.tkill)
+	.func_iiii_l	("SYS_rt_sigaction",		fun i => i.rt_sigaction)
+	.func_ii_l	("__wasm_init_memory",		fun i => i.wasm_init_memory)
+	.func_v_i	("__cl_get_argc",		fun i => i.cl_get_argc)
+	.func_i_i	("__cl_get_argv_len",		fun i => i.cl_get_argv_len)
+	.func_ii_i	("__cl_copy_argv",		fun i => i.cl_copy_argv)
+	.func_v_v	("__call_ctors",		fun i => i.call_ctors)
+	.func_v_v	("__call_dtors",		fun i => i.call_dtors)
+	.func_u_vr	("__proc_exit",			fun i => i.proc_exit)
+	.func_ii_i	("__get_init_envfile",		fun i => i.get_init_envfile)
+	.init(WaliInstance.init)
+	.getMain(WaliInstance.getMain)
+	.register(true);
+
+def TODO_ZERO = 0;
+def TODO_EMPTY = ();
+def TODO_UNIMPLEMENTED: long = WaliErrno.ENOSYS.code; // returned for any unimplemented call.
+
+// Implements the "wali" module interface as a host module.
+class WaliInstance {
+	private var memory: Memory;
+	private def fdmap = FileDescriptorMap.new(1000); // per-instance: fd table
+	private var cmdline_args: Array<string>; // global: environment
+	private var cmdline_env: Array<string>; // global: environment, TODO
+	private var trace: bool;
+
+	def bind(instance: Instance) {
+		memory = instance.findExportOfType<Memory>(null);
+	}
+	def init(args: Array<string>, t: bool, err: ErrorGen) {
+		cmdline_args = args;
+		trace = t;
+	}
+	def getMain(instance: Instance) -> (Function, Array<Value>) {
+		var main = instance.findExportOfType<Function>(GlobMatcher.new("_start"));
+		if (main == null) {
+			for (iex in instance.exports) {
+				match (iex) {
+					x: Function => {
+						// If more than one exported function, don't know
+						if (main != null) return (null, null);
+						main = x;
+					}
+				}
+			}
+		}
+		if (main == null) return (null, null);
+		if (Arrays.equal(main.sig.params, SigCache.arr_i)) return (main, [Values.box_i(cmdline_args.length)]);
+		return (main, Arrays.map(main.sig.params, Values.default));
+	}
+	def getPath(ptr: u32) -> MaybeTrap<Range<byte>> {
+		if (memory == null) return MaybeTrap(null, TrapReason.MEM_OUT_OF_BOUNDS);
+		return memory.range_o_32z(ptr, u32.!(LinuxConst.MAXPATHLEN));
+	}
+	def getRegion(buf: int, len: int) -> MaybeTrap<Range<byte>> {
+		if (memory == null) return MaybeTrap(null, TrapReason.MEM_OUT_OF_BOUNDS);
+		return memory.range_ol_32(u32.view(buf), u32.view(len));
+	}
+
+	//========================================================================================
+	// Implementations of exported host functions.
+	//========================================================================================
+	def read(fd: int, buf: int, len: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var region = getRegion(buf, len);
+		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		return Linux.syscall(LinuxConst.SYS_read, (sys_fd, Pointer.atContents(region.result), len)).0;
+	}
+	//========================================================================================
+	def write(fd: int, buf: int, len: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var region = getRegion(buf, len);
+		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		return Linux.syscall(LinuxConst.SYS_write, (sys_fd, Pointer.atContents(region.result), len)).0;
+	}
+	//========================================================================================
+	def open(path: int, flags: int, mode: int) -> long {
+		var region = getPath(u32.view(path));
+		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		var r = Linux.syscall(LinuxConst.SYS_open, (Pointer.atContents(region.result), flags, mode)).0;
+		if (r < 0) return r;
+		var fd = fdmap.alloc();
+		fdmap.set(fd, int.!(r));
+		return fd;
+	}
+	//========================================================================================
+	def close(fd: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		fdmap.free(fd);
+		return Linux.syscall(LinuxConst.SYS_close, sys_fd).0;
+	}
+	//========================================================================================
+	def dup(fd: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var r = Linux.syscall(LinuxConst.SYS_dup, sys_fd).0;
+		if (r < 0) return r;
+		var fd = fdmap.alloc();
+		fdmap.set(fd, int.!(r));
+		return r;
+	}
+	//========================================================================================
+	def dup2(oldfd: int, newfd: int) -> long {
+		var sys_oldfd = fdmap.get(oldfd), sys_newfd = fdmap.get(newfd);
+		if (sys_newfd >= 0) {
+			var r = Linux.syscall(LinuxConst.SYS_dup2, (sys_oldfd, sys_newfd)).0;
+			if (r < 0) return r;
+			return newfd;
+		}
+		var r = Linux.syscall(LinuxConst.SYS_dup, (sys_oldfd)).0;
+		if (r < 0) return r;
+		fdmap.set(newfd, int.!(r));
+		return newfd;
+	}
+	//========================================================================================
+	def dup3(oldfd: int, newfd: int, flags: int) -> long {
+		var sys_oldfd = fdmap.get(oldfd), sys_newfd = fdmap.get(newfd);
+		if (sys_newfd < 0) {
+			var r = Linux.syscall(LinuxConst.SYS_dup, (sys_oldfd)).0;
+			if (r < 0) return r;
+			sys_newfd = int.!(r);
+			fdmap.set(newfd, sys_newfd);
+		}
+		var r = Linux.syscall(LinuxConst.SYS_dup3, (sys_oldfd, sys_newfd, flags)).0;
+		if (r < 0) return r;
+		return newfd;
+	}
+	//========================================================================================
+	def stat(path: int, buf: int) -> long {
+		var region = getPath(u32.view(path));
+		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		var statbuf = getRegion(buf, WaliStruct_stat.size);
+		if (statbuf.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		return Linux.syscall(LinuxConst.SYS_stat, (Pointer.atContents(region.result), Pointer.atContents(statbuf.result))).0;
+	}
+	//========================================================================================
+	def lseek(fd: int, offset: long, whence: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		return Linux.syscall(LinuxConst.SYS_lseek, (sys_fd, offset, whence)).0;
+	}
+	//========================================================================================
+	def exit(code: int) -> long {
+		return Linux.syscall(LinuxConst.SYS_exit, code).0;
+	}
+	//========================================================================================
+	def fork() -> long {
+		return Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	}
+	//========================================================================================
+	def access(path: int, mode: int) -> long {
+		var region = getPath(u32.view(path));
+		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		return Linux.syscall(LinuxConst.SYS_access, (Pointer.atContents(region.result), mode)).0;
+	}
+	//========================================================================================
+	def exit_group(code: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def sched_getaffinity(x: int, y: int, z: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def set_tid_address(x: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def mmap(x: int, y: int, z: int, w: int, t: int, u: long) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def fcntl(x: int, y: int, z: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def sysinfo(x: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def brk(x: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def prlimit64(x: int, y: int, z: int, w: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def getrlimit(x: int, y: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def mprotect(x: int, y: int, z: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def mremap(x: int, y: int, z: int, w: int, t: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def munmap(x: int, y: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def fstat(x: int, y: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def fstatat(x: int, y: int, z: int, w: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def lstat(x: int, y: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def writev(x: int, y: int, z: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def ioctl(x: int, y: int, z: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def futex(x: int, y: int, z: int, w: int, t: int, u: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def rt_sigprocmask(x: int, y: int, z: int, w: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def tkill(x: int, y: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def rt_sigaction(x: int, y: int, z: int, w: int) => TODO_UNIMPLEMENTED;
+	//========================================================================================
+	def wasm_init_memory(x: int, y: int) -> long {
+		return TODO_ZERO;
+	}
+	//========================================================================================
+	def cl_get_argc() -> int {
+		return if(cmdline_args != null, cmdline_args.length);
+	}
+	//========================================================================================
+	def cl_get_argv_len(index: int) -> int {
+		if (cmdline_args == null || index >= cmdline_args.length) return 0;
+		return cmdline_args[index].length;
+	}
+	//========================================================================================
+	def cl_copy_argv(buf: int, index: int) -> int {
+		if (cmdline_args == null || index >= cmdline_args.length) return 0;
+		var str = cmdline_args[index];
+		var reason = memory.copyIn(u32.view(buf), str, 0, u32.!(str.length));
+		if (reason != TrapReason.NONE) return TODO_ZERO; // trap instead?
+		return str.length;
+	}
+	//========================================================================================
+	def call_ctors() {
+		return TODO_EMPTY;
+	}
+	//========================================================================================
+	def call_dtors() {
+		return TODO_EMPTY;
+	}
+	//========================================================================================
+	def proc_exit(code: u32) -> HostResult {
+		return HostResult.Throw(Exit.new(code));
+	}
+	//========================================================================================
+	def get_init_envfile(x: int, y: int) -> int {
+		return TODO_ZERO;
+	}
+}
+
+layout WaliStruct_stat { // TODO: copied from Virgil x86-64-linux
+	+0	st_dev:		u64;
+	+8	st_ino:		u64;
+	+16	st_mode:	u64;
+	+24	st_nlink:	u64;
+//	+28	st_uid:		u32;
+	+32	st_gid:		u32;
+	+48	st_size:	u64;
+	+56	st_blksize:	u64;
+	+64	st_blocks:	u64;
+	+72	st_atim:	timespec;
+	+88	st_mtim:	timespec;
+	+104	st_ctim:	timespec;
+	=144;
+}
