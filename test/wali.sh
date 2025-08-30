@@ -44,14 +44,14 @@ function run_test() {
     if [ -z $TEST_FILE ]; then
         for file in "$TEST_DIR"/*.v3; do
           if [ -f "$file" ]; then
-              $CUR_V3C -heap-size=64k -symbols -target=wasm $file
+              $CUR_V3C -reserved-data-size=100 -heap-size=64k -symbols -target=wasm $file
               if [ $? -ne 0 ]; then
               exit 1
               fi
           fi
         done
     else
-      $CUR_V3C -heap-size=64k -symbols -target=wasm $TEST_FILE
+      $CUR_V3C -reserved-data-size=100 -heap-size=64k -symbols -target=wasm $TEST_FILE
       if [ $? -ne 0 ]; then
       exit 1
       fi
