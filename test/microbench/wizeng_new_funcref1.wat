@@ -10,9 +10,9 @@
   (func $main (export "main")
     (local $y i32)
 
-    (local.set $y (i32.const 325000 (;$INNER_ITERATIONS;)))
+    (local.set $y (i32.const 1 (;$INNER_ITERATIONS;)))
     (loop $l
-      (drop (call $new_funcref (i32.const 0) (i32.const 3)))
+      (call_ref $v_v (call $new_funcref (i32.const 0) (i32.const 3)))
       (local.tee $y (i32.sub (local.get $y) (i32.const 1)))
       (br_if $l)
     )
