@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -38,8 +38,7 @@ TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
-SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
-SPEC="test/wasm-spec/*.v3"
+SPECTEST="test/wasm-spec/*.v3"
 WIZENG="src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
@@ -92,12 +91,10 @@ function make_build_file() {
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $SPEC $WIZENG"
+    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $SPECTEST $WIZENG"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
-elif [ "$PROGRAM" = "spectest" ]; then
-    SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
