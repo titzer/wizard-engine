@@ -18,7 +18,7 @@ shift
 
 . $HERE/common.sh proposal:$PROPOSAL
 
-make_binary spectest || exit $?
+make_binary wizeng || exit $?
 
 CMD="$BINARY $WIZENG_OPTS --expected=$WIZENG_TEST/proposal:$PROPOSAL.failures --expected=$WIZENG_TEST/proposal:$PROPOSAL.failures.${TEST_TARGET}"
 
