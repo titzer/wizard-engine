@@ -38,8 +38,9 @@ TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
-SPECTEST="test/wasm-spec/*.v3"
-WIZENG="src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
+SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
+WASM_MODE="src/WasmMode.v3"
+WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
 WASI_X86_64_LINUX="src/modules/wasi/x86-64-linux/*.v3 $VIRGIL_LIB/x86-64-linux/SyscallLayouts.v3"
@@ -59,6 +60,16 @@ fi
 
 if [ "$1" = "--debug-gc" ]; then
     DEBUG_GC=1
+    shift
+fi
+
+if [ "$1" = "--no-spec-test" ]; then
+    SPECTEST_MODE=""
+    shift
+fi
+
+if [ "$1" = "--no-wasm-run" ]; then
+    WASM_MODE=""
     shift
 fi
 
@@ -91,7 +102,7 @@ function make_build_file() {
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $SPECTEST $WIZENG"
+    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $SPECTEST_MODE $WASM_MODE $WIZENG"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
