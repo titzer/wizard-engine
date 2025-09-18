@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 PAT=jawa
 PAT=${PAT/w/v}
