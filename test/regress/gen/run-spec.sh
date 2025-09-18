@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ $# = 0 ]; then
     echo "Usage: run-spec.sh <spec/interpreter/wasm> [files]"

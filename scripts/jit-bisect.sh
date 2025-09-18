@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 CYAN='[0;36m'
 RED='[0;31m'
