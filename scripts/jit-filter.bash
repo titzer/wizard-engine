@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 T=/tmp/jit-filter/
 mkdir -p $T

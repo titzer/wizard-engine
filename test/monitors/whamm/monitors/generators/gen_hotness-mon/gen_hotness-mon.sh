@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Generate the Whamm opcode monitor using the current Opcodes.v3
 
 SOURCE="${BASH_SOURCE[0]}"
