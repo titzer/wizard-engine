@@ -656,7 +656,20 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// check for extended LEB, abstract type, or type with immediate
 		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
-		genConditionalJumpDeferred(C.NZ, genComplexTypeDecode(_, typeGpr));
+		genConditionalJumpDeferred(C.NZ, fun retpoint {
+			// slowpath: handle extended LEB, types with immediates, and abstract types
+			var type_not_leb = X86_64Label.new();
+			asm.d.test_r_i(typeGpr, LEB_UPPER_BIT);		// check for LEB first
+			asm.jc_rel_near(C.Z, type_not_leb);
+			genSkipLeb0(r_tmp4);
+			asm.bind(type_not_leb);
+			// check for types that have an immediate
+			var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
+			asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
+			asm.jc_rel_far(C.Z, retpoint);
+			genSkipLeb0(r_tmp4);			// skip offset
+			asm.jmp_rel_near(retpoint);
+		});
 		
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
@@ -679,13 +692,44 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.frameVariables) {
 			asm.movq_r_m(r_tmp2, r_func_decl.plus(offsets.FuncDecl_frame_var_tags));
 			asm.q.cmp_r_i(r_tmp2, 0);
-			genConditionalJumpDeferred(C.NZ, genPushFrameVarTags(_, r_tmp2));
+			genConditionalJumpDeferred(C.NZ, fun retpoint {
+				// slowpath: push values for frame variables.
+				var r_frame_var_tags = r_tmp2;
+				var r_start = r_tmp2, r_end = r_tmp1, r_tag = r_tmp3;
+				asm.movd_r_m(r_end, r_frame_var_tags.plus(offsets.Array_length));
+				asm.q.lea(r_start, r_frame_var_tags.plus(offsets.Array_contents));
+				asm.q.add_r_r(r_end, r_start);
+				var loop = X86_64Label.new();
+				// while (r_start < r_end)
+				asm.bind(loop);
+				asm.q.cmp_r_r(r_start, r_end);
+				asm.jc_rel_far(C.GE, retpoint);
+				asm.movbzx_r_m(r_tag, r_start.plus(0));
+				genTagPushR(r_tag);			// *(sp) = type
+				asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
+				incrementVsp();	// sp += 1 slot
+				// gen: while (--num != 0)
+				asm.q.inc_r(r_start);
+				asm.jmp_rel_near(loop);
+			});
 		}
 
 		// Check for function entry probe.
 		if (!FeatureDisable.entryProbes) {
 			asm.test_m_i(r_func_decl.plus(offsets.FuncDecl_entry_probed), 1);
-			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
+			genConditionalJumpDeferred(C.NZ, fun retpoint {
+				// slowpath: call function entry probe
+				computePcFromCurIp();
+				if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
+				saveCallerIVars();
+				asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
+				masm.emit_get_curstack(xenv.tmp1);
+				callRuntime(refRuntimeCall(X86_64RT.runtime_PROBE_instr), [r_tmp1, r_tmp0, r_curpc], true);
+				// fall through
+				restoreCallerIVars();
+				//TODO: restoreDispatchTableReg();
+				genJumpToDispatch();
+			});
 		}
 		// Dispatch to first instruction.
 		genDispatchOrJumpToDispatch();
@@ -697,50 +741,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		restoreDispatchTableReg();
 		genJumpToDispatch();
 		genDeferred();
-	}
-	def genComplexTypeDecode(retpoint: X86_64Label, r_type: X86_64Gpr) {
-		// handle extended LEB, types with immediates, and abstract types
-		var type_not_leb = X86_64Label.new();
-		asm.d.test_r_i(r_type, LEB_UPPER_BIT);		// check for LEB first
-		asm.jc_rel_near(C.Z, type_not_leb);
-		genSkipLeb0(r_tmp4);
-		asm.bind(type_not_leb);
-		// check for types that have an immediate
-		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
-		asm.d.test_m_i(r_type.plus(typeTableAddr), TYPE_HAS_IMM);
-		asm.jc_rel_far(C.Z, retpoint);
-		genSkipLeb0(r_tmp4);			// skip offset
-		asm.jmp_rel_near(retpoint);
-	}
-	def genFuncEntryProbe(retpoint: X86_64Label) {
-		computePcFromCurIp();
-		if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
-		saveCallerIVars();
-		asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
-		masm.emit_get_curstack(xenv.tmp1);
-		callRuntime(refRuntimeCall(X86_64RT.runtime_PROBE_instr), [r_tmp1, r_tmp0, r_curpc], true);
-		// fall through
-		restoreCallerIVars();
-		//TODO: restoreDispatchTableReg();
-		genJumpToDispatch();
-	}
-	def genPushFrameVarTags(retpoint: X86_64Label, r_frame_var_tags: X86_64Gpr) {
-		var r_start = r_frame_var_tags, r_end = r_tmp1, r_tag = r_tmp3;
-		asm.movd_r_m(r_end, r_frame_var_tags.plus(offsets.Array_length));
-		asm.q.lea(r_start, r_frame_var_tags.plus(offsets.Array_contents));
-		asm.q.add_r_r(r_end, r_start);
-		var loop = X86_64Label.new();
-		// while (r_start < r_end)
-		asm.bind(loop);
-		asm.q.cmp_r_r(r_start, r_end);
-		asm.jc_rel_far(C.GE, retpoint);
-		asm.movbzx_r_m(r_tag, r_start.plus(0));
-		genTagPushR(r_tag);			// *(sp) = type
-		asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
-		incrementVsp();	// sp += 1 slot
-		// gen: while (--num != 0)
-		asm.q.inc_r(r_start);
-		asm.jmp_rel_near(loop);
 	}
 	def genDeferred() {
 		for (l = deferred; l != null; l = l.tail) {
