@@ -2066,41 +2066,26 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitLoad(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ())  {
-		var base_reg = regs.mem0_base;
-		if (imm.memory_index != 0) {
-			// XXX: cache the base register for memories > 0
-			base_reg = allocTmp(ValueKind.REF);
-			emit_load_instance(base_reg);
-			masm.emit_v3_Instance_memories_r_r(base_reg, base_reg);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
-			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
-		}
 		var iv = pop();
-		var index_reg: Reg;
-		var offset = imm.offset;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-		} else {
-			index_reg = ensureReg(iv, state.sp);
-		}
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
 		var dest = allocRegTos(kind); // XXX: can reuse index reg if frequency == 1 and ValueKind.I32
-		meth(kind, dest, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+		meth(kind, dest, addr.base_reg, addr.index_reg, addr.offset);
+		var indexKind = if(addr.is64, ValueKind.I64, ValueKind.I32);
 		var nflags = IN_REG | SpcConsts.kindToFlags(kind);
-		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
+		if (kind == indexKind) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
 
-		if (intrinsified_read_probe != null) {
+		if (intrinsified_read_probe != null) { // TODO(memory64)
 			// spill everything
 			state.emitSaveAll(resolver, probeSpillMode);
-
+			var index_reg = addr.index_reg;
 			// load RT args (addr, val) and call RT
-			if (index_reg.index == 0) { // fixed addr
+			if (addr.index_reg == NO_REG) { // fixed addr
 				index_reg = allocTmp(ValueKind.I32);
-				masm.emit_mov_r_i(index_reg, i32.!(offset));
+				masm.emit_mov_r_i(index_reg, int.view(addr.offset));
 			} else {
-				masm.emit_addw_r_i(index_reg, i32.!(offset));
+				masm.emit_addw_r_i(index_reg, int.view(addr.offset));
 			}
 			var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
 			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
@@ -2113,6 +2098,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ()) {
+		var sv = popReg();
+		var iv = pop();
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
+		meth(kind, sv.reg, addr.base_reg, addr.index_reg, addr.offset);
+	}
+	def emitComputeEffectiveAddress(imm: MemArg, iv: SpcVal) -> EffectiveAddr {
+		var mdecl = module.memories[imm.memory_index];
 		var base_reg = regs.mem0_base;
 		if (imm.memory_index != 0) {
 			// XXX: cache the base register for memories > 0
@@ -2122,19 +2115,38 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
 			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
 		}
-		var offset = imm.offset;
-		var sv = popReg();
-		var iv = state.peek();
 		var index_reg: Reg;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-			pop();
-		} else {
-			index_reg = popReg().reg;
+		var offset = imm.offset;
+		var limit = if(mdecl.size.is64, Target.limit_memory_size_64, Target.limit_memory_size);
+		if (offset >= limit) {
+			emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
+			return OOB_ADDR;
 		}
-		meth(kind, sv.reg, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+		if (iv.isConst()) {
+			offset += u32.view(iv.const); // fold offset calculation
+			if (offset >= limit) {
+				emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
+				return OOB_ADDR;
+			}
+		} else {
+			index_reg = ensureReg(iv, state.sp);
+			if (mdecl.size.is64 && !SpcTuning.disableMemoryBoundsChecks) {
+				// emit a bounds check of (index >> N) != 0
+				var shift_reg = allocTmp(ValueKind.I64);
+				masm.emit_mov_r_r(ValueKind.I64, shift_reg, index_reg);
+				masm.emit_shrw_r_i(shift_reg, 34); // TODO: compute shift amount from max memory size
+				var oob_label = newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS);
+				masm.emit_br_r(shift_reg, MasmBrCond.I64_NONZERO, oob_label); // XXX: on x86, shift sets flags
+			}
+		}
+		if (u32.?(offset)) {
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, index_reg, u32.!(offset));
+		} else {
+			var sum_reg = allocTmp(ValueKind.I64);
+			masm.emit_mov_r_l(sum_reg, long.view(offset));
+			if (index_reg != NO_REG) masm.emit_addw_r_r(sum_reg, index_reg);
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, sum_reg, 0);
+		}
 	}
 
 	//====================================================================
@@ -2375,6 +2387,10 @@ enum SpillMode(free_regs: bool, remember_stored: bool) {
 	SAVE_AND_REMEMBER_STORED(false, true),	// save registers and constants, remember slots are stored
 	SAVE_AND_FREE_REGS(true, true),		// save registers and free all registers
 }
+
+// Used for computing memory load/store addresses
+type EffectiveAddr(oob: bool, is64: bool, base_reg: Reg, index_reg: Reg, offset: u32) #unboxed;
+def OOB_ADDR = EffectiveAddr(true, false, NO_REG, NO_REG, 0);
 
 // Compiler representation of (abstract) values on the WebAssembly value stack,
 // including its {ValueKind}, whether the value is stored into the corresponding slot,

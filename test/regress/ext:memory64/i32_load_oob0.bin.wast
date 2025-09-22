@@ -6,6 +6,22 @@
   "\00\28\02\00\1a\0b"
 )
 (module instance)
+(assert_trap
+  (invoke "load" (i64.const 0x1_0000_0000))
+  "out of bounds memory access"
+)
+(assert_trap
+  (invoke "load" (i64.const 0x2_0000_0000))
+  "out of bounds memory access"
+)
+(assert_trap
+  (invoke "load" (i64.const 0x4_0000_0000))
+  "out of bounds memory access"
+)
+(assert_trap
+  (invoke "load" (i64.const 0x8_0000_0000))
+  "out of bounds memory access"
+)
 (assert_return (invoke "load" (i64.const 0x0)))
 (assert_return (invoke "load" (i64.const 0x100)))
 (assert_return (invoke "load" (i64.const 0x1000)))
