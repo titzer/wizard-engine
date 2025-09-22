@@ -1,11 +1,5 @@
 (module
-  (func $start (export "_start")
-    (nop)
-    (nop)
-    (call $main)
-    (drop)
-  )
-  (func $main (export "main") (result i32)
+  (func $main (export "_start") (result i32)
     (nop)
     (nop)
     (nop)

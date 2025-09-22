@@ -1,10 +1,8 @@
 (module
   (global $a i32 (i32.const 0))
   (global $b (mut i64) (i64.const 1))
-  (func $start (export "_start")
-    (call $main)
-  )
-  (func $main (export "main")
+
+  (func $_start (export "_start")
     (local $y i32)
     (local.set $y (i32.const 10))
     (loop $l
