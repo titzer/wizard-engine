@@ -1,5 +1,5 @@
 (module
-  (func (export "main")
+  (func (export "_start")
 	(call $countdown (i32.const 99))
   )
   (func $countdown (param i32)
