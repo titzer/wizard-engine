@@ -1,4 +1,4 @@
-;; TODO: once fixed, this is the output we should expect (i think):
+;; TODO: once you can request data @dynamic time, this is the output we should expect (i think):
 ;; @static
 ;; main
 ;; @static
