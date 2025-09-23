@@ -1,3 +1,12 @@
+;; TODO: once fixed, this is the output we should expect (i think):
+;; @static
+;; main
+;; @static
+;; main
+;; @dynamic
+;; main
+;; @dynamic
+;; main
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
 

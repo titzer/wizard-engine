@@ -1,3 +1,6 @@
+;; TODO: once fixed, this is the output we should expect (i think):
+;; mainhello world!
+;; mainhello world!
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
 
