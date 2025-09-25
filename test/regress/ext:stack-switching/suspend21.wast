@@ -1,0 +1,18 @@
+(module
+  (type $f1 (func (param externref)))
+  (type $c1 (cont $f1))
+  (type $f2 (func))
+  (type $c2 (cont $f2))
+  (tag $e (param externref))
+  (func $s (param $ref externref) (suspend $e (local.get $ref)))
+  (elem declare func $s)
+  (func (export "main") (param $ref externref) (result externref)
+    (block $h (result externref (ref null $c2))
+      (resume $c1 (on $e $h) (local.get $ref) (cont.new $c1 (ref.func $s)))
+      (unreachable)
+    )
+    (drop)
+  )
+)
+
+(assert_return (invoke "main" (ref.extern 0)) (ref.extern 0))
