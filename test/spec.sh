@@ -17,14 +17,14 @@ fi
 
 make_binary wizeng || exit $?
 
-IGNORE_MEMORY64=1
+IGNORE_MEMORY64=0
 
 function run {
     p=$1
     cd $WIZENG_LOC
 
     if [[ "$p" = spec && "$IGNORE_MEMORY64" = 1 && "$TEST_TARGET" = "x86-64-linux" ]]; then
-        # TODO: workaround for incomplete memory64 support on x86-64-linux
+        # TODO: remove workaround for incomplete memory64 support on x86-64-linux
         TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast' | grep -v memory64)
     else
         TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast')
