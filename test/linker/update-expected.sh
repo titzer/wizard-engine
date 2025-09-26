@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 TESTS=$(ls -d */)
 
 function run_tests {
