@@ -36,6 +36,7 @@ type WhammParam {
 	case FrameAccessor;
 	case Pc;
 	case Func;
+	case OpName;
 	case Fname;
 	case ProbeId;
 	case NumTargets;
@@ -53,6 +54,7 @@ type WhammParam {
 			FrameAccessor => return buf.puts("frame");
 			Pc => return buf.puts("pc");
 			Func => return buf.puts("fid");
+			OpName => return buf.puts("op_name");
 			Fname => return buf.puts("fname");
 			ProbeId => return buf.puts("probe_id");
 			NumTargets => return buf.puts("num_targets");
@@ -225,6 +227,7 @@ def parseParam0(r: TextReader) -> WhammParam {
 
 	if (Strings.equal("pc", token.image)) return WhammParam.Pc;
 	if (Strings.equal("fid", token.image)) return WhammParam.Func;
+	if (Strings.equal("op_name", token.image)) return WhammParam.OpName;
 	if (Strings.equal("fname", token.image)) return WhammParam.Fname;
 	if (Strings.equal("probe_id", token.image)) return WhammParam.ProbeId;
 	if (Strings.equal("frame", token.image)) return WhammParam.FrameAccessor;
@@ -348,6 +351,23 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 				Func => { // func scope
 					arg = bindFunc(op, expParams[i_exp], cv);
 				}
+				OpName         => {
+					if (!nested) {
+						// TODO: this we need to have a special WhammArg that writes a datasegment to memory at runtime!
+						putErr("`op_name` not supported dynamically (yet)", cv);
+						return null;
+					}
+					if (i_exp + 1 >= expParams.length) {
+						putErr(Strings.format2("expected at least %d function params, got %d", i_exp + 2, expParams.length), cv);
+						return null;
+					}
+					def opPtr = bindOpName(op, expParams[i_exp], expParams[i_exp + 1], cv);
+					if (opPtr.0 == WhammArg.Null) return null;
+					args[i_exp] = opPtr.0;
+
+					arg = opPtr.1;
+					i_exp++;
+				}
 				Fname          => {
 					if (!nested) {
 						// TODO: this we need to have a special WhammArg that writes a datasegment to memory at runtime!
@@ -358,7 +378,7 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 						putErr(Strings.format2("expected at least %d function params, got %d", i_exp + 2, expParams.length), cv);
 						return null;
 					}
-					def fnamePtr = bindFname(op, expParams[i_exp], expParams[i_exp + 1], cv);
+					def fnamePtr = bindFname(expParams[i_exp], expParams[i_exp + 1], cv);
 					if (fnamePtr.0 == WhammArg.Null) return null;
 					args[i_exp] = fnamePtr.0;
 
@@ -456,77 +476,13 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 		return WhammArg.Val(Values.box_i(cv.func.func_index));
 	}
 
-	private def bindFname(op: Opcode, expType0: ValueType, expType1: ValueType, cv: CodeValidator) -> (WhammArg, WhammArg) {
-		if (buffer == null) {
-			// lazily bind engine memory
-			if (!bindWhammBuffer(cv)) {
-				return (WhammArg.Null, WhammArg.Null);
-			}
-		}
-		if (expType0 != ValueType.I32 || expType1 != ValueType.I32) {
-			errTypeMismatch2(WhammParam.Fname, ValueType.I32, ValueType.I32, expType0, expType1, cv);
-			return (WhammArg.Null, WhammArg.Null);
-		}
+	private def bindOpName(op: Opcode, expType0: ValueType, expType1: ValueType, cv: CodeValidator) -> (WhammArg, WhammArg) {
+		return writeData(op.mnemonic, WhammParam.OpName, expType0, expType1, cv);
+	}
+
+	private def bindFname(expType0: ValueType, expType1: ValueType, cv: CodeValidator) -> (WhammArg, WhammArg) {
 		var fname = renderFnameNoQuotes(cv.func, cv.module.names);
-
-		// if writing fname to memory would overflow the buffer, just write the amount that fits.
-		def fname_len = if(buffer_next + u32.!(fname.length) > buffer_start + buffer_max,
-						   (buffer_start + buffer_max) - buffer_next,
-						   u32.!(fname.length));
-
-		// write the fname to the exported memory
-		buffer.copyIn(buffer_next, fname, 0, u64.!(fname_len));
-
-		// Update where we will put the next batch of data in the buffer
-		def data_start = buffer_next;
-		buffer_next += fname_len;
-		return (WhammArg.Val(Values.box_u(data_start)), WhammArg.Val(Values.box_u(fname_len)));
-	}
-	private def renderFnameNoQuotes(func: FuncDecl, names: NameSection) -> string {
-		var name = if (names != null, names.getFuncName(func.func_index));
-		if (name != null) return name;
-		else return "";
-	}
-
-	private def bindWhammBuffer(cv: CodeValidator) -> bool {
-		var found_start: bool, found_max: bool;
-		for (i = 0; i < wi.instance.module.exports.length; i++) {
-			def exp = wi.instance.module.exports[i];
-			match (exp.1) {
-				x: MemoryDecl => {
-					if (Strings.equal(exp.0, LABEL_BUFFER)) {
-						buffer = wi.instance.memories[x.memory_index];
-					}
-				}
-				x: GlobalDecl => {
-					if (Strings.equal(exp.0, LABEL_BUFFER_START)) {
-						buffer_start = Values.unbox_u(wi.instance.globals[x.global_index].get());
-						found_start = true;
-					}
-					if (Strings.equal(exp.0, LABEL_BUFFER_MAX)) {
-						buffer_max = Values.unbox_u(wi.instance.globals[x.global_index].get());
-						found_max = true;
-					}
-				}
-				_ => continue;
-			};
-		}
-		if (buffer == null) {
-			errExportNotFound("memory", LABEL_BUFFER, cv);
-			return false;
-		}
-		if (!found_start) {
-			errExportNotFound("global", LABEL_BUFFER_START, cv);
-			return false;
-		}
-		if (!found_max) {
-			errExportNotFound("global", LABEL_BUFFER_MAX, cv);
-			return false;
-		}
-
-		buffer_next = buffer_start;
-		if (Trace.whamm) Trace.OUT.ln().put2("whamm_buffer memory region (inclusive): %d -> %d", buffer_start, buffer_next + buffer_max).ln();
-		return true;
+		return writeData(fname, WhammParam.Fname, expType0, expType1, cv);
 	}
 
 	private def bindProbeId(op: Opcode, expType: ValueType, cv: CodeValidator) -> WhammArg {
@@ -760,6 +716,11 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 		}
 		return arg;
 	}
+
+	// ===============
+	// ==== Utils ====
+	// ===============
+
 	private def lookupExportedFunction(name: string) -> Function {
 		if (func_cache == null) {
 			func_cache = Strings.newMap();
@@ -772,6 +733,80 @@ class WhammVarBinder(wi: WhammInstance, err: ErrorGen) {
 		}
 		return func_cache[name];
 	}
+	private def renderFnameNoQuotes(func: FuncDecl, names: NameSection) -> string {
+		var name = if (names != null, names.getFuncName(func.func_index));
+		if (name != null) return name;
+		else return "";
+	}
+	private def writeData(data: Array<byte>, param: WhammParam, expType0: ValueType, expType1: ValueType, cv: CodeValidator) -> (WhammArg, WhammArg) {
+		if (buffer == null) {
+			// lazily bind engine memory
+			if (!bindWhammBuffer(cv)) {
+				return (WhammArg.Null, WhammArg.Null);
+			}
+		}
+		if (expType0 != ValueType.I32 || expType1 != ValueType.I32) {
+			errTypeMismatch2(param, ValueType.I32, ValueType.I32, expType0, expType1, cv);
+			return (WhammArg.Null, WhammArg.Null);
+		}
+
+		// if writing data to memory would overflow the buffer, just write the amount that fits.
+		def data_len = if(buffer_next + u32.!(data.length) > buffer_start + buffer_max,
+						   (buffer_start + buffer_max) - buffer_next,
+						   u32.!(data.length));
+
+		// write the data to the exported memory
+		buffer.copyIn(buffer_next, data, 0, u64.!(data_len));
+
+		// Update where we will put the next batch of data in the buffer
+		def data_start = buffer_next;
+		buffer_next += data_len;
+		return (WhammArg.Val(Values.box_u(data_start)), WhammArg.Val(Values.box_u(data_len)));
+	}
+	private def bindWhammBuffer(cv: CodeValidator) -> bool {
+		var found_start: bool, found_max: bool;
+		for (i = 0; i < wi.instance.module.exports.length; i++) {
+			def exp = wi.instance.module.exports[i];
+			match (exp.1) {
+				x: MemoryDecl => {
+					if (Strings.equal(exp.0, LABEL_BUFFER)) {
+						buffer = wi.instance.memories[x.memory_index];
+					}
+				}
+				x: GlobalDecl => {
+					if (Strings.equal(exp.0, LABEL_BUFFER_START)) {
+						buffer_start = Values.unbox_u(wi.instance.globals[x.global_index].get());
+						found_start = true;
+					}
+					if (Strings.equal(exp.0, LABEL_BUFFER_MAX)) {
+						buffer_max = Values.unbox_u(wi.instance.globals[x.global_index].get());
+						found_max = true;
+					}
+				}
+				_ => continue;
+			};
+		}
+		if (buffer == null) {
+			errExportNotFound("memory", LABEL_BUFFER, cv);
+			return false;
+		}
+		if (!found_start) {
+			errExportNotFound("global", LABEL_BUFFER_START, cv);
+			return false;
+		}
+		if (!found_max) {
+			errExportNotFound("global", LABEL_BUFFER_MAX, cv);
+			return false;
+		}
+
+		buffer_next = buffer_start;
+		if (Trace.whamm) Trace.OUT.ln().put2("whamm_buffer memory region (inclusive): %d -> %d", buffer_start, buffer_next + buffer_max).ln();
+		return true;
+	}
+
+	// ================
+	// ==== Errors ====
+	// ================
 
 	private def errExportNotFound(exportType: string, exportName: string, cv: CodeValidator) {
 		putErr(Strings.format2("expected exported %s named '%s' not found", exportType, exportName), cv);
