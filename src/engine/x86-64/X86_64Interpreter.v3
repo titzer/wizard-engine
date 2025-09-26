@@ -2604,7 +2604,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var pos = w.atEnd().pos;
 			writeDispatchEntry(dispatchTables[0].1, InternalOpcode.WHAMM_PROBE.code, pos);
 			if (Debug.interpreter) {
-				Trace.OUT.put1("\thandle_%s:", InternalOpcode.WHAMM_PROBE.name).pad(' ', 35)
+				Trace.OUT.put1("\thandle_%s: ", InternalOpcode.WHAMM_PROBE.name).pad(' ', 35)
 					.put1("break *0x%x", (ic.start + pos) - Pointer.NULL)
 					.ln();
 			}
@@ -3567,7 +3567,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var pos = w.atEnd().pos;
 		patchDispatchTable(opcode, pos);
 		if (Debug.interpreter) {
-			Trace.OUT.put1("\thandle_%s:", opcode.name).pad(' ', 35)
+			Trace.OUT.put1("\thandle_%s: ", opcode.name).pad(' ', 35)
 				.put1("break *0x%x", (ic.start + pos) - Pointer.NULL)
 				.ln();
 		}
@@ -3697,15 +3697,18 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genLoad<T>(opcode: Opcode, tag: byte, gen: (X86_64Gpr, X86_64Addr) -> T) {
 		bindHandler(opcode);
 		computeCurIpForTrap(-1);
-		var finish = asm.newLabel(), has_index: X86_64Label;
+		asm.q.inc_r(r_ip);				// skip flags byte
+		var finish = asm.newLabel(), has_index: X86_64Label, index64: X86_64Label;
+		if (!FeatureDisable.memory64) {
+			index64 = asm.newLabel();
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_STOLEN_IS64); // XXX: test byte
+			asm.jc_rel_far(C.NZ, index64);
+		}
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
-			asm.q.inc_r(r_ip);				// skip flags byte
 			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
 			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
-		} else {
-			asm.q.inc_r(r_ip);				// skip flags byte
 		}
 		genReadUleb32(r_tmp0);				// decode offset
 		asm.movd_r_m(r_tmp1, vsph[-1].value);		// read index off value stack
@@ -3728,18 +3731,36 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			gen(r_tmp1, memN.plusR(r_tmp0, 1, 0));
 			asm.jmp_rel_near(finish);
 		}
+		if (index64 != null) {
+			asm.bind(index64);
+			// TODO: multi-memory with memory64
+			masm.emit_read_uleb(r_tmp3, r_ip, r_tmp1, r_tmp0); // decode offset
+			asm.movq_r_m(r_tmp1, vsph[-1].value);		// read index off value stack
+			asm.movq_r_r(r_tmp2, r_tmp1);
+			asm.q.or_r_r(r_tmp2, r_tmp3);			// check that neither offset or index have
+			asm.q.shr_r_i(r_tmp2, 34);			// upper bits set
+			var label = newTrapLabel(TrapReason.MEMORY_OOB);
+			asm.jc_rel_far(X86_64Conds.NZ, label); 
+			asm.q.add_r_r(r_tmp3, r_tmp1);			// add index + offset
+			gen(r_tmp1, r_mem0_base.plusR(r_tmp3, 1, 0));
+			if (valuerep.tagged && tag != BpTypeCode.I64.code) genTagUpdate(tag); // update tag if necessary
+			asm.jmp_rel_near(finish);
+		}
 	}
 	def genStore<T>(gen: (X86_64Addr, X86_64Gpr) -> T) {
 		computeCurIpForTrap(-1);
-		var finish = asm.newLabel(), has_index: X86_64Label;
+		var finish = asm.newLabel(), has_index: X86_64Label, index64: X86_64Label;
+		asm.q.inc_r(r_ip);				// skip flags byte
+		if (!FeatureDisable.memory64) {
+			index64 = asm.newLabel();
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_STOLEN_IS64); // XXX: test byte
+			asm.jc_rel_far(C.NZ, index64);
+		}
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
-			asm.q.inc_r(r_ip);				// skip flags byte
 			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
 			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
-		} else {
-			asm.q.inc_r(r_ip);				// skip flags byte
 		}
 		genReadUleb32(r_tmp0);			// decode offset
 		asm.movd_r_m(r_tmp1, vsph[-2].value);	// read index
@@ -3761,6 +3782,21 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.q.add_r_r(r_tmp0, r_tmp1);		// add index + offset
 			asm.movq_r_m(r_tmp1, vsph[-1].value);	// read value
 			gen(memN.plusR(r_tmp0, 1, 0), r_tmp1);
+			asm.jmp_rel_near(finish);
+		}
+		if (index64 != null) {
+			asm.bind(index64);
+			// TODO: multi-memory with memory64
+			masm.emit_read_uleb(r_tmp3, r_ip, r_tmp1, r_tmp0); // decode offset
+			asm.movq_r_m(r_tmp1, vsph[-2].value);		// read index off value stack
+			asm.movq_r_r(r_tmp2, r_tmp1);
+			asm.q.or_r_r(r_tmp2, r_tmp3);			// check that neither offset or index have
+			asm.q.shr_r_i(r_tmp2, 34);			// upper bits set
+			var label = newTrapLabel(TrapReason.MEMORY_OOB);
+			asm.jc_rel_far(X86_64Conds.NZ, label); 
+			asm.q.add_r_r(r_tmp3, r_tmp1);			// add index + offset
+			asm.movq_r_m(r_tmp1, vsph[-1].value);		// read value
+			gen(r_mem0_base.plusR(r_tmp3, 1, 0), r_tmp1);
 			asm.jmp_rel_near(finish);
 		}
 	}
@@ -3959,10 +3995,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				fatal("prefix 0 opcode > 255");
 			}
 			var ref0 = dispatchTables[0].1;		// main dispatch table
-			if (Debug.interpreter) {
-				Trace.OUT.put3("\t\tpatch main table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
-			}
 			writeDispatchEntry(ref0, opcode.code, pos);
 			w.atEnd();
 			return;
@@ -3986,17 +4018,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				if (refsub == null) continue;
 				// if upper is 0, can encode as just lower, so put there as well
 				if (upper == 0) {
-					if (Debug.interpreter)
-						Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
-							       lower, opcode.prefix, opcode.code);
 					writeDispatchEntry(refsndary, lower, pos);
 				}
 				// write subpage entry at upper
 				// also covers case of non-minimal encoding of upper == 0
-				if (Debug.interpreter) {
-					Trace.OUT.put2("\t\tpatch subpage table %x at %x", lower, upper);
-					Trace.OUT.put2(" for prefix %x code %x\n", opcode.prefix, opcode.code);
-				}
 				writeDispatchEntry(refsub, upper, pos);
 				w.atEnd();
 				return;
@@ -4012,15 +4037,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (opcode.code < 128) {
 			// minimal encoding goes to secondary
 			// other encodings will redirect here
-			if (Debug.interpreter)
-				Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
 			writeDispatchEntry(refsndary, opcode.code, pos);
 		} else {
 			// all encodings go to LEB table
-			if (Debug.interpreter)
-				Trace.OUT.put3("\t\tpatch LEB table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
 			writeDispatchEntry(refleb, opcode.code, pos);
 		}
 		w.atEnd();
