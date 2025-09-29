@@ -113,7 +113,7 @@ var found = false;
 // Our monitor uses a custom probe that checks whether an "i32.add" will produce 42.
 class AddCheckerProbe extends Probe {
 	// 3. Execute probe logic at runtime.
-	def fire(dynamicLoc: DynamicLoc) -> Resumption {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
 		System.puts("Executing an i32.add...\n");
 		var accessor = dynamicLoc.frame.getFrameAccessor();	// get accessor to inspect stack frame
 		var a = accessor.getOperand(-1);			// get first operand to add
@@ -122,9 +122,9 @@ class AddCheckerProbe extends Probe {
 		if (result == 42) {					// check if we should terminate
 			found = true;
 			System.puts("42 was the result!\n");
-			return Resumption.Trap(TrapReason.BREAK, true);
+			return ProbeAction.Trap(TrapReason.BREAK, true);
 		}
-		return Resumption.Continue;				// otherwise, continue unimpeded
+		return ProbeAction.Continue;				// otherwise, continue unimpeded
 	}
 }
 ```
