@@ -1,7 +1,7 @@
 (module
     (import "wizeng" "puts" (func $puts (param i32 i32)))
 
-    (func $simple_probe (export "wasm:opcode:call ($static_call(op_name))") (param i32)
+    (func $simple_probe (export "wasm:opcode:call ($static_call(opname))") (param i32)
         (call $puts (i32.const 0) (i32.const 13))
     )
 
