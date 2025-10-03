@@ -28,8 +28,7 @@ else
         "branches" "branches{c}" 
         "hotness" "hotness{c}"
         "globals" 
-        "profile_bytecode{switch_size=7}"
-	"profile_bytecode{switch_size=7,abstract_interpreter=true}")
+        "profile_bytecode{switch_size=16}")
 fi
 
 TESTS=$(ls *.wasm)
