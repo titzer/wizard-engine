@@ -10,7 +10,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 . $HERE/../common.sh virgil
 
-make_binary spectest || exit $?
+make_binary wizeng || exit $?
 
 CMD="$WIZENG_LOC/$BINARY $WIZENG_OPTS "
 

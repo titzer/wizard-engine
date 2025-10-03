@@ -1,0 +1,200 @@
+// Copyright 2020 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Wrapper functions for executing WebAssembly (.wasm).
+component WasmMode {
+
+	new() {
+		WizengModes.runWasm = run;
+	}
+
+	def run(engine: Engine, monitors: Range<Monitor>, wasm: Range<string>, args: Array<string>) -> int {
+		var hasMonitors = monitors.length > 0 || BasicTracing.requiresInstrumentation();
+
+		if (hasMonitors) Execute.tiering.onMonitorsStart();
+
+		// Load an instrument all modules.
+		var t = WasmMode.loadAndInstrumentModules(engine, monitors, wasm);
+		if (t.0 != null) return ErrorBuilder.new()
+			.render(t.0.error_code, t.0.filename, t.0.section, t.0.error_index, t.0.error_pos, t.0.error_msg)
+			.exit(3);
+
+		// Loading succeeded. Link modules and execute (potentially repeatedly).
+		var exit_code = 0;
+		for (i < WizengOptions.REPEAT.val) {
+			exit_code = WasmMode.linkAndExecuteMain(engine, monitors, t.1, args);
+			if (exit_code != 0) break;
+		}
+
+		return exit_code;
+	}
+
+	// Load and instrument all Wasm modules.
+	def loadAndInstrumentModules(engine: Engine, monitors: Range<Monitor>, wasmFiles: Range<string>) -> (ErrorGen, Array<NamedModule>) {
+		var makeOutline = false, hasMonitors = monitors.length > 0 || BasicTracing.requiresInstrumentation();
+		for (m in monitors) makeOutline |= WhammMonitor.?(m);
+
+		var result = Array<NamedModule>.new(wasmFiles.length);
+		for (i < wasmFiles.length) {
+			var path = wasmFiles[i];
+			// Parse the binary module.
+			var err = ErrorGen.new(path);
+			var outline = if(makeOutline, ModuleOutline.new());
+			var module = engine.loadWasmFile(path, err, null, outline);
+			if (err.error()) return (err, null);
+			BasicTracing.instrumentModule(module);
+			var nm = NamedModule(path, PathUtil.extractName(path, false), module);
+			result[i] = nm;
+			// Call all monitors for the module.
+			for (i < monitors.length) {
+				def mon_err = ErrorGen.new("monitor");
+				monitors[i].onParse(nm.module, mon_err);
+
+				if (mon_err.error()) return (mon_err, null);  // error in monitor run on parsed module
+			}
+			if (hasMonitors) Execute.tiering.onMonitorsFinish(nm.module, err);
+		}
+		return (null, result);
+	}
+	// Link and execute a program.
+	def linkAndExecuteMain(engine: Engine, monitors: Range<Monitor>, nm: Array<NamedModule>, programArgs: Array<string>) -> int {
+		var path = nm[nm.length - 1].path;
+		var err = ErrorGen.new(path);
+		var linker = ModuleLinker.new(engine, programArgs, err);
+		linker.lookup.put(ModuleRegistry.get);
+		linker.binder = if(BasicTracing.moduleFilter != null, ImportTracer.new(BasicTracing.moduleFilter).wrap);
+
+		linker.named_modules.putr(nm);
+		var all_instantiators = linker.link();
+		if (!err.ok()) return ErrorBuilder.new()
+			.render(err.error_code,
+				if(u32.view(err.index) < nm.length, nm[err.index], nm[nm.length - 1]).path,
+				err.section,
+				err.error_index,
+				err.error_pos,
+				err.error_msg)
+			.exit(6);
+
+		// Instantiation succeeded. Call monitors for all instances on instantiate.
+		for (instantiator in all_instantiators) for (monitor in monitors) monitor.onInstantiate(instantiator.instance);
+
+		var exit_code = 0;
+		for (i < all_instantiators.length) {
+			// Try to find the main entrypoint for all modules.
+			var path = nm[i].path;
+			var instantiator = all_instantiators[i];
+			var ins = instantiator.instance;
+			var module = ins.module;
+			var invokeName = WizengOptions.ENTRYPOINT.val;
+			var entry: (Function, Array<Value>);
+			for (j < instantiator.processors.length) {
+				var p = instantiator.processors[j];
+				if (HostModule.?(p)) {
+					entry = HostModule.!(p).getMain(ins);
+					if (entry.0 != null) break;
+				}
+			}
+
+			if (entry.0 == null || invokeName != null) {
+				entry = findMain(ins);
+			}
+
+			if (i == all_instantiators.length - 1 && entry.0 == null) return ErrorBuilder.new()
+				.puts(path)
+				.puts(": no entrypoint found in module\n")
+				.exit(7);
+
+			// Execute the start function, if any.
+			if (module.start_function >= 0) {
+				var start = ins.functions[module.start_function];
+				for (monitor in monitors) monitor.onStart(start);
+				exit_code = executeStartFunction(start);
+			}
+
+			// Execute the main entrypoint.
+			if (exit_code == 0 && entry.0 != null) {
+				for (monitor in monitors) monitor.onMain(entry.0, entry.1);
+				var t = executeMainFunction(entry.0, entry.1);
+				exit_code = t.1;
+				for (monitor in monitors) monitor.onFinish(ins, t.0);
+			}
+		}
+		return exit_code;
+	}
+	// Execute the given start function.
+	def executeStartFunction(start: Function) -> int {
+		var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
+		match (r) {
+			Throw(thrown) => {
+				// Start function trapped or exited, return
+				TraceUtil.renderThrowable(Trace.OUT, thrown);
+				MonitorRegistry.runReports();
+				Metrics.report();
+				return -1;
+			}
+			_ => ; // ignore return value and break
+		}
+		return 0;
+	}
+	// Find the main function in an instance.
+	def findMain(instance: Instance) -> (Function, Array<Value>) {
+		var module = instance.module;
+		var exports = module.exports;
+		var found: Function;
+		var invokeNames = if(WizengOptions.ENTRYPOINT.val != null, [WizengOptions.ENTRYPOINT.val], ["main", "_start"]);
+		for (j < exports.length) {
+			var mex = module.exports[j], iex = instance.exports[j];
+			if (!Function.?(iex)) continue;
+			found = Function.!(iex);
+			for (name in invokeNames) {
+				if (Strings.equal(name, mex.0)) {
+					return (found, Arrays.map(found.sig.params, Values.default));
+				}
+			}
+		}
+		return (null, null);
+	}
+	// Execute the main function.
+	def executeMainFunction(f: Function, args: Range<Value>) -> (Result, int) {
+		var before_us = Metrics.main_time_us.ticks();
+		var before_cycles = Metrics.main_time_cycles.ticks();
+		var r = Execute.call(f, args);
+		Metrics.main_time_cycles.updateDiff(before_cycles);
+		Metrics.main_time_us.updateDiff(before_us);
+
+		match (r) {
+			Value(vals) => {
+				if (vals.length == 1) {
+					match (vals[0]) {
+						I32(val) => return (r, int.view(val));
+						I64(val) => return (r, int.view(val));
+						_ => ;
+					}
+				}
+				if (WizengOptions.PRINT_RESULT.val) {
+					for (i < vals.length) {
+						if (i > 0) Trace.OUT.sp();
+						Trace.OUT.putv(vals[i]);
+					}
+					Trace.OUT.ln();
+				}
+			}
+			Throw(thrown) => match (thrown) {
+				x: Exit => {
+					return (r, int.view(x.code));
+				}
+				_ => {
+					TraceUtil.renderThrowable(Trace.OUT, thrown);
+					return (r, -1);
+				}
+			}
+			Switch => {
+				// TraceUtil.renderThrowable(Trace.OUT, info.parent.trap(TrapReason.INVALID_SUSPEND));
+				// UNREACHABLE as far as V3Interpreter is concerned.
+				// TODO[ss]: check how to make this better
+				return (r, -1);
+			}
+		}
+		return (r, 0);
+	}
+}

@@ -1,8 +1,5 @@
 (module
-  (func $start (export "_start")
-    (call $main)
-  )
-  (func $main (export "main")
+  (func $main (export "_start")
     (local $y i32)
     (local.set $y (i32.const 10))
     (loop $l

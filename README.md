@@ -8,7 +8,7 @@ Built with the future in mind, it is written in a fast and lightweight, safe, ga
 
 ## Feature Support ##
 
-Wizard supports most Wasm standard features, including all of Wasm 2.0.
+Wizard supports most Wasm standard features, including all of Wasm 3.0.
 Newer features are under development and vary in their support in the different execution tiers, which include the V3 interpreter (v3-int), the fast interpreter (fast-int) and the single-pass compiler (spc).
 
 | Feature / Proposal | load | v3-int | fast-int | spc |
@@ -23,13 +23,13 @@ Newer features are under development and vary in their support in the different 
 | gc | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | function-references  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | extended-const  | &#x2705; | &#x2705; | &#x2705; | &#x2705; |
-| legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
 | exception-handling  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | relaxed-simd |  &#x2705; |  &#x2705; | &#x2705; | &#x2705; |
-| custom-page-sizes  | &#x2705;| &#x2705; |  |  |
+| memory64 | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | stack-switching  | &#x2705;| &#x2705; | &#x2705; |  &#x2705; |
+| custom-page-sizes  | &#x2705;| &#x2705; |  |  |
+| legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
 | threads  | &#x2705;| &#9745; | &#9745; |  |
-| memory64 | &#x2705;| &#x2705; | | |
 
 Wizard can run testcases specified in the `.bin.wast format`, like the specification tests that are part of the Wasm spec repo and proposal repos.
 Wizard supports a small embedding environment suitable for running simple programs.

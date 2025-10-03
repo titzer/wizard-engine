@@ -2,10 +2,7 @@
   (type $void (func))
   (table funcref (elem $foo $bar $baz $baz))
 
-  (func $start (export "_start")
-    (call $main)
-  )
-  (func $main (export "main")
+  (func $_start (export "_start")
     (local $y i32)
     (local.set $y (i32.const 3))
     (loop $l
