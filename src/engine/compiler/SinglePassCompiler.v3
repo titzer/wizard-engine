@@ -995,7 +995,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
 		// record reachable label positions for handler stub
 		for (i < catches.length) {
-			var depth = getCatchCodeLabel(catches[i]);
+			var depth = catches[i].getLabel();
 			var control = state.getControl(depth);
 			buildHandlerDest(control);
 		}
@@ -1009,18 +1009,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var dest_id = func.handlers.handler_dest_map[handler_id];
 		var info = handler_dest_info[dest_id];
 
-		if (control == null) { // dummy handler
-			if (Trace.compiler) {
-				Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
-			}
-			handler_dest_info[dest_id] = SpcHandlerInfo(true, null, null, null);
-			return;
-		}
-
 		// If target has not been reached via merge, populate with stack state which has everything
 		// in memory. Otherwise, there will be a processed {merge_state} that we can use directly.
 		if (control.merge_count == 0) {
-			control.merge_state = buildInMemoryState(int.view(control.val_stack_top), labelArgs(control));
+			control.merge_state = state.getInMemoryMergeWithArgs(int.view(control.val_stack_top), labelArgs(control));
 		}
 		control.merge_count++;
 
@@ -1033,29 +1025,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.label, masm.newLabel(it.pc), control.merge_state);
 		}
 	}
-	// Build a {merge_state} that contains the current stack truncated to {val_stack_top} plus
-	// {args}, all stored in memory.
-	private def buildInMemoryState(val_stack_top: int, args: Array<ValueType>) -> Array<SpcVal> {
-		var stack = Array<SpcVal>.new(val_stack_top + args.length);
-		// frozen stack values
-		for (slot < val_stack_top) {
-			var sv = state.state[slot].withoutReg().notConst();
-			stack[slot] = SpcVal(sv.flags | IS_STORED | TAG_STORED, NO_REG, 0);
+	def buildSwitchHandler() {
+		var handler_id = visited_handlers++;
+		var dest_id = func.handlers.handler_dest_map[handler_id];
+		if (Trace.compiler) {
+			Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 		}
-		// new in-memory values
-		for (i < args.length) {
-			var slot = val_stack_top + i;
-			stack[slot] = SpcVal(typeToKindFlags(args[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
-		}
-		return stack;
-	}
-	private def getCatchCodeLabel(catch: BpCatchCode) -> u31 {
-		match (catch) {
-			Catch(tag_index, label) => return label;
-			CatchRef(tag_index, label) => return label;
-			CatchAll(label) => return label;
-			CatchAllRef(label) => return label;
-		}
+		handler_dest_info[dest_id] = SpcHandlerInfo(true, null, null, null);
 	}
 	def emitSelect(valcount: u32) {
 		var sv = pop();
@@ -1267,9 +1243,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, reg, reg, int.!(memory_index));
 		masm.emit_v3_Memory_start_r_r(r2, reg);
 		masm.emit_v3_Memory_limit_r_r(r1, reg);
+		def is64 = module.memories[memory_index].size.is64;
 		masm.emit_subw_r_r(r1, r2);
 		masm.emit_shrw_r_i(r1, 16); // TODO(custom-page-sizes): load the log2 of pagesize from decl
-		state.push(KIND_I32 | IN_REG, r1, 0);
+		state.push(if(is64, KIND_I64, KIND_I32) | IN_REG, r1, 0);
 	}
 	def visit_MEMORY_GROW(memory_index: u31) {
 		def is64 = module.memories[memory_index].size.is64;
@@ -1359,7 +1336,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var handler = handlers[i];
 			match (handler) {
 				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
-				Switch(tag_index) => buildHandlerDest(null);
+				Switch(tag_index) => buildSwitchHandler();
 			}
 		}
 
@@ -1511,7 +1488,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var handler = handlers[i];
 			match (handler) {
 				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
-				Switch(tag_index) => buildHandlerDest(null);
+				Switch(tag_index) => buildSwitchHandler();
 			}
 		}
 
@@ -1785,8 +1762,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_TABLE_COPY(tindex1: u31, tindex2: u31) {
 		emit_call_runtime_op2(Opcode.TABLE_COPY, tindex1, tindex2, true);
 	}
-	def visit_TABLE_GROW(index: u31) {
-		emit_call_runtime_op1n(Opcode.TABLE_GROW, index, 2, [ValueType.I32], false);
+	def visit_TABLE_GROW(table_index: u31) {
+		var t = if(module.tables[table_index].size.is64, SigCache.arr_l, SigCache.arr_i);
+		emit_call_runtime_op1n(Opcode.TABLE_GROW, table_index, 2, t, false);
 	}
 	def visit_TABLE_SIZE(table_index: u31) {
 		var tmp = allocTmp(ValueKind.REF);
@@ -1796,7 +1774,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp, tmp, int.!(table_index));
 		masm.emit_v3_Table_elems_r_r(tmp, tmp);
 		masm.emit_v3_Array_length_r_r(r1, tmp);
-		state.push(KIND_I32 | IN_REG, r1, 0);
+		def is64 = module.tables[table_index].size.is64;
+		state.push(if(is64, KIND_I64 | IN_REG, KIND_I32 | IN_REG), r1, 0);
 	}
 	def visit_TABLE_FILL(index: u31) {
 		emit_call_runtime_op1n(Opcode.TABLE_FILL, index, 3, ValueTypes.NONE, true);
@@ -2063,41 +2042,26 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitLoad(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ())  {
-		var base_reg = regs.mem0_base;
-		if (imm.memory_index != 0) {
-			// XXX: cache the base register for memories > 0
-			base_reg = allocTmp(ValueKind.REF);
-			emit_load_instance(base_reg);
-			masm.emit_v3_Instance_memories_r_r(base_reg, base_reg);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
-			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
-		}
 		var iv = pop();
-		var index_reg: Reg;
-		var offset = imm.offset;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-		} else {
-			index_reg = ensureReg(iv, state.sp);
-		}
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
 		var dest = allocRegTos(kind); // XXX: can reuse index reg if frequency == 1 and ValueKind.I32
-		meth(kind, dest, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+		meth(kind, dest, addr.base_reg, addr.index_reg, addr.offset);
+		var indexKind = if(addr.is64, ValueKind.I64, ValueKind.I32);
 		var nflags = IN_REG | SpcConsts.kindToFlags(kind);
-		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
+		if (kind == indexKind) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
 
-		if (intrinsified_read_probe != null) {
+		if (intrinsified_read_probe != null) { // TODO(memory64)
 			// spill everything
 			state.emitSaveAll(resolver, probeSpillMode);
-
+			var index_reg = addr.index_reg;
 			// load RT args (addr, val) and call RT
-			if (index_reg.index == 0) { // fixed addr
+			if (addr.index_reg == NO_REG) { // fixed addr
 				index_reg = allocTmp(ValueKind.I32);
-				masm.emit_mov_r_i(index_reg, i32.!(offset));
+				masm.emit_mov_r_i(index_reg, int.view(addr.offset));
 			} else {
-				masm.emit_addw_r_i(index_reg, i32.!(offset));
+				masm.emit_addw_r_i(index_reg, int.view(addr.offset));
 			}
 			var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
 			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
@@ -2110,6 +2074,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ()) {
+		var sv = popReg();
+		var iv = pop();
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
+		meth(kind, sv.reg, addr.base_reg, addr.index_reg, addr.offset);
+	}
+	def emitComputeEffectiveAddress(imm: MemArg, iv: SpcVal) -> EffectiveAddr {
+		var mdecl = module.memories[imm.memory_index];
 		var base_reg = regs.mem0_base;
 		if (imm.memory_index != 0) {
 			// XXX: cache the base register for memories > 0
@@ -2119,32 +2091,38 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
 			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
 		}
-		var offset = imm.offset;
-		var sv = popReg();
-		var iv = state.peek();
 		var index_reg: Reg;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-			pop();
-		} else {
-			index_reg = popReg().reg;
+		var offset = imm.offset;
+		var limit = if(mdecl.size.is64, Target.limit_memory_size_64, Target.limit_memory_size);
+		if (offset >= limit) {
+			emitTrap(TrapReason.MEMORY_OOB); // statically OOB
+			return OOB_ADDR;
 		}
-		meth(kind, sv.reg, base_reg, index_reg, u32.!(offset)); // TODO: memory64
-	}
-
-	def emitIntrinsifiedMemoryReadProbe() {
-		// spill everything
-		state.emitSaveAll(resolver, probeSpillMode);
-		// compute VSP for potential frame access
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-
-
-		emit_reload_regs();
-		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+		if (iv.isConst()) {
+			offset += u32.view(iv.const); // fold offset calculation
+			if (offset >= limit) {
+				emitTrap(TrapReason.MEMORY_OOB); // statically OOB
+				return OOB_ADDR;
+			}
+		} else {
+			index_reg = ensureReg(iv, state.sp);
+			if (mdecl.size.is64 && !SpcTuning.disableMemoryBoundsChecks) {
+				// emit a bounds check of (index >> N) != 0
+				var shift_reg = allocTmp(ValueKind.I64);
+				masm.emit_mov_r_r(ValueKind.I64, shift_reg, index_reg);
+				masm.emit_shrw_r_i(shift_reg, 34); // TODO: compute shift amount from max memory size
+				var oob_label = newTrapLabel(TrapReason.MEMORY_OOB);
+				masm.emit_br_r(shift_reg, MasmBrCond.I64_NONZERO, oob_label); // XXX: on x86, shift sets flags
+			}
+		}
+		if (u32.?(offset)) {
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, index_reg, u32.!(offset));
+		} else {
+			var sum_reg = allocTmp(ValueKind.I64);
+			masm.emit_mov_r_l(sum_reg, long.view(offset));
+			if (index_reg != NO_REG) masm.emit_addw_r_r(sum_reg, index_reg);
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, sum_reg, 0);
+		}
 	}
 
 	//====================================================================
@@ -2386,6 +2364,10 @@ enum SpillMode(free_regs: bool, remember_stored: bool) {
 	SAVE_AND_FREE_REGS(true, true),		// save registers and free all registers
 }
 
+// Used for computing memory load/store addresses
+type EffectiveAddr(oob: bool, is64: bool, base_reg: Reg, index_reg: Reg, offset: u32) #unboxed;
+def OOB_ADDR = EffectiveAddr(true, false, NO_REG, NO_REG, 0);
+
 // Compiler representation of (abstract) values on the WebAssembly value stack,
 // including its {ValueKind}, whether the value is stored into the corresponding slot,
 // whether the value tag (if tags enabled) is stored into the slot, which if any
@@ -2562,6 +2544,19 @@ class SpcState(regAlloc: RegAlloc) {
 	}
 	def doFirstTransferAndGetMerge(valcount: u32, popcount: u32, resolver: SpcMoveResolver) -> Array<SpcVal> {
 		return SpcMerger.new(state, num_locals, sp, regAlloc, resolver).createMerge(valcount, popcount);
+	}
+	// Get a merge that contains the current stack up to {val_stack_top} plus {args}, all stored in memory.
+	def getInMemoryMergeWithArgs(val_stack_top: int, args: Array<ValueType>) -> Array<SpcVal> {
+		var merge = Array<SpcVal>.new(val_stack_top + args.length);
+		for (slot < val_stack_top) {
+			var flags = state[slot].kindFlags(IS_STORED | TAG_STORED);
+			merge[slot] = SpcVal(flags, NO_REG, 0);
+		}
+		for (i < args.length) {
+			var slot = val_stack_top + i;
+			merge[slot] = SpcVal(typeToKindFlags(args[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+		return merge;
 	}
 	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.IF.code, params, results, end_label);

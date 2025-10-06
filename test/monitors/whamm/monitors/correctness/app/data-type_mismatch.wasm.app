@@ -1,0 +1,1 @@
+../../apps/i32_add.wasm

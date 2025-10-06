@@ -253,8 +253,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def valuerep = Target.tagging;
 	def initialSize = w.data.length;
 
-	def m_curStack = X86_64Addr.new(null, null, 1, int.view(offsets.X86_64Runtime_curStack - Pointer.NULL));
-
 	var oolULeb32Sites = Vector<OutOfLineLEB>.new();
 	var firstDispatchOffset: int;
 	var dispatchJmpOffset: int = -1;
@@ -490,7 +488,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		masm.bindLabel(hostCallStubLabel);
 		ic.header.hostCallStubOffset = w.pos;
 		// mov %stack, [cur_stack]    ; reload stack object from (thread-local) curStack
-		masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+		masm.emit_get_curstack(r_stack);
 		// mov [%stack.rsp], %rsp     ; save rsp in case of possible unwind
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(r_stack, xenv.sp);
 		// mov [%stack.vsp], %vsp
@@ -504,7 +502,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		masm.emit_call_runtime_callHost(xenv.func_arg);
 
 		// mov %stack, [cur_stack]    ; reload stack object from curStack
-		masm.emit_mov_r_m(ValueKind.REF, r_stack, m_curStack);
+		masm.emit_get_curstack(r_stack);
 		// mov %vsp, [%stack.vsp]     ; reload VSP from stack object
 		masm.emit_v3_X86_64Stack_vsp_r_r(xenv.vsp, r_stack);
 		// mov %func, %runtime_ret1   ; move WasmFunction return into r_func
@@ -524,8 +522,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		} else {
 			// Load entrypoint from r_func.decl.target_code
 			var do_jump = masm.newLabel(-1);
-			masm.emit_mov_r_m(ValueKind.REF, xenv.tmp2, MasmAddr(r_func, masm.offsets.WasmFunction_decl));
-			masm.emit_mov_r_m(ValueKind.REF, xenv.tmp2, MasmAddr(xenv.tmp2, masm.offsets.FuncDecl_target_code));
+			masm.emit_v3_WasmFunction_decl_r_r(xenv.tmp2, r_func);
+			masm.emit_v3_FuncDecl_target_code_r_r(xenv.tmp2, xenv.tmp2);
 			// Jump to interpreter if entrypoint not set
 			asm.q.cmp_r_i(G(xenv.tmp2), 0);
 			asm.jc_rel_far(C.Z, spcEntryLabel);
@@ -634,7 +632,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.d.cmp_r_i(r_tmp0, 0);
 		asm.jc_rel_near(C.Z, no_mem);
 		asm.movq_r_m(mem0, mem0.plus(offsets.Array_contents));
-		asm.movq_r_m(mem0, mem0.plus(offsets.X86_64Memory_start));
+		asm.movq_r_m(mem0, mem0.plus(offsets.NativeWasmMemory_start));
 		asm.bind(no_mem);
 		saveIVar(r_mem0_base);
 
@@ -658,7 +656,20 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// check for extended LEB, abstract type, or type with immediate
 		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
-		genConditionalJumpDeferred(C.NZ, genComplexTypeDecode(_, typeGpr));
+		genConditionalJumpDeferred(C.NZ, fun retpoint {
+			// slowpath: handle extended LEB, types with immediates, and abstract types
+			var type_not_leb = X86_64Label.new();
+			asm.d.test_r_i(typeGpr, LEB_UPPER_BIT);		// check for LEB first
+			asm.jc_rel_near(C.Z, type_not_leb);
+			genSkipLeb0(r_tmp4);
+			asm.bind(type_not_leb);
+			// check for types that have an immediate
+			var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
+			asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
+			asm.jc_rel_far(C.Z, retpoint);
+			genSkipLeb0(r_tmp4);			// skip offset
+			asm.jmp_rel_near(retpoint);
+		});
 		
 		// gen: if(num != 0) do
 		var start2 = X86_64Label.new(), done2 = X86_64Label.new();
@@ -681,13 +692,44 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (!FeatureDisable.frameVariables) {
 			asm.movq_r_m(r_tmp2, r_func_decl.plus(offsets.FuncDecl_frame_var_tags));
 			asm.q.cmp_r_i(r_tmp2, 0);
-			genConditionalJumpDeferred(C.NZ, genPushFrameVarTags(_, r_tmp2));
+			genConditionalJumpDeferred(C.NZ, fun retpoint {
+				// slowpath: push values for frame variables.
+				var r_frame_var_tags = r_tmp2;
+				var r_start = r_tmp2, r_end = r_tmp1, r_tag = r_tmp3;
+				asm.movd_r_m(r_end, r_frame_var_tags.plus(offsets.Array_length));
+				asm.q.lea(r_start, r_frame_var_tags.plus(offsets.Array_contents));
+				asm.q.add_r_r(r_end, r_start);
+				var loop = X86_64Label.new();
+				// while (r_start < r_end)
+				asm.bind(loop);
+				asm.q.cmp_r_r(r_start, r_end);
+				asm.jc_rel_far(C.GE, retpoint);
+				asm.movbzx_r_m(r_tag, r_start.plus(0));
+				genTagPushR(r_tag);			// *(sp) = type
+				asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
+				incrementVsp();	// sp += 1 slot
+				// gen: while (--num != 0)
+				asm.q.inc_r(r_start);
+				asm.jmp_rel_near(loop);
+			});
 		}
 
 		// Check for function entry probe.
 		if (!FeatureDisable.entryProbes) {
 			asm.test_m_i(r_func_decl.plus(offsets.FuncDecl_entry_probed), 1);
-			genConditionalJumpDeferred(C.NZ, genFuncEntryProbe);
+			genConditionalJumpDeferred(C.NZ, fun retpoint {
+				// slowpath: call function entry probe
+				computePcFromCurIp();
+				if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
+				saveCallerIVars();
+				asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
+				masm.emit_get_curstack(xenv.tmp1);
+				callRuntime(refRuntimeCall(X86_64RT.runtime_PROBE_instr), [r_tmp1, r_tmp0, r_curpc], true);
+				// fall through
+				restoreCallerIVars();
+				//TODO: restoreDispatchTableReg();
+				genJumpToDispatch();
+			});
 		}
 		// Dispatch to first instruction.
 		genDispatchOrJumpToDispatch();
@@ -699,50 +741,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		restoreDispatchTableReg();
 		genJumpToDispatch();
 		genDeferred();
-	}
-	def genComplexTypeDecode(retpoint: X86_64Label, r_type: X86_64Gpr) {
-		// handle extended LEB, types with immediates, and abstract types
-		var type_not_leb = X86_64Label.new();
-		asm.d.test_r_i(r_type, LEB_UPPER_BIT);		// check for LEB first
-		asm.jc_rel_near(C.Z, type_not_leb);
-		genSkipLeb0(r_tmp4);
-		asm.bind(type_not_leb);
-		// check for types that have an immediate
-		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
-		asm.d.test_m_i(r_type.plus(typeTableAddr), TYPE_HAS_IMM);
-		asm.jc_rel_far(C.Z, retpoint);
-		genSkipLeb0(r_tmp4);			// skip offset
-		asm.jmp_rel_near(retpoint);
-	}
-	def genFuncEntryProbe(retpoint: X86_64Label) {
-		computePcFromCurIp();
-		if (!FeatureDisable.stacktraces) asm.movq_r_i(r_curpc, 0);
-		saveCallerIVars();
-		asm.movq_r_m(r_tmp0, m_wasm_func); // XXX: compute func and pc directly in the right regs
-		masm.emit_get_curstack(xenv.tmp1);
-		callRuntime(refRuntimeCall(X86_64RT.runtime_PROBE_instr), [r_tmp1, r_tmp0, r_curpc], true);
-		// fall through
-		restoreCallerIVars();
-		//TODO: restoreDispatchTableReg();
-		genJumpToDispatch();
-	}
-	def genPushFrameVarTags(retpoint: X86_64Label, r_frame_var_tags: X86_64Gpr) {
-		var r_start = r_frame_var_tags, r_end = r_tmp1, r_tag = r_tmp3;
-		asm.movd_r_m(r_end, r_frame_var_tags.plus(offsets.Array_length));
-		asm.q.lea(r_start, r_frame_var_tags.plus(offsets.Array_contents));
-		asm.q.add_r_r(r_end, r_start);
-		var loop = X86_64Label.new();
-		// while (r_start < r_end)
-		asm.bind(loop);
-		asm.q.cmp_r_r(r_start, r_end);
-		asm.jc_rel_far(C.GE, retpoint);
-		asm.movbzx_r_m(r_tag, r_start.plus(0));
-		genTagPushR(r_tag);			// *(sp) = type
-		asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
-		incrementVsp();	// sp += 1 slot
-		// gen: while (--num != 0)
-		asm.q.inc_r(r_start);
-		asm.jmp_rel_near(loop);
 	}
 	def genDeferred() {
 		for (l = deferred; l != null; l = l.tail) {
@@ -1568,7 +1566,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			restoreCallerIVars();
 			endHandler();
 		}
-		// TODO: ATOMIC_FENCE
+		bindHandler(Opcode.ATOMIC_FENCE); {
+			asm.q.inc_r(r_ip); // skip zero byte
+			asm.mfence();
+			endHandler();
+		}
 	}
 	def genAtomicLoadsAndStores() {
 		// Load Seq_Cst -> MOV (from memory)
@@ -1950,7 +1952,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var memN = r_tmp4;
 			asm.movq_r_m(memN, r_instance.plus(offsets.Instance_memories));
 			asm.movq_r_m(memN, memN.plusR(r_tmp0, 8, offsets.Array_contents));
-			asm.movq_r_m(memN, memN.plus(offsets.X86_64Memory_start));
+			asm.movq_r_m(memN, memN.plus(offsets.NativeWasmMemory_start));
 			genReadUleb32(r_tmp0);			// decode offset
 
 			if (isCmpAndExchange) {
@@ -2356,8 +2358,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(r_tmp1);
 			asm.movq_r_m(r_tmp0, r_instance.plus(offsets.Instance_memories));
 			asm.movq_r_m(r_tmp0, r_tmp0.plusR(r_tmp1, offsets.REF_SIZE, offsets.Array_contents));
-			asm.movd_r_m(r_tmp1, r_tmp0.plus(offsets.X86_64Memory_num_pages));
-			asm.movb_r_m(r_tmp0, r_tmp0.plus(offsets.X86_64Memory_index_tag));
+			asm.movd_r_m(r_tmp1, r_tmp0.plus(offsets.NativeWasmMemory_num_pages));
+			asm.movb_r_m(r_tmp0, r_tmp0.plus(offsets.NativeWasmMemory_index_tag));
 			genTagPushR(r_tmp0);
 			asm.movq_m_r(vsph[0].value, r_tmp1);
 			incrementVsp();
@@ -2403,9 +2405,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genReadUleb32(r_tmp1);
 			asm.movq_r_m(r_tmp0, r_instance.plus(offsets.Instance_tables));
 			asm.movq_r_m(r_tmp0, r_tmp0.plusR(r_tmp1, offsets.REF_SIZE, offsets.Array_contents));
+			asm.movb_r_m(r_tmp2, r_tmp0.plus(offsets.Table_index_tag));
+			genTagPushR(r_tmp2);
 			asm.movq_r_m(r_tmp0, r_tmp0.plus(offsets.Table_elems));
-			asm.movq_r_m(r_tmp0, r_tmp0.plus(offsets.Array_length));
-			genTagPush(BpTypeCode.I32.code);
+			asm.movd_r_m(r_tmp0, r_tmp0.plus(offsets.Array_length));
 			asm.movq_m_r(vsph[0].value, r_tmp0);
 			incrementVsp();
 			endHandler();
@@ -2601,7 +2604,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var pos = w.atEnd().pos;
 			writeDispatchEntry(dispatchTables[0].1, InternalOpcode.WHAMM_PROBE.code, pos);
 			if (Debug.interpreter) {
-				Trace.OUT.put1("\thandle_%s:", InternalOpcode.WHAMM_PROBE.name).pad(' ', 35)
+				Trace.OUT.put1("\thandle_%s: ", InternalOpcode.WHAMM_PROBE.name).pad(' ', 35)
 					.put1("break *0x%x", (ic.start + pos) - Pointer.NULL)
 					.ln();
 			}
@@ -2625,8 +2628,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			if (SpcTuning.disable) {
 				asm.call_rel_far(callReentryLabel);
 			} else {
-				masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(xenv.func_arg, offsets.WasmFunction_decl));
-				masm.emit_mov_r_m(ValueKind.REF, xenv.scratch, MasmAddr(xenv.scratch, offsets.FuncDecl_target_code));
+				masm.emit_v3_WasmFunction_decl_r_r(xenv.scratch, xenv.func_arg);
+				masm.emit_v3_FuncDecl_target_code_r_r(xenv.scratch, xenv.scratch);
 				masm.emit_call_r(xenv.scratch);
 			}
 
@@ -2637,7 +2640,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_r(pc, r_ip);
 			asm.sub_r_m(pc, m_code);
 			var origIp = r_tmp0; // FUNC_DECL.orig_bytecode + pc - 1
-			asm.movq_r_m(origIp, r_func_decl.plus(offsets.FuncDecl_orig_bytecode));
+			masm.emit_v3_FuncDecl_orig_bytecode_r_r(xenv.tmp0, xenv.func_decl);
 
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
@@ -2654,7 +2657,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_r(pc, r_ip);
 			asm.sub_r_m(pc, m_code);
 			var origIp = r_tmp0; // FUNC_DECL.orig_bytecode + pc - 1
-			asm.movq_r_m(origIp, r_func_decl.plus(offsets.FuncDecl_orig_bytecode));
+			masm.emit_v3_FuncDecl_orig_bytecode_r_r(xenv.tmp0, xenv.func_decl);
 			asm.add_r_r(origIp, pc);
 			asm.sub_r_i(origIp, 1);
 			genDispatch0(origIp.indirect(), dispatchTables[0].1, false);
@@ -3564,7 +3567,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		var pos = w.atEnd().pos;
 		patchDispatchTable(opcode, pos);
 		if (Debug.interpreter) {
-			Trace.OUT.put1("\thandle_%s:", opcode.name).pad(' ', 35)
+			Trace.OUT.put1("\thandle_%s: ", opcode.name).pad(' ', 35)
 				.put1("break *0x%x", (ic.start + pos) - Pointer.NULL)
 				.ln();
 		}
@@ -3694,15 +3697,18 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genLoad<T>(opcode: Opcode, tag: byte, gen: (X86_64Gpr, X86_64Addr) -> T) {
 		bindHandler(opcode);
 		computeCurIpForTrap(-1);
-		var finish = asm.newLabel(), has_index: X86_64Label;
+		asm.q.inc_r(r_ip);				// skip flags byte
+		var finish = asm.newLabel(), has_index: X86_64Label, index64: X86_64Label;
+		if (!FeatureDisable.memory64) {
+			index64 = asm.newLabel();
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_STOLEN_IS64); // XXX: test byte
+			asm.jc_rel_far(C.NZ, index64);
+		}
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
-			asm.q.inc_r(r_ip);				// skip flags byte
 			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
 			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
-		} else {
-			asm.q.inc_r(r_ip);				// skip flags byte
 		}
 		genReadUleb32(r_tmp0);				// decode offset
 		asm.movd_r_m(r_tmp1, vsph[-1].value);		// read index off value stack
@@ -3718,25 +3724,43 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var memN = r_tmp4;
 			asm.movq_r_m(memN, r_instance.plus(offsets.Instance_memories));
 			asm.movq_r_m(memN, memN.plusR(r_tmp0, 8, offsets.Array_contents));
-			asm.movq_r_m(memN, memN.plus(offsets.X86_64Memory_start));
+			asm.movq_r_m(memN, memN.plus(offsets.NativeWasmMemory_start));
 			genReadUleb32(r_tmp0);			// decode offset
 			asm.movd_r_m(r_tmp1, vsph[-1].value);	// read index off value stack
 			asm.q.add_r_r(r_tmp0, r_tmp1);		// add index + offset
 			gen(r_tmp1, memN.plusR(r_tmp0, 1, 0));
 			asm.jmp_rel_near(finish);
 		}
+		if (index64 != null) {
+			asm.bind(index64);
+			// TODO: multi-memory with memory64
+			masm.emit_read_uleb(r_tmp3, r_ip, r_tmp1, r_tmp0); // decode offset
+			asm.movq_r_m(r_tmp1, vsph[-1].value);		// read index off value stack
+			asm.movq_r_r(r_tmp2, r_tmp1);
+			asm.q.or_r_r(r_tmp2, r_tmp3);			// check that neither offset or index have
+			asm.q.shr_r_i(r_tmp2, 34);			// upper bits set
+			var label = newTrapLabel(TrapReason.MEMORY_OOB);
+			asm.jc_rel_far(X86_64Conds.NZ, label); 
+			asm.q.add_r_r(r_tmp3, r_tmp1);			// add index + offset
+			gen(r_tmp1, r_mem0_base.plusR(r_tmp3, 1, 0));
+			if (valuerep.tagged && tag != BpTypeCode.I64.code) genTagUpdate(tag); // update tag if necessary
+			asm.jmp_rel_near(finish);
+		}
 	}
 	def genStore<T>(gen: (X86_64Addr, X86_64Gpr) -> T) {
 		computeCurIpForTrap(-1);
-		var finish = asm.newLabel(), has_index: X86_64Label;
+		var finish = asm.newLabel(), has_index: X86_64Label, index64: X86_64Label;
+		asm.q.inc_r(r_ip);				// skip flags byte
+		if (!FeatureDisable.memory64) {
+			index64 = asm.newLabel();
+			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_STOLEN_IS64); // XXX: test byte
+			asm.jc_rel_far(C.NZ, index64);
+		}
 		if (!FeatureDisable.multiMemory) { // dynamically check for memory index
 			has_index = asm.newLabel();
-			asm.q.inc_r(r_ip);				// skip flags byte
 			// this instruction is tricky: it considers 32 bits, but looks only in the low byte
 			asm.d.test_m_i(r_ip.plus(-1), BpConstants.MEMARG_INDEX_FLAG); // XXX: test byte
 			asm.jc_rel_near(C.NZ, has_index);
-		} else {
-			asm.q.inc_r(r_ip);				// skip flags byte
 		}
 		genReadUleb32(r_tmp0);			// decode offset
 		asm.movd_r_m(r_tmp1, vsph[-2].value);	// read index
@@ -3752,12 +3776,27 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var memN = r_tmp4;
 			asm.movq_r_m(memN, r_instance.plus(offsets.Instance_memories));
 			asm.movq_r_m(memN, memN.plusR(r_tmp0, 8, offsets.Array_contents));
-			asm.movq_r_m(memN, memN.plus(offsets.X86_64Memory_start));
+			asm.movq_r_m(memN, memN.plus(offsets.NativeWasmMemory_start));
 			genReadUleb32(r_tmp0);			// decode offset
 			asm.movd_r_m(r_tmp1, vsph[-2].value);	// read index off value stack
 			asm.q.add_r_r(r_tmp0, r_tmp1);		// add index + offset
 			asm.movq_r_m(r_tmp1, vsph[-1].value);	// read value
 			gen(memN.plusR(r_tmp0, 1, 0), r_tmp1);
+			asm.jmp_rel_near(finish);
+		}
+		if (index64 != null) {
+			asm.bind(index64);
+			// TODO: multi-memory with memory64
+			masm.emit_read_uleb(r_tmp3, r_ip, r_tmp1, r_tmp0); // decode offset
+			asm.movq_r_m(r_tmp1, vsph[-2].value);		// read index off value stack
+			asm.movq_r_r(r_tmp2, r_tmp1);
+			asm.q.or_r_r(r_tmp2, r_tmp3);			// check that neither offset or index have
+			asm.q.shr_r_i(r_tmp2, 34);			// upper bits set
+			var label = newTrapLabel(TrapReason.MEMORY_OOB);
+			asm.jc_rel_far(X86_64Conds.NZ, label); 
+			asm.q.add_r_r(r_tmp3, r_tmp1);			// add index + offset
+			asm.movq_r_m(r_tmp1, vsph[-1].value);		// read value
+			gen(r_mem0_base.plusR(r_tmp3, 1, 0), r_tmp1);
 			asm.jmp_rel_near(finish);
 		}
 	}
@@ -3956,10 +3995,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				fatal("prefix 0 opcode > 255");
 			}
 			var ref0 = dispatchTables[0].1;		// main dispatch table
-			if (Debug.interpreter) {
-				Trace.OUT.put3("\t\tpatch main table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
-			}
 			writeDispatchEntry(ref0, opcode.code, pos);
 			w.atEnd();
 			return;
@@ -3983,17 +4018,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				if (refsub == null) continue;
 				// if upper is 0, can encode as just lower, so put there as well
 				if (upper == 0) {
-					if (Debug.interpreter)
-						Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
-							       lower, opcode.prefix, opcode.code);
 					writeDispatchEntry(refsndary, lower, pos);
 				}
 				// write subpage entry at upper
 				// also covers case of non-minimal encoding of upper == 0
-				if (Debug.interpreter) {
-					Trace.OUT.put2("\t\tpatch subpage table %x at %x", lower, upper);
-					Trace.OUT.put2(" for prefix %x code %x\n", opcode.prefix, opcode.code);
-				}
 				writeDispatchEntry(refsub, upper, pos);
 				w.atEnd();
 				return;
@@ -4009,15 +4037,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (opcode.code < 128) {
 			// minimal encoding goes to secondary
 			// other encodings will redirect here
-			if (Debug.interpreter)
-				Trace.OUT.put3("\t\tpatch secondary table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
 			writeDispatchEntry(refsndary, opcode.code, pos);
 		} else {
 			// all encodings go to LEB table
-			if (Debug.interpreter)
-				Trace.OUT.put3("\t\tpatch LEB table at %x for prefix %x code %x\n",
-					       opcode.code, opcode.prefix, opcode.code);
 			writeDispatchEntry(refleb, opcode.code, pos);
 		}
 		w.atEnd();
@@ -4121,7 +4143,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.movq_r_l(Target.V3_RET_GPRS[0], trapObj - Pointer.NULL);
 		genPopFrameAndRet();
 		ic.header.stackOverflowHandlerOffset = stackoverflow_label.pos;
-		ic.header.oobMemoryHandlerOffset = newTrapLabel(TrapReason.MEM_OUT_OF_BOUNDS).pos;
+		ic.header.oobMemoryHandlerOffset = newTrapLabel(TrapReason.MEMORY_OOB).pos;
 		ic.header.divZeroHandlerOffset = newTrapLabel(TrapReason.DIV_BY_ZERO).pos;
 
 		// Generate the code for the CRASH opcode.

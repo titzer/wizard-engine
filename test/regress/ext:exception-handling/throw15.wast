@@ -1,0 +1,26 @@
+(module
+  (type $f1 (func))
+  (tag $t (param i32))
+  (func $throw
+    (throw $t (i32.const 47))
+  )
+  (elem declare func $throw)
+  (func (export "main") (param i32) (result i32)
+    (i32.add (i32.const 11) (call $f1 (local.get 0)))
+  )
+  (func $f1 (param i32) (result i32)
+    (local f32)
+    (local f32)
+    (local f32)
+    (i32.const 33)
+    (block (result i32)
+      (try_table (catch $t 1)
+        (call $throw)
+      )
+      (i32.const 22)
+    )
+    return
+  )
+)
+
+(assert_return (invoke "main" (i32.const 44)) (i32.const 58))
