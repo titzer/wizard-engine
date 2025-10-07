@@ -1,0 +1,17 @@
+(module
+  (type $0 (func))
+  (type $1 (func))
+  (export "_start" (func 0))
+  (elem declare func 1)
+  (func $0
+    (type 1)
+    (ref.func 1)
+    (call_ref 0)
+  )
+  (func $1 (type 0)
+    (ref.func 1)
+    (call_ref 0)
+    (unreachable)
+  )
+)
+(assert_exhaustion (invoke "_start") "call stack exhausted")
