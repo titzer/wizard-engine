@@ -1,4 +1,4 @@
-(module binary
+(module definition binary
   "\00\61\73\6d\01\00\00\00\01\8b\80\80\80\00\02\60"
   "\00\00\60\03\7f\7f\7f\01\7f\03\84\80\80\80\00\03"
   "\00\01\00\07\8a\80\80\80\00\01\06\73\65\6c\65\63"
@@ -13,6 +13,7 @@
   "\10\20\00\41\11\48\21\11\1b\0b\82\80\80\80\00\00"
   "\0b"
 )
+(module instance)
 (assert_return
   (invoke "select" (i32.const 0x29a) (i32.const 0x6f) (i32.const 0x0))
   (i32.const 0x6f)
