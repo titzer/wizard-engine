@@ -1,4 +1,4 @@
-(module binary
+(module definition binary
   "\00\61\73\6d\01\00\00\00\01\9b\80\80\80\00\0c\5f"
   "\00\5f\00\5f\00\5f\00\5f\00\5f\00\5f\00\5f\00\5f"
   "\00\5f\00\5f\00\60\01\7f\00\03\82\80\80\80\00\01"
@@ -6,5 +6,6 @@
   "\80\00\01\8f\80\80\80\00\00\fb\01\0a\fb\01\0a\20"
   "\00\1c\01\64\0a\1a\0b"
 )
+(module instance)
 (assert_return (invoke "f" (i32.const 0x0)))
 (assert_return (invoke "f" (i32.const 0x1)))
