@@ -1,0 +1,17 @@
+(module
+  (type $0 (func (param (ref eq) (ref eq) (ref eq))))
+  (type $1 (func))
+  (type $S (struct))
+  (export "_start" (func 0))
+  (elem declare func 1)
+  (func $0
+    (type 1)
+    (struct.new_default $S)
+    (struct.new_default $S)
+    (struct.new_default $S)
+    (ref.func 1)
+    (call_ref 0)
+  )
+  (func $1 (type 0) (unreachable))
+)
+(assert_trap (invoke "_start") "unreachable")

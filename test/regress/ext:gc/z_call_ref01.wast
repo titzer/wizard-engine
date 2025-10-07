@@ -1,0 +1,15 @@
+(module
+  (type $0 (func (param i32 i32)))
+  (type $1 (func))
+  (export "_start" (func 0))
+  (elem declare func 1)
+  (func $0
+    (type 1)
+    (i32.const 7)
+    (i32.const 8)
+    (ref.func 1)
+    (call_ref 0)
+  )
+  (func $1 (type 0) (unreachable))
+)
+(assert_trap (invoke "_start") "unreachable")
