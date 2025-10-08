@@ -1,10 +1,10 @@
 (module
-  (func (result i32)
+  (import "wizeng" "puti" (func $puti (param i32)))
+  (func $f (result i32)
 	i32.const 10)
   (func (export "main") (result i32)
-        call 0
-        i32.const 126
-        i32.const 126
-	i32.add
-	i32.add)
+        call $f
+	call $puti
+	i32.const 0
+  )
 )
