@@ -1,0 +1,26 @@
+(module
+  (tag $e0)
+  (func (export "simple-throw-catch") (param i32) (result i32)
+    (block $h
+      (if (i32.const 0)
+        (then
+	  (unreachable)
+          (try_table (result i32) (catch $e0 $h)
+           (if (i32.eqz (local.get 0)) (then (throw $e0)) (else))
+           (i32.const 42)
+          )
+	  (unreachable)
+      ))
+      (try_table (result i32) (catch $e0 $h)
+        (if (i32.eqz (local.get 0)) (then (throw $e0)) (else))
+        (i32.const 42)
+      )
+      (return)
+    )
+    (i32.const 23)
+  )
+)
+
+(assert_return (invoke "simple-throw-catch" (i32.const 0)) (i32.const 23))
+(assert_return (invoke "simple-throw-catch" (i32.const 1)) (i32.const 42))
+
