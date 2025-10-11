@@ -6,13 +6,13 @@ The Wizard Engine has a few tools for debugging its low-level code, specifically
 
 Wizard's build script accepts a `--debug` flag that produces a debug build. When enabled, the following features are turned on:
 - Validation (check) monitors
-- Symbols in JIT compiled modules (TODO)
+- Symbols in JIT compiled modules
 
-### Validation Monitors
+### Engine Diagnostic Monitors
 
-Validation monitors check for invariants during Wizard's execution and verifies that Wizard's internal states (e.g., memory layout, guards, etc.) are correct.
+Engine diagnostic monitors check for invariants during Wizard's execution and verifies that Wizard's internal states (e.g., memory layout, guards, etc.) are correct.
 
-The debugging flag `Debug.check` in [Debug](/src/engine/Debug.v3) enables verbose validation.
+The debugging flag `Debug.diagnostic` in [Debug](/src/engine/Debug.v3) enables verbose validation.
 
 ### JIT Symbols
 
