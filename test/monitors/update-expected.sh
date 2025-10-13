@@ -25,7 +25,7 @@ else
         "hotness" "hotness{c}"
         "globals" 
         "memstats"
-        "profile_bytecode{switch_size=16}")
+	"profile_bytecode{switch_size=16}")
 fi
 
 # generate output files from all .wasm in a folder
