@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 function usage() {
     echo "Usage: wasm-query.sh command <file.wasm>"

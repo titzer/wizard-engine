@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 function exit_usage() {
     echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
@@ -193,7 +193,7 @@ elif [ "$TARGET" = "v3i" ]; then
 	fi
 	LIST="$LIST $(ls $f)"
     done
-    echo '#!/bin/bash' > bin/$PROGRAM.v3i
+    echo '#!/usr/bin/env bash' > bin/$PROGRAM.v3i
     echo "v3i $LANG_OPTS \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
     chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors
