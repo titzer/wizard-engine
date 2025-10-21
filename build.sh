@@ -69,15 +69,15 @@ if [ "$1" = "--debug" ]; then
     shift
 fi
 
-# if [ "$1" = "--boxed-continuations" ]; then
-if [ true ]; then
+# if [ true ]; then
+if [ "$1" = "--boxed-continuations" ]; then
     CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
     if [ "$REDEFS" = "" ]; then
         REDEFS="FeatureDisable.unboxedContinuation=true"
     else
         REDEFS="$REDEFS,FeatureDisable.unboxedContinuation=true"
     fi
-    # shift
+    shift
 else
     CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
 fi
