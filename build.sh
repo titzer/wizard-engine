@@ -69,6 +69,21 @@ if [ "$1" = "--debug" ]; then
     shift
 fi
 
+# if [ true ]; then
+if [ "$1" = "--boxed-continuations" ]; then
+    CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
+    if [ "$REDEFS" = "" ]; then
+        REDEFS="FeatureDisable.unboxedContinuation=true"
+    else
+        REDEFS="$REDEFS,FeatureDisable.unboxedContinuation=true"
+    fi
+    shift
+else
+    CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
+fi
+
+ENGINE="$ENGINE $CONTINUATION"
+
 if [ "$1" = "--debug-gc" ]; then
     DEBUG_GC=1
     shift
