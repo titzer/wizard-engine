@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 function exit_usage() {
     echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
@@ -34,6 +34,7 @@ fi
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 MONITORS="src/monitors/*.v3"
 TEST_MONITORS="src/monitors/test/*.v3"
+DEBUG_MONITORS="src/monitors/debug/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
@@ -55,6 +56,16 @@ fi
 
 if [ "$1" = "--test-monitors" ]; then
     MONITORS="$MONITORS $TEST_MONITORS"
+    shift
+fi
+
+if [ "$1" = "--debug" ]; then
+    MONITORS="$MONITORS $DEBUG_MONITORS"
+    if [ "$REDEFS" = "" ]; then
+        REDEFS="MonitorOptions.enableCheckMonitors=true"
+    else
+        REDEFS="$REDEFS,MonitorOptions.enableCheckMonitors=true"
+    fi
     shift
 fi
 
@@ -182,7 +193,7 @@ elif [ "$TARGET" = "v3i" ]; then
 	fi
 	LIST="$LIST $(ls $f)"
     done
-    echo '#!/bin/bash' > bin/$PROGRAM.v3i
+    echo '#!/usr/bin/env bash' > bin/$PROGRAM.v3i
     echo "v3i $LANG_OPTS \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
     chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors

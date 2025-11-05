@@ -1,0 +1,22 @@
+(module
+  (type $S (struct))
+  (type $1 (func (param i32)))
+  (global $0 (ref eq) (struct.new_default $S))
+  (global $1 (ref eq) (struct.new_default $S))
+  (global $g (mut i32) (i32.const 1234))
+
+  (func $set (param i32) (global.set $g (local.get 0)))
+
+  (func (export "main")
+    (global.get $0)
+    (global.get $1)
+    (i32.const 0)
+    (select (result (ref eq)))
+    (global.get $0)
+    (ref.eq)
+    (call $set)
+  )
+  (func (export "get") (result i32) (global.get $g))
+)
+(assert_return (invoke "main"))
+(assert_return (invoke "get") (i32.const 0))

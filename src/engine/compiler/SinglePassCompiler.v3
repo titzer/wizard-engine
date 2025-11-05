@@ -221,14 +221,26 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			if (Trace.compiler) {
 				Trace.OUT.put1("  handler stub #%d:", i).ln();
 				Trace.OUT.put1("    stub offset=+%d", X86_64MasmLabel.!(info.stub_label).label.pos).ln();
+				Trace.OUT.put1("    end of func=%s", if(info.func_end, "true", "false")).ln();
 			}
 
-			for (slot < u32.!(info.merge_state.length)) {
-				var sv = info.merge_state[slot];
-				if (!sv.inReg()) continue;
-				var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
-				var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
-				resolver.addMove((slot, tv), (slot, fv));
+			if (info.func_end) {
+				if (Trace.compiler) Trace.OUT.put1("    moving %d values to ($vfp)", func.sig.results.length).ln();
+				for (to_slot < u32.!(func.sig.results.length)) {
+					var from_slot = to_slot + func.num_locals;
+					var sv = info.merge_state[to_slot];
+					var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+					var tv = SpcVal(typeToKindFlags(func.sig.results[i]) | IS_STORED, NO_REG, 0);
+					resolver.addMove((to_slot, tv), (from_slot, fv));
+				}
+			} else {
+				for (slot < u32.!(info.merge_state.length)) {
+					var sv = info.merge_state[slot];
+					if (!sv.inReg()) continue;
+					var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+					var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
+					resolver.addMove((slot, tv), (slot, fv));
+				}
 			}
 			emit_reload_regs();
 			resolver.emitMoves();
@@ -942,8 +954,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			return;
 		}
 		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var tmp = allocTmp(ValueKind.REF);
 		sv = popFixedReg(regs.func_arg);
+		var tmp = allocTmp(ValueKind.REF);
 		var func_reg = sv.reg;
 		
 		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, tailCall);
@@ -988,7 +1000,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			Trace.OUT.put1("    catch tag[%s]", tag_display).ln();
 			Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 		}
-		handler_dest_info[dest_id] = SpcHandlerInfo(false, dest_label, masm.newLabel(it.pc), reset_state);
+		handler_dest_info[dest_id] = SpcHandlerInfo(false, false, dest_label, masm.newLabel(it.pc), reset_state);
 		// Reset reachability.
 		ctl_top.reachable = true;
 	}
@@ -1022,7 +1034,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			if (Trace.compiler) {
 				Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 			}
-			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.label, masm.newLabel(it.pc), control.merge_state);
+			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.opcode == Opcode.RETURN.code, control.label, masm.newLabel(it.pc), control.merge_state);
 		}
 	}
 	def buildSwitchHandler() {
@@ -1031,26 +1043,31 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (Trace.compiler) {
 			Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 		}
-		handler_dest_info[dest_id] = SpcHandlerInfo(true, null, null, null);
+		handler_dest_info[dest_id] = SpcHandlerInfo(true, false, null, null, null);
 	}
 	def emitSelect(valcount: u32) {
 		var sv = pop();
 		var base: u32 = state.sp - valcount*2;
 		if (sv.isConst()) {
-			// XXX: select K* K* v => K* if all constants match
 			if (sv.const != 0) {
 				// select a* b* T => a*
 			} else {
 				// select a* b* 0 => b*
 				for (i < valcount) {
-					var ti = base + i;
-					var fi = ti + valcount;
-					var fv = state.state[fi];
-					unrefSlot(ti);
-					if (fv.inReg()) regAlloc.reassign(fv.reg, int.!(fi), int.!(ti));
-					var tv = state.state[ti];
-					state.state[ti] = SpcVal(tv.kindFlagsAndTag(fv.flags & (IN_REG | IS_CONST)), fv.reg, fv.const);
+					var ti = base + i, fi = ti + valcount;
+					var tv = state.state[ti], fv = state.state[fi];
+					if (tv.sameValue(fv)) continue;
+					unrefSlot(ti); // unref any register of dropped true values
+					if (fv.inReg()) {
+						regAlloc.reassign(fv.reg, int.!(fi), int.!(ti));
+						state.state[ti] = SpcVal(tv.kindFlagsAndTag(fv.flags & (IN_REG | IS_CONST)), fv.reg, fv.const);
+					} else {
+						var tv = SpcVal(tv.kindFlagsAndTag(IS_STORED | (fv.flags & IS_CONST)), NO_REG, fv.const);
+						resolver.addMove((ti, tv), (fi, fv));
+						state.state[ti] = tv;
+					}
 				}
+				resolver.emitMoves();
 			}
 			dropN(valcount);
 			return;
@@ -1061,8 +1078,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var fi = ti + valcount;
 			var fv = state.state[fi];
 			var tv = state.state[ti];
-			if ((fv.reg != NO_REG && fv.reg == tv.reg)
-				|| (fv.isConst() && tv.isConst() && (fv.const == tv.const))) {
+			if (tv.sameValue(fv)) {
 				// no move necessary on either side
 				state.state[fi] = tv;
 				if (Trace.compiler) Trace.OUT.put1("    sp=%d: no move necessary", ti).ln();
@@ -2368,10 +2384,10 @@ enum SpillMode(free_regs: bool, remember_stored: bool) {
 type EffectiveAddr(oob: bool, is64: bool, base_reg: Reg, index_reg: Reg, offset: u32) #unboxed;
 def OOB_ADDR = EffectiveAddr(true, false, NO_REG, NO_REG, 0);
 
-// Compiler representation of (abstract) values on the WebAssembly value stack,
-// including its {ValueKind}, whether the value is stored into the corresponding slot,
-// whether the value tag (if tags enabled) is stored into the slot, which if any
-// register holds its value, and which constant value, if any, it is.
+// Compiler representation of slots containing abstract values on the WebAssembly value stack,
+// including the {ValueKind}, whether the value is stored into value stack memory, whether the
+// value tag is stored into value stack memory, which if any register holds its value, and which
+// constant value, if any, it is.
 type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	def kind() -> ValueKind {
 		return SpcConsts.kinds[flags >> 4];
@@ -2408,6 +2424,11 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	}
 	def notConst() -> SpcVal {
 		return SpcVal(flags & ~IS_CONST, reg, 0);
+	}
+	def sameValue(that: SpcVal) -> bool {
+		if (((this.flags & that.flags & IS_CONST) != 0) && this.const == that.const) return true;
+		if (((this.flags & that.flags & IN_REG) != 0) && this.reg == that.reg) return true;
+		return false;
 	}
 	def render(buf: StringBuilder, regSet: RegSet) -> StringBuilder {
 		match (kind()) {
@@ -3062,4 +3083,4 @@ type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
 //  
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
-type SpcHandlerInfo(is_dummy: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
+type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);

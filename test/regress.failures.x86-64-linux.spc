@@ -25,13 +25,3 @@ test/regress/ext:legacy-eh/try_delegate1.bin.wast
 test/regress/ext:legacy-eh/try_delegate3.bin.wast
 test/regress/ext:legacy-eh/try_delegate4.bin.wast
 test/regress/ext:legacy-eh/try_delegate5.bin.wast
-test/regress/ext:exception-handling/throw10.bin.wast
-test/regress/ext:exception-handling/throw14.bin.wast
-test/regress/ext:exception-handling/throw15.bin.wast
-test/regress/ext:exception-handling/throw16.bin.wast
-test/regress/ext:exception-handling/throw17.bin.wast
-test/regress/ext:exception-handling/throw18.bin.wast
-test/regress/ext:exception-handling/throw19.bin.wast
-test/regress/ext:exception-handling/throw20.bin.wast
-test/regress/ext:exception-handling/throw21.bin.wast
-test/regress/ext:stack-switching/resume_and_throw1.bin.wast

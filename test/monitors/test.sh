@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -30,7 +30,8 @@ else
         "globals" 
         "profile_bytecode{switch_size=16}"
         "profile_bytecode{switch_size=7,abstract_interpreter=false}"
-        "profile_bytecode{switch_size=7,abstract_interpreter=true}")
+        "profile_bytecode{switch_size=7,abstract_interpreter=true}"
+	      "alloc")
 fi
 
 TESTS=$(ls *.wasm)
@@ -51,18 +52,19 @@ function run_test {
             args=$(cat $test.args)
         fi
 
-        echo "##+$test | $monitor"
-
         local suffix=$(echo "$monitor" | tr '{}=,' '-')
-        local P=$T/$test.$suffix
-
-        if [ -f $test.in  ]; then
-            $CMD $flags $mflag "$test" $args < $test.in > $P.out
-        else
-            $CMD $flags $mflag "$test" $args > $P.out
-        fi  
-
+	
         if [ -f expected/$test.$suffix.out  ]; then
+            echo "##+$test | $monitor"
+
+            local P=$T/$test.$suffix
+
+            if [ -f $test.in  ]; then
+		$CMD $flags $mflag "$test" $args < $test.in > $P.out
+            else
+		$CMD $flags $mflag "$test" $args > $P.out
+            fi  
+
             diff expected/$test.$suffix.out $P.out | tee $P.out.diff
             DIFF=${PIPESTATUS[0]}
             if [ "$DIFF" != 0  ]; then
@@ -75,9 +77,9 @@ function run_test {
                 echo "##-fail: $P.out.diff"
                 return 1
             fi
+            echo "##-ok"
         fi
 
-        echo "##-ok"
     done
 }
 
