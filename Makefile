@@ -29,8 +29,8 @@ UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
-TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
-	vctags -e $(WIZENG) $(WAVE) $(WASI) $(WALI) $(UNITTEST) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(JIT) $(X86_64)
+TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
+	vctags -e $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(JIT) $(X86_64)
 
 # JVM targets
 bin/unittest.jvm: $(UNITTEST) build.sh
@@ -63,13 +63,16 @@ bin/objdump.x86-linux: $(OBJDUMP) build.sh
 	./build.sh objdump x86-linux
 
 # x86-64-linux targets
-bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(x86_64) $(JIT) build.sh
 	./build.sh unittest x86-64-linux
 
-bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+bin/spectest.x86-64-linux: $(SPECTEST) $(x86_64) $(JIT) build.sh
+	./build.sh spectest x86-64-linux
+
+bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(x86_64) $(JIT) build.sh
 	./build.sh wizeng x86-64-linux
 
-bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
+bin/objdump.x86-64-linux: $(OBJDUMP) $(x86_64) build.sh
 	./build.sh objdump x86-64-linux
 
 # interpreter targets

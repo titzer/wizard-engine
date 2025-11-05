@@ -49,6 +49,9 @@ WALI="src/modules/wali/*.v3"
 WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
 
+TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
+TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
+
 if [ "$1" = "--nojit" ]; then
     REDEFS="SpcTuning.disable=true"
     shift
@@ -81,6 +84,12 @@ fi
 
 if [ "$1" = "--no-wasm-run" ]; then
     WASM_MODE=""
+    shift
+fi
+
+CBD=false
+if [[ "$1" = "--cbd" ]]; then
+    CBD=true
     shift
 fi
 
@@ -141,11 +150,15 @@ fi
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    TARGET_SRC=$TARGET_V3
+    if "$CBD"; then TARGET_SRC="$TARGET_CBD_SLOW $TARGET_V3"; fi
+    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 elif [[ "$TARGET" = "x86-64-darwin" || "$TARGET" = "x86_64_darwin" ]]; then
     exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
+    TARGET_SRC=$TARGET_X86_64
+    if "$CBD"; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_X86_64"; fi
+    exec v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
     STATUS=$?
     if [ $STATUS != 0 ]; then
 	exit $STATUS
