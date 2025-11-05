@@ -87,14 +87,14 @@ if [ "$1" = "--no-wasm-run" ]; then
     shift
 fi
 
+CBD=false
+if [[ "$1" = "--cbd" ]]; then
+    CBD=true
+    shift
+fi
+
 PROGRAM=$1
 TARGET=$2
-CBD=$3
-if [[ -z "$3" ]]; then
-    CBD=false
-elif [[ "$3" = "--cbd" ]]; then
-    CBD=true
-fi
 
 if [[ "$TARGET" =~ x86 && $DEBUG_GC = 1 ]]; then
     V3C_OPTS="$V3C_OPTS -redef-field=RiGc.debug=true"
