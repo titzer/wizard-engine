@@ -12,6 +12,8 @@
 var MIN_DISPATCH_CASE_COUNT = 150;
 // The maximum size in bytes that separates 2 consecutive opcodes.
 var MAX_OPERAND_LEN = 6;
+// Use abstract interpreter as dispatch heuristic.
+var USE_ABSTRACT_INTERP = false;
 
 def E = MonitorRegistry.add(
 	"profile_bytecode", "Recovers source level information from bytecode execution",
@@ -19,6 +21,9 @@ def E = MonitorRegistry.add(
 def output_folder_opt = E.options.newStringOption("output_folder", null, "output folder for profiling results");
 def switch_size_opt = E.options.newIntOption("switch_size", MIN_DISPATCH_CASE_COUNT, "minimum number opcode switch targets to be considered a dispatch function");
 def operand_len_opt = E.options.newIntOption("operand_len", MAX_OPERAND_LEN, "maximum number of bytes for immediates between consecutive opcodes");
+def use_abstract_interp = E.options.newBoolOption("abstract_interpreter", false, "use abstract interpreter to determine opcode reads");
+
+def traceHeuristics = false;
 
 class BytecodeProfilingMonitor extends Monitor {
 	var visitor: DispatchFunctionBytecodeVisitor;
@@ -31,6 +36,7 @@ class BytecodeProfilingMonitor extends Monitor {
 		output_folder = output_folder_opt.val;
 		MIN_DISPATCH_CASE_COUNT = switch_size_opt.val;
 		MAX_OPERAND_LEN = operand_len_opt.val;
+		USE_ABSTRACT_INTERP = use_abstract_interp.val;
 		return null;
 	}
 	def onParse(module: Module, err: ErrorGen) {
@@ -53,7 +59,14 @@ class BytecodeProfilingMonitor extends Monitor {
 	private def instrumentFunc(mi: ModuleInstrumenter, func: FuncDecl) {
 		visitor.reset();
 		visitor.bi.reset(func).dispatchAll(visitor);
+
 		if (visitor.is_dispatch_func) { // save the profile state and insert memory probes 
+			var opcode_read_pc: int = if(USE_ABSTRACT_INTERP,
+					findDispatchSource(mi.module, func),
+					visitor.opcode_read_pc);
+			if (traceHeuristics) {
+				System.puts(Strings.format2("found load func=%d, pc=%d\n", func.func_index, opcode_read_pc));
+			}
 			var state = GuestProfileState.new(fuel_counter, func.func_index,
 				func.render(mi.module.names, StringBuilder.new()).toString());
 			potential_dispatch_functions = List.new(state, potential_dispatch_functions);
@@ -64,7 +77,7 @@ class BytecodeProfilingMonitor extends Monitor {
 			guest_bytecode_read_visitor.bi = visitor.bi.reset(func);
 			guest_bytecode_imm_read_visitor.bi = guest_bytecode_read_visitor.bi;
 			for (bi = guest_bytecode_read_visitor.bi; bi.more(); bi.next()) {
-				if (bi.pc == visitor.opcode_read_pc) {
+				if (bi.pc == opcode_read_pc) {
 					bi.dispatch(guest_bytecode_read_visitor);
 				} else {
 					bi.dispatch(guest_bytecode_imm_read_visitor);
@@ -117,6 +130,9 @@ private class DispatchFunctionBytecodeVisitor(module: Module, bi: BytecodeIterat
 		visitOp(Opcode.BR_TABLE);
 		if (!is_dispatch_func && labels.length >= MIN_DISPATCH_CASE_COUNT && opcode_read_pc >= 0) {
 			is_dispatch_func = true;
+			if (traceHeuristics) {
+				System.puts(Strings.format2("found dispatch func=%d, pc=%d \n", bi.func.func_index, bi.pc));
+			}
 		}
 	}
 	def visit_I32_LOAD8_U(imm: MemArg) {
@@ -414,7 +430,7 @@ private class BytecodeHotness(output_prefix: string) {
 
 private type TraceEntry {
 	case CALL(func_id: u32);
-case STEP(bytecode: u8, offset: u64, cost: u64, wasm_func_trace: List<WasmFuncTrace>);
+	case STEP(bytecode: u8, offset: u64, cost: u64, wasm_func_trace: List<WasmFuncTrace>);
 	case RETURN(func_id: u32);
 	case SYSTEM(cost: u64, wasm_func_trace: List<WasmFuncTrace>);
 }
@@ -430,4 +446,154 @@ private type ProbeEvent {
 	case GUEST_OPCODE_READ(bytecode: u8, offset: u32);
 	case CALL;
 	case RETURN;
+}
+
+/* Abstract interpreter returns the pc of the i32.load8_u instruction which is
+ * later consumed by a br_table instruction.
+ */
+def findDispatchSource(module: Module, func: FuncDecl) -> int {
+	// create a mapping for pc -> StackDelta
+	def deltas: Array<(int, int)> = Array.new(func.orig_bytecode.length);
+	def extensions = Extension.set.all;
+	def cv = CodeValidator.new(extensions, Limits.new().set(extensions), module, ErrorGen.new(null));
+	cv.probe = callback(deltas, _, _, _);
+	cv.validateFunc(func, 0);
+
+	// iterate over basic blocks
+	def it = BasicBlockIterator.new();
+	it.reset(func);
+	// map of block start -> block end
+	def blocks: Array<int> = Array.new(func.orig_bytecode.length);
+	var fst = int.max;
+	while (it.more()) {
+		def p = it.current();
+		if (p.0 < fst) fst = p.0;
+		blocks[p.0] = p.1;
+
+		it.next();
+	}
+	blocks[0] = blocks[fst]; // XXX hackfix for pc start of function
+
+	def cfg = CfgBuilder.new();
+	def blk = cfg.build(func);
+
+	var label: int;
+	def poss = Vector<int>.new();
+	for (path in paths(blk, null)) {
+		label = 0;
+
+		def stack: ArrayStack<int> = ArrayStack.new();
+		def locals: Array<int> = Array.new(func.num_locals);
+		def source: Vector<int> = Vector.new();
+		source.put(-2); // value 0 = not generated from wasm code
+
+		for (list = path; list != null; list = list.tail) {
+			def block = list.head;
+			if (block.bind_pos < 0) continue;
+
+			def end = blocks[block.bind_pos];
+
+			def bi = BytecodeIterator.new();
+			bi.reset(func);
+			bi.at(block.bind_pos, -1);
+
+			while (bi.pc < end) {
+				def op = bi.current();
+				def d = deltas[bi.pc];
+
+				// d.0 = consume these values
+				for (i < d.0) {
+					def val = stack.pop();
+					// local?
+					match (op) {
+						LOCAL_SET, LOCAL_TEE => {
+							def imm = bi.immptr().read_uleb31();
+							locals[imm] = val;
+						}
+						/* this is the opcode we care about dispatch on */
+						BR_TABLE => {
+							def src = source[val];
+							poss.put(src);
+						}
+						_ => ;
+					}
+				}
+				// d.1 = generate these values
+				for (i < d.1) {
+					var val: int;
+					// local?
+					match (op) {
+						LOCAL_GET, LOCAL_TEE => {
+							def imm = bi.immptr().read_uleb31();
+							val = locals[imm];
+						}
+						_ => {
+							// generate fresh value and push to vector
+							val = ++label;
+							source.put(bi.pc);
+						}
+					}
+					stack.push(val);
+				}
+				bi.next();
+			}
+		}
+	}
+
+	// XXX collecting all possibilities even though we return the first
+	// i32.load8_u instruction anyway (the presence of two unique i32.load8_u
+	// would be troublesome)
+	def bi = BytecodeIterator.new();
+	bi.reset(func);
+	for (i < poss.length) {
+		def pc = poss[i];
+		bi.at(pc, -1);
+		def op = bi.current();
+		if (op == Opcode.I32_LOAD8_U) {
+			return pc;
+		}
+	}
+
+	// error
+	return -1;
+}
+
+def callback(map: Array<(int, int)>, cv: CodeValidator, pc: int, op: Opcode) {
+	map[pc] = Opcodes.stackDelta(cv.sig, op, dupParser(cv));
+}
+
+def dupParser(cv: CodeValidator) -> WasmParser {
+	def decoder = cv.parser.decoder;
+	def newDecoder = CodePtr.new(null);
+	newDecoder.reset(Ranges.dup(decoder.data), decoder.pos, decoder.limit);
+	return WasmParser.new(cv.parser.extensions, cv.parser.limits, cv.parser.module, cv.parser.err, newDecoder);
+}
+
+// Construct all possible control flow paths from this block but do not include
+// cycles.
+def paths(block: CfgBlock, visited: List<CfgBlock>) -> Array<List<CfgBlock>> {
+	def vec = Vector<List<CfgBlock>>.new();
+
+	for (list = block.outgoing; list != null; list = list.tail) {
+	    def head = list.head.1;
+		
+		// if head is already visited skip
+		var found: bool;
+		for (l = visited; l != null; l = l.tail) {
+			if (l.head == head) {
+				found = true;
+				break;
+			}
+		}
+		if (found) continue;
+
+		for (path in paths(head, List.new(block, visited))) {
+			vec.put(List.new(block, path));
+		}
+	}
+	if (vec.length == 0) {
+		vec.put(Lists.cons1(block));
+	}
+
+	return vec.extract();
 }

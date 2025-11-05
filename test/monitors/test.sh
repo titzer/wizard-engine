@@ -29,7 +29,9 @@ else
         "hotness" "hotness{c}"
         "globals" 
         "profile_bytecode{switch_size=16}"
-	"alloc")
+        "profile_bytecode{switch_size=7,abstract_interpreter=false}"
+        "profile_bytecode{switch_size=7,abstract_interpreter=true}"
+	      "alloc")
 fi
 
 TESTS=$(ls *.wasm)
