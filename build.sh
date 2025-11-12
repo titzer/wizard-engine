@@ -5,6 +5,18 @@ function exit_usage() {
     exit 1
 }
 
+# Append a comma-separated string to the given variable.
+append_comma_sep() {
+    local varname=$1
+    local newpair=$2
+    local current="${!varname}"
+    if [ -z "$current" ]; then
+        eval "$varname=\"$newpair\""
+    else
+        eval "$varname=\"$current,$newpair\""
+    fi
+}
+
 if [ "$#" -lt 2 ]; then
     exit_usage
 fi
@@ -52,40 +64,33 @@ MODULES="src/modules/*.v3"
 TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
 TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
 
-if [ "$1" = "--nojit" ]; then
-    REDEFS="SpcTuning.disable=true"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nojit)
+            append_comma_sep REDEFS "SpcTuning.disable=true"
+            ;;
+        --test-monitors)
+            MONITORS="$MONITORS $TEST_MONITORS"
+            ;;
+        --debug)
+            MONITORS="$MONITORS $DEBUG_MONITORS"
+            append_comma_sep REDEFS "MonitorOptions.enableCheckMonitors=true"
+            ;;
+        --debug-gc)
+            DEBUG_GC=1
+            ;;
+        --no-spec-test)
+            SPECTEST_MODE=""
+            ;;
+        --no-wasm-run)
+            WASM_MODE=""
+            ;;
+        *)
+            break
+            ;;
+    esac
     shift
-fi
-
-if [ "$1" = "--test-monitors" ]; then
-    MONITORS="$MONITORS $TEST_MONITORS"
-    shift
-fi
-
-if [ "$1" = "--debug" ]; then
-    MONITORS="$MONITORS $DEBUG_MONITORS"
-    if [ "$REDEFS" = "" ]; then
-        REDEFS="MonitorOptions.enableCheckMonitors=true"
-    else
-        REDEFS="$REDEFS,MonitorOptions.enableCheckMonitors=true"
-    fi
-    shift
-fi
-
-if [ "$1" = "--debug-gc" ]; then
-    DEBUG_GC=1
-    shift
-fi
-
-if [ "$1" = "--no-spec-test" ]; then
-    SPECTEST_MODE=""
-    shift
-fi
-
-if [ "$1" = "--no-wasm-run" ]; then
-    WASM_MODE=""
-    shift
-fi
+done
 
 CBD=false
 if [[ "$1" = "--cbd" ]]; then
