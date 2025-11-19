@@ -25,16 +25,3 @@ test/regress/ext:legacy-eh/try_delegate1.bin.wast
 test/regress/ext:legacy-eh/try_delegate3.bin.wast
 test/regress/ext:legacy-eh/try_delegate4.bin.wast
 test/regress/ext:legacy-eh/try_delegate5.bin.wast
-
-test/regress/ext:stack-switching/resume_throw_ref0.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref0b.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref1.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref10.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref2.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref3.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref4.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref5.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref6.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref7.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref8.bin.wast
-test/regress/ext:stack-switching/resume_throw_ref9.bin.wast
