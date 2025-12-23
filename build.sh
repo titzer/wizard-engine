@@ -64,7 +64,7 @@ MODULES="src/modules/*.v3"
 TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
 TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
 
-CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
+CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -87,9 +87,9 @@ while [[ $# -gt 0 ]]; do
         --no-wasm-run)
             WASM_MODE=""
             ;;
-        --unboxed-continuation)
+        --boxed-continuation)
             append_comma_sep REDEFS "FeatureDisable.unboxedConts=true"
-            CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
+            CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
             ;;
         *)
             break
