@@ -1,0 +1,13 @@
+(module
+  (func $puts (import "wizeng" "puts") (param i32 i32))
+  (func $main (export "main")
+    (call $puts (i32.const 100) (i32.const 5))
+  )
+  (func $entrypoint (export "entrypoint")
+    (call $puts (i32.const 200) (i32.const 11))
+  )
+  (memory (;0;) 1)
+  (export "memory" (memory 0))
+  (data (;0;) (i32.const 100) "main\0a")
+  (data (;1;) (i32.const 200) "entrypoint\0a")
+)
