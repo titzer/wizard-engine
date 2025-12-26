@@ -26,6 +26,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def ex_handlers = Vector<ExHandlerEntry>.new();
 	def suspend_handlers = Vector<ExHandlerEntry>.new();
 	def switch_handlers = Vector<ExHandlerEntry>.new();
+	// handler_pc_index_map[...] = (pc, list_of_handler_id)
+	var handler_pc_index_map = Vector<(int, Array<int>)>.new();
 	var handler_dest_map = Vector<int>.new();
 	var handler_dests = Vector<TargetHandlerDest>.new();
 
@@ -94,6 +96,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		if (suspend_handlers.length > 0) handlers.suspend_handlers = suspend_handlers.extract();
 		if (switch_handlers.length > 0) handlers.switch_handlers = switch_handlers.extract();
 		if (handler_dest_map.length > 0) handlers.handler_dest_map = handler_dest_map.extract();
+		if (handler_pc_index_map.length > 0) {
+			// XXX: use stable sort to flatten this array
+			handlers.handler_pc_index_map = handler_pc_index_map.extract();
+			Ranges.quicksort<(int, Array<int>)>(handlers.handler_pc_index_map, fun (a, b) => a.0 < b.0);
+		}
 		if (handler_dests.length > 0) handlers.handler_dests = handler_dests.extract();
 		if (frame_var_tags.length > 0) func.frame_var_tags = frame_var_tags.extract();
 
@@ -159,7 +166,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	// {index == -1} to allocate a new one; otherwise write onto the given index.
 	// {target == null} to always generate a new dest.
 	// {no_dest == true} if the handler do not perform a jump (e,g,. switch).
-	private def addExHandler(index: int, to: Vector<ExHandlerEntry>, info: ExHandlerInfo, target: ControlEntry, no_dest: bool, tag_index: int, range: (int, int)) {
+	//
+	// Returns the index of the new handler. The caller is responsible for adding it
+	// into the handler_pc_index_map (XXX: better organization?).
+	private def addExHandler(index: int, pc: int, inline_offset: int, to: Vector<ExHandlerEntry>, info: ExHandlerInfo, target: ControlEntry, no_dest: bool, tag_index: int, range: (int, int)) -> int {
 		var dest_id: int;
 		if (target == null || target.handler_dest_id == -1) {
 			dest_id = handler_dests.length;
@@ -173,6 +183,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			handler_dest_map[index] = dest_id;
 		}
 		to.put(ExHandlerEntry(index, tag_index, range.0, range.1, info));
+		return index;
 	}
 	def readLocals(vec: Vector<ValueType>) -> bool {
 		var start = vec.length, max = limits.max_num_locals;
@@ -289,7 +300,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.ref0(ctl_top, opcode_pos);  // implicit jump to end of try block
 					var ex_slot = findExSlot(null).0;
 					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					addExHandler(-1, ex_handlers, info, null, false, tag.tag_index, range);
+					var new_index = addExHandler(-1, opcode_pos, 0, ex_handlers, info, null, false, tag.tag_index, range);
+					handler_pc_index_map.put((opcode_pos, [new_index]));
 					checkArgsAndTransfer();
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
@@ -341,14 +353,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 							// finish exception handler entries
 							var sidetable_pos = ctl.sidetable_pos;
 							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
+							var indices = Array<int>.new(ctl.catches.length);
 							for (i < ctl.catches.length) {
 								var c = ctl.catches[i];
 								var target = getControl(c.depth);
 								var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
 								var tag_index = if(c.tag != null, c.tag.tag_index, Modules.EX_TAG_ALL);
 								var info = ExHandlerInfo.Sidetable(c.exnref, sidetable_entry);
-								addExHandler(ctl.catches_index + i, ex_handlers, info, target, false, tag_index, (ctl.start_pos - func_start_pos, opcode_pos - func_start_pos));
+								indices[i] = addExHandler(ctl.catches_index + i, ctl.start_pos, i, ex_handlers, info, target, false, tag_index, (ctl.start_pos - func_start_pos, opcode_pos - func_start_pos));
 							}
+							handler_pc_index_map.put((ctl.start_pos, indices));
 						}
 						_ => {
 							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
@@ -461,7 +475,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					if (target == null) return;
 					checkArgsAndTransfer();
 					var info = ExHandlerInfo.Direct(target.delegate_pos - func_start_pos, 0, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					addExHandler(-1, ex_handlers, info, null, true, Modules.EX_TAG_DELEGATE, range);
+					var new_index = addExHandler(-1, opcode_pos, 0, ex_handlers, info, null, true, Modules.EX_TAG_DELEGATE, range);
+					handler_pc_index_map.put((opcode_pos, [new_index]));
 					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.sidetable.length);
 					resetInit();
 					ctl_stack.pop();
@@ -479,7 +494,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.ref0(ctl_top, opcode_pos); // implicit jump to end of try block
 					var ex_slot = findExSlot(null).0;
 					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
-					addExHandler(-1, ex_handlers, info, null, false, Modules.EX_TAG_ALL, range);
+					var new_index = addExHandler(-1, opcode_pos, 0, ex_handlers, info, null, false, Modules.EX_TAG_ALL, range);
+					handler_pc_index_map.put((opcode_pos, [new_index]));
 					resetInit();
 					val_stack.top = ctl_top.val_stack_top;
 				}
@@ -953,7 +969,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.refS(target, opcode_pos, val_stack.top);
 					popE(t1);
 					push(t2);
-					checkAndPopArgs(labelArgs(target));
+					var args = labelArgs(target);
+					checkAndPopArgs(args);
+					pushTypes(args);
+					popAny();
 					push(ValueType.Ref(t1.nullable && !t2.nullable, t1.heap));
 				}
 				BR_ON_CAST_FAIL => {
@@ -965,7 +984,10 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					ctlxfer.refS(target, opcode_pos, val_stack.top);
 					popE(t1);
 					push(ValueType.Ref(t1.nullable && !t2.nullable, t1.heap));
-					checkAndPopArgs(labelArgs(target));
+					var args = labelArgs(target);
+					checkAndPopArgs(args);
+					pushTypes(args);
+					popAny();
 					push(t2);
 				}
 				ANY_CONVERT_EXTERN => {
@@ -1496,6 +1518,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	}
 	def readAndCheckContHandlerTable(cont: ContDecl, handlers: Array<SuspensionHandler>) {
 		var sidetable_pos = ctlxfer.sidetable.length;
+		var handler_indices = Array<int>.new(handlers.length);
 		for (i < handlers.length) {
 			// Same sidetable structure is used for both {suspend} and {switch}.
 			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
@@ -1508,7 +1531,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 					if (target == null) return;
 					checkContHandle(i, tag, cont, target);
 					ctlxfer.refC(target, tag, false, "refH[suspend]");
-					addExHandler(-1, suspend_handlers, info, target, false, tag.tag_index, (resume_pos, resume_pos + 1));
+					handler_indices[i] = addExHandler(-1, opcode_pos, i, suspend_handlers, info, target, false, tag.tag_index, (resume_pos, resume_pos + 1));
 				}
 				Switch(tag_index) => {
 					var tag = module.tags[tag_index];
@@ -1526,10 +1549,11 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 						}
 					}
 					ctlxfer.refC(null, tag, false, "refH[switch]");
-					addExHandler(-1, switch_handlers, info, null, true, tag.tag_index, (resume_pos, resume_pos + 1));
+					handler_indices[i] = addExHandler(-1, opcode_pos, i, switch_handlers, info, null, true, tag.tag_index, (resume_pos, resume_pos + 1));
 				}
 			}
 		}
+		handler_pc_index_map.put((opcode_pos, handler_indices));
 	}
 	def checkContHandle(i: int, tag: TagDecl, cont: ContDecl, target: ControlEntry) {
 		var p = labelArgs(target);

@@ -105,7 +105,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var last_probe = 0;
 	var skip_to_end: bool;
 	// XXX: hack
-	var visited_handlers = 0;
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
 	// when function is inlined, we continue using caller's abstract state, and
@@ -151,7 +150,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		osr_state = null;
 		handler_dest_info.clear();
 		handler_dest_info.resize(func.handlers.handler_dests.length);
-		visited_handlers = 0;
 
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
@@ -977,7 +975,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setupCatchBlock("all", []);
 	}
 	private def setupCatchBlock(tag_display: string, tag_fields: Array<ValueType>) {
-		var handler_id = visited_handlers++;
+		var handler_id = getHandlerIndex(it.pc, 0);
 		var dest_id = func.handlers.handler_dest_map[handler_id];
 		var dest_label = masm.newLabel(it.pc);
 		var ctl_top = state.ctl_stack.peek();
@@ -1006,18 +1004,20 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
 		// record reachable label positions for handler stub
+		var pos = it.pc;
 		for (i < catches.length) {
 			var depth = catches[i].getLabel();
 			var control = state.getControl(depth);
-			buildHandlerDest(control);
+			buildHandlerDest(control, pos, i);
 		}
 
 		var pr = btc.toAbstractBlockType(module);
 		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
 	}
 	// Given a control to xfer to, set up the {SpcHandlerInfo} and the merge.
-	def buildHandlerDest(control: SpcControl) {
-		var handler_id = visited_handlers++;
+	def buildHandlerDest(control: SpcControl, pc: int, inline_index: int) {
+		if (Trace.compiler) Trace.OUT.put2("Building handler at pc=%d inline_index=%d", pc, inline_index).ln();
+		var handler_id = getHandlerIndex(pc, inline_index);
 		var dest_id = func.handlers.handler_dest_map[handler_id];
 		var info = handler_dest_info[dest_id];
 
@@ -1037,8 +1037,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.opcode == Opcode.RETURN.code, control.label, masm.newLabel(it.pc), control.merge_state);
 		}
 	}
-	def buildSwitchHandler() {
-		var handler_id = visited_handlers++;
+	def buildSwitchHandler(pc: int, inline_index: int) {
+		var handler_id = getHandlerIndex(pc, inline_index);
 		var dest_id = func.handlers.handler_dest_map[handler_id];
 		if (Trace.compiler) {
 			Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
@@ -1347,12 +1347,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
 	}
 	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
 		// record reachable label positions for handler stub
 		for (i < handlers.length) {
 			var handler = handlers[i];
 			match (handler) {
-				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
-				Switch(tag_index) => buildSwitchHandler();
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
 			}
 		}
 
@@ -1499,12 +1500,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.bindLabel(end);
 	}
 	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
 		// record reachable label positions for handler stub
 		for (i < handlers.length) {
 			var handler = handlers[i];
 			match (handler) {
-				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth));
-				Switch(tag_index) => buildSwitchHandler();
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
 			}
 		}
 
@@ -1533,6 +1535,77 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
 		masm.emit_call_runtime_RESUME_THROW();
 		dropN(u32.!(tag.fields.length));
+		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
+		// XXX: make RT function return {Continuation} directly
+		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+
+		/* === only reachable when continuation handles the error === */
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+		masm.emit_v3_Continuation_stack_r_r(contStack, cont); // [contStack == cont] = cont.stack
+
+		// save %vsp to frame
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+
+		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+ 
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
+	}
+	def visit_RESUME_THROW_REF(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
+			}
+		}
+
+		var offsets = V3Offsets.new();
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var cont = allocTmp(ValueKind.REF);
+		var curStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(cont);
+		var contStack = cont;
+
+		popFixedReg(regs.runtime_arg3);
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, cont);
+		masm.emit_call_runtime_RESUME_THROW_REF();
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
 		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
@@ -2364,6 +2437,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			OUT.ln();
 		}
 	}
+	// Gets the handler ID of the <inline_index>-th handler declared at pc.
+	private def getHandlerIndex(pc: int, inline_index: int) -> int {
+		var start = Ranges.binarySearchEq<(int, Array<int>)>(
+			func.handlers.handler_pc_index_map, (pc, null), fun (a, b) => a.0 < b.0
+		);
+		return func.handlers.handler_pc_index_map[start].1[inline_index];
+	}
 }
 // Different branch instructions have different repush
 enum BrRepush(taken: bool, not_taken: bool) {
@@ -2487,6 +2567,8 @@ class SpcControl {
 	// the state (up to val_stack_top, excluding tag fields) to reset back to before catch
 	// XXX: merge with {reset_state}?
 	var catch_reset_state: Array<SpcVal>;
+	// true if a SPC handler stub has already been recorded for this block
+	var recorded_as_handler = false;
 
 	def clearMerge() {
 		merge_count = 0;
