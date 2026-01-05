@@ -28,10 +28,35 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 	def w = DataWriter.new();
 	def mmasm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	def asm = mmasm.asm;
+	var ic: X86_64InterpreterCode;
 
-	new(extensions: Extension.set, limits: Limits, config: RegConfig)
-		super(X86_64MasmRegs.SPC_EXEC_ENV, mmasm, X86_64MasmRegs.SPC_ALLOC.copy(), extensions, limits) {
+	new(ic, extensions: Extension.set, limits: Limits, config: RegConfig, fast: bool)
+		super(X86_64MasmRegs.SPC_EXEC_ENV, mmasm, 
+				if(fast, X86_64MasmRegs.INT_ALLOC.copy(), X86_64MasmRegs.SPC_ALLOC.copy()), 
+				extensions, limits, fast) {
 		mmasm.trap_stubs = TRAPS_STUB;
+	}
+
+	def emitFastDispatch() {
+		ic = X86_64Spc.ic;
+
+		def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
+		def r_ip       = G(xenv.ip);
+		def r_dispatch = G(xenv.dispatch);
+		def r_tmp0     = G(xenv.tmp0);		// RCX
+		def r_tmp1     = G(xenv.tmp1);		// RDX
+		def ip_ptr     = r_ip.plus(0);
+
+		// simplified dispatch sequence
+		var opcode = r_tmp0;
+		var base = r_tmp1;
+		asm.movbzx_r_m(opcode, ip_ptr);
+		asm.inc_r(r_ip);
+		var addr = ic.start + ic.header.fastDispatchTableOffset;
+		asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+		asm.ijmp_r(base);
+
+		asm.invalid();
 	}
 
 	private def visitCompareI(asm: X86_64Assembler, cond: X86_64Cond) -> bool {
@@ -1370,6 +1395,8 @@ def genSpcEntryFunc(ic: X86_64InterpreterCode, w: DataWriter) {
 	asm.invalid();
 }
 def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	
+
 	if (SpcTuning.disable) return;
 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	var asm = X86_64Assembler.!(masm.asm);
@@ -1407,6 +1434,59 @@ def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
  * - jump into the new `fast_target_code` (or re-dispatch on itself)
  */
 def genFastCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
+	X86_64Spc.ic = ic;
+	// TODO: figure out this ic thing, because this sucks (and doesn't even work)
+
+ 	if (SpcTuning.disable) return;
+ 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+ 	var asm = X86_64Assembler.!(masm.asm);
+ 	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
+	var func_arg = G(regs.func_arg);
+	// TODO ensure that register use is compatible with fast-int usage
+	asm.pushq_r(G(regs.func_arg));					// push function onto stack
+	masm.emit_store_curstack_vsp(regs.vsp);
+	asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
+	// Load {null} for the receiver.
+	asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+	// Call {X86_64Spc.fastCompile} directly.
+	masm.emit_call_abs(codePointer(X86_64Spc.fastCompile));
+	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
+	// Check for non-null abrupt return.
+	var unwind = X86_64Label.new();
+	asm.q.cmp_r_i(Target.V3_RET_GPRS[2], 0);
+	asm.jc_rel_near(C.NZ, unwind);
+	// Tail-call the result of the compile.
+	var scratch = X86_64Regs.R15;
+// 	asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
+// 	asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
+// 	masm.emit_load_curstack_vsp(regs.vsp);
+// 	asm.ijmp_r(scratch);						// jump to entrypoint
+	asm.invalid();
+	// Simply return the {Throwable} object.
+	asm.bind(unwind);
+	asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
+
+	// DISPATCH
+
+	def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
+	def r_ip       = G(xenv.ip);
+	def r_dispatch = G(xenv.dispatch);
+	def r_tmp0     = G(xenv.tmp0);		// RCX
+	def r_tmp1     = G(xenv.tmp1);		// RDX
+	def ip_ptr     = r_ip.plus(0);
+
+	// simplified dispatch sequence
+	var opcode = r_tmp0;
+	var base = r_tmp1;
+	asm.movbzx_r_m(opcode, ip_ptr);
+	asm.inc_r(r_ip);
+	var addr = ic.start + ic.header.fastDispatchTableOffset;
+	asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+	asm.ijmp_r(base);
+
+	asm.invalid();
+}
+def genFastNopStub(ic: X86_64InterpreterCode, w: DataWriter) {
  	if (SpcTuning.disable) return;
  	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
  	var asm = X86_64Assembler.!(masm.asm);
@@ -1495,6 +1575,7 @@ def codePointer<P, R>(f: P -> R) -> Pointer {
 
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
+	var ic: X86_64InterpreterCode;
 	// A handy chokepoint for entering JIT code from V3.
 	def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
 		return V3_SPC_ENTRY_FUNC.get()(wf, sp, wf.decl.target_code.spc_entry);
@@ -1528,7 +1609,7 @@ component X86_64Spc {
 	}
 	private def fastCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.
-		var result = X86_64ExecutionStrategy.!(Execute.tiering).fastCompile(wf); // no condition that tiering uses SPC (int => fast SPC)
+		var result = X86_64ExecutionStrategy.!(Execute.tiering).fastCompile(wf, ic); // no condition that tiering uses SPC (int => fast SPC)
 		return (result.wf, result.entrypoint, result.thrown);
 	}
 	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
