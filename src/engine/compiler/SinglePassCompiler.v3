@@ -131,15 +131,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def gen(module: Module, func: FuncDecl, err: ErrorGen) -> bool {
 		this.osr_pc = -1;
 		this.err = err;
-		return Metrics.spc_time_us.run(gen0, (module, func));
+		return Metrics.spc_time_us.run(gen0(_, _, false), (module, func));
 	}
 	def genOsr(module: Module, func: FuncDecl, pc: int, err: ErrorGen) -> MasmLabel {
 		this.osr_pc = pc;
 		this.err = err;
-		var ok = Metrics.spc_time_us.run(gen0, (module, func));
+		var ok = Metrics.spc_time_us.run(gen0(_, _, false), (module, func));
 		return if(ok, osr_entry_label);
 	}
-	private def gen0(module: Module, func: FuncDecl) -> bool {
+	private def gen0(module: Module, func: FuncDecl, fast: bool) -> bool {
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).ln();
 		var before_code_bytes = masm.curCodeBytes();
 		var before_data_bytes = masm.curDataBytes();
@@ -170,7 +170,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
-		emitPrologue();
+		if (!fast) emitPrologue();
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -812,12 +812,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.bindLabel(ctl_top.label);
 				state.resetToMerge(ctl_top);
 				state.ctl_stack.pop();
+			// case for END for fallthrough at end of function?
 			} else if (ctl_top.opcode == Opcode.RETURN.code) {
 				state.emitFallthru(resolver);
 				masm.bindLabel(ctl_top.label);
 				state.resetToMerge(ctl_top);
 				emitProbe();
-				if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+				if (ctl_top.merge_count > 1) emitReturn(ctl_top); // emitReturn !
 				state.ctl_stack.pop();
 			}
 			emitProbe();
@@ -2030,6 +2031,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_br(target.label);
 		}
 	}
+	// Return includes epilogue?
 	def emitReturn(ctl: SpcControl) {
 		// All explicit RETURN instructions branch here.
 		if (ret_label != null) {
@@ -2037,6 +2039,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			ret_label = null;
 		}
 		var results = sig.results;
+		// fix values?
 		if (masm.valuerep.tagged) {
 			// update mismatched value tags
 			var params = sig.params;
@@ -2046,13 +2049,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_mov_m_i(masm.tagAddr(state.sp - u32.view(results.length) + u32.view(i)), rtag.code);
 			}
 		}
-		// Compute VSP = VFP + state.sp
-		emit_compute_vsp(regs.vsp, state.sp);
-		// Return to caller
-		masm.emit_mov_r_i(regs.ret_throw, 0);
-		// Deallocate stack frame
-		masm.emit_addw_r_i(regs.sp, frame.frameSize);
-		masm.emit_ret();
+		// epilogue? can guard around fast here?
+
+		// Compute VSP = VFP + state.sp               // \
+		emit_compute_vsp(regs.vsp, state.sp);         // | 
+		// Return to caller                           // | fast context: do not emit these instructions 
+		masm.emit_mov_r_i(regs.ret_throw, 0);         // | instead, emit the dispatch sequence from the interpreter
+		// Deallocate stack frame                     // | 
+		masm.emit_addw_r_i(regs.sp, frame.frameSize); // | 
+		masm.emit_ret();                              // / 
 	}
 	def emitOsrEntry(osr_entry_label: MasmLabel, state: Array<SpcVal>) {
 		if (Trace.compiler) Trace.OUT.put1("  OSR (+%d)", osr_entry_label.create_pos).ln();

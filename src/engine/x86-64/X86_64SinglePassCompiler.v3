@@ -34,6 +34,50 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		mmasm.trap_stubs = TRAPS_STUB;
 	}
 
+	var dispatchJmpOffset: int = -1;
+	// Generate a load of the next bytecode and a dispatch through the dispatch table.
+	def genDispatch0(ic: X86_64InterpreterCode, ptr: X86_64Addr, table: IcCodeRef, increment: bool) {
+		def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
+		def r_ip       = G(xenv.ip);
+		def r_dispatch = G(xenv.dispatch);
+		def r_tmp0     = G(xenv.tmp0);		// RCX
+		def r_tmp1     = G(xenv.tmp1);		// RDX
+
+		var opcode = r_tmp0;
+		var base = r_tmp1;
+		if (ptr != null) asm.movbzx_r_m(opcode, ptr);
+		if (increment) asm.inc_r(r_ip);
+		match (FastIntTuning.dispatchEntrySize) {
+			2 => {
+				if (table == null) asm.movq_r_r(base, r_dispatch);
+				else asm.lea(base, table); // RIP-relative LEA
+				asm.movwsx_r_m(opcode, base.plusR(opcode, 2, 0)); // load 16-bit offset
+				asm.add_r_r(base, opcode);
+				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+				asm.ijmp_r(base);
+			}
+			4 => {
+				if (table == null) {
+					asm.movd_r_m(base, r_dispatch.plusR(opcode, 4, 0));
+				} else {
+					var addr = ic.start + table.offset;
+					asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+				}
+				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+				asm.ijmp_r(base);
+			}
+			8 => {
+				if (table == null) {
+					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+					asm.ijmp_m(r_dispatch.plusR(opcode, 8, 0));
+				} else {
+					var addr = ic.start + table.offset;
+					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
+					asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
+				}
+			}
+		}
+	}
 	private def visitCompareI(asm: X86_64Assembler, cond: X86_64Cond) -> bool {
 		var b = pop(), a = popReg();
 		if (b.isConst()) asm.cmp_r_i(G(a.reg), b.const);
@@ -1345,6 +1389,7 @@ class X86_64SpcCompileStub extends RiUserCode {
 
 def V3_SPC_ENTRY_FUNC = X86_64PreGenFunc<(WasmFunction, Pointer, Pointer), Throwable>.new("v3-spc-entry", null, genSpcEntryFunc);
 def LAZY_COMPILE_STUB = X86_64PreGenStub.new("spc-lazy-compile", X86_64SpcCompileStub.new("lazy"), genLazyCompileStub);
+def FAST_COMPILE_STUB = X86_64PreGenStub.new("spc-fast-compile", X86_64SpcCompileStub.new("fast"), genFastCompileStub);
 def TIERUP_COMPILE_STUB = X86_64PreGenStub.new("spc-tierup-compile", X86_64SpcCompileStub.new("tierup"), genTierUpCompileStub);
 def TRAPS_STUB = X86_64SpcTrapsStub.new();
 def TRAPS_PREGEN = X86_64PreGenStub.new("spc-trap", TRAPS_STUB, genTrapsStub);
@@ -1397,6 +1442,36 @@ def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	asm.bind(unwind);
 	asm.movq_r_r(G(Target.V3_RET_GPRS[0]), G(Target.V3_RET_GPRS[2]));
 	asm.ret();
+}
+// XXX the stub must also respect the register usage of the fast interpreter
+def genFastCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
+ 	if (SpcTuning.disable) return;
+ 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+ 	var asm = X86_64Assembler.!(masm.asm);
+ 	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
+ 	var func_arg = G(regs.func_arg);
+
+	def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
+	def r_ip       = G(xenv.ip);
+	def r_dispatch = G(xenv.dispatch);
+	def r_tmp0     = G(xenv.tmp0);		// RCX
+	def r_tmp1     = G(xenv.tmp1);		// RDX
+	def ip_ptr     = r_ip.plus(0);
+
+	// simplified dispatch sequence
+
+	var opcode = r_tmp0;
+	var base = r_tmp1;
+
+	asm.movbzx_r_m(opcode, ip_ptr);
+	asm.inc_r(r_ip);
+
+	// flattened 4 case
+	var addr = ic.start + ic.header.fastDispatchTableOffset;
+	asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+	asm.ijmp_r(base);
+
+	asm.invalid();
 }
 def genTierUpCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	if (SpcTuning.disable) return;
@@ -1462,6 +1537,10 @@ component X86_64Spc {
 	def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
 		return V3_SPC_ENTRY_FUNC.get()(wf, sp, wf.decl.target_code.spc_entry);
 	}
+	def setFastCompileFor(module: Module, decl: FuncDecl) {
+		if (Debug.runtime) Trace.OUT.put1("setFastCompile %q", decl.render(module.names, _)).ln();
+		decl.fast_target_code = TargetCode(FAST_COMPILE_STUB.getEntry());
+	}
 	def setLazyCompileFor(module: Module, decl: FuncDecl) {
 		if (Debug.runtime) Trace.OUT.put1("setLazyCompile %q", decl.render(module.names, _)).ln();
 		decl.target_code = TargetCode(LAZY_COMPILE_STUB.getEntry());
@@ -1483,6 +1562,11 @@ component X86_64Spc {
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.
 		var result = X86_64SpcStrategy.!(Execute.tiering).lazyCompile(wf);
+		return (result.wf, result.entrypoint, result.thrown);
+	}
+	private def fastCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
+		// The global stub simply consults the execution strategy.
+		var result = X86_64ExecutionStrategy.!(Execute.tiering).fastCompile(wf); // no condition that tiering uses SPC (int => fast SPC)
 		return (result.wf, result.entrypoint, result.thrown);
 	}
 	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
