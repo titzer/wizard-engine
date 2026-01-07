@@ -65,7 +65,7 @@ TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
 TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
 
 CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
-CONTINUATION_X86_64="src/engine/continuation/X86_64UnboxedContinuation.v3"
+CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64UnboxedContinuation.v3"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -91,7 +91,7 @@ while [[ $# -gt 0 ]]; do
         --boxed-continuation)
             append_comma_sep REDEFS "FeatureDisable.unboxedConts=true"
             CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
-            CONTINUATION_X86_64="src/engine/continuation/X86_64BoxedContinuation.v3"
+            CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64BoxedContinuation.v3"
             ;;
         *)
             break
