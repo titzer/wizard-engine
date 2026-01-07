@@ -1,8 +1,8 @@
 (module
-  
+
   (type $f_v_v (func))
   (type $c_v_v (cont $f_v_v))
-  
+
   (type $f_i_v (func (param i32)))
   (type $c_i_v (cont $f_i_v))
 
@@ -15,7 +15,7 @@
   (func $foo (param $n i32)
     (suspend $t (local.get $n))
   )
-  
+
   (elem declare func $foo)
   (func (export "main") (param $i i32) (result i32)
     (call $start_conts (local.get $i))

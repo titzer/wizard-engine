@@ -53,8 +53,9 @@ component SpcConsts {
 	def KIND_F64: byte = kindToFlags(ValueKind.F64);
 	def KIND_V128: byte = kindToFlags(ValueKind.V128);
 	def KIND_REF: byte = kindToFlags(ValueKind.REF);
+	def KIND_REF_U64: byte = kindToFlags(ValueKind.REF_U64);
 	def kinds: Array<ValueKind> = [ValueKind.I32, ValueKind.I64, ValueKind.F32, ValueKind.F64,
-					ValueKind.V128, ValueKind.REF];
+					ValueKind.V128, ValueKind.REF, ValueKind.REF_U64];
 	def kindToFlags(kind: ValueKind) -> byte {
 		return byte.view(kind.tag) << 4;
 	}
@@ -73,6 +74,7 @@ def KIND_F32 = SpcConsts.KIND_F32;
 def KIND_F64 = SpcConsts.KIND_F64;
 def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
+def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
@@ -589,6 +591,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							}
 							kind = ValueKind.REF.code;
 						}
+						Cont(v) => {
+							if (inline_config.can_inline) {
+								var reg = allocRegTos(ValueKind.REF_U64);
+								masm.emit_mov_r_Cont(reg, v);
+								state.push(KIND_REF_U64 | IN_REG, reg, 0);
+							} else {
+								// TODO[stack-switching]: designated xmm scratch register
+								// masm.emit_mov_r_Cont(regs.scratch, v);
+								// asm.movdqu_m_s(slot_addr, regs.scratch)
+							}
+							kind = ValueKind.REF.code;
+						}
 					}
 				}
 				Operand(_, i) => {
@@ -955,7 +969,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		sv = popFixedReg(regs.func_arg);
 		var tmp = allocTmp(ValueKind.REF);
 		var func_reg = sv.reg;
-		
+
 		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, tailCall);
 	}
 	def visit_DROP() {
@@ -1306,8 +1320,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.push(KIND_V128 | IN_REG, reg, 0);
 	}
 
+	// In most cases this does not need to be specialized for REF_U64 due to
+	// constant folding, and in those cases assigning a REF tag to a REF_U64
+	// still elicit correct behavior. However when performing an in-assembly
+	// value transfer to another stack without going through the runtime,
+	// constant values must be tagged with the right type as the tag will be
+	// copied over onto the other stack.
 	def visit_REF_NULL(ht_val: int) {
-		state.push(KIND_REF | IS_CONST, NO_REG, 0);
+		if (ht_val >= 0 && ContDecl.?(module.heaptypes[ht_val])) {
+			state.push(KIND_REF_U64 | IS_CONST, NO_REG, 0); // push a REF_U64
+		} else {
+			state.push(KIND_REF | IS_CONST, NO_REG, 0); // push a REF
+		}
 	}
 	def visit_REF_FUNC(func_index: u31) {
 		var reg = allocRegTos(ValueKind.REF);
@@ -1364,10 +1388,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var top = popReg();
-		var cont = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF, cont, top.reg);
-		masm.emit_validate_and_consume_cont(cont); // [contStack == cont] = cont.stack
-		var contStack = cont;
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, top.reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		// transfer params to child stack
 		// XXX: not necessary to store the entire value stack to memory
@@ -1391,7 +1415,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(xenv.vsp);
 		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
- 
+
 		// reserve space for call addr
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
@@ -1413,7 +1437,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_SUSPEND(tag_index: u31) {
 		var offsets = V3Offsets.new();
 		var stub_suspend = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
-		
+
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1454,7 +1478,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
 		var offsets = V3Offsets.new();
 		var stub_switch = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
-		
+
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1517,11 +1541,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (checkForConstNull(state.peek())) return;
 
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var cont = allocTmp(ValueKind.REF);
 		var curStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
-		masm.emit_validate_and_consume_cont(cont);
-		var contStack = cont;
+
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1531,19 +1556,22 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
 		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, cont);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
 		masm.emit_call_runtime_RESUME_THROW();
 		dropN(u32.!(tag.fields.length));
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
-		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+		state.push(KIND_REF_U64 | TAG_STORED | IS_STORED, NO_REG, 0);
 
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
-		masm.emit_v3_Continuation_stack_r_r(contStack, cont); // [contStack == cont] = cont.stack
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		// contStack = cont.cont
+		masm.emit_ref_from_ref_u64(contStack, cont);
+		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
+		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1553,7 +1581,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_get_curstack(curStack);
 		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
- 
+
 		// reserve space for call addr
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
@@ -1589,11 +1617,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (checkForConstNull(state.peek())) return;
 
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var cont = allocTmp(ValueKind.REF);
 		var curStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
-		masm.emit_validate_and_consume_cont(cont);
-		var contStack = cont;
+
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		popFixedReg(regs.runtime_arg3);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
@@ -1604,7 +1633,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
 		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, cont);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		masm.emit_call_runtime_RESUME_THROW_REF();
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
@@ -1613,8 +1642,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(ValueKind.REF, cont, popReg().reg);
-		masm.emit_v3_Continuation_stack_r_r(contStack, cont); // [contStack == cont] = cont.stack
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		// contStack = cont.cont
+		masm.emit_ref_from_ref_u64(contStack, cont);
+		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
+		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1624,7 +1656,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_get_curstack(curStack);
 		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
- 
+
 		// reserve space for call addr
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
@@ -1875,7 +1907,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_I64X2_RELAXED_LANESELECT() { visit_V128_BITSELECT(); }
 
 	def emit_call_runtime_op1(op: Opcode, arg1: u31, canTrap: bool) {
-		var count = u32.!(op.sig.params.length);		
+		var count = u32.!(op.sig.params.length);
 		emit_call_runtime_op1n(op, arg1, count, op.sig.results, canTrap);
 	}
 	def emit_call_runtime_op2(op: Opcode, arg1: u31, arg2: u31, canTrap: bool) {
@@ -1927,12 +1959,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				setUnreachable();
 			}
 		} else if (emptyTransfer) {
-			if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
+			if (sv.inReg()) emitBrIfR(sv, cond, label);
 			else masm.emit_br_m(masm.slotAddr(state.sp), cond, label);
 			if (repush.not_taken) state.pushV(sv);
 		} else {
 			var skip = masm.newLabel(it.pc);
-			if (sv.inReg()) masm.emit_br_r(sv.reg, masm.negate(cond), skip);
+			if (sv.inReg()) emitBrIfR(sv, masm.negate(cond), skip);
 			else masm.emit_br_m(masm.slotAddr(state.sp), masm.negate(cond), skip);
 			if (repush.taken) state.pushV(sv);
 			state.emitTransfer(target, resolver);
@@ -1940,6 +1972,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(skip);
 			if (repush.taken) state.pop();
 			if (repush.not_taken) state.pushV(sv);
+		}
+	}
+	// If {sv} is a REF_U64, extract the REF part into %scratch and condition on that.
+	// Asserts {sv.inReg()}.
+	def emitBrIfR(sv: SpcVal, cond: MasmBrCond, label: MasmLabel) {
+		if (sv.kind() == ValueKind.REF_U64) {
+			masm.emit_ref_from_ref_u64(xenv.scratch, sv.reg);
+			masm.emit_br_r(xenv.scratch, cond, label);
+		} else {
+			masm.emit_br_r(sv.reg, cond, label);
 		}
 	}
 	def emitBrTable(sv: SpcVal, depths: Range<u31>) {
@@ -2488,6 +2530,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 		return (flags & IS_STORED) != 0;
 	}
 	def isConst() -> bool {
+		if (kind() == ValueKind.REF_U64) return (flags & IS_CONST) != 0 && const == 0;
 		return (flags & IS_CONST) != 0;
 	}
 	def inReg() -> bool {
@@ -2518,6 +2561,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 			F64 => buf.puts("d");
 			V128 => buf.puts("v");
 			REF => buf.puts("r");
+			REF_U64 => buf.puts("c");
 		}
 		buf.put2("%s%s",
 			if(tagStored(), "T", ""),
@@ -2539,6 +2583,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 			F64 => buf.puts("d");
 			V128 => buf.puts("v");
 			REF => buf.puts("r");
+			REF_U64 => buf.puts("c");
 		}
 		if (!buf.hasColor(Color.BOLD) && tagStored()) buf.puts("T");
 		if (!buf.hasColor(Color.UNDERLINE) && isStored()) buf.puts("S");
@@ -2867,6 +2912,7 @@ def typeToKindFlags(vt: ValueType) -> byte {
 		F32 => return KIND_F32;
 		F64 => return KIND_F64;
 		V128 => return KIND_V128;
+		Ref(_, ht) => return if (HeapType.Cont.?(ht), KIND_REF_U64, KIND_REF);
 		_ => return KIND_REF;
 	}
 }
@@ -3162,7 +3208,7 @@ type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
 
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
-//  
+//
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
 type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
