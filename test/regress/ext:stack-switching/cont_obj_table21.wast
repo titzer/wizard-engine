@@ -15,6 +15,7 @@
   (elem declare func $add_and_suspend)
 
   (func (export "main") (result i32)
+    (local $tmp (ref null $c1))
     (local $result i32)
     ;; Slot 0: bind base=10, will add suspend result
     (table.set $t (i32.const 0)
@@ -27,22 +28,25 @@
       (resume $c2 (on $yield $h0) (table.get $t (i32.const 0)))
       (return (i32.const -1))
     )
+    (local.set $tmp)
+
     ;; Store suspended continuation in slot 2
-    (table.set $t (i32.const 2) (cont.bind $c1 $c2))
+    (table.set $t (i32.const 2) (cont.bind $c1 $c2 (i32.const 42) (local.get $tmp)))
     ;; Resume slot 1, it suspends
     (block $h1 (result (ref $c1))
       (resume $c2 (on $yield $h1) (table.get $t (i32.const 1)))
       (return (i32.const -1))
     )
+    (local.set $tmp)
+
     ;; Reuse slot 0 for this suspended continuation
-    (table.set $t (i32.const 0) (cont.bind $c1 $c2))
+    (table.set $t (i32.const 0) (cont.bind $c1 $c2 (i32.const 24) (local.get $tmp)))
     ;; Complete slot 2 (was slot 0's suspended cont) with 5: 10 + 5 = 15
-    (local.set $result (resume $c2 (i32.const 5) (table.get $t (i32.const 2))))
+    (local.set $result (resume $c2 (table.get $t (i32.const 2))))
     ;; Complete slot 0 (was slot 1's suspended cont) with 7: 20 + 7 = 27
-    (local.set $result (i32.add (local.get $result) (resume $c2 (i32.const 7) (table.get $t (i32.const 0)))))
-    ;; 15 + 27 = 42
+    (local.set $result (i32.add (local.get $result) (resume $c2 (table.get $t (i32.const 0)))))
     (local.get $result)
   )
 )
 
-(assert_return (invoke "main") (i32.const 42))
+(assert_return (invoke "main") (i32.const 96))

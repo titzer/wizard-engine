@@ -21,13 +21,10 @@
       (resume $c1 (on $yield $on_yield) (global.get $g))
       (return (i32.const -1))
     )
-    ;; Stack has [5 (ref $c2)], bind 32 to it and store in global
-    (global.set $g (cont.bind $c2 $c1 (global.get $g)))
-    ;; Yielded value 5 is still on stack, drop it
-    drop
-    ;; Resume bound continuation, result = 10 + 32 = 42
+    (cont.bind $c2 $c1)
+    (global.set $g)
     (resume $c1 (global.get $g))
   )
 )
 
-(assert_return (invoke "main") (i32.const 42))
+(assert_return (invoke "main") (i32.const 15))

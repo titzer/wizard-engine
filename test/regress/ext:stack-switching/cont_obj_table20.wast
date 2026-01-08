@@ -2,10 +2,13 @@
 (module
   (type $f1 (func (result i32)))
   (type $c1 (cont $f1))
+  (type $f2 (func (param i32) (result i32)))
+  (type $c2 (cont $f2))
 
   (tag $yield (result i32))
 
   (table $t 1 (ref null $c1))
+  (table $u 1 (ref null $c2))
 
   (func $multi_suspend (result i32)
     (i32.add
@@ -16,26 +19,31 @@
 
   (func (export "main") (result i32)
     (table.set $t (i32.const 0) (cont.new $c1 (ref.func $multi_suspend)))
+    (i32.const 0)
     ;; First resume, suspends
-    (block $h1 (result (ref $c1))
+    (block $h1 (result (ref $c2))
       (resume $c1 (on $yield $h1) (table.get $t (i32.const 0)))
       (return (i32.const -1))
     )
-    (table.set $t (i32.const 0))
+    (table.set $u)
+
+    (i32.const 0)
     ;; Second resume with 10, suspends
-    (block $h2 (result (ref $c1))
-      (resume $c1 (on $yield $h2) (i32.const 10) (table.get $t (i32.const 0)))
+    (block $h2 (result (ref $c2))
+      (resume $c2 (on $yield $h2) (i32.const 10) (table.get $u (i32.const 0)))
       (return (i32.const -1))
     )
-    (table.set $t (i32.const 0))
+    (table.set $u)
+
+    (i32.const 0)
     ;; Third resume with 20, suspends
-    (block $h3 (result (ref $c1))
-      (resume $c1 (on $yield $h3) (i32.const 20) (table.get $t (i32.const 0)))
+    (block $h3 (result (ref $c2))
+      (resume $c2 (on $yield $h3) (i32.const 20) (table.get $u (i32.const 0)))
       (return (i32.const -1))
     )
-    (table.set $t (i32.const 0))
+    (table.set $u)
     ;; Fourth resume with 12, completes: 10 + 20 + 12 = 42
-    (resume $c1 (i32.const 12) (table.get $t (i32.const 0)))
+    (resume $c2 (i32.const 12) (table.get $u (i32.const 0)))
   )
 )
 

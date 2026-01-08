@@ -18,6 +18,7 @@
   (func (export "main") (result i32)
     ;; Create and bind base=20, store fully bound continuation
     (global.set $g (cont.bind $c1 $c2 (i32.const 20) (cont.new $c1 (ref.func $complex_func))))
+    (i32.const 22)
     ;; Resume, will suspend
     (block $on_yield (result (ref $c1))
       (resume $c2 (on $yield $on_yield) (global.get $g))

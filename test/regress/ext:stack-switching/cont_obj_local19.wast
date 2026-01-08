@@ -20,13 +20,10 @@
       (resume $c1 (on $yield $on_yield) (local.get $c))
       (return (i32.const -1))
     )
-    ;; Stack has [5 (ref $c2)], bind 32 to it and store in local
-    (local.set $c (cont.bind $c2 $c1))
-    ;; Yielded value 5 is still on stack, drop it
-    drop
-    ;; Resume bound continuation, result = 10 + 32 = 42
+    (cont.bind $c2 $c1)
+    (local.set $c)
     (resume $c1 (local.get $c))
   )
 )
 
-(assert_return (invoke "main") (i32.const 42))
+(assert_return (invoke "main") (i32.const 15))

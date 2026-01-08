@@ -14,14 +14,8 @@
 
   (func (export "main") (result i32)
     (table.set $t (i32.const 0) (cont.new $c1 (ref.func $unreachable_func)))
-    (block $handler (result i32)
-      (throw_ref
-        (block $on_abort (result exnref)
-          (resume_throw $c1 $abort (on $abort $on_abort) (table.get $t (i32.const 0)))
-          (return (i32.const -1))
-        )
-      )
-    )
+    (resume_throw $c1 $abort (table.get $t (i32.const 0)))
+    (return (i32.const -1))
   )
 )
 
