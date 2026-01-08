@@ -2,6 +2,8 @@
 (module
   (type $f1 (func (result i32)))
   (type $c1 (cont $f1))
+  (type $f2 (func (param i32) (result i32)))
+  (type $c2 (cont $f2))
 
   (tag $yield (result i32))
 
@@ -13,14 +15,16 @@
   (func (export "main") (result i32)
     (local $c (ref null $c1))
     (local.set $c (cont.new $c1 (ref.func $suspending_func)))
-    (block $on_yield (result (ref $c1))
+    (i32.const 40)
+    (block $on_yield (result (ref $c2))
       (resume $c1 (on $yield $on_yield) (local.get $c))
       (return (i32.const -1))
     )
+    (cont.bind $c2 $c1)
     ;; Store suspended continuation back to local
     (local.set $c)
     ;; Resume with value 40, result should be 42
-    (resume $c1 (i32.const 40) (local.get $c))
+    (resume $c1 (local.get $c))
   )
 )
 

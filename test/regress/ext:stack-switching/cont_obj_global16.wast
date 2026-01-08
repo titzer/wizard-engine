@@ -14,14 +14,8 @@
 
   (func (export "main") (result i32)
     (global.set $g (cont.new $c1 (ref.func $unreachable_func)))
-    (block $handler (result i32)
-      (throw_ref
-        (block $on_abort (result exnref)
-          (resume_throw $c1 $abort (on $abort $on_abort) (global.get $g))
-          (return (i32.const -1))
-        )
-      )
-    )
+    (resume_throw $c1 $abort (global.get $g))
+    (return (i32.const -1))
   )
 )
 

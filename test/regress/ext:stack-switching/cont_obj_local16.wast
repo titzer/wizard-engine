@@ -13,14 +13,8 @@
   (func (export "main") (result i32)
     (local $c (ref null $c1))
     (local.set $c (cont.new $c1 (ref.func $unreachable_func)))
-    (block $handler (result i32)
-      (throw_ref
-        (block $on_abort (result exnref)
-          (resume_throw $c1 $abort (on $abort $on_abort) (local.get $c))
-          (return (i32.const -1))
-        )
-      )
-    )
+    (resume_throw $c1 $abort (local.get $c))
+    (return (i32.const -1))
   )
 )
 
