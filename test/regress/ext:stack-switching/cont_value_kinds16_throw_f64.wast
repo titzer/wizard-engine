@@ -7,24 +7,19 @@
 
   (func $inner (result f64)
     (block $h (result f64)
-      (throw_ref
-        (block $catch (result exnref)
-          (try_table (catch $e $catch)
-            (suspend $e (f64.const 0))
-          )
-          (return (f64.const -1))
-        )
-      )
+      (try_table (catch $e $h) (suspend $e (f64.const 3.14159265358979)))
+      (f64.const -1)
     )
   )
   (elem declare func $inner)
 
   (func (export "main") (result f64)
-    (block $h (result (ref $c))
+    (block $h (result f64 (ref $c))
       (resume $c (on $e $h) (cont.new $c (ref.func $inner)))
       (return)
     )
-    (resume_throw $c $e (f64.const 3.14159265358979))
+    ;; throw f64 value into the continuation
+    (resume_throw $c $e)
   )
 )
 

@@ -2,6 +2,9 @@
 (module
   (type $f (func (result v128)))
   (type $c (cont $f))
+  ;; Suspended continuation type: takes v128 from tag result
+  (type $fs (func (param v128) (result v128)))
+  (type $cs (cont $fs))
 
   (tag $t (param v128) (result v128))
 
@@ -11,12 +14,12 @@
   (elem declare func $inner)
 
   (func (export "main") (result v128)
-    (block $h (result v128 (ref $c))
+    (block $h (result v128 (ref $cs))
       (resume $c (on $t $h) (cont.new $c (ref.func $inner)))
       (return)
     )
     ;; pass back the same v128, inner adds 1 to each lane
-    (resume $c)
+    (resume $cs)
   )
 )
 

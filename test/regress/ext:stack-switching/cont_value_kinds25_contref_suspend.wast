@@ -4,6 +4,9 @@
   (type $helper_c (cont $helper_f))
   (type $f (func (result i32)))
   (type $c (cont $f))
+  ;; Suspended continuation type: takes i32 (from tag result), returns i32
+  (type $suspended_f (func (param i32) (result i32)))
+  (type $suspended_c (cont $suspended_f))
 
   (tag $t (param (ref $helper_c)) (result i32))
 
@@ -17,13 +20,15 @@
 
   (func (export "main") (result i32)
     (local $helper (ref $helper_c))
-    (block $h (result (ref $helper_c) (ref $c))
+    (local $k (ref $suspended_c))
+    (block $h (result (ref $helper_c) (ref $suspended_c))
       (resume $c (on $t $h) (cont.new $c (ref.func $inner)))
       (return)
     )
+    (local.set $k)
     (local.set $helper)
     ;; resume the helper to get 21, pass back to inner which doubles it
-    (resume $c (resume $helper_c (local.get $helper)))
+    (resume $suspended_c (resume $helper_c (local.get $helper)) (local.get $k))
   )
 )
 

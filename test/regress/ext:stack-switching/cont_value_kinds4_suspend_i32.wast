@@ -2,6 +2,9 @@
 (module
   (type $f (func (result i32)))
   (type $c (cont $f))
+  ;; Suspended continuation type: takes i32 from tag result
+  (type $fs (func (param i32) (result i32)))
+  (type $cs (cont $fs))
 
   (tag $t (param i32) (result i32))
 
@@ -11,12 +14,12 @@
   (elem declare func $inner)
 
   (func (export "main") (result i32)
-    (block $h (result i32 (ref $c))
+    (block $h (result i32 (ref $cs))
       (resume $c (on $t $h) (cont.new $c (ref.func $inner)))
       (return)
     )
     ;; received 32 from suspend, pass back 32, inner adds 10 = 42
-    (resume $c)
+    (resume $cs)
   )
 )
 

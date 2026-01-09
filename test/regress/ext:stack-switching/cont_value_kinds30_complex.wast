@@ -8,6 +8,9 @@
   (type $f2 (func (result i32)))
   (type $c1 (cont $f1))
   (type $c2 (cont $f2))
+  ;; Suspended continuation type: takes (ref $inner) from tag result
+  (type $fs (func (param (ref $inner)) (result i32)))
+  (type $cs (cont $fs))
 
   (tag $t (param (ref $arr)) (result (ref $inner)))
 
@@ -31,10 +34,10 @@
   (elem declare func $process)
 
   (func (export "main") (result i32)
-    (local $k (ref $c1))
+    (local $k (ref $cs))
     (local $a (ref $arr))
     ;; bind the outer struct: inner(10) + inner(12) = 22
-    (block $h (result (ref $arr) (ref $c1))
+    (block $h (result (ref $arr) (ref $cs))
       (resume $c2 (on $t $h)
         (cont.bind $c1 $c2
           (struct.new $outer
@@ -47,7 +50,7 @@
     (local.set $a)
     ;; sum array elements: 1 + 2 = 3, but return inner(20)
     ;; so final result = 22 + 20 = 42
-    (resume $c1 (struct.new $inner (i32.const 20)) (local.get $k))
+    (resume $cs (struct.new $inner (i32.const 20)) (local.get $k))
   )
 )
 
