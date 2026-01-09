@@ -7,24 +7,19 @@
 
   (func $inner (result i64)
     (block $h (result i64)
-      (throw_ref
-        (block $catch (result exnref)
-          (try_table (catch $e $catch)
-            (suspend $e (i64.const 0))
-          )
-          (return (i64.const -1))
-        )
-      )
+      (try_table (catch $e $h) (suspend $e (i64.const 0xDEADBEEFCAFEBABE)))
+      (i64.const -1)
     )
   )
   (elem declare func $inner)
 
   (func (export "main") (result i64)
-    (block $h (result (ref $c))
+    (block $h (result i64 (ref $c))
       (resume $c (on $e $h) (cont.new $c (ref.func $inner)))
       (return)
     )
-    (resume_throw $c $e (i64.const 0xDEADBEEFCAFEBABE))
+    ;; throw i64 value into the continuation
+    (resume_throw $c $e)
   )
 )
 
