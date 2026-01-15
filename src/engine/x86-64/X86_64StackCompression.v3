@@ -1,0 +1,154 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def valuerep = Target.tagging;
+
+component X86_64Compression {
+	def collector = StackFrameCollector.new();
+
+	def loadTargetFrame(frame: TargetFrame, next_vfp: Pointer) -> RelocatableFrame {
+		var accessor = frame.getFrameAccessor();
+		var func = accessor.func();
+		var pc = accessor.pc();
+		var values = Vector<Value>.new();
+		// XXX: bytecode_ip is only meaningful for interpreter frames. If {frame} is an
+		// SPC frame this load reads a slot with different semantics. See writeFrames bug below.
+		var h = X86_64FrameHandle.Interpreter(accessor.sfp());
+		var bytecode_ip = h.ip();
+
+		var ret_addr = frame.srp().load<Pointer>();
+
+		if (Debug.compression) {
+			var vfp_ptr = accessor.sfp() + X86_64InterpreterFrame.vfp.offset - Pointer.NULL;
+			var vfp_val = h.vfp() - Pointer.NULL;
+			Trace.OUT.put2("vfp (at compression) *(0x%x) = 0x%x", vfp_ptr, vfp_val).ln();
+		}
+
+		var offset = 0;
+		for (this_vfp = h.vfp(); this_vfp < next_vfp; this_vfp += valuerep.slot_size) {
+			var value = accessor.getValue(offset);
+			values.put(value);
+			offset++;
+		}
+
+		return RelocatableFrame(func, pc, TargetReentryLabel(ret_addr), TargetReentryLabel(bytecode_ip), values.extract());
+	}
+
+	def readFrames(stack: X86_64Stack) -> Array<RelocatableFrame> {
+		if (Debug.compression) Trace.OUT.put1("Reading stack info:\n%q", renderStackBounds(stack, _)).ln();
+		var collector = StackFrameCollector.new();
+		var result = Vector<RelocatableFrame>.new();
+		stack.walk<void>(collector.visitFrame, void, stack.rsp, false);
+
+		for (i = collector.frames.length - 1; i >= 0; i--) {
+			var next_vfp = stack.vsp;
+			if (i != 0) {
+				next_vfp = collector.frames[i-1].getFrameAccessor().handle.vfp();
+			}
+
+			result.put(loadTargetFrame(collector.frames[i], next_vfp));
+		}
+
+		return result.extract();
+	}
+
+	// XXX / FIXME: this function unconditionally reconstructs every frame as an INTERPRETER
+	// frame, regardless of whether the source frame was interpreter or SPC. This is a known
+	// pre-existing bug preserved across rebase; a proper fix must:
+	//   (1) record the frame-kind in RelocatableFrame,
+	//   (2) allocate the correct-size frame,
+	//   (3) write interpreter-only vs SPC-only slots on the correct layout,
+	//   (4) choose a reentry stub compatible with the destination frame kind.
+	// See {setFrameContext}, {setNewProgramLocation}, and the in-line "SPC:" notes below.
+	def writeFrames(to: X86_64Stack, frames: Array<RelocatableFrame>) {
+		to.clear();
+		var root_func = frames[0].func;
+		var instance = root_func.instance;
+		to.reset(instance.functions[root_func.decl.func_index]);
+		to.rsp += Pointer.SIZE; // Pop the enter-func-stub off (only needed for first entry).
+		if (Debug.compression) Trace.OUT.put1(
+			"  Root function: %q", root_func.decl.render(null, _)
+		).ln();
+
+		for (f in frames) {
+			var map = SidetableMap.new(f.func.decl);
+			var stp = map[f.pc];
+			if (Debug.compression) Trace.OUT.put2("pc[%d] -> stp[%d]", f.pc, stp).ln();
+
+			// XXX: hardcoded to X86_64InterpreterFrame.size — wrong if origin was an SPC frame.
+			to.rsp += -X86_64InterpreterFrame.size;
+			var h = X86_64FrameHandle.Interpreter(to.rsp);
+			// XXX: setFrameContext / setNewProgramLocation write interpreter-only slots.
+			setFrameContext(h, f.func);
+			setNewProgramLocation(h, f.func.decl, f.pc, stp, f.bytecode_ip.ret_addr);
+
+			// Load values.
+			h.set_vfp(to.vsp); // Store %vfp.
+			for (val in f.vals) to.push(val);
+			h.set_vsp(to.vsp); // Store %vsp.
+
+			if (Debug.compression) {
+				var vfp_ptr = to.rsp + X86_64InterpreterFrame.vfp.offset - Pointer.NULL;
+				var vfp_val = h.vfp() - Pointer.NULL;
+				Trace.OUT.put2("vfp (at decompression) *(0x%x) = 0x%x", vfp_ptr, vfp_val).ln();
+			}
+
+			// XXX: stored reentry address assumes an interpreter reentry. For SPC origins
+			// this should instead be an SPC reentry (likely via a handler stub), not the
+			// raw captured ret_addr.
+			to.rsp += -Pointer.SIZE;
+			to.rsp.store<Pointer>(f.reentry.ret_addr);
+		}
+
+		if (Debug.compression) Trace.OUT.put1("Stack info:\n%q", renderStackBounds(to, _)).ln();
+	}
+
+	private def renderStackBounds(stack: X86_64Stack, buf: StringBuilder) -> StringBuilder {
+		buf.put1("  vsp: 0x%x", stack.vsp - Pointer.NULL).ln();
+		buf.put1("  rsp: 0x%x", stack.rsp - Pointer.NULL).ln();
+		return buf;
+	}
+
+	// XXX: interpreter-only — sidetable slot does not exist in {X86_64SpcFrame}.
+	def setFrameContext(h: X86_64FrameHandle.Interpreter, wf: WasmFunction) {
+		var module = wf.instance.module;
+		h.set_wasm_func(wf);
+		h.set_instance(wf.instance);
+		h.set_sidetable(wf.decl.sidetable.entries);
+		h.set_accessor(null);
+
+		// Load instance.memories[0].start into MEM0_BASE
+		if (module.memories.length > 0) {
+			var memory = NativeWasmMemory.!(wf.instance.memories[0]);
+			h.set_mem0_base(memory.start);
+		}
+	}
+
+	// XXX: merge with functionality in FrameAccessor (cf. X86_64FrameHandle.writeInterpreterState)
+	// XXX: interpreter-only — func_decl/code/ip/eip/stp slots are absent/repurposed in {X86_64SpcFrame}.
+	// TODO: forgeRange
+	def setNewProgramLocation(h: X86_64FrameHandle.Interpreter, func: FuncDecl, pc: int, stp: int, bytecode_ip: Pointer) {
+		var code = func.cur_bytecode;
+
+		h.set_func_decl(func);
+		h.set_curpc(pc);
+		h.set_code(code);
+		h.set_ip(bytecode_ip); // NOTE: preserves captured bytecode_ip (differs from writeInterpreterState).
+		h.set_eip(Pointer.atContents(code) + code.length);
+		var st_entries = func.sidetable.entries;
+		var st_ptr = if(stp == st_entries.length, Pointer.atContents(st_entries), Pointer.atElement(func.sidetable.entries, stp));
+		h.set_stp(st_ptr);
+	}
+}
+
+// Class for collecting and organizing the frames of a {X86_64Stack} during its
+// compression by walking its stack frames.
+class StackFrameCollector {
+	def frames = Vector<TargetFrame>.new();
+
+	def reset() { frames.clear(); }
+	def visitFrame(p: Pointer, c: RiUserCode, pos: StackFramePos, v: void) -> bool {
+		if (X86_64InterpreterCode.?(c) || X86_64SpcModuleCode.?(c)) frames.put(pos.frame);
+		return true;
+	}
+}
