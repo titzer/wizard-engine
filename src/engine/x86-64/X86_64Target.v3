@@ -242,10 +242,16 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 	def onFuncValidationFinish(module: Module, func: FuncDecl, err: ErrorGen) {
 		if (err != null && !err.ok()) return;
 		Target.setUnconditionalInterpreterEntryIfMultiTier(func);
+
+		for (i < module.exports.length) {
+			def ex = module.exports[i];
+			if (ex.1 == func && Strings.startsWith(ex.0, "fast:")) {
+				System.puts(Strings.format1("fast function %s\n", ex.0));
+			}
+		}
 	}
 	def onNewFunction(wf: WasmFunction, err: ErrorGen) {
 		Target.setUnconditionalInterpreterEntryIfMultiTier(wf.decl);
-		X86_64Spc.setFastCompileFor(wf.instance.module, wf.decl);
 	}
 
 	def onFuncProbeInsert1(module: Module, func: FuncDecl, offset: int, p: Probe) {
@@ -257,7 +263,7 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 	def fastCompile(wf: WasmFunction, ic: X86_64InterpreterCode) -> SpcResultForStub {
 		var module = wf.instance.module;
 		var code = module.target_module.spc_code;
-		var compiler = newCompiler(module.filename, true, ic);
+		var compiler = newCompiler(module.filename, true, null);
 		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
 		// generate code for the function
@@ -286,10 +292,70 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 		}
 		return SpcResultForStub(wf, entrypoint, null);
 	}
+	def fastCompileEntireModule(module: Module, size: u32, interpreter_fallback: bool, err: ErrorGen, ballast: u32) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
+
+		var compiler = newCompiler(module.filename, true, null);
+		var w = compiler.w;
+
+		// generate code for all functions
+		var bounds = Array<(int, int)>.new(module.functions.length);
+		var suberr = if(!interpreter_fallback, err);
+		for (i = 0; err.ok() && i < module.functions.length; i++) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			for (j < module.exports.length) {
+				def ex = module.exports[j];
+				if (ex.1 == f && Strings.startsWith(ex.0, "fast:")) {
+					var start = w.atEnd().pos;
+					var compiled = compiler.gen(module, f, suberr);
+					if (compiled) bounds[i] = (start, w.end());
+					else bounds[i] = (-1, -1);
+				}
+			}
+		}
+
+		// copy and map code
+		var length = u64.view(w.atEnd().pos) + ballast;
+		var mapping = Mmap.reserve(length, Mmap.PROT_WRITE), range = mapping.range; // TODO: handle failure
+		var masm = X86_64MacroAssembler.!(compiler.masm);
+		masm.setTargetAddress(u64.view(range.start - Pointer.NULL));
+		Target.copyInto(mapping.range, 0, w);
+		// TODO: for security, move embedded references out of the code region and make it non-writable
+		Mmap.protect(range.start, u64.!(range.end - range.start), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
+		for (i < bounds.length) {
+			var b = bounds[i];
+			if (b.0 >= 0) {
+				var addr = mapping.range.start;
+				var f = module.functions[i];
+				Target.setFastTargetCode(f, addr + b.0, addr + b.1);
+			} else {
+				var f = module.functions[i];
+				if (Trace.compiler) Trace.OUT.put1("func[%d] initial compile failed", f.func_index).ln();
+				X86_64Spc.setInterpreterFallback(f);
+			}
+		}
+		// XXX: reduce duplication with {X86_64SpcModuleCode.appendCode}.
+		var code = X86_64SpcModuleCode.new(mapping);
+		if (masm.source_locs != null) {
+			code.sourcePcs = Vector.new();
+			code.sourcePcs.putv(masm.source_locs);
+		}
+		if (masm.embeddedRefOffsets != null) {
+			if (code.embeddedRefOffsets == null) code.embeddedRefOffsets = Vector.new();
+			code.embeddedRefOffsets.putv(masm.embeddedRefOffsets);
+		}
+
+		module.target_module = TargetModule(code);
+		RiRuntime.registerUserCode(code);
+		module.target_module.spc_code.keepAlive();
+		Debug.afterCompileModule(module);
+	}
 
 	// XXX not an exhaustive way to add stubs. but what is?
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
-		installStubForModule(module, X86_64Spc.setFastCompileFor);
+		fastCompileEntireModule(module, size, false, err, 1024);
 	}
 }
 
