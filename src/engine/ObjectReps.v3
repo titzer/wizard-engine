@@ -1,3 +1,33 @@
+// Alternate, possibly faster, representations for Wasm heap objects
+
+enum ArrayMode(code: int) {
+	Original(0),	// Default value: HeapArrayValue only
+	Typed(1),	// HeapArrayX where X can be one of the storage types
+}
+
+enum StructMode(code: int) {
+	Original(0),	// Default value: Values only
+	Pair(1)		// Having Array<Object> (holdings the refs) and Array<byte> (holding prims)
+}
+
+def arrayModeFor(code: int) -> ArrayMode {
+	def modes = [ArrayMode.Original, ArrayMode.Typed];
+	return if(code >= 0 && code < modes.length, modes[code], ArrayMode.Original);
+}
+
+def structModeFor(code: int) -> StructMode {
+	def modes = [StructMode.Original, StructMode.Pair];
+	return if(code >= 0 && code < modes.length, modes[code], StructMode.Original);
+}
+
+component ObjReps {
+	def arrayModeCode = 1;
+	def arrayMode = arrayModeFor(arrayModeCode);
+
+	def structModeCode = 1;
+	def structMode = structModeFor(structModeCode);
+}
+
 // Paired array representation: an Array<Object> holds all the reference fields,
 // and an Array<byte> holds all the primitive values
 class HeapStructPair extends HeapStructGeneric {
@@ -5,201 +35,115 @@ class HeapStructPair extends HeapStructGeneric {
 	def bytes: Array<byte>;
 	new(decl: StructDecl, objs, bytes) super(decl) { }
 
+	private def getHelperV<T>(offset: i32, len: int, fetch: Range<byte> -> T, wrap: T -> Value) -> Value {
+		return wrap(fetch(bytes[offset ..+ len]));
+	}
 	def getFieldValue(index: u31) -> Value {
 		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
 		match (decl.field_shifts[index]) {
-			-1 => {
-				return Value.Ref(objs[decl.field_offsets[index]]);
-			}
-			0 => {
-				var v = bytes[decl.field_offsets[index]];
-				return Value.I32(u32.view(v));
-			}
-			1 => {
-				var v = Ref<Layout_u16>.at(bytes, decl.field_offsets[index]).val;
-				return Value.I32(u32.view(v));
-			}
-			2 => {
-				var v = Ref<Layout_u32>.at(bytes, decl.field_offsets[index]).val;
-				return if(decl.field_types[index].valtype == ValueType.I32, Value.I32(v), Value.F32(v));
-			}
-			3 => {
-				var v = Ref<Layout_u64>.at(bytes, decl.field_offsets[index]).val;
-				return if(decl.field_types[index].valtype == ValueType.I64, Value.I64(v), Value.F64(v));
-			}
-			4 => {
-				var r = Ref<Layout_u128>.at(bytes, decl.field_offsets[index]);
-				return Value.V128(r.lo_val, r.hi_val);
-			}
+			-1 => return Value.Ref(objs[offset]);
+			0  => return getHelperV<u32>(offset, 1, DataReaders.read_range_u32_u8, Values.box_u);
+			1  => return getHelperV<u32>(offset, 2, DataReaders.read_range_u32_u16, Values.box_u);
+			2  => return getHelperV<u32>(offset, 4, DataReaders.read_range_u32,
+						     if(decl.field_types[index].valtype == ValueType.I32, Values.box_u, Values.box_fu32));
+			3  => return getHelperV<u64>(offset, 8, DataReaders.read_range_u64,
+						     if(decl.field_types[index].valtype == ValueType.I64, Values.box_w, Values.box_du64));
+			4  => return getHelperV<(u64, u64)>(offset, 16, DataReaders.read_range_u128, Values.box_s);
 		}
 		return Value.I32(u32.view(-1));
 	}
-	def getFieldSignExtend8Value(index: u31) -> Value {
+	private def getHelperV2<T, U>(index: u31, len: int, fetch: Range<byte> -> T, widen: T -> U, wrap: U -> Value) -> Value {
 		var decl = StructDecl.!(this.decl);
-		var v = Ref<Layout_i8>.at(bytes, decl.field_offsets[index]).val;
-		return Value.I32(u32.view(i32.!(v)));
+		return wrap(widen(fetch(bytes[decl.field_offsets[index] ..+ len])));
+	}
+	def getFieldSignExtend8Value(index: u31) -> Value {
+		return getHelperV2<i8, i32>(index, 1, DataReaders.read_range_i8, i32.!, Values.box_i);
 	}
 	def getFieldSignExtend16Value(index: u31) -> Value {
-		var decl = StructDecl.!(this.decl);
-		var v = Ref<Layout_i16>.at(bytes, decl.field_offsets[index]).val;
-		return Value.I32(u32.view(i32.!(v)));
+		return getHelperV2<i16, i32>(index, 2, DataReaders.read_range_i16, i32.!, Values.box_i);
 	}
 	def getFieldZeroExtend8Value(index: u31) -> Value {
-		var decl = StructDecl.!(this.decl);
-		var v = Ref<Layout_u8>.at(bytes, decl.field_offsets[index]).val;
-		return Value.I32(u32.view(v));
+		return getHelperV2<u8, u32>(index, 1, DataReaders.read_range_u8, u32.!, Values.box_u);
 	}
 	def getFieldZeroExtend16Value(index: u31) -> Value {
+		return getHelperV2<u16, u32>(index, 2, DataReaders.read_range_u16, u32.!, Values.box_u);
+	}
+	private def getHelper<T>(index: u32, len: int, fetch: Range<byte> -> T) -> T {
 		var decl = StructDecl.!(this.decl);
-		var v = Ref<Layout_u16>.at(bytes, decl.field_offsets[index]).val;
-		return Value.I32(u32.view(v));
-	 }
+		var offset = decl.field_offsets[index];
+		return fetch(bytes[offset ..+ len]);
+	}
 	def getFieldI32(index: u32) -> i32 {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && (ft.pack != Packedness.UNPACKED || ft.valtype != ValueType.I32)) { return -1; }
-		var v = Ref<Layout_i32>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<i32>(index, 4, DataReaders.read_range_i32);
 	}
 	def getFieldI64(index: u32) -> i64 {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && (ft.pack != Packedness.UNPACKED || ft.valtype != ValueType.I64)) { return -1; }
-		var v = Ref<Layout_i64>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<i64>(index, 8, DataReaders.read_range_i64);
 	}
 	def getFieldI8(index: u32) -> i8 {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && ft.pack != Packedness.PACKED_I8) { return -1; }
-		var v = Ref<Layout_i8>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<i8>(index, 1, DataReaders.read_range_i8);
 	}
 	def getFieldI16(index: u32) -> i16 {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && ft.pack != Packedness.PACKED_I16) { return -1; }
-		var v = Ref<Layout_i16>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<i16>(index, 2, DataReaders.read_range_i16);
 	}
 	def getFieldF32(index: u32) -> float {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && (ft.pack != Packedness.UNPACKED || ft.valtype != ValueType.F32)) { return -1f; }
-		var v = Ref<Layout_float>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<float>(index, 4, DataReaders.read_range_float);
 	}
 	def getFieldF64(index: u32) -> double {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && (ft.pack != Packedness.UNPACKED || ft.valtype != ValueType.F64)) { return -1d; }
-		var v = Ref<Layout_double>.at(bytes, decl.field_offsets[index]).val;
-		return v;
+		return getHelper<double>(index, 8, DataReaders.read_range_double);
 	}
 	def getFieldRef(index: u32) -> Object {
 		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && ValueType.Ref.?(ft.valtype)) { return null; }
 		return objs[decl.field_offsets[index]];
 	}
 	def getFieldV128(index: u32) -> (u64, u64) {
+		return getHelper<(u64, u64)>(index, 16, DataReaders.read_range_u128);
+	}
+	private def setHelperV<T>(index: u32, len: int, val: Value, unbox: Value -> T, store: (Range<byte>, T) -> void) {
 		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (!Values.NO_CHECKS && (ft.pack != Packedness.UNPACKED || ft.valtype != ValueType.V128)) { return (u64.view(-1), u64.view(-1)); }
-		var r = Ref<Layout_u128>.at(bytes, decl.field_offsets[index]);
-		return (r.lo_val, r.hi_val);
+		var offset = decl.field_offsets[index];
+		return store(bytes[offset ..+ len], unbox(val));
 	}
 	def setFieldValue(index: u31, val: Value) {
 		var decl = StructDecl.!(this.decl);
 		match (decl.field_shifts[index]) {
-			-1 => {
-				objs[decl.field_offsets[index]] = Value.Ref.!(val).val;
-			}
-			0 => {
-				bytes[decl.field_offsets[index]] = u8.view(Value.I32.!(val).val);
-			}
-			1 => {
-				Ref<Layout_u16>.at(bytes, decl.field_offsets[index]).val = u16.view(Value.I32.!(val).val);
-			}
-			2 => {
-				if (Value.I32.?(val)) {
-					Ref<Layout_u32>.at(bytes, decl.field_offsets[index]).val = Value.I32.!(val).val;
-				} else {
-					Ref<Layout_u32>.at(bytes, decl.field_offsets[index]).val = Value.F32.!(val).bits;
-				}
-			}
-			3 => {
-				if (Value.I64.?(val)) {
-					Ref<Layout_u64>.at(bytes, decl.field_offsets[index]).val = Value.I64.!(val).val;
-				} else {
-					Ref<Layout_u64>.at(bytes, decl.field_offsets[index]).val = Value.F64.!(val).bits;
-				}
-			}
-			4 => {
-				var r = Ref<Layout_u128>.at(bytes, decl.field_offsets[index]);
-				var pair = Value.V128.!(val);
-				r.lo_val = pair.low;
-				r.hi_val = pair.high;
-			}
+			-1 => objs[decl.field_offsets[index]] = Value.Ref.!(val).val;
+			0 => setHelperV<u8>(index, 1, val, Values.unbox_u8, DataWriters.write_range_u8);
+			1 => setHelperV<u16>(index, 2, val, Values.unbox_u16, DataWriters.write_range_u16);
+			2 => setHelperV<u32>(index, 4, val, if(Value.I32.?(val), Values.unbox_u, Values.unbox_fu32), DataWriters.write_range_u32);
+			3 => setHelperV<u64>(index, 8, val, if(Value.I64.?(val), Values.unbox_w, Values.unbox_du64), DataWriters.write_range_u64);
+			4 => setHelperV<(u64, u64)>(index, 16, val, Values.unbox_s, DataWriters.write_range_u128);
 		}
+	}
+	private def setHelper<T>(index: u32, len: int, val: T, store: (Range<byte>, T) -> void) {
+		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
+		return store(bytes[offset ..+ len], val);
 	}
 	def setFieldI32(index: u32, val: i32) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || (ft.pack == Packedness.UNPACKED && ft.valtype == ValueType.I32)) {
-			Ref<Layout_u32>.at(bytes, decl.field_offsets[index]).val = u32.view(val);
-		}
+		setHelper<i32>(index, 4, val, DataWriters.write_range_i32);
 	}
 	def setFieldI64(index: u32, val: i64) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || (ft.pack == Packedness.UNPACKED && ft.valtype == ValueType.I64)) {
-			Ref<Layout_u64>.at(bytes, decl.field_offsets[index]).val = u64.view(val);
-		}
+		setHelper<i64>(index, 8, val, DataWriters.write_range_i64);
 	}
 	def setFieldI8(index: u32, val: i8) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || ft.pack == Packedness.PACKED_I8) {
-			bytes[decl.field_offsets[index]] = u8.view(val);
-		}
+		setHelper<i8>(index, 1, val, DataWriters.write_range_i8);
 	}
 	def setFieldI16(index: u32, val: i16) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || ft.pack == Packedness.PACKED_I16) {
-			Ref<Layout_i16>.at(bytes, decl.field_offsets[index]).val = val;
-		}
+		setHelper<i16>(index, 2, val, DataWriters.write_range_i16);
 	}
 	def setFieldF32(index: u32, val: float) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || (ft.pack == Packedness.UNPACKED && ft.valtype == ValueType.F32)) {
-			Ref<Layout_float>.at(bytes, decl.field_offsets[index]).val = val;
-		}
+		setHelper<float>(index, 4, val, DataWriters.write_range_float);
 	 }
 	def setFieldF64(index: u32, val: double) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || (ft.pack == Packedness.UNPACKED && ft.valtype == ValueType.F64)) {
-			Ref<Layout_double>.at(bytes, decl.field_offsets[index]).val = val;
-		}
+		setHelper<double>(index, 8, val, DataWriters.write_range_double);
 	}
 	def setFieldRef(index: u32, val: Object) {
 		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || ValueType.Ref.?(ft.valtype)) {
-			objs[decl.field_offsets[index]] = val;
-		}
+		objs[decl.field_offsets[index]] = val;
 	}
 	def setFieldV128(index: u32, low: u64, high: u64) {
-		var decl = StructDecl.!(this.decl);
-		var ft = decl.field_types[index];
-		if (Values.NO_CHECKS || (ft.pack == Packedness.UNPACKED && ft.valtype == ValueType.V128)) {
-			var r = Ref<Layout_u128>.at(bytes, decl.field_offsets[index]);
-			r.lo_val = low;
-			r.hi_val = high;
-		}
+		setHelper<(u64, u64)>(index, 16, (low, high), DataWriters.write_range_u128);
 	}
 }
 
@@ -320,9 +264,7 @@ class HeapArrayF32 extends HeapArrayGeneric {
 		return if(index >= 0 && index < vals.length, float.view(vals[index]), -1);
 	}
 	def setF32(index: u32, val: float) {
-		if (index >= 0 && index < vals.length) {
-			vals[index] = u32.view(val);
-		}
+		vals[index] = u32.view(val);
 	}
 }
 
@@ -412,40 +354,27 @@ component ObjectRuntime {
 		for (i = decl.field_types.length - 1; i >= 0; i--) {
 			var index = u31.!(i);
 			match (decl.field_shifts[i]) {
-				0 => {
-					var val = stack.popi();
-					obj.setFieldI8(index, i8.view(val));
-				}
-				1 => {
-					var val = stack.popi();
-					obj.setFieldI16(index, i16.view(val));
-				}
+				0 => obj.setFieldI8(index, i8.view(stack.popi()));
+				1 => obj.setFieldI16(index, i16.view(stack.popi()));
 				2 => {
 					if (decl.field_types[i].valtype == ValueType.I32) {
-						var val = stack.popi();
-						obj.setFieldI32(index, val);
+						obj.setFieldI32(index, stack.popi());
 					} else {
-						var val = stack.popf();
-						obj.setFieldF32(index, val);
+						obj.setFieldF32(index, stack.popf());
 					}
 				}
 				3 => {
 					if (decl.field_types[i].valtype == ValueType.I64) {
-						var val = stack.popl();
-						obj.setFieldI64(index,  val);
+						obj.setFieldI64(index, stack.popl());
 					} else {
-						var val = stack.popd();
-						obj.setFieldF64(index, val);
+						obj.setFieldF64(index, stack.popd());
 					}
 				}
 				4 => {
 					var pair = stack.pops();
 					obj.setFieldV128(index, pair.0, pair.1);
 				}
-				-1 => {
-					var o = stack.popObject();
-					obj.setFieldRef(index, o);
-				}
+				-1 => obj.setFieldRef(index, stack.popObject());
 			}
 		}
 		return obj;
@@ -457,12 +386,8 @@ component ObjectRuntime {
 		for (i < decl.field_types.length) {
 			var index = u31.view(i);
 			match (decl.field_shifts[i]) {
-				0 => {
-					obj.setFieldI8(index, 0);
-				}
-				1 => {
-					obj.setFieldI16(index, 0);
-				}
+				0 => obj.setFieldI8(index, 0);
+				1 => obj.setFieldI16(index, 0);
 				2 => {
 					if (decl.field_types[i].valtype == ValueType.I32) {
 						obj.setFieldI32(index, 0);
@@ -477,89 +402,48 @@ component ObjectRuntime {
 						obj.setFieldF64(index, 0.0d);
 					}
 				}
-				4 => {
-					obj.setFieldV128(index, 0, 0);
-				}
-				-1 => {
-					obj.setFieldRef(index, null);
-				}
+				4 => obj.setFieldV128(index, 0, 0);
+				-1 => obj.setFieldRef(index, null);
 			}
 		}
 		return obj;
+	}
+	private def arrayNewHelper<T>(stack: ExecStack, decl: ArrayDecl, elem: T, length: u32, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		for (i < vals.length) vals[i] = elem;
+		stack.push(Value.Ref(make(decl, vals)));
 	}
 	def ARRAY_NEW(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
 		match (decl.elem_types[0].pack) {
 			UNPACKED => {
 				match (decl.elem_types[0].valtype) {
-					I32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						var elem = stack.popu();
-						for (i < vals.length) vals[i] = elem;
-						stack.push(Value.Ref(HeapArrayI32.new(decl, vals)));
-					}
-					I64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						var elem = stack.popw();
-						for (i < vals.length) vals[i] = elem;
-						stack.push(Value.Ref(HeapArrayI64.new(decl, vals)));
-					}
-					F32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						var elem = u32.view(stack.popf());
-						for (i < vals.length) vals[i] = elem;
-						stack.push(Value.Ref(HeapArrayF32.new(decl, vals)));
-					}
-					F64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						var elem = u64.view(stack.popd());
-						for (i < vals.length) vals[i] = elem;
-						stack.push(Value.Ref(HeapArrayF64.new(decl, vals)));
-					}
+					I32 => arrayNewHelper<u32>(stack, decl, stack.popu(), length, HeapArrayI32.new);
+					I64 => arrayNewHelper<u64>(stack, decl, stack.popw(), length, HeapArrayI64.new);
+					F32 => arrayNewHelper<u32>(stack, decl, u32.view(stack.popf()), length, HeapArrayF32.new);
+					F64 => arrayNewHelper<u64>(stack, decl, u64.view(stack.popd()), length, HeapArrayF64.new);
 					Ref(nullable, heaptype) => {
 						if (heaptype == HeapType.I31 && !nullable) {
-							var vals = Array<u31>.new(u31.!(length));
 							var elem = stack.popV(ValueType.Ref(false, HeapType.I31));
 							var val = ObjectI31.!(Value.Ref.!(elem).val).val;
-							for (i < vals.length) vals[i] = val;
-							stack.push(Value.Ref(HeapArrayI31.new(decl, vals)));
+							arrayNewHelper<u31>(stack, decl, val, length, HeapArrayI31.new);
 						} else {
-							var vals = Array<Object>.new(u31.!(length));
-							var elem = stack.popObject();
-							for (i < vals.length) vals[i] = elem;
-							stack.push(Value.Ref(HeapArrayRef.new(decl, vals)));
+							arrayNewHelper<Object>(stack, decl, stack.popObject(), length, HeapArrayRef.new);
 						}
 					}
 					V128 => {
 						var vals = Array<u64>.new(u31.!(length << 1));
 						var v128 = stack.pops();
-						var low = v128.0;
-						var high = v128.1;
 						for (i = 0; i < vals.length; i += 2) {
-							vals[i] = low;
-							vals[i+1] = high;
+							vals[i  ] = v128.0;
+							vals[i+1] = v128.1;
 						}
 						stack.push(Value.Ref(HeapArrayV128.new(decl, vals)));
 					}
-					_ => {
-						var vals = Array<Value>.new(u31.!(length));
-						var elem = stack.popV(decl.elem_types[0].valtype);
-						for (i < vals.length) vals[i] = elem;
-						stack.push(Value.Ref(HeapArrayValue.new(decl, vals)));
-					}
+					_ => arrayNewHelper<Value>(stack, decl, stack.popV(decl.elem_types[0].valtype), length, HeapArrayValue.new);
 				}
 			}
-			PACKED_I8 => {
-				var vals = Array<u8>.new(u31.!(length));
-				var elem = u8.view(stack.popu());
-				for (i < vals.length) vals[i] = elem;
-				stack.push(Value.Ref(HeapArrayI8.new(decl, vals)));
-			}
-			PACKED_I16 => {
-				var vals = Array<u16>.new(u31.!(length));
-				var elem = u16.view(stack.popu());
-				for (i < vals.length) vals[i] = elem;
-				stack.push(Value.Ref(HeapArrayI16.new(decl, vals)));
-			}
+			PACKED_I8 => arrayNewHelper<u8>(stack, decl, u8.view(stack.popu()), length, HeapArrayI8.new);
+			PACKED_I16 => arrayNewHelper<u16>(stack, decl, u16.view(stack.popu()), length, HeapArrayI16.new);
 		}
 		return null;
 	}
@@ -567,42 +451,15 @@ component ObjectRuntime {
 		match (decl.elem_types[0].pack) {
 			UNPACKED => {
 				match (decl.elem_types[0].valtype) {
-					I32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						// for (i < vals.length) vals[i] = 0u32;
-						stack.push(Value.Ref(HeapArrayI32.new(decl, vals)));
-					}
-					I64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						// for (i < vals.length) vals[i] = 0u64;
-						stack.push(Value.Ref(HeapArrayI64.new(decl, vals)));
-					}
-					F32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						// for (i < vals.length) vals[i] = u32.view(0.0f);
-						stack.push(Value.Ref(HeapArrayF32.new(decl, vals)));
-					}
-					F64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						// for (i < vals.length) vals[i] = u64.view(0.0d);
-						stack.push(Value.Ref(HeapArrayF64.new(decl, vals)));
-					}
-					Ref(nullable, heaptype) => {
-						if (heaptype == HeapType.I31 && !nullable) {
-							var vals = Array<u31>.new(u31.!(length));
-							// for (i < vals.length) vals[i] = null;
-							stack.push(Value.Ref(HeapArrayI31.new(decl, vals)));
-						} else {
-							var vals = Array<Object>.new(u31.!(length));
-							// for (i < vals.length) vals[i] = null;
-							stack.push(Value.Ref(HeapArrayRef.new(decl, vals)));
-						}
-					}
-					V128 => {
-						var vals = Array<u64>.new(u31.!(length << 1));
-						// for (i < vals.length) vals[i] = 0u64;
-						stack.push(Value.Ref(HeapArrayV128.new(decl, vals)));
-					}
+					I32 => stack.push(Value.Ref(HeapArrayI32.new(decl, Array<u32>.new(u31.!(length)))));
+					I64 => stack.push(Value.Ref(HeapArrayI64.new(decl, Array<u64>.new(u31.!(length)))));
+					F32 => stack.push(Value.Ref(HeapArrayF32.new(decl, Array<u32>.new(u31.!(length)))));
+					F64 => stack.push(Value.Ref(HeapArrayF64.new(decl, Array<u64>.new(u31.!(length)))));
+					Ref(nullable, heaptype) =>
+						stack.push(Value.Ref(if(heaptype == HeapType.I31 && !nullable,
+									HeapArrayI31.new(decl, Array<u31>.new(u31.!(length))),
+									HeapArrayRef.new(decl, Array<Object>.new(u31.!(length))))));
+					V128 => stack.push(Value.Ref(HeapArrayV128.new(decl, Array<u64>.new(u31.!(length << 1)))));
 					_ => {
 						var vals = Array<Value>.new(u31.!(length));
 						var elem = Values.default(decl.elem_types[0].valtype);
@@ -611,43 +468,25 @@ component ObjectRuntime {
 					}
 				}
 			}
-			PACKED_I8 => {
-				var vals = Array<u8>.new(u31.!(length));
-				// for (i < vals.length) vals[i] = 0u8;
-				stack.push(Value.Ref(HeapArrayI8.new(decl, vals)));
-			}
-			PACKED_I16 => {
-				var vals = Array<u16>.new(u31.!(length));
-				// for (i < vals.length) vals[i] = 0u16;
-				stack.push(Value.Ref(HeapArrayI16.new(decl, vals)));
-			}
+			PACKED_I8 => stack.push(Value.Ref(HeapArrayI8.new(decl, Array<u8>.new(u31.!(length)))));
+			PACKED_I16 => stack.push(Value.Ref(HeapArrayI16.new(decl, Array<u16>.new(u31.!(length)))));
 		}
 		return null;
+	}
+	private def arrayNewFixedHelper<T>(stack: ExecStack, decl: ArrayDecl, length: u32,
+					    popper: void -> T, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		for (i = vals.length - 1; i >= 0; i--) vals[i] = popper();
+		stack.push(Value.Ref(make(decl, vals)));
 	}
 	def ARRAY_NEW_FIXED(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
 		match (decl.elem_types[0].pack) {
 			UNPACKED => {
 				match (decl.elem_types[0].valtype) {
-					I32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						for (i = vals.length - 1; i >= 0; i--) vals[i] = u32.view(stack.popu());
-						stack.push(Value.Ref(HeapArrayI32.new(decl, vals)));
-					}
-					I64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						for (i = vals.length - 1; i >= 0; i--) vals[i] = u64.view(stack.popw());
-						stack.push(Value.Ref(HeapArrayI64.new(decl, vals)));
-					}
-					F32 => {
-						var vals = Array<u32>.new(u31.!(length));
-						for (i = vals.length - 1; i >= 0; i--) vals[i] = u32.view(stack.popf());
-						stack.push(Value.Ref(HeapArrayF32.new(decl, vals)));
-					}
-					F64 => {
-						var vals = Array<u64>.new(u31.!(length));
-						for (i = vals.length - 1; i >= 0; i--) vals[i] = u64.view(stack.popd());
-						stack.push(Value.Ref(HeapArrayF64.new(decl, vals)));
-					}
+					I32 => arrayNewFixedHelper<u32>(stack, decl, length, stack.popu, HeapArrayI32.new);
+					I64 => arrayNewFixedHelper<u64>(stack, decl, length, stack.popw, HeapArrayI64.new);
+					F32 => arrayNewFixedHelper<u32>(stack, decl, length, fun () -> u32 { return u32.view(stack.popf()); }, HeapArrayF32.new);
+					F64 => arrayNewFixedHelper<u64>(stack, decl, length, fun () -> u64 { return u64.view(stack.popd()); }, HeapArrayF64.new);
 					Ref(nullable, heaptype) => {
 						if (heaptype == HeapType.I31 && !nullable) {
 							var vals = Array<u31>.new(u31.!(length));
@@ -664,78 +503,45 @@ component ObjectRuntime {
 						var vals = Array<u64>.new(u31.!(length << 1));
 						for (i = vals.length - 2; i >= 0; i -= 2) {
 							var v128 = stack.pops();
-							vals[i] = v128.0;
+							vals[i  ] = v128.0;
 							vals[i+1] = v128.1;
 						}
 						stack.push(Value.Ref(HeapArrayV128.new(decl, vals)));
 					}
 					_ => {
-						var vals = Array<Value>.new(u31.!(length));
 						var t = decl.elem_types[0].valtype;
-						for (i = vals.length - 1; i >= 0; i--) vals[i] = stack.popV(t);
-						stack.push(Value.Ref(HeapArrayValue.new(decl, vals)));
+						arrayNewFixedHelper<Value>(stack, decl, length, fun () -> Value { return stack.popV(t); }, HeapArrayValue.new);
 					}
 				}
 			}
-			PACKED_I8 => {
-				var vals = Array<u8>.new(u31.!(length));
-				for (i = vals.length - 1; i >= 0; i--) vals[i] = u8.view(stack.popu());
-				stack.push(Value.Ref(HeapArrayI8.new(decl, vals)));
-			}
-			PACKED_I16 => {
-				var vals = Array<u16>.new(u31.!(length));
-				for (i = vals.length - 1; i >= 0; i--) vals[i] = u16.view(stack.popu());
-				stack.push(Value.Ref(HeapArrayI16.new(decl, vals)));
-			}
+			PACKED_I8 => arrayNewFixedHelper<u8>(stack, decl, length, fun () -> u8 { return u8.view(stack.popu()); }, HeapArrayI8.new);
+			PACKED_I16 => arrayNewFixedHelper<u16>(stack, decl, length, fun () -> u16 { return u16.view(stack.popu()); }, HeapArrayI16.new);
 		}
+		return null;
+	}
+	private def arrayNewDataHelper<T>(stack: ExecStack, instance: Instance, rtt: ArrayDecl, offset: u32, length: u32, data_index: u31,
+					  read: DataReader -> T, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> Throwable {
+		var r = Runtime.getData<T>(instance, data_index, offset, length, read);
+		if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
+		stack.push(Value.Ref(make(rtt, r.1)));
 		return null;
 	}
 	def ARRAY_NEW_DATA(stack: ExecStack, instance: Instance, rtt: ArrayDecl, ddecl: DataDecl, offset: u32, length: u32, data_index: u31) -> Throwable {
 		match (rtt.elem_types[0].pack) {
 			UNPACKED => {
 				match (rtt.elem_types[0].valtype) {
-					I32 => {
-						var r = Runtime.getData<u32>(instance, data_index, offset, length, DataReader.read_u32);
-						if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-						stack.push(Value.Ref(HeapArrayI32.new(rtt, r.1)));
-					}
-					I64 => {
-						var r = Runtime.getData<u64>(instance, data_index, offset, length, DataReader.read_u64);
-						if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-						stack.push(Value.Ref(HeapArrayI64.new(rtt, r.1)));
-					}
-					F32 => {
-						var r = Runtime.getData<u32>(instance, data_index, offset, length, DataReader.read_u32);
-						if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-						stack.push(Value.Ref(HeapArrayF32.new(rtt, r.1)));
-					}
-					F64 => {
-						var r = Runtime.getData<u64>(instance, data_index, offset, length, DataReader.read_u64);
-						if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-						stack.push(Value.Ref(HeapArrayF64.new(rtt, r.1)));
-					}
-					V128 => {
-						var r = Runtime.getData<u64>(instance, data_index, offset, length << 1, DataReader.read_u64);
-						if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-						stack.push(Value.Ref(HeapArrayV128.new(rtt, r.1)));
-					}
-					_ => {
-						return stack.trap(TrapReason.ERROR);
-					}
+					I32 => return arrayNewDataHelper<u32>(stack, instance, rtt, offset, length, data_index, DataReader.read_u32, HeapArrayI32.new);
+					I64 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length, data_index, DataReader.read_u64, HeapArrayI64.new);
+					F32 => return arrayNewDataHelper<u32>(stack, instance, rtt, offset, length, data_index, DataReader.read_u32, HeapArrayF32.new);
+					F64 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length, data_index, DataReader.read_u64, HeapArrayF64.new);
+					V128 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length << 1, data_index, DataReader.read_u64, HeapArrayV128.new);
+					_ => return stack.trap(TrapReason.ERROR);
 				}
 			}
-			PACKED_I8 => {
-				var r = Runtime.getData<u8>(instance, data_index, offset, length, DataReader.read1);
-				if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-				stack.push(Value.Ref(HeapArrayI8.new(rtt, r.1)));
-			}
-			PACKED_I16 => {
-				var r = Runtime.getData<u16>(instance, data_index, offset, length, fun (d: DataReader) => DataReaders.read_range_u16(d.acquire(2)));
-				if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
-				stack.push(Value.Ref(HeapArrayI16.new(rtt, r.1)));
-			}
+			PACKED_I8 => return arrayNewDataHelper<u8>(stack, instance, rtt, offset, length, data_index, DataReader.read1, HeapArrayI8.new);
+			PACKED_I16 => return arrayNewDataHelper<u16>(stack, instance, rtt, offset, length, data_index,
+								     fun (d: DataReader) => DataReaders.read_range_u16(d.acquire(2)), HeapArrayI16.new);
 		}
-		return null;
 	}
 	def ARRAY_NEW_ELEM(stack: ExecStack, instance: Instance, rtt: ArrayDecl, edecl: ElemDecl, offset: u32, length: u32) -> Throwable {
 		match (rtt.elem_types[0].pack) {
@@ -753,295 +559,83 @@ component ObjectRuntime {
 		}
 		return null;
 	}
+	def rangeFill<T>(r: Range<T>, val: T) { for (i < r.length) r[i] = val; }
 	def ARRAY_FILL(obj: HeapArrayGeneric, rtt: ArrayDecl, index: int, size: u32, val: Value) -> Throwable {
 		match (obj) {
-			x: HeapArrayValue => {
-				var r = x.vals[index ..+ size];
-				for (i < r.length) r[i] = val;
-			}
-			x: HeapArrayI32 => {
-				var r = x.vals[index ..+ size];
-				var v = Value.I32.!(val).val;
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayI31 => {
-				var r = x.vals[index ..+ size];
-				var v = Value.I31.!(val).val;
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayI64 => {
-				var r = x.vals[index ..+ size];
-				var v = Value.I64.!(val).val;
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayI8 => {
-				var r = x.vals[index ..+ size];
-				var v = u8.view(Value.I32.!(val).val);
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayI16 => {
-				var r = x.vals[index ..+ size];
-				var v = u16.view(Value.I32.!(val).val);
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayF32 => {
-				var r = x.vals[index ..+ size];
-				var v = Value.F32.!(val).bits;
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayF64 => {
-				var r = x.vals[index ..+ size];
-				var v = Value.F64.!(val).bits;
-				for (i < r.length) r[i] = v;
-			}
-			x: HeapArrayRef => {
-				var r = x.vals[index ..+ size];
-				var v = Value.Ref.!(val).val;
-				for (i < r.length) r[i] = v;
-			}
+			x: HeapArrayValue => rangeFill<Value>(x.vals[index ..+ size], val);
+			x: HeapArrayI32 => rangeFill<u32>(x.vals[index ..+ size], Values.unbox_u(val));
+			x: HeapArrayI31 => rangeFill<u31>(x.vals[index ..+ size], Value.I31.!(val).val);
+			x: HeapArrayI64 => rangeFill<u64>(x.vals[index ..+ size], Values.unbox_w(val));
+			x: HeapArrayI8 => rangeFill<u8>(x.vals[index ..+ size], Values.unbox_u8(val));
+			x: HeapArrayI16 => rangeFill<u16>(x.vals[index ..+ size], Values.unbox_u16(val));
+			x: HeapArrayF32 => rangeFill<u32>(x.vals[index ..+ size], Values.unbox_fu32(val));
+			x: HeapArrayF64 => rangeFill<u64>(x.vals[index ..+ size], Values.unbox_du64(val));
+			x: HeapArrayRef => rangeFill<Object>(x.vals[index ..+ size], Value.Ref.!(val).val);
 			x: HeapArrayV128 => {
 				var r = x.vals[index ..+ (size << 1)];
 				var v128 = Value.V128.!(val);
-				for (i=0; i < r.length; i+=2) {
-					r[i] = v128.low;
+				for (i = 0; i < r.length; i += 2) {
+					r[i  ] = v128.low;
 					r[i+1] = v128.high;
 				}
 			}
 		}
 		return null;
 	}
-	def ARRAY_COPY(stack: ExecStack, src: HeapArrayGeneric, dst: HeapArrayGeneric, src_offset: u32, dst_offset: u32, size: u32) -> Throwable {
-		if (HeapArrayValue.?(src) && HeapArrayValue.?(dst)) {
-			var r = ArrayUtil.safeCopy(dst.getArray<Value>(), dst_offset, src.getArray<Value>(), src_offset, size);
+	private def arrayCopyHelper<A, T>(stack: ExecStack, elems: A -> Array<T>,
+					  dst: HeapArrayGeneric, src: A, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		if (A.?(dst)) {
+			var arr = A.!(dst);
+			var r = ArrayUtil.safeCopy(elems(arr), dst_offset, elems(src), src_offset, size);
 			if (!r) return stack.trap(TrapReason.ARRAY_OOB);
 			return null;
 		}
-
-		if (HeapArrayValue.?(dst)) {
-			var arr = HeapArrayValue.!(dst);
-			var r = ArrayUtil.safeCopyDiffTypes(arr.vals, dst_offset, u31.view(src.length()), src_offset, size, src.getValue);
-			if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-			return null;
-		}
-
-		if (HeapArrayValue.?(src)){
-			var arr = HeapArrayValue.!(src);
-			match (dst) {
-				x: HeapArrayI32 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU32);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayI31 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, fun (x: u32) => u31.!(arr.getI31(x)));
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayI64 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU64);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayI8 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU8);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayI16 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU16);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayF32 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU32);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayF64 => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getU64);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayRef => {
-					var r = ArrayUtil.safeCopyDiffTypes(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getRef);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-				x: HeapArrayV128 => {
-					var r = ArrayUtil.safeCopyFromV128(x.vals, dst_offset, u31.view(arr.length()), src_offset, size, arr.getV128);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-
-				_ => { return stack.trap(TrapReason.ERROR); }
-			}
-		}
-
+		return stack.trap(TrapReason.ERROR);
+	}
+	def ARRAY_COPY(stack: ExecStack, dst: HeapArrayGeneric, src: HeapArrayGeneric, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
 		match (src) {
-			x: HeapArrayI32 => {
-				if (HeapArrayI32.?(dst)) {
-					var arr = HeapArrayI32.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayI31 => {
-				if (HeapArrayI31.?(dst)) {
-					var arr = HeapArrayI31.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayI64 => {
-				if (HeapArrayI64.?(dst)) {
-					var arr = HeapArrayI64.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayI8 => {
-				if (HeapArrayI8.?(dst)) {
-					var arr = HeapArrayI8.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayI16 => {
-				if (HeapArrayI16.?(dst)) {
-					var arr = HeapArrayI16.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayF32 => {
-				if (HeapArrayF32.?(dst)) {
-					var arr = HeapArrayF32.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayF64 => {
-				if (HeapArrayF64.?(dst)) {
-					var arr = HeapArrayF64.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayRef => {
-				if (HeapArrayRef.?(dst)) {
-					var arr = HeapArrayRef.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
-			x: HeapArrayV128 => {
-				if (HeapArrayV128.?(dst)) {
-					var arr = HeapArrayV128.!(dst);
-					var r = ArrayUtil.safeCopy(x.vals, dst_offset, arr.vals, src_offset, size << 1);
-					if (!r) return stack.trap(TrapReason.ARRAY_OOB);
-					return null;
-				}
-			}
+			x: HeapArrayI32 => return arrayCopyHelper(stack, HeapArrayI32.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI31 => return arrayCopyHelper(stack, HeapArrayI31.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI64 => return arrayCopyHelper(stack, HeapArrayI64.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI8 => return arrayCopyHelper(stack, HeapArrayI8.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI16 => return arrayCopyHelper(stack, HeapArrayI16.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayF32 => return arrayCopyHelper(stack, HeapArrayF32.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayF64 => return arrayCopyHelper(stack, HeapArrayF64.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayRef => return arrayCopyHelper(stack, HeapArrayRef.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayV128 => return arrayCopyHelper(stack, HeapArrayV128.vals, dst, x, dst_offset, src_offset, size << 1);
 		}
 		return stack.trap(TrapReason.ERROR);
 	}	
-	def ARRAY_INIT_DATA(stack: ExecStack, obj: HeapArrayGeneric, rtt: ArrayDecl, data: Array<byte>, src_offset: u32, dst_offset: u32, size: u32) -> Throwable {
-		/*match (obj) {
-			x: HeapArrayValue => {
-				var t = Runtime.bytesToVals(rtt.elem_types[0], data, src_offset, size);
-				if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-				ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
+	private def arrayInitDataHelper<A, T>(stack: ExecStack, obj: HeapArrayGeneric, getBytes: (Array<byte>, u32, u32) -> (bool, Array<T>), elems: A -> Array<T>,
+					      data: Array<byte>, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		var t = getBytes(data, src_offset, size);
+		if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
+		match (obj) {
+			x: A => {
+				ArrayUtil.safeCopy(elems(x), dst_offset, t.1, 0, size);
 				return null;
-			}
-		}*/
-		match (rtt.elem_types[0].pack) {
-			UNPACKED => {
-				match (rtt.elem_types[0].valtype) {
-					I32 => {
-						var t = bytesToI32s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						match (obj) {
-							x: HeapArrayI32 => {
-								ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-								return null;
-							}
-						}
-					}
-					I64 => {
-						var t = bytesToI64s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						match (obj) {
-							x: HeapArrayI64 => {
-								ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-								return null;
-							}
-						}
-					}
-					F32 => {
-						var t = bytesToI32s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						match (obj) {
-							x: HeapArrayF32 => {
-								ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-								return null;
-							}
-						}
-					}
-					F64 => {
-						var t = bytesToI64s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						match (obj) {
-							x: HeapArrayF64 => {
-								ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-								return null;
-							}
-						}
-					}
-					V128 => {
-						var t = bytesToI64s(data, src_offset, size << 1);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						match (obj) {
-							x: HeapArrayV128 => {
-								ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size << 1);
-								return null;
-							}
-						}
-					}
-					_ => { }
-				}
-			}
-			PACKED_I8 => {
-				match (obj) {
-					x: HeapArrayI8 => {
-						var t = bytesToI8s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-						return null;
-					}
-				}
-			}
-			PACKED_I16 => {
-				match (obj) {
-					x: HeapArrayI16 => {
-						var t = bytesToI16s(data, src_offset, size);
-						if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
-						ArrayUtil.safeCopy(x.vals, dst_offset, t.1, 0, size);
-						return null;
-					}
-				}
 			}
 		}
 		return stack.trap(TrapReason.ERROR);
 	}
-	def ARRAY_INIT_ELEM(stack: ExecStack, obj: HeapArrayGeneric, instance: Instance, edecl: ElemDecl, src_offset: u32, dst_offset: u32, size: u32) -> Throwable {
+	def ARRAY_INIT_DATA(stack: ExecStack, obj: HeapArrayGeneric, rtt: ArrayDecl, data: Array<byte>, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		match (rtt.elem_types[0].pack) {
+			UNPACKED => {
+				match (rtt.elem_types[0].valtype) {
+					I32 => return arrayInitDataHelper(stack, obj, bytesToI32s, HeapArrayI32.vals, data, dst_offset, src_offset, size);
+					I64 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayI64.vals, data, dst_offset, src_offset, size);
+					F32 => return arrayInitDataHelper(stack, obj, bytesToI32s, HeapArrayF32.vals, data, dst_offset, src_offset, size);
+					F64 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayF64.vals, data, dst_offset, src_offset, size);
+					V128 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayV128.vals, data, dst_offset, src_offset, size << 1);
+					_ => { }
+				}
+			}
+			PACKED_I8 => return arrayInitDataHelper(stack, obj, bytesToI8s, HeapArrayI8.vals, data, dst_offset, src_offset, size);
+			PACKED_I16 => return arrayInitDataHelper(stack, obj, bytesToI16s, HeapArrayI16.vals, data, dst_offset, src_offset, size);
+		}
+		return stack.trap(TrapReason.ERROR);
+	}
+	def ARRAY_INIT_ELEM(stack: ExecStack, obj: HeapArrayGeneric, instance: Instance, edecl: ElemDecl, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
 		match (obj) {
 			x: HeapArrayI31 => {
 				var r = Runtime.getElems(instance, edecl, src_offset, size);
@@ -1063,6 +657,104 @@ component ObjectRuntime {
 		}
 		return null;
 	}
+	def arrayFromVal<T>(decl: ArrayDecl, val: Value, len: int, f: Value -> T,
+			    build: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> HeapArrayGeneric {
+		var elem: T = f(val);
+		var vvals = Array<T>.new(len);
+		for (i < len) vvals[i] = elem;
+		return build(decl, vvals);
+	}
+	def evalInitExprObjectArray(t: HeapType.Array, st: StorageType, velem: Value, vlen: int) -> HeapArrayGeneric {
+		var decl = t.array;
+		match (st.pack) {
+			UNPACKED => {
+				match (st.valtype) {
+					I32 => return arrayFromVal<u32>(decl, velem, vlen, fun (v: Value) -> u32 { return Value.I32.!(v).val; }, HeapArrayI32.new);
+					I64 => return arrayFromVal<u64>(decl, velem, vlen, fun (v: Value) -> u64 { return Value.I64.!(v).val; }, HeapArrayI64.new);
+					F32 => return arrayFromVal<u32>(decl, velem, vlen, fun (v: Value) -> u32 { return Value.F32.!(v).bits; }, HeapArrayF32.new);
+					F64 => return arrayFromVal<u64>(decl, velem, vlen, fun (v: Value) -> u64 { return Value.F64.!(v).bits; }, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable) {
+							return arrayFromVal<u31>(decl, velem, vlen, fun (v: Value) -> u31 { return Value.I31.!(v).val; }, HeapArrayI31.new);
+						} else {
+							return arrayFromVal<Object>(decl, velem, vlen, fun (v: Value) -> Object { return Value.Ref.!(v).val; }, HeapArrayRef.new);
+						}
+					}
+					V128 => {
+						// does not fit the arrayFromVal pattern
+						var v128 = Value.V128.!(velem);
+						var vvals = Array<u64>.new(vlen << 1);
+						for (i = 0; i < vvals.length; i += 2) {
+							vvals[i  ] = v128.low;
+							vvals[i+1] = v128.high;
+						}
+						return HeapArrayV128.new(t.array, vvals);
+					}
+					_ => return arrayFromVal<Value>(decl, velem, vlen, fun (v: Value) -> Value { return v; }, HeapArrayValue.new);
+				}
+			}
+			PACKED_I8 => return arrayFromVal<u8>(decl, velem, vlen, fun (v: Value) -> u8 { return u8.view(Value.I32.!(v).val); }, HeapArrayI8.new);
+			PACKED_I16 => return arrayFromVal<u16>(decl, velem, vlen, fun (v: Value) -> u16 { return u16.view(Value.I32.!(v).val); }, HeapArrayI16.new);
+		}
+	}
+	def arrayFromVals<T>(instance: Instance, decl: ArrayDecl, vals: Array<InitExpr>,
+			     f: Value -> T, build: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> HeapArrayGeneric {
+		var len = vals.length;
+		var vvals = Array<T>.new(len);
+		for (i < len) {
+			var velem = instance.evalInitExpr(vals[i]);
+			vvals[i] = f(velem);
+		}
+		return build(decl, vvals);
+	}
+	def evalInitExprObjectFixedArray(instance: Instance, t: HeapType.Array, st: StorageType, vals: Array<InitExpr>) -> HeapArrayGeneric {
+		var vlen = vals.length;
+		var decl = t.array;
+		match (st.pack) {
+			UNPACKED => {
+				match (st.valtype) {
+					I32 => return arrayFromVals<u32>(instance, decl, vals, fun (v: Value) -> u32 { return Value.I32.!(v).val; }, HeapArrayI32.new);
+					I64 => return arrayFromVals<u64>(instance, decl, vals, fun (v: Value) -> u64 { return Value.I64.!(v).val; }, HeapArrayI64.new);
+					F32 => return arrayFromVals<u32>(instance, decl, vals, fun (v: Value) -> u32 { return Value.F32.!(v).bits; }, HeapArrayF32.new);
+					F64 => return arrayFromVals<u64>(instance, decl, vals, fun (v: Value) -> u64 { return Value.F64.!(v).bits; }, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable) {
+							return arrayFromVals<u31>(instance, decl, vals, fun (v: Value) -> u31 { return Value.I31.!(v).val; }, HeapArrayI31.new);
+						} else {
+							return arrayFromVals<Object>(instance, decl, vals, fun (v: Value) -> Object { return Value.Ref.!(v).val; }, HeapArrayRef.new);
+						}
+					}
+					V128 => {
+						// does not fit the arrayFromVals pattern
+						var vvals = Array<u64>.new(vlen << 1);
+						for (i = 0; i < vlen; i += 2) {
+							var velem = instance.evalInitExpr(vals[i]);
+							var v128 = Value.V128.!(velem);
+							vvals[i  ] = v128.low;
+							vvals[i+1] = v128.high;
+						}
+						return HeapArrayV128.new(t.array, vvals);
+					}
+					_ => {
+						var vvals = Arrays.map(vals, instance.evalInitExpr);
+						return HeapArrayValue.new(t.array, vvals);
+					}
+				}
+			}
+			PACKED_I8 => return arrayFromVals<u8>(instance, decl, vals, fun (v: Value) -> u8 { return u8.view(Value.I32.!(v).val); }, HeapArrayI8.new);
+			PACKED_I16 => return arrayFromVals<u16>(instance, decl, vals, fun (v: Value) -> u16 { return u16.view(Value.I32.!(v).val); }, HeapArrayI16.new);
+		}
+	}
+	def evalInitExprObjectStruct(t: HeapType.Struct, vvals: Array<Value>) -> Object {
+		var decl = t.sdecl;
+		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
+		var objs = if(decl.num_refs == 0, null, Array<Object>.new(decl.num_refs));
+		var obj = HeapStructPair.new(decl, objs, bytes);
+		for (i < decl.field_types.length) {
+			obj.setFieldValue(u31.view(i), vvals[i]);
+		}
+		return obj;
+	}
 }
 
 def bytesToBytes(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<byte>) {
@@ -1079,7 +771,7 @@ def bytesToI8s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u8>)
 	var limit = length + offset;
 	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = d.read_u8();
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 def bytesToI8sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
 	var start = ArrayUtil.boundsCheck(data, offset, length);
@@ -1088,7 +780,7 @@ def bytesToI8sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Arra
 	var limit = length + offset;
 	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = u32.view(d.read_u8());
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 def bytesToI16s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u16>) {
 	var nbytes = length << 1;
@@ -1098,7 +790,7 @@ def bytesToI16s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u16
 	var limit = offset + nbytes;
 	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = d.read_u16();
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 def bytesToI16sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
 	var nbytes = length << 1;
@@ -1108,7 +800,7 @@ def bytesToI16sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Arr
 	var limit = offset + nbytes;
 	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = u32.view(d.read_u16());
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 def bytesToI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
 	var nbytes = length << 2;
@@ -1118,7 +810,7 @@ def bytesToI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32
 	var limit = offset + nbytes;
 	var d = DataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = d.read_u32();
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 def bytesToI64s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u64>) {
 	var nbytes = length << 3;
@@ -1128,6 +820,6 @@ def bytesToI64s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u64
 	var limit = offset + nbytes;
 	var d = DataReader.new(data).reset(data, start, int.!(limit));
 	for (i < vals.length) vals[i] = d.read_u64();
-	return (d.ok, if(d.ok, vals));
+	return (d.ok, vals);
 }
 
