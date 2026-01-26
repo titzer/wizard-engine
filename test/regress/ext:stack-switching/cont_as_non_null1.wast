@@ -6,7 +6,7 @@
   (type $c2 (cont $f2))
   (func $smol (param i32))
   (elem declare func $smol)
-  
+
   (table $table 2 (ref null $c1))
   (func (export "init")
     (table.set (i32.const 1) (cont.new $c1 (ref.func $smol)))

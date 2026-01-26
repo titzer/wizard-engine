@@ -25,7 +25,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	var source_loc: int = -1;		// current source location, if any
 	var newTrapLabel: TrapReason -> MasmLabel;
 	var embeddedRefOffsets: Vector<int>;
-	private var offsets: V3Offsets;
+	var offsets = Target.getOffsets();
 
 	// define in subclass to support tracing
 	def setTargetTracing(outf: Range<byte> -> void) { }
@@ -37,7 +37,6 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	}
 
 	def getOffsets() -> V3Offsets {
-		if (offsets == null) offsets = V3Offsets.new();
 		return offsets;
 	}
 	def curCodeBytes() -> u64 {
@@ -112,6 +111,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			F32 => emit_mov_s_f(slot, u32.view(val));
 			F64 => emit_mov_s_d(slot, u64.view(long.view(val))); // TODO: zero extend?
 			V128 => emit_mov_s_q(slot, u64.view(long.view(val)), if(val < 0, u64.max, 0)); // TODO: zero extend?
+			REF_U64 => emit_mov_s_q(slot, u64.view(long.view(val)), 0);
 		}
 	}
 	def emit_mov_s_i(slot: u32, val: int) { // utility method
@@ -229,7 +229,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_Continuation_stack_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Continuation_stack));
 	}
-	
+
 	// Must be overridden in architecture-specific subclass.
 	def emit_v3_Memory_start_r_r(dst: Reg, memobj: Reg);
 	def emit_v3_Memory_limit_r_r(dst: Reg, memobj: Reg);
@@ -237,7 +237,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_X86_64Stack_rsp_r_r(dst: Reg, ptr: Reg);
 	def emit_v3_set_X86_64Stack_vsp_r_r(stk: Reg, vsp: Reg);
 	def emit_v3_set_X86_64Stack_rsp_r_r(stk: Reg, rsp: Reg);
-	
+
 	def emit_push_X86_64Stack_rsp_r_r(stk: Reg);
 	def emit_pop_X86_64Stack_rsp_r_r(stk: Reg);
 
@@ -246,7 +246,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			I32, F32 => return 4;
 			I64, F64 => return 8;
 			REF => return 8; // override in subclasses if any 32-bit port
-			V128 => return 16;
+			V128, REF_U64 => return 16;
 		}
 	}
 	def logScaleOf(kind: ValueKind) -> u6 {
@@ -254,7 +254,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			I32, F32 => return 2;
 			I64, F64 => return 3;
 			REF => return 3; // override in subclasses if any 32-bit port
-			V128 => return 4;
+			V128, REF_U64 => return 4;
 		}
 	}
 
@@ -284,6 +284,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			F32 => emit_mov_r_f32(reg, u32.view(val));
 			F64 => emit_mov_r_d64(reg, u64.view(val));
 			V128 => emit_mov_r_q(reg, u64.view(long.view(val)), if(val < 0, u64.max, 0)); // TODO: zero extend?
+			REF_U64 => emit_mov_r_q(reg, u64.view(long.view(val)), 0);
 		}
 	}
 	def emit_mov_r_i(reg: Reg, val: int);
@@ -297,6 +298,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_mov_r_Function(reg: Reg, func: Function);
 	def emit_mov_r_Instance(reg: Reg, instance: Instance);
 	def emit_movbsx_r_m(kind: ValueKind, reg: Reg, addr: MasmAddr);
+	def emit_mov_r_Continuation(reg: Reg, cont: Continuation);
 
 	def emit_mov_m_r(kind: ValueKind, addr: MasmAddr, reg: Reg);
 	def emit_mov_m_i(addr: MasmAddr, val: int);
@@ -365,6 +367,10 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	def emit_debugger_breakpoint();
 
+	def emit_ref_from_ref_u64(to: Reg, from: Reg);
+	def emit_u64_from_ref_u64(to: Reg, from: Reg);
+
+	def emit_mov_r_Cont(to: Reg, cont: Continuation);
 	// stk.state_ = state;
 	def emit_set_stack_state(stk: Reg, state: StackState);
 	// This should be called after all stack value transfers, but before the
@@ -376,16 +382,38 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_cont_mv(from_vsp: Reg, contStack: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg);
 
 	// Validates {cont} and:
-	// - Move {cont.stack} to {cont}
-	// - Set original {cont.stack} to {null}
-	def emit_validate_and_consume_cont(cont: Reg) {
+	// - Mark {cont} as used
+	// - Move {cont.stack} to {destContStack}
+	def emit_validate_and_consume_cont(destContStack: Reg, cont: Reg) {
 		var scratch = regConfig.scratch, offsets = getOffsets();
-		emit_br_r(cont, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_stack));
-		emit_br_r(scratch, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.USED_CONTINUATION));
-		emit_mov_m_l(MasmAddr(cont, offsets.Continuation_stack), 0);
-		emit_mov_r_r(ValueKind.REF, cont, scratch);
+		if (FeatureDisable.unboxedConts) { // boxed continuation mode
+			var contObj = destContStack;
+			// [contObj == destContStack] = cont[0]
+			emit_ref_from_ref_u64(contObj, cont);
+			// Check for {contObj == null}.
+			emit_br_r(contObj, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			// Check for {cont.stack == null} (true when {cont} is already used).
+			emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(contObj, offsets.Continuation_stack));
+			emit_br_r(scratch, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.USED_CONTINUATION));
+			// Consume {cont} by setting {cont.stack} to null.
+			emit_mov_m_l(MasmAddr(contObj, offsets.Continuation_stack), 0);
+			// Set {destContStack} to {cont.stack} (its value before being cleared).
+			emit_mov_r_r(ValueKind.REF, destContStack, scratch);
+		} else { // unboxed continuation mode
+			// Set {destContStack} to {cont.stack}
+			emit_ref_from_ref_u64(destContStack, cont);
+			// Check for {cont == null}.
+			emit_br_r(destContStack, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			emit_u64_from_ref_u64(scratch, cont);
+			// Check for {cont.stack == null} (true when {cont} is already used).
+			emit_validate_cont_version_unboxed(destContStack, scratch);
+			// Consume {cont} by incrementing {destContStack.version}.
+			emit_inc_stack_version(destContStack);
+		}
 	}
+	def emit_validate_cont_version_unboxed(stack: Reg, version: Reg);
+	def emit_inc_stack_version(stack: Reg);
+
 	// Called as the last step during resume. Switches {curStack} to the top of {cont}.
 	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg) {
 		var scratch = regConfig.scratch, offsets = getOffsets();
