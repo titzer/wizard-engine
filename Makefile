@@ -86,3 +86,7 @@ bin/wizeng.v3i: $(WIZENG) $(MONITORS) build.sh
 
 bin/objdump.v3i: $(OBJDUMP) build.sh
 	./build.sh objdump v3i
+
+# GDB memory info generation
+gdb/gdbgen.py: build.sh
+	echo "test"
