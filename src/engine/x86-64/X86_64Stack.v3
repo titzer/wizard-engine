@@ -11,7 +11,7 @@ class X86_64Stack extends WasmStack {
 	var vsp: Pointer;
 	var rsp: Pointer;
 	var func: Function; // TODO: move into "enter-func-stub"
-	
+
 	// For tail-calling purposes (from V3): ALWAYS, ALWAYS use this instead of
 	// [%parent.rsp]. In case of linking two stacks (due to one resuming the
 	// other, assert that the value stored at the pointer is {null} on the child
@@ -275,6 +275,10 @@ class X86_64Stack extends WasmStack {
 	}
 	private def unwind(p_retaddr: Pointer, new_sp: Pointer) {
 		if (new_sp != this.rsp) {
+			if (Trace.stack) Trace.OUT.put2(
+				"unwind(*0x%x=<unwind stub addr>, new_sp=0x%d)",
+				p_retaddr - Pointer.NULL, new_sp - Pointer.NULL
+			).ln();
 			this.rsp = new_sp;
 			if (p_retaddr != Pointer.NULL) p_retaddr.store<Pointer>(STACK_UNWIND_STUB.getEntry() + NOP_ENTRY);
 		}
@@ -361,11 +365,26 @@ class X86_64Stack extends WasmStack {
 			Ref(nullable, heap) => match(heap) { // TODO: tighter checking of ref value tags
 				ANY, EXTERN, EQ, I31 => return popRef();
 				Func => return Value.Ref(popFunction());
+				Cont => return Value.Cont(popContinuation());
 				_ => return Value.Ref(popObject());
 			}
 			_ => fatal(Strings.format1("unexpected type: %s", t.name));
 		}
 		return Value.Ref(null);
+	}
+	def popContinuation() -> Continuation {
+		if (FeatureDisable.unboxedConts) {
+			var ptr = vsp + (valuerep.tag_size - valuerep.slot_size);
+			var cont = ptr.load<Continuation>();
+			vsp += -(valuerep.slot_size);
+			return cont;
+		} else {
+			var ptr = vsp + (valuerep.tag_size - valuerep.slot_size);
+			var stack = ptr.load<WasmStack>();
+			var version = (ptr + 8).load<u64>();
+			vsp += -(valuerep.slot_size);
+			return Continuations.continuationWithVersion(stack, version);
+		}
 	}
 	def popRef() -> Value {
 		var val = peekRef();
@@ -373,6 +392,7 @@ class X86_64Stack extends WasmStack {
 		return val;
 	}
 	def peekRef() -> Value {
+		// TODO[ss]: filter out a Value.Cont after giving it its own BpTypeCode in storage
 		if (valuerep.tagged) {
 			var got = peekTag();
 			if (!valuerep.maybeRefTag(got)) fatal(Strings.format1("value stack tag mismatch, expected ref, got %x", got));
@@ -514,6 +534,15 @@ class X86_64Stack extends WasmStack {
 				if (valuerep.tagged) tag_ptr.store<u8>(BpTypeCode.V128.code);
 				(val_ptr + 0).store(u64.view(low));
 				(val_ptr + 8).store(u64.view(high));
+			}
+			Cont(val) => {
+				if (valuerep.tagged) tag_ptr.store<u8>(BpTypeCode.REF_NULL.code);
+				if (FeatureDisable.unboxedConts) { // boxed continuation
+					(val_ptr + 0).store(val);
+				} else { // unboxed continuation
+					(val_ptr + 0).store(Continuations.getStoredStack(val));
+					(val_ptr + 8).store(Continuations.getStoredVersion(val));
+				}
 			}
 		}
 	}
@@ -1122,9 +1151,16 @@ component X86_64StackManager {
 	var cache: X86_64Stack;
 
 	def getFreshStack() -> X86_64Stack {
-		if (cache == null) return X86_64Stack.new(EngineOptions.STACK_SIZE.get());
-		var result = cache;
-		cache = null;
+		var result: X86_64Stack;
+		if (cache == null) {
+			result = X86_64Stack.new(EngineOptions.STACK_SIZE.get());
+		} else {
+			result = cache;
+			cache = null;
+		}
+		if (Trace.stack) Trace.OUT.put1(
+			"Requested fresh x86_stack @ 0x%x", Pointer.atObject(result) - Pointer.NULL
+		).ln();
 		return result;
 	}
 	def recycleStack(stack: X86_64Stack) {

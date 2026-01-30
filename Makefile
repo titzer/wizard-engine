@@ -15,6 +15,8 @@ wasm-wave: bin/wizeng.wasm bin/unittest.wasm
 
 v3i: bin/wizeng.v3i bin/unittest.v3i
 
+WIZENG_BUILD_SH_ARGS ?=
+
 ENGINE=src/engine/*.v3 src/engine/v3/*.v3 src/util/*.v3
 MONITORS=src/monitors/*.v3 src/monitors/test/*.v3
 JIT=src/engine/compiler/*.v3
@@ -37,7 +39,7 @@ bin/unittest.jvm: $(UNITTEST) build.sh
 	./build.sh unittest jvm
 
 bin/wizeng.jvm: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng jvm
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng jvm
 
 bin/objdump.jvm: $(OBJDUMP) build.sh
 	./build.sh objdump jvm
@@ -47,7 +49,7 @@ bin/unittest.wasm: $(UNITTEST) build.sh
 	./build.sh unittest wasm-wave
 
 bin/wizeng.wasm: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng wasm-wave
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng wasm-wave
 
 bin/objdump.wasm: $(OBJDUMP) build.sh
 	./build.sh objdump wasm-wave
@@ -57,7 +59,7 @@ bin/unittest.x86-linux: $(UNITTEST) build.sh
 	./build.sh unittest x86-linux
 
 bin/wizeng.x86-linux: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng x86-linux
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng x86-linux
 
 bin/objdump.x86-linux: $(OBJDUMP) build.sh
 	./build.sh objdump x86-linux
@@ -80,7 +82,7 @@ bin/unittest.v3i: $(UNITTEST) build.sh
 	./build.sh unittest v3i
 
 bin/wizeng.v3i: $(WIZENG) $(MONITORS) build.sh
-	./build.sh wizeng v3i
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng v3i
 
 bin/objdump.v3i: $(OBJDUMP) build.sh
 	./build.sh objdump v3i
