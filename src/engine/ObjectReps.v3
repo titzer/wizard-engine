@@ -1,0 +1,882 @@
+// Alternate, possibly faster, representations for Wasm heap objects
+
+enum ArrayMode(code: int) {
+	Original(0),	// Default value: HeapArrayValue only
+	Typed(1),	// HeapArrayX where X can be one of the storage types
+}
+
+enum StructMode(code: int) {
+	Original(0),	// Default value: Values only
+	Pair(1)		// Having Array<Object> (holdings the refs) and Array<byte> (holding prims)
+}
+
+def arrayModeFor(code: int) -> ArrayMode {
+	def modes = [ArrayMode.Original, ArrayMode.Typed];
+	return if(code >= 0 && code < modes.length, modes[code], ArrayMode.Original);
+}
+
+def structModeFor(code: int) -> StructMode {
+	def modes = [StructMode.Original, StructMode.Pair];
+	return if(code >= 0 && code < modes.length, modes[code], StructMode.Original);
+}
+
+component ObjReps {
+	def arrayModeCode = 1;
+	def arrayMode = arrayModeFor(arrayModeCode);
+
+	def structModeCode = 1;
+	def structMode = structModeFor(structModeCode);
+
+	// other constants related to representations
+	def REF_SHIFT     = -1i8;  // indicates an object slot for StructMode.Pair
+	def REF_U64_SHIFT = -2i8;  // indicates a REF_U64 for StructMode.Pair
+
+	def packFieldOffsets(refs_offset: i32, bytes_offset: i32) -> i32 {
+		return (refs_offset << 16) | bytes_offset;
+	}
+	def unpackFieldOffsets(offset: i32) -> (i32, i32) {
+		return (offset >>> 16, offset & 0xFFFF);
+	}
+}
+
+// Paired array representation: an Array<Object> holds all the reference fields,
+// and an Array<byte> holds all the primitive values
+class HeapStructPair extends HeapStructGeneric {
+	def objs: Array<Exportable>;
+	def bytes: Array<byte>;
+	new(decl: StructDecl, objs, bytes) super(decl) { }
+
+	private def getHelperV<T>(offset: i32, len: int, fetch: Range<byte> -> T, wrap: T -> Value) -> Value {
+		return wrap(fetch(bytes[offset ..+ len]));
+	}
+	def getFieldValue(index: u31) -> Value {
+		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
+		match (decl.field_shifts[index]) {
+			ObjReps.REF_SHIFT => return if(HeapType.Cont.?(ValueType.Ref.!(decl.field_types[index].valtype).heap),
+						       Value.Cont(Continuations.fromObject(objs[offset])),
+						       Value.Ref(Object.!(objs[offset])));
+			ObjReps.REF_U64_SHIFT => return Value.Cont(getFieldCont(index));
+			0  => return getHelperV<u32>(offset, 1, DataReaders.read_range_u32_u8, Values.box_u);
+			1  => return getHelperV<u32>(offset, 2, DataReaders.read_range_u32_u16, Values.box_u);
+			2  => return getHelperV<u32>(offset, 4, DataReaders.read_range_u32,
+						     if(decl.field_types[index].valtype == ValueType.I32, Values.box_u, Values.box_fu32));
+			3  => return getHelperV<u64>(offset, 8, DataReaders.read_range_u64,
+						     if(decl.field_types[index].valtype == ValueType.I64, Values.box_w, Values.box_du64));
+			4  => return getHelperV<(u64, u64)>(offset, 16, DataReaders.read_range_u128, Values.box_s);
+		}
+		return Value.I32(u32.view(-1));
+	}
+	private def getHelperV2<T, U>(index: u31, len: int, fetch: Range<byte> -> T, widen: T -> U, wrap: U -> Value) -> Value {
+		var decl = StructDecl.!(this.decl);
+		return wrap(widen(fetch(bytes[decl.field_offsets[index] ..+ len])));
+	}
+	def getFieldSignExtend8Value(index: u31) -> Value {
+		return getHelperV2<i8, i32>(index, 1, DataReaders.read_range_i8, i32.!, Values.box_i);
+	}
+	def getFieldSignExtend16Value(index: u31) -> Value {
+		return getHelperV2<i16, i32>(index, 2, DataReaders.read_range_i16, i32.!, Values.box_i);
+	}
+	def getFieldZeroExtend8Value(index: u31) -> Value {
+		return getHelperV2<u8, u32>(index, 1, DataReaders.read_range_u8, u32.!, Values.box_u);
+	}
+	def getFieldZeroExtend16Value(index: u31) -> Value {
+		return getHelperV2<u16, u32>(index, 2, DataReaders.read_range_u16, u32.!, Values.box_u);
+	}
+	private def getHelper<T>(index: u32, len: int, fetch: Range<byte> -> T) -> T {
+		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
+		return fetch(bytes[offset ..+ len]);
+	}
+	def getFieldI32(index: u32) -> i32 {
+		return getHelper<i32>(index, 4, DataReaders.read_range_i32);
+	}
+	def getFieldI64(index: u32) -> i64 {
+		return getHelper<i64>(index, 8, DataReaders.read_range_i64);
+	}
+	def getFieldI8(index: u32) -> i8 {
+		return getHelper<i8>(index, 1, DataReaders.read_range_i8);
+	}
+	def getFieldI16(index: u32) -> i16 {
+		return getHelper<i16>(index, 2, DataReaders.read_range_i16);
+	}
+	def getFieldF32(index: u32) -> float {
+		return getHelper<float>(index, 4, DataReaders.read_range_float);
+	}
+	def getFieldF64(index: u32) -> double {
+		return getHelper<double>(index, 8, DataReaders.read_range_double);
+	}
+	def getFieldRef(index: u32) -> Object {
+		var decl = StructDecl.!(this.decl);
+		return Object.!(objs[decl.field_offsets[index]]);
+	}
+	def getFieldCont(index: u32) -> Continuation { // use this only for REF_U64 Continuations
+		var decl = StructDecl.!(this.decl);
+		var offsets = ObjReps.unpackFieldOffsets(decl.field_offsets[index]);
+		var stack = WasmStack.!(objs[offsets.0]);
+		var version = DataReaders.read_range_u64(bytes[offsets.1 ..+ 8]);
+		return Continuations.continuationWithVersion(stack, version);
+	}
+	def getFieldV128(index: u32) -> (u64, u64) {
+		return getHelper<(u64, u64)>(index, 16, DataReaders.read_range_u128);
+	}
+	private def setHelperV<T>(index: u32, len: int, val: Value, unbox: Value -> T, store: (Range<byte>, T) -> void) {
+		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
+		return store(bytes[offset ..+ len], unbox(val));
+	}
+	def setFieldValue(index: u31, val: Value) {
+		var decl = StructDecl.!(this.decl);
+		match (decl.field_shifts[index]) {
+			ObjReps.REF_SHIFT => objs[decl.field_offsets[index]] = if(Value.Cont.?(val), Continuations.getObject(Value.Cont.!(val).val), Value.Ref.!(val).val);
+			ObjReps.REF_U64_SHIFT => setFieldCont(index, Value.Cont.!(val).val);
+			0 => setHelperV<u8>(index, 1, val, Values.unbox_u8, DataWriters.write_range_u8);
+			1 => setHelperV<u16>(index, 2, val, Values.unbox_u16, DataWriters.write_range_u16);
+			2 => setHelperV<u32>(index, 4, val, if(Value.I32.?(val), Values.unbox_u, Values.unbox_fu32), DataWriters.write_range_u32);
+			3 => setHelperV<u64>(index, 8, val, if(Value.I64.?(val), Values.unbox_w, Values.unbox_du64), DataWriters.write_range_u64);
+			4 => setHelperV<(u64, u64)>(index, 16, val, Values.unbox_s, DataWriters.write_range_u128);
+		}
+	}
+	private def setHelper<T>(index: u32, len: int, val: T, store: (Range<byte>, T) -> void) {
+		var decl = StructDecl.!(this.decl);
+		var offset = decl.field_offsets[index];
+		return store(bytes[offset ..+ len], val);
+	}
+	def setFieldI32(index: u32, val: i32) {
+		setHelper<i32>(index, 4, val, DataWriters.write_range_i32);
+	}
+	def setFieldI64(index: u32, val: i64) {
+		setHelper<i64>(index, 8, val, DataWriters.write_range_i64);
+	}
+	def setFieldI8(index: u32, val: i8) {
+		setHelper<i8>(index, 1, val, DataWriters.write_range_i8);
+	}
+	def setFieldI16(index: u32, val: i16) {
+		setHelper<i16>(index, 2, val, DataWriters.write_range_i16);
+	}
+	def setFieldF32(index: u32, val: float) {
+		setHelper<float>(index, 4, val, DataWriters.write_range_float);
+	 }
+	def setFieldF64(index: u32, val: double) {
+		setHelper<double>(index, 8, val, DataWriters.write_range_double);
+	}
+	def setFieldRef(index: u32, val: Object) {
+		var decl = StructDecl.!(this.decl);
+		objs[decl.field_offsets[index]] = val;
+	}
+	def setFieldCont(index: u32, val: Continuation) { // use this only for REF_U64 Continuations
+		var decl = StructDecl.!(this.decl);
+		var offsets = ObjReps.unpackFieldOffsets(decl.field_offsets[index]);
+		objs[offsets.0] = Continuations.getStoredStack(val);
+		DataWriters.write_range_u64(bytes[offsets.1 ..+ 8], Continuations.getStoredVersion(val));
+	}
+	def setFieldV128(index: u32, low: u64, high: u64) {
+		setHelper<(u64, u64)>(index, 16, (low, high), DataWriters.write_range_u128);
+	}
+}
+
+// Implementations of arrays of specific types
+class HeapArrayI32 extends HeapArrayGeneric {
+	def vals: Array<u32>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.I32(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u32.view(Value.I32.!(val).val);
+	}
+	def getI32(index: u32) -> i32 {
+		return i32.view(vals[index]);
+	}
+	def setI32(index: u32, val: i32) {
+		vals[index] = u32.view(val);
+	}
+}
+
+class HeapArrayI31 extends HeapArrayGeneric {
+	def vals: Array<u31>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.I31(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u31.view(Value.I31.!(val).val);
+	}
+	def getI31(index: u32) -> i31 {
+		return i31.view(vals[index]);
+	}
+	def setI31(index: u32, val: i31) {
+		vals[index] = u31.view(val);
+	}
+}
+
+class HeapArrayI64 extends HeapArrayGeneric {
+	def vals: Array<u64>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.I64(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u64.view(Value.I64.!(val).val);
+	}
+	def getI64(index: u32) -> i64 {
+		return i64.view(vals[index]);
+	}
+	def setI64(index: u32, val: i64) {
+		vals[index] = u64.view(val);
+	}
+}
+
+class HeapArrayI8 extends HeapArrayGeneric {
+	def vals: Array<u8>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.I32(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u8.view(Value.I32.!(val).val);
+	}
+	def getI8(index: u32) -> i8 {
+		return i8.view(vals[index]);
+	}
+	def setI8(index: u32, val: i8) {
+		vals[index] = u8.view(val);
+	}
+}
+
+class HeapArrayI16 extends HeapArrayGeneric {
+	def vals: Array<u16>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.I32(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u16.view(Value.I32.!(val).val);
+	}
+	def getI16(index: u32) -> i16 {
+		return i16.view(vals[index]);
+	}
+	def setI16(index: u32, val: i16) {
+		vals[index] = u16.view(val);
+	}
+}
+
+class HeapArrayF32 extends HeapArrayGeneric {
+	def vals: Array<u32>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.F32(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u32.view(Value.F32.!(val).bits);
+	}
+	def getF32(index: u32) -> float {
+		return if(index >= 0 && index < vals.length, float.view(vals[index]), -1);
+	}
+	def setF32(index: u32, val: float) {
+		vals[index] = u32.view(val);
+	}
+}
+
+class HeapArrayF64 extends HeapArrayGeneric {
+	def vals: Array<u64>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.F64(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = u64.view(Value.F64.!(val).bits);
+	}
+	def getF64(index: u32) -> double {
+		return double.view(vals[index]);
+	}
+	def setF64(index: u32, val: double) {
+		vals[index] = u64.view(val);
+	}
+}
+
+class HeapArrayRef extends HeapArrayGeneric {
+	def vals: Array<Object>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		match (vals[index]) {
+			x: ObjectI31 => return Value.I31(x.val);
+			x: Object => return Value.Ref(x);
+			_ => return Values.REF_NULL;
+		}
+	}
+	def setValue(index: u32, val: Value) {
+		var obj: Object;
+		match (val) {
+			Ref(v) => obj = v;
+			I31(v) => obj = ObjectI31.new(v);
+			_ => ;
+		}
+		vals[index] = obj;
+	}
+	def getRef(index: u32) -> Object {
+		return vals[index];
+	}
+	def setRef(index: u32, val: Object) {
+		vals[index] = val;
+	}
+}
+
+class HeapArrayCont extends HeapArrayGeneric {
+	def vals: Array<Continuation>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.Cont(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = Value.Cont.!(val).val;
+	}
+	def getCont(index: u32) -> Continuation {
+		return vals[index];
+	}
+	def setCont(index: u32, val: Continuation) {
+		vals[index] = val;
+	}
+}
+
+// A v128 uses two adjacent u64 entries in the vals array
+class HeapArrayV128 extends HeapArrayGeneric {
+	def vals: Array<u64>; // The array format: [low 0, high 0, low 1, high 1, ...]
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length >> 1; }
+
+	def getValue(index: u32) -> Value {
+		var idx = index << 1;
+		return Value.V128(vals[idx], vals[idx+1]);
+	}
+	def setValue(index: u32, val: Value) {
+		var idx = index << 1;
+		var v128 = Value.V128.!(val);
+		vals[idx] = u64.view(v128.low);
+		vals[idx+1] = u64.view(v128.high);
+	}
+	def getV128(index: u32) -> (u64, u64) {
+		var idx = index << 1;
+		return (vals[idx], vals[idx+1]);
+	}
+	def setV128(index: u32, low: u64, high: u64) {
+		var idx = index << 1;
+		vals[idx] = low;
+		vals[idx+1] = high;
+	}
+}
+
+component ObjectRuntime {
+	def STRUCT_NEW(stack: ExecStack, decl: StructDecl) -> HeapStructGeneric {
+		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
+		var obj: HeapStructGeneric = HeapStructPair.new(decl, objs, bytes);
+		for (i = decl.field_types.length - 1; i >= 0; i--) {
+			var index = u31.!(i);
+			match (decl.field_shifts[i]) {
+				0 => obj.setFieldI8(index, i8.view(stack.popi()));
+				1 => obj.setFieldI16(index, i16.view(stack.popi()));
+				2 => {
+					if (decl.field_types[i].valtype == ValueType.I32) {
+						obj.setFieldI32(index, stack.popi());
+					} else {
+						obj.setFieldF32(index, stack.popf());
+					}
+				}
+				3 => {
+					if (decl.field_types[i].valtype == ValueType.I64) {
+						obj.setFieldI64(index, stack.popl());
+					} else {
+						obj.setFieldF64(index, stack.popd());
+					}
+				}
+				4 => {
+					var pair = stack.pops();
+					obj.setFieldV128(index, pair.0, pair.1);
+				}
+				ObjReps.REF_SHIFT => obj.setFieldRef(index, stack.popObject());
+				ObjReps.REF_U64_SHIFT => obj.setFieldCont(index, stack.popContinuation());
+			}
+		}
+		return obj;
+	}
+	def STRUCT_NEW_DEFAULT(decl: StructDecl) -> HeapStructGeneric {
+		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
+		var obj: HeapStructGeneric = HeapStructPair.new(decl, objs, bytes);
+		for (i < decl.field_types.length) {
+			var index = u31.view(i);
+			match (decl.field_shifts[i]) {
+				0 => obj.setFieldI8(index, 0);
+				1 => obj.setFieldI16(index, 0);
+				2 => {
+					if (decl.field_types[i].valtype == ValueType.I32) {
+						obj.setFieldI32(index, 0);
+					} else {
+						obj.setFieldF32(index, 0.0f);
+					}
+				}
+				3 => {
+					if (decl.field_types[i].valtype == ValueType.I64) {
+						obj.setFieldI64(index, 0);
+					} else {
+						obj.setFieldF64(index, 0.0d);
+					}
+				}
+				4 => obj.setFieldV128(index, 0, 0);
+				ObjReps.REF_SHIFT => obj.setFieldRef(index, null);
+				ObjReps.REF_U64_SHIFT => obj.setFieldCont(index, Continuations.NULL);
+			}
+		}
+		return obj;
+	}
+	private def arrayNewHelper<T>(stack: ExecStack, decl: ArrayDecl, elem: T, length: u32, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		for (i < vals.length) vals[i] = elem;
+		stack.push(Value.Ref(make(decl, vals)));
+	}
+	def ARRAY_NEW(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
+		match (decl.elem_types[0].pack) {
+			UNPACKED => {
+				match (decl.elem_types[0].valtype) {
+					I32 => arrayNewHelper<u32>(stack, decl, stack.popu(), length, HeapArrayI32.new);
+					I64 => arrayNewHelper<u64>(stack, decl, stack.popw(), length, HeapArrayI64.new);
+					F32 => arrayNewHelper<u32>(stack, decl, u32.view(stack.popf()), length, HeapArrayF32.new);
+					F64 => arrayNewHelper<u64>(stack, decl, u64.view(stack.popd()), length, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable) {
+							var elem = stack.popV(ValueType.Ref(false, HeapType.I31));
+							var val = ObjectI31.!(Value.Ref.!(elem).val).val;
+							arrayNewHelper<u31>(stack, decl, val, length, HeapArrayI31.new);
+						} else if (HeapType.Cont.?(heaptype)) {
+							var val = stack.popContinuation();
+							arrayNewHelper<Continuation>(stack, decl, val, length, HeapArrayCont.new);
+						} else {
+							arrayNewHelper<Object>(stack, decl, stack.popObject(), length, HeapArrayRef.new);
+						}
+					}
+					V128 => {
+						var vals = Array<u64>.new(u31.!(length << 1));
+						var v128 = stack.pops();
+						for (i = 0; i < vals.length; i += 2) {
+							vals[i  ] = v128.0;
+							vals[i+1] = v128.1;
+						}
+						stack.push(Value.Ref(HeapArrayV128.new(decl, vals)));
+					}
+					_ => arrayNewHelper<Value>(stack, decl, stack.popV(decl.elem_types[0].valtype), length, HeapArrayValue.new);
+				}
+			}
+			PACKED_I8 => arrayNewHelper<u8>(stack, decl, u8.view(stack.popu()), length, HeapArrayI8.new);
+			PACKED_I16 => arrayNewHelper<u16>(stack, decl, u16.view(stack.popu()), length, HeapArrayI16.new);
+		}
+		return null;
+	}
+	private def arrayNewDefaultHelper<T>(stack: ExecStack, decl: ArrayDecl, length: u32, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		stack.push(Value.Ref(make(decl, vals)));
+	}
+	def ARRAY_NEW_DEFAULT(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
+		match (decl.elem_types[0].pack) {
+			UNPACKED => {
+				match (decl.elem_types[0].valtype) {
+					I32 => arrayNewDefaultHelper<u32>(stack, decl, length, HeapArrayI32.new);
+					I64 => arrayNewDefaultHelper<u64>(stack, decl, length, HeapArrayI64.new);
+					F32 => arrayNewDefaultHelper<u32>(stack, decl, length, HeapArrayF32.new);
+					F64 => arrayNewDefaultHelper<u64>(stack, decl, length, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && ! nullable) arrayNewDefaultHelper<u31>(stack, decl, length, HeapArrayI31.new);
+						else if (HeapType.Cont.?(heaptype)) arrayNewDefaultHelper<Continuation>(stack, decl, length, HeapArrayCont.new);
+						else arrayNewDefaultHelper<Object>(stack, decl, length, HeapArrayRef.new);
+					}
+					V128 => stack.push(Value.Ref(HeapArrayV128.new(decl, Array<u64>.new(u31.!(length << 1)))));
+					_ => {
+						var vals = Array<Value>.new(u31.!(length));
+						var elem = Values.default(decl.elem_types[0].valtype);
+						for (i < vals.length) vals[i] = elem;
+						stack.push(Value.Ref(HeapArrayValue.new(decl, vals)));
+					}
+				}
+			}
+			PACKED_I8 => arrayNewDefaultHelper<u8>(stack, decl, length, HeapArrayI8.new);
+			PACKED_I16 => arrayNewDefaultHelper<u16>(stack, decl, length, HeapArrayI16.new);
+		}
+		return null;
+	}
+	private def arrayNewFixedHelper<T>(stack: ExecStack, decl: ArrayDecl, length: u32,
+					    popper: void -> T, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		for (i = vals.length - 1; i >= 0; i--) vals[i] = popper();
+		stack.push(Value.Ref(make(decl, vals)));
+	}
+	def ARRAY_NEW_FIXED(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
+		match (decl.elem_types[0].pack) {
+			UNPACKED => {
+				match (decl.elem_types[0].valtype) {
+					I32 => arrayNewFixedHelper<u32>(stack, decl, length, stack.popu, HeapArrayI32.new);
+					I64 => arrayNewFixedHelper<u64>(stack, decl, length, stack.popw, HeapArrayI64.new);
+					F32 => arrayNewFixedHelper<u32>(stack, decl, length, fun () -> u32 { return u32.view(stack.popf()); }, HeapArrayF32.new);
+					F64 => arrayNewFixedHelper<u64>(stack, decl, length, fun () -> u64 { return u64.view(stack.popd()); }, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable)
+							arrayNewFixedHelper<u31>(stack, decl, length, fun () -> u31 { return ObjectI31.!(stack.popObject()).val; }, HeapArrayI31.new);
+						else if (HeapType.Cont.?(heaptype))
+							arrayNewFixedHelper<Continuation>(stack, decl, length, stack.popContinuation, HeapArrayCont.new);
+						else
+							arrayNewFixedHelper<Object>(stack, decl, length, stack.popObject, HeapArrayRef.new);
+					}
+					V128 => {
+						var vals = Array<u64>.new(u31.!(length << 1));
+						for (i = vals.length - 2; i >= 0; i -= 2) {
+							var v128 = stack.pops();
+							vals[i  ] = v128.0;
+							vals[i+1] = v128.1;
+						}
+						stack.push(Value.Ref(HeapArrayV128.new(decl, vals)));
+					}
+					_ => {
+						var t = decl.elem_types[0].valtype;
+						arrayNewFixedHelper<Value>(stack, decl, length, fun () -> Value { return stack.popV(t); }, HeapArrayValue.new);
+					}
+				}
+			}
+			PACKED_I8 => arrayNewFixedHelper<u8>(stack, decl, length, fun () -> u8 { return u8.view(stack.popu()); }, HeapArrayI8.new);
+			PACKED_I16 => arrayNewFixedHelper<u16>(stack, decl, length, fun () -> u16 { return u16.view(stack.popu()); }, HeapArrayI16.new);
+		}
+		return null;
+	}
+	private def arrayNewDataHelper<T>(stack: ExecStack, instance: Instance, rtt: ArrayDecl, offset: u32, length: u32, data_index: u31,
+					  read: DataReader -> T, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> Throwable {
+		var r = Runtime.getData<T>(instance, data_index, offset, length, read);
+		if (!r.0) return stack.trap(TrapReason.MEMORY_OOB);
+		stack.push(Value.Ref(make(rtt, r.1)));
+		return null;
+	}
+	def ARRAY_NEW_DATA(stack: ExecStack, instance: Instance, rtt: ArrayDecl, ddecl: DataDecl, offset: u32, length: u32, data_index: u31) -> Throwable {
+		match (rtt.elem_types[0].pack) {
+			UNPACKED => {
+				match (rtt.elem_types[0].valtype) {
+					I32 => return arrayNewDataHelper<u32>(stack, instance, rtt, offset, length, data_index, DataReader.read_u32, HeapArrayI32.new);
+					I64 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length, data_index, DataReader.read_u64, HeapArrayI64.new);
+					F32 => return arrayNewDataHelper<u32>(stack, instance, rtt, offset, length, data_index, DataReader.read_u32, HeapArrayF32.new);
+					F64 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length, data_index, DataReader.read_u64, HeapArrayF64.new);
+					V128 => return arrayNewDataHelper<u64>(stack, instance, rtt, offset, length << 1, data_index, DataReader.read_u64, HeapArrayV128.new);
+					_ => return stack.trap(TrapReason.ERROR);
+				}
+			}
+			PACKED_I8 => return arrayNewDataHelper<u8>(stack, instance, rtt, offset, length, data_index, DataReader.read1, HeapArrayI8.new);
+			PACKED_I16 => return arrayNewDataHelper<u16>(stack, instance, rtt, offset, length, data_index,
+								     fun (d: DataReader) => DataReaders.read_range_u16(d.acquire(2)), HeapArrayI16.new);
+		}
+	}
+	// Note: handles only Ref, not I31 (limitation) and not continuations (should not happen (?))
+	def ARRAY_NEW_ELEM(stack: ExecStack, instance: Instance, rtt: ArrayDecl, edecl: ElemDecl, offset: u32, length: u32) -> Throwable {
+		match (rtt.elem_types[0].pack) {
+			UNPACKED => {
+				match (rtt.elem_types[0].valtype) {
+					Ref(nullable, heaptype) => {
+						var r = Runtime.getElems(instance, edecl, offset, length);
+						if (!r.0) return stack.trap(TrapReason.TABLE_OOB);
+						stack.push(Value.Ref(HeapArrayRef.new(rtt, r.1)));
+					}
+					_ => return stack.trap(TrapReason.ERROR);
+				}
+			}
+			_ => return stack.trap(TrapReason.ERROR);
+		}
+		return null;
+	}
+	def rangeFill<T>(r: Range<T>, val: T) { for (i < r.length) r[i] = val; }
+	def ARRAY_FILL(obj: HeapArrayGeneric, rtt: ArrayDecl, index: int, size: u32, val: Value) -> Throwable {
+		match (obj) {
+			x: HeapArrayValue => rangeFill<Value>(x.vals[index ..+ size], val);
+			x: HeapArrayI32 => rangeFill<u32>(x.vals[index ..+ size], Values.unbox_u(val));
+			x: HeapArrayI31 => rangeFill<u31>(x.vals[index ..+ size], Value.I31.!(val).val);
+			x: HeapArrayI64 => rangeFill<u64>(x.vals[index ..+ size], Values.unbox_w(val));
+			x: HeapArrayI8 => rangeFill<u8>(x.vals[index ..+ size], Values.unbox_u8(val));
+			x: HeapArrayI16 => rangeFill<u16>(x.vals[index ..+ size], Values.unbox_u16(val));
+			x: HeapArrayF32 => rangeFill<u32>(x.vals[index ..+ size], Values.unbox_fu32(val));
+			x: HeapArrayF64 => rangeFill<u64>(x.vals[index ..+ size], Values.unbox_du64(val));
+			x: HeapArrayRef => rangeFill<Object>(x.vals[index ..+ size], Value.Ref.!(val).val);
+			x: HeapArrayCont => rangeFill<Continuation>(x.vals[index ..+ size], Value.Cont.!(val).val);
+			x: HeapArrayV128 => {
+				var r = x.vals[index ..+ (size << 1)];
+				var v128 = Value.V128.!(val);
+				for (i = 0; i < r.length; i += 2) {
+					r[i  ] = v128.low;
+					r[i+1] = v128.high;
+				}
+			}
+		}
+		return null;
+	}
+	private def arrayCopyHelper<A, T>(stack: ExecStack, elems: A -> Array<T>,
+					  dst: HeapArrayGeneric, src: A, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		if (A.?(dst)) {
+			var arr = A.!(dst);
+			var r = ArrayUtil.safeCopy(elems(arr), dst_offset, elems(src), src_offset, size);
+			if (!r) return stack.trap(TrapReason.ARRAY_OOB);
+			return null;
+		}
+		return stack.trap(TrapReason.ERROR);
+	}
+	def ARRAY_COPY(stack: ExecStack, dst: HeapArrayGeneric, src: HeapArrayGeneric, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		match (src) {
+			x: HeapArrayI32 => return arrayCopyHelper(stack, HeapArrayI32.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI31 => return arrayCopyHelper(stack, HeapArrayI31.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI64 => return arrayCopyHelper(stack, HeapArrayI64.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI8 => return arrayCopyHelper(stack, HeapArrayI8.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayI16 => return arrayCopyHelper(stack, HeapArrayI16.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayF32 => return arrayCopyHelper(stack, HeapArrayF32.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayF64 => return arrayCopyHelper(stack, HeapArrayF64.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayRef => return arrayCopyHelper(stack, HeapArrayRef.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayCont => return arrayCopyHelper(stack, HeapArrayCont.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayV128 => return arrayCopyHelper(stack, HeapArrayV128.vals, dst, x, dst_offset, src_offset, size << 1);
+		}
+		return stack.trap(TrapReason.ERROR);
+	}	
+	private def arrayInitDataHelper<A, T>(stack: ExecStack, obj: HeapArrayGeneric, getBytes: (Array<byte>, u32, u32) -> (bool, Array<T>), elems: A -> Array<T>,
+					      data: Array<byte>, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		var t = getBytes(data, src_offset, size);
+		if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
+		match (obj) {
+			x: A => {
+				ArrayUtil.safeCopy(elems(x), dst_offset, t.1, 0, size);
+				return null;
+			}
+		}
+		return stack.trap(TrapReason.ERROR);
+	}
+	def ARRAY_INIT_DATA(stack: ExecStack, obj: HeapArrayGeneric, rtt: ArrayDecl, data: Array<byte>, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		match (rtt.elem_types[0].pack) {
+			UNPACKED => {
+				match (rtt.elem_types[0].valtype) {
+					I32 => return arrayInitDataHelper(stack, obj, bytesToI32s, HeapArrayI32.vals, data, dst_offset, src_offset, size);
+					I64 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayI64.vals, data, dst_offset, src_offset, size);
+					F32 => return arrayInitDataHelper(stack, obj, bytesToI32s, HeapArrayF32.vals, data, dst_offset, src_offset, size);
+					F64 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayF64.vals, data, dst_offset, src_offset, size);
+					V128 => return arrayInitDataHelper(stack, obj, bytesToI64s, HeapArrayV128.vals, data, dst_offset, src_offset, size << 1);
+					_ => { }
+				}
+			}
+			PACKED_I8 => return arrayInitDataHelper(stack, obj, bytesToI8s, HeapArrayI8.vals, data, dst_offset, src_offset, size);
+			PACKED_I16 => return arrayInitDataHelper(stack, obj, bytesToI16s, HeapArrayI16.vals, data, dst_offset, src_offset, size);
+		}
+		return stack.trap(TrapReason.ERROR);
+	}
+	def ARRAY_INIT_ELEM(stack: ExecStack, obj: HeapArrayGeneric, instance: Instance, edecl: ElemDecl, dst_offset: u32, src_offset: u32, size: u32) -> Throwable {
+		match (obj) {
+			x: HeapArrayI31 => {
+				var r = Runtime.getElems(instance, edecl, src_offset, size);
+				if (!r.0) return stack.trap(TrapReason.ARRAY_OOB);
+				if (ArrayUtil.boundsCheck(x.vals, dst_offset, size) < 0) return stack.trap(TrapReason.ARRAY_OOB);
+				for (i < r.1.length) {
+					x.vals[int.!(dst_offset)+i] = ObjectI31.!(r.1[i]).val;
+				}
+			}
+			x: HeapArrayRef => {
+				var r = Runtime.getElems(instance, edecl, src_offset, size);
+				if (!r.0) return stack.trap(TrapReason.ARRAY_OOB);
+				if (ArrayUtil.boundsCheck(x.vals, dst_offset, size) < 0) return stack.trap(TrapReason.ARRAY_OOB);
+				for (i < r.1.length) {
+					x.vals[int.!(dst_offset)+i] = r.1[i];
+				}
+			}
+			_ => { return stack.trap(TrapReason.ARRAY_OOB); }  // on the belief that continuations cannot be Elements
+		}
+		return null;
+	}
+	def arrayFromVal<T>(decl: ArrayDecl, val: Value, len: int, f: Value -> T,
+			    build: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> HeapArrayGeneric {
+		var elem: T = f(val);
+		var vvals = Array<T>.new(len);
+		for (i < len) vvals[i] = elem;
+		return build(decl, vvals);
+	}
+	def evalInitExprObjectArray(t: HeapType.Array, st: StorageType, velem: Value, vlen: int) -> HeapArrayGeneric {
+		var decl = t.array;
+		match (st.pack) {
+			UNPACKED => {
+				match (st.valtype) {
+					I32 => return arrayFromVal<u32>(decl, velem, vlen, fun (v: Value) -> u32 { return Value.I32.!(v).val; }, HeapArrayI32.new);
+					I64 => return arrayFromVal<u64>(decl, velem, vlen, fun (v: Value) -> u64 { return Value.I64.!(v).val; }, HeapArrayI64.new);
+					F32 => return arrayFromVal<u32>(decl, velem, vlen, fun (v: Value) -> u32 { return Value.F32.!(v).bits; }, HeapArrayF32.new);
+					F64 => return arrayFromVal<u64>(decl, velem, vlen, fun (v: Value) -> u64 { return Value.F64.!(v).bits; }, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable) {
+							return arrayFromVal<u31>(decl, velem, vlen, fun (v: Value) -> u31 { return Value.I31.!(v).val; }, HeapArrayI31.new);
+						} else {
+							return arrayFromVal<Object>(decl, velem, vlen, fun (v: Value) -> Object { return Value.Ref.!(v).val; }, HeapArrayRef.new);
+						}
+					}
+					V128 => {
+						// does not fit the arrayFromVal pattern
+						var v128 = Value.V128.!(velem);
+						var vvals = Array<u64>.new(vlen << 1);
+						for (i = 0; i < vvals.length; i += 2) {
+							vvals[i  ] = v128.low;
+							vvals[i+1] = v128.high;
+						}
+						return HeapArrayV128.new(t.array, vvals);
+					}
+					_ => return arrayFromVal<Value>(decl, velem, vlen, fun (v: Value) -> Value { return v; }, HeapArrayValue.new);
+				}
+			}
+			PACKED_I8 => return arrayFromVal<u8>(decl, velem, vlen, fun (v: Value) -> u8 { return u8.view(Value.I32.!(v).val); }, HeapArrayI8.new);
+			PACKED_I16 => return arrayFromVal<u16>(decl, velem, vlen, fun (v: Value) -> u16 { return u16.view(Value.I32.!(v).val); }, HeapArrayI16.new);
+		}
+	}
+	def arrayFromVals<T>(instance: Instance, decl: ArrayDecl, vals: Array<InitExpr>,
+			     f: Value -> T, build: (ArrayDecl, Array<T>) -> HeapArrayGeneric) -> HeapArrayGeneric {
+		var len = vals.length;
+		var vvals = Array<T>.new(len);
+		for (i < len) {
+			var velem = instance.evalInitExpr(vals[i]);
+			vvals[i] = f(velem);
+		}
+		return build(decl, vvals);
+	}
+	def evalInitExprObjectFixedArray(instance: Instance, t: HeapType.Array, st: StorageType, vals: Array<InitExpr>) -> HeapArrayGeneric {
+		var vlen = vals.length;
+		var decl = t.array;
+		match (st.pack) {
+			UNPACKED => {
+				match (st.valtype) {
+					I32 => return arrayFromVals<u32>(instance, decl, vals, fun (v: Value) -> u32 { return Value.I32.!(v).val; }, HeapArrayI32.new);
+					I64 => return arrayFromVals<u64>(instance, decl, vals, fun (v: Value) -> u64 { return Value.I64.!(v).val; }, HeapArrayI64.new);
+					F32 => return arrayFromVals<u32>(instance, decl, vals, fun (v: Value) -> u32 { return Value.F32.!(v).bits; }, HeapArrayF32.new);
+					F64 => return arrayFromVals<u64>(instance, decl, vals, fun (v: Value) -> u64 { return Value.F64.!(v).bits; }, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && !nullable) {
+							return arrayFromVals<u31>(instance, decl, vals, fun (v: Value) -> u31 { return Value.I31.!(v).val; }, HeapArrayI31.new);
+						} else {
+							return arrayFromVals<Object>(instance, decl, vals, fun (v: Value) -> Object { return Value.Ref.!(v).val; }, HeapArrayRef.new);
+						}
+					}
+					V128 => {
+						// does not fit the arrayFromVals pattern
+						var vvals = Array<u64>.new(vlen << 1);
+						for (i = 0; i < vlen; i += 2) {
+							var velem = instance.evalInitExpr(vals[i]);
+							var v128 = Value.V128.!(velem);
+							vvals[i  ] = v128.low;
+							vvals[i+1] = v128.high;
+						}
+						return HeapArrayV128.new(t.array, vvals);
+					}
+					_ => {
+						var vvals = Arrays.map(vals, instance.evalInitExpr);
+						return HeapArrayValue.new(t.array, vvals);
+					}
+				}
+			}
+			PACKED_I8 => return arrayFromVals<u8>(instance, decl, vals, fun (v: Value) -> u8 { return u8.view(Value.I32.!(v).val); }, HeapArrayI8.new);
+			PACKED_I16 => return arrayFromVals<u16>(instance, decl, vals, fun (v: Value) -> u16 { return u16.view(Value.I32.!(v).val); }, HeapArrayI16.new);
+		}
+	}
+	def evalInitExprObjectStruct(t: HeapType.Struct, vvals: Array<Value>) -> Object {
+		var decl = t.sdecl;
+		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
+		var obj = HeapStructPair.new(decl, objs, bytes);
+		for (i < decl.field_types.length) {
+			obj.setFieldValue(u31.view(i), vvals[i]);
+		}
+		return obj;
+	}
+}
+
+def bytesToBytes(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<byte>) {
+	var start = ArrayUtil.boundsCheck(data, offset, length);
+	if (start < 0) return (false, null);
+	var limit = length + offset;
+	var bytes = DataReader.new(data).reset(data, start, int.!(limit)).readN(int.!(length));
+	return (true, bytes);
+}
+def bytesToI8s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u8>) {
+	var start = ArrayUtil.boundsCheck(data, offset, length);
+	if (start < 0) return (false, null);
+	var vals = Array<u8>.new(int.!(length));
+	var limit = length + offset;
+	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = d.read_u8();
+	return (d.ok, vals);
+}
+def bytesToI8sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
+	var start = ArrayUtil.boundsCheck(data, offset, length);
+	if (start < 0) return (false, null);
+	var vals = Array<u32>.new(int.!(length));
+	var limit = length + offset;
+	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = u32.view(d.read_u8());
+	return (d.ok, vals);
+}
+def bytesToI16s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u16>) {
+	var nbytes = length << 1;
+	var start = ArrayUtil.boundsCheck(data, offset, nbytes);
+	if (start < 0) return (false, null);
+	var vals = Array<u16>.new(int.!(length));
+	var limit = offset + nbytes;
+	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = d.read_u16();
+	return (d.ok, vals);
+}
+def bytesToI16sAsI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
+	var nbytes = length << 1;
+	var start = ArrayUtil.boundsCheck(data, offset, nbytes);
+	if (start < 0) return (false, null);
+	var vals = Array<u32>.new(int.!(length));
+	var limit = offset + nbytes;
+	var d = ExtendedDataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = u32.view(d.read_u16());
+	return (d.ok, vals);
+}
+def bytesToI32s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u32>) {
+	var nbytes = length << 2;
+	var start = ArrayUtil.boundsCheck(data, offset, nbytes);
+	if (start < 0) return (false, null);
+	var vals = Array<u32>.new(int.!(length));
+	var limit = offset + nbytes;
+	var d = DataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = d.read_u32();
+	return (d.ok, vals);
+}
+def bytesToI64s(data: Array<byte>, offset: u32, length: u32) -> (bool, Array<u64>) {
+	var nbytes = length << 3;
+	var start = ArrayUtil.boundsCheck(data, offset, nbytes);
+	if (start < 0) return (false, null);
+	var vals = Array<u64>.new(int.!(length));
+	var limit = offset + nbytes;
+	var d = DataReader.new(data).reset(data, start, int.!(limit));
+	for (i < vals.length) vals[i] = d.read_u64();
+	return (d.ok, vals);
+}
+
