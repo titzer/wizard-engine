@@ -1704,13 +1704,28 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				var tmp = allocTmp(ValueKind.REF);
 				var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
 				masm.emit_breq_r_l(str, 0, label);
-				if (ValueType.Ref.?(etype)) {
-					masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
-					offset = offset << 3;
-				} else {
-					masm.emit_v3_HeapStructPair_bytes_r_r(tmp, str);
+				match (kind) {
+					REF => {
+						masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
+						offset = offset << 3;
+						masm.emit_mov_r_m(kind, dst, MasmAddr(tmp, offset + masm.getOffsets().Array_contents));
+					}
+					REF_U64 => {
+						var offsets = ObjReps.unpackFieldOffsets(offset);
+						var refs_offset = offsets.0 << 3;
+						var bytes_offset = offsets.1;
+						masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
+						var tmp1 = allocTmp(ValueKind.REF);
+						masm.emit_v3_HeapStructPair_bytes_r_r(tmp1, str);
+						var ref_addr = MasmAddr(tmp, refs_offset + masm.getOffsets().Array_contents);
+						var u64_addr = MasmAddr(tmp1, bytes_offset + masm.getOffsets().Array_contents);
+						masm.emit_ref_u64_from_ref_and_u64_mem(dst, ref_addr, u64_addr);
+					}
+					_ => {
+						masm.emit_v3_HeapStructPair_bytes_r_r(tmp, str);
+						masm.emit_mov_r_m(kind, dst, MasmAddr(tmp, offset + masm.getOffsets().Array_contents));
+					}
 				}
-				masm.emit_mov_r_m(kind, dst, MasmAddr(tmp, offset + masm.getOffsets().Array_contents));
 				state.push(SpcConsts.kindToFlags(kind) | IN_REG, dst, 0);
 			}
 			_ => {
@@ -1783,13 +1798,28 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				var tmp = allocTmp(ValueKind.REF);
 				var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
 				masm.emit_breq_r_l(str, 0, label);
-				if (ValueType.Ref.?(etype)) {
-					masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
-					offset = offset << 3;
-				} else {
-					masm.emit_v3_HeapStructPair_bytes_r_r(tmp, str);
+				match (kind) {
+					REF => {
+						masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
+						offset = offset << 3;
+						masm.emit_mov_m_r(kind, MasmAddr(tmp, offset + masm.getOffsets().Array_contents), val);
+					}
+					REF_U64 => {
+						var offsets = ObjReps.unpackFieldOffsets(offset);
+						var refs_offset = offsets.0 << 3;
+						var bytes_offset = offsets.1;
+						masm.emit_v3_HeapStructPair_objs_r_r(tmp, str);
+						var tmp1 = allocTmp(ValueKind.REF);
+						masm.emit_v3_HeapStructPair_bytes_r_r(tmp1, str);
+						var ref_addr = MasmAddr(tmp, refs_offset + masm.getOffsets().Array_contents);
+						var u64_addr = MasmAddr(tmp1, bytes_offset + masm.getOffsets().Array_contents);
+						masm.emit_ref_and_u64_mem_from_ref_u64(ref_addr, u64_addr, val);
+					}
+					_ => {
+						masm.emit_v3_HeapStructPair_bytes_r_r(tmp, str);
+						masm.emit_mov_m_r(kind, MasmAddr(tmp, offset + masm.getOffsets().Array_contents), val);
+					}
 				}
-				masm.emit_mov_m_r(kind, MasmAddr(tmp, offset + masm.getOffsets().Array_contents), val);
 			}
 			_ => {
 				emit_call_runtime_op2n(Opcode.STRUCT_SET, struct_index, field_index, 1, ValueTypes.NONE, true);
@@ -1817,30 +1847,33 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var etype = stg_type.valtype;
 		var kind = ValueTypes.kind(etype);
 		// PACKED forms should not get here, but default to run-time call, in case
-		if ((stg_type.pack != Packedness.UNPACKED) ||
-		    (ValueType.Ref.?(etype) && ValueType.Ref.!(etype).heap == HeapType.I31)) {
+		var useRunTime = false;
+		if (ObjReps.arrayMode != ArrayMode.Typed) useRunTime = true;
+		else if (stg_type.pack != Packedness.UNPACKED) useRunTime = true;
+		else if (ValueType.Ref.?(etype)) {
+			var ht = ValueType.Ref.!(etype).heap;
+			match (ht) {
+				I31 => useRunTime = true;
+				Cont => useRunTime = (!Continuations.boxed && !CiRuntime.FEATURE_MIXED_ARRAYS);
+				_ => ;
+			}
+		}
+		if (useRunTime) {
 			emit_call_runtime_op1n(Opcode.ARRAY_GET, ht_index, 2, [decl.elem_types[0].valtype], true);
 			return;
 		}
-		match (ObjReps.arrayMode) {
-			Typed => {
-				var idx = popReg().reg;
-				var arr = popReg().reg;
-				var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
-				masm.emit_breq_r_l(arr, 0, label);
-				var tmp = allocTmp(ValueKind.REF);
-				masm.emit_v3_HeapArrayI32_vals_r_r(tmp, arr);
-				var oob_label = masm.newTrapLabel(TrapReason.ARRAY_OOB);
-				masm.emit_v3_Array_bounds_check_rr(tmp, idx, oob_label);
-				var dst = allocRegTos(kind);
-				masm.emit_v3_Array_elem_r_rr(kind, dst, tmp, idx);
-				state.push(SpcConsts.kindToFlags(kind) | IN_REG, dst, 0);
-			}
-			_ => {
-				// Original format, and any other added formats without explicit coverage, use run-time
-				emit_call_runtime_op1n(Opcode.ARRAY_GET, ht_index, 2, [decl.elem_types[0].valtype], true);
-			}
-		}
+		// only ArrayMode.Typed gets here
+		var idx = popReg().reg;
+		var arr = popReg().reg;
+		var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
+		masm.emit_breq_r_l(arr, 0, label);
+		var tmp = allocTmp(ValueKind.REF);
+		masm.emit_v3_HeapArrayI32_vals_r_r(tmp, arr);
+		var oob_label = masm.newTrapLabel(TrapReason.ARRAY_OOB);
+		masm.emit_v3_Array_bounds_check_rr(tmp, idx, oob_label);
+		var dst = allocRegTos(kind);
+		masm.emit_v3_Array_elem_r_rr(kind, dst, tmp, idx);
+		state.push(SpcConsts.kindToFlags(kind) | IN_REG, dst, 0);
 	}
 	def visit_ARRAY_GET_S(ht_index: u31) {
 		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
@@ -1904,29 +1937,32 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var etype = stg_type.valtype;
 		var kind = ValueTypes.kind(etype);
 		// PACKED forms may get here, but use run-time call for the moment
-		if ((stg_type.pack != Packedness.UNPACKED) ||
-		    (ValueType.Ref.?(etype) && ValueType.Ref.!(etype).heap == HeapType.I31)) {
+		var useRunTime = false;
+		if (ObjReps.arrayMode != ArrayMode.Typed) useRunTime = true;
+		else if (stg_type.pack != Packedness.UNPACKED) useRunTime = true;
+		else if (ValueType.Ref.?(etype)) {
+			var ht = ValueType.Ref.!(etype).heap;
+			match (ht) {
+				I31 => useRunTime = true;
+				Cont => useRunTime = (!Continuations.boxed && !CiRuntime.FEATURE_MIXED_ARRAYS);
+				_ => ;
+			}
+		}
+		if (useRunTime) {
 			emit_call_runtime_op1n(Opcode.ARRAY_SET, ht_index, 3, ValueTypes.NONE, true);
 			return;
 		}
-		match (ObjReps.arrayMode) {
-			Typed => {
-				var val = popReg().reg;
-				var idx = popReg().reg;
-				var arr = popReg().reg;
-				var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
-				masm.emit_breq_r_l(arr, 0, label);
-				var tmp = allocTmp(ValueKind.REF);
-				masm.emit_v3_HeapArrayI32_vals_r_r(tmp, arr);
-				var oob_label = masm.newTrapLabel(TrapReason.ARRAY_OOB);
-				masm.emit_v3_Array_bounds_check_rr(tmp, idx, oob_label);
-				masm.emit_v3_Array_elem_rr_r(kind, tmp, idx, val);
-			}
-			_ => {
-				// Original format, and any other added formats without explicit coverage, use run-time
-				emit_call_runtime_op1n(Opcode.ARRAY_SET, ht_index, 3, ValueTypes.NONE, true);
-			}
-		}
+		// only ArrayMode.Typed gets here
+		var val = popReg().reg;
+		var idx = popReg().reg;
+		var arr = popReg().reg;
+		var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
+		masm.emit_breq_r_l(arr, 0, label);
+		var tmp = allocTmp(ValueKind.REF);
+		masm.emit_v3_HeapArrayI32_vals_r_r(tmp, arr);
+		var oob_label = masm.newTrapLabel(TrapReason.ARRAY_OOB);
+		masm.emit_v3_Array_bounds_check_rr(tmp, idx, oob_label);
+		masm.emit_v3_Array_elem_rr_r(kind, tmp, idx, val);
 	}
 	def visit_ARRAY_LEN() {
 		match (ObjReps.arrayMode) {

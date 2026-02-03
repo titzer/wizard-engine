@@ -26,12 +26,23 @@ component ObjReps {
 
 	def structModeCode = 1;
 	def structMode = structModeFor(structModeCode);
+
+	// other constants related to representations
+	def REF_SHIFT     = -1i8;  // indicates an object slot for StructMode.Pair
+	def REF_U64_SHIFT = -2i8;  // indicates a REF_U64 for StructMode.Pair
+
+	def packFieldOffsets(refs_offset: i32, bytes_offset: i32) -> i32 {
+		return (refs_offset << 16) | bytes_offset;
+	}
+	def unpackFieldOffsets(offset: i32) -> (i32, i32) {
+		return (offset >>> 16, offset & 0xFFFF);
+	}
 }
 
 // Paired array representation: an Array<Object> holds all the reference fields,
 // and an Array<byte> holds all the primitive values
 class HeapStructPair extends HeapStructGeneric {
-	def objs: Array<Object>;
+	def objs: Array<Exportable>;
 	def bytes: Array<byte>;
 	new(decl: StructDecl, objs, bytes) super(decl) { }
 
@@ -42,7 +53,10 @@ class HeapStructPair extends HeapStructGeneric {
 		var decl = StructDecl.!(this.decl);
 		var offset = decl.field_offsets[index];
 		match (decl.field_shifts[index]) {
-			-1 => return Value.Ref(objs[offset]);
+			ObjReps.REF_SHIFT => return if(HeapType.Cont.?(ValueType.Ref.!(decl.field_types[index].valtype).heap),
+						       Value.Cont(Continuations.fromObject(objs[offset])),
+						       Value.Ref(Object.!(objs[offset])));
+			ObjReps.REF_U64_SHIFT => return Value.Cont(getFieldCont(index));
 			0  => return getHelperV<u32>(offset, 1, DataReaders.read_range_u32_u8, Values.box_u);
 			1  => return getHelperV<u32>(offset, 2, DataReaders.read_range_u32_u16, Values.box_u);
 			2  => return getHelperV<u32>(offset, 4, DataReaders.read_range_u32,
@@ -94,7 +108,14 @@ class HeapStructPair extends HeapStructGeneric {
 	}
 	def getFieldRef(index: u32) -> Object {
 		var decl = StructDecl.!(this.decl);
-		return objs[decl.field_offsets[index]];
+		return Object.!(objs[decl.field_offsets[index]]);
+	}
+	def getFieldCont(index: u32) -> Continuation { // use this only for REF_U64 Continuations
+		var decl = StructDecl.!(this.decl);
+		var offsets = ObjReps.unpackFieldOffsets(decl.field_offsets[index]);
+		var stack = WasmStack.!(objs[offsets.0]);
+		var version = DataReaders.read_range_u64(bytes[offsets.1 ..+ 8]);
+		return Continuations.continuationWithVersion(stack, version);
 	}
 	def getFieldV128(index: u32) -> (u64, u64) {
 		return getHelper<(u64, u64)>(index, 16, DataReaders.read_range_u128);
@@ -107,7 +128,8 @@ class HeapStructPair extends HeapStructGeneric {
 	def setFieldValue(index: u31, val: Value) {
 		var decl = StructDecl.!(this.decl);
 		match (decl.field_shifts[index]) {
-			-1 => objs[decl.field_offsets[index]] = Value.Ref.!(val).val;
+			ObjReps.REF_SHIFT => objs[decl.field_offsets[index]] = if(Value.Cont.?(val), Continuations.getObject(Value.Cont.!(val).val), Value.Ref.!(val).val);
+			ObjReps.REF_U64_SHIFT => setFieldCont(index, Value.Cont.!(val).val);
 			0 => setHelperV<u8>(index, 1, val, Values.unbox_u8, DataWriters.write_range_u8);
 			1 => setHelperV<u16>(index, 2, val, Values.unbox_u16, DataWriters.write_range_u16);
 			2 => setHelperV<u32>(index, 4, val, if(Value.I32.?(val), Values.unbox_u, Values.unbox_fu32), DataWriters.write_range_u32);
@@ -141,6 +163,12 @@ class HeapStructPair extends HeapStructGeneric {
 	def setFieldRef(index: u32, val: Object) {
 		var decl = StructDecl.!(this.decl);
 		objs[decl.field_offsets[index]] = val;
+	}
+	def setFieldCont(index: u32, val: Continuation) { // use this only for REF_U64 Continuations
+		var decl = StructDecl.!(this.decl);
+		var offsets = ObjReps.unpackFieldOffsets(decl.field_offsets[index]);
+		objs[offsets.0] = Continuations.getStoredStack(val);
+		DataWriters.write_range_u64(bytes[offsets.1 ..+ 8], Continuations.getStoredVersion(val));
 	}
 	def setFieldV128(index: u32, low: u64, high: u64) {
 		setHelper<(u64, u64)>(index, 16, (low, high), DataWriters.write_range_u128);
@@ -318,6 +346,26 @@ class HeapArrayRef extends HeapArrayGeneric {
 	}
 }
 
+class HeapArrayCont extends HeapArrayGeneric {
+	def vals: Array<Continuation>;
+	new(decl: ArrayDecl, vals) super(decl) { }
+
+	def length() -> int { return vals.length; }
+
+	def getValue(index: u32) -> Value {
+		return Value.Cont(vals[index]);
+	}
+	def setValue(index: u32, val: Value) {
+		vals[index] = Value.Cont.!(val).val;
+	}
+	def getCont(index: u32) -> Continuation {
+		return vals[index];
+	}
+	def setCont(index: u32, val: Continuation) {
+		vals[index] = val;
+	}
+}
+
 // A v128 uses two adjacent u64 entries in the vals array
 class HeapArrayV128 extends HeapArrayGeneric {
 	def vals: Array<u64>; // The array format: [low 0, high 0, low 1, high 1, ...]
@@ -349,7 +397,7 @@ class HeapArrayV128 extends HeapArrayGeneric {
 component ObjectRuntime {
 	def STRUCT_NEW(stack: ExecStack, decl: StructDecl) -> HeapStructGeneric {
 		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
-		var objs = if(decl.num_refs == 0, null, Array<Object>.new(decl.num_refs));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
 		var obj: HeapStructGeneric = HeapStructPair.new(decl, objs, bytes);
 		for (i = decl.field_types.length - 1; i >= 0; i--) {
 			var index = u31.!(i);
@@ -374,14 +422,15 @@ component ObjectRuntime {
 					var pair = stack.pops();
 					obj.setFieldV128(index, pair.0, pair.1);
 				}
-				-1 => obj.setFieldRef(index, stack.popObject());
+				ObjReps.REF_SHIFT => obj.setFieldRef(index, stack.popObject());
+				ObjReps.REF_U64_SHIFT => obj.setFieldCont(index, stack.popContinuation());
 			}
 		}
 		return obj;
 	}
 	def STRUCT_NEW_DEFAULT(decl: StructDecl) -> HeapStructGeneric {
 		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
-		var objs = if(decl.num_refs == 0, null, Array<Object>.new(decl.num_refs));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
 		var obj: HeapStructGeneric = HeapStructPair.new(decl, objs, bytes);
 		for (i < decl.field_types.length) {
 			var index = u31.view(i);
@@ -403,7 +452,8 @@ component ObjectRuntime {
 					}
 				}
 				4 => obj.setFieldV128(index, 0, 0);
-				-1 => obj.setFieldRef(index, null);
+				ObjReps.REF_SHIFT => obj.setFieldRef(index, null);
+				ObjReps.REF_U64_SHIFT => obj.setFieldCont(index, Continuations.NULL);
 			}
 		}
 		return obj;
@@ -426,6 +476,9 @@ component ObjectRuntime {
 							var elem = stack.popV(ValueType.Ref(false, HeapType.I31));
 							var val = ObjectI31.!(Value.Ref.!(elem).val).val;
 							arrayNewHelper<u31>(stack, decl, val, length, HeapArrayI31.new);
+						} else if (HeapType.Cont.?(heaptype)) {
+							var val = stack.popContinuation();
+							arrayNewHelper<Continuation>(stack, decl, val, length, HeapArrayCont.new);
 						} else {
 							arrayNewHelper<Object>(stack, decl, stack.popObject(), length, HeapArrayRef.new);
 						}
@@ -447,18 +500,23 @@ component ObjectRuntime {
 		}
 		return null;
 	}
+	private def arrayNewDefaultHelper<T>(stack: ExecStack, decl: ArrayDecl, length: u32, make: (ArrayDecl, Array<T>) -> HeapArrayGeneric) {
+		var vals = Array<T>.new(u31.!(length));
+		stack.push(Value.Ref(make(decl, vals)));
+	}
 	def ARRAY_NEW_DEFAULT(stack: ExecStack, decl: ArrayDecl, length: u32) -> Throwable {
 		match (decl.elem_types[0].pack) {
 			UNPACKED => {
 				match (decl.elem_types[0].valtype) {
-					I32 => stack.push(Value.Ref(HeapArrayI32.new(decl, Array<u32>.new(u31.!(length)))));
-					I64 => stack.push(Value.Ref(HeapArrayI64.new(decl, Array<u64>.new(u31.!(length)))));
-					F32 => stack.push(Value.Ref(HeapArrayF32.new(decl, Array<u32>.new(u31.!(length)))));
-					F64 => stack.push(Value.Ref(HeapArrayF64.new(decl, Array<u64>.new(u31.!(length)))));
-					Ref(nullable, heaptype) =>
-						stack.push(Value.Ref(if(heaptype == HeapType.I31 && !nullable,
-									HeapArrayI31.new(decl, Array<u31>.new(u31.!(length))),
-									HeapArrayRef.new(decl, Array<Object>.new(u31.!(length))))));
+					I32 => arrayNewDefaultHelper<u32>(stack, decl, length, HeapArrayI32.new);
+					I64 => arrayNewDefaultHelper<u64>(stack, decl, length, HeapArrayI64.new);
+					F32 => arrayNewDefaultHelper<u32>(stack, decl, length, HeapArrayF32.new);
+					F64 => arrayNewDefaultHelper<u64>(stack, decl, length, HeapArrayF64.new);
+					Ref(nullable, heaptype) => {
+						if (heaptype == HeapType.I31 && ! nullable) arrayNewDefaultHelper<u31>(stack, decl, length, HeapArrayI31.new);
+						else if (HeapType.Cont.?(heaptype)) arrayNewDefaultHelper<Continuation>(stack, decl, length, HeapArrayCont.new);
+						else arrayNewDefaultHelper<Object>(stack, decl, length, HeapArrayRef.new);
+					}
 					V128 => stack.push(Value.Ref(HeapArrayV128.new(decl, Array<u64>.new(u31.!(length << 1)))));
 					_ => {
 						var vals = Array<Value>.new(u31.!(length));
@@ -468,8 +526,8 @@ component ObjectRuntime {
 					}
 				}
 			}
-			PACKED_I8 => stack.push(Value.Ref(HeapArrayI8.new(decl, Array<u8>.new(u31.!(length)))));
-			PACKED_I16 => stack.push(Value.Ref(HeapArrayI16.new(decl, Array<u16>.new(u31.!(length)))));
+			PACKED_I8 => arrayNewDefaultHelper<u8>(stack, decl, length, HeapArrayI8.new);
+			PACKED_I16 => arrayNewDefaultHelper<u16>(stack, decl, length, HeapArrayI16.new);
 		}
 		return null;
 	}
@@ -488,16 +546,12 @@ component ObjectRuntime {
 					F32 => arrayNewFixedHelper<u32>(stack, decl, length, fun () -> u32 { return u32.view(stack.popf()); }, HeapArrayF32.new);
 					F64 => arrayNewFixedHelper<u64>(stack, decl, length, fun () -> u64 { return u64.view(stack.popd()); }, HeapArrayF64.new);
 					Ref(nullable, heaptype) => {
-						if (heaptype == HeapType.I31 && !nullable) {
-							var vals = Array<u31>.new(u31.!(length));
-							for (i = vals.length - 1; i >= 0; i--) vals[i] = ObjectI31.!(stack.popObject()).val;
-							stack.push(Value.Ref(HeapArrayI31.new(decl, vals)));
-
-						} else {
-							var vals = Array<Object>.new(u31.!(length));
-							for (i = vals.length - 1; i >= 0; i--) vals[i] = stack.popObject();
-							stack.push(Value.Ref(HeapArrayRef.new(decl, vals)));
-						}
+						if (heaptype == HeapType.I31 && !nullable)
+							arrayNewFixedHelper<u31>(stack, decl, length, fun () -> u31 { return ObjectI31.!(stack.popObject()).val; }, HeapArrayI31.new);
+						else if (HeapType.Cont.?(heaptype))
+							arrayNewFixedHelper<Continuation>(stack, decl, length, stack.popContinuation, HeapArrayCont.new);
+						else
+							arrayNewFixedHelper<Object>(stack, decl, length, stack.popObject, HeapArrayRef.new);
 					}
 					V128 => {
 						var vals = Array<u64>.new(u31.!(length << 1));
@@ -543,6 +597,7 @@ component ObjectRuntime {
 								     fun (d: DataReader) => DataReaders.read_range_u16(d.acquire(2)), HeapArrayI16.new);
 		}
 	}
+	// Note: handles only Ref, not I31 (limitation) and not continuations (should not happen (?))
 	def ARRAY_NEW_ELEM(stack: ExecStack, instance: Instance, rtt: ArrayDecl, edecl: ElemDecl, offset: u32, length: u32) -> Throwable {
 		match (rtt.elem_types[0].pack) {
 			UNPACKED => {
@@ -571,6 +626,7 @@ component ObjectRuntime {
 			x: HeapArrayF32 => rangeFill<u32>(x.vals[index ..+ size], Values.unbox_fu32(val));
 			x: HeapArrayF64 => rangeFill<u64>(x.vals[index ..+ size], Values.unbox_du64(val));
 			x: HeapArrayRef => rangeFill<Object>(x.vals[index ..+ size], Value.Ref.!(val).val);
+			x: HeapArrayCont => rangeFill<Continuation>(x.vals[index ..+ size], Value.Cont.!(val).val);
 			x: HeapArrayV128 => {
 				var r = x.vals[index ..+ (size << 1)];
 				var v128 = Value.V128.!(val);
@@ -602,6 +658,7 @@ component ObjectRuntime {
 			x: HeapArrayF32 => return arrayCopyHelper(stack, HeapArrayF32.vals, dst, x, dst_offset, src_offset, size);
 			x: HeapArrayF64 => return arrayCopyHelper(stack, HeapArrayF64.vals, dst, x, dst_offset, src_offset, size);
 			x: HeapArrayRef => return arrayCopyHelper(stack, HeapArrayRef.vals, dst, x, dst_offset, src_offset, size);
+			x: HeapArrayCont => return arrayCopyHelper(stack, HeapArrayCont.vals, dst, x, dst_offset, src_offset, size);
 			x: HeapArrayV128 => return arrayCopyHelper(stack, HeapArrayV128.vals, dst, x, dst_offset, src_offset, size << 1);
 		}
 		return stack.trap(TrapReason.ERROR);
@@ -653,7 +710,7 @@ component ObjectRuntime {
 					x.vals[int.!(dst_offset)+i] = r.1[i];
 				}
 			}
-			_ => {return stack.trap(TrapReason.ARRAY_OOB);}
+			_ => { return stack.trap(TrapReason.ARRAY_OOB); }  // on the belief that continuations cannot be Elements
 		}
 		return null;
 	}
@@ -748,7 +805,7 @@ component ObjectRuntime {
 	def evalInitExprObjectStruct(t: HeapType.Struct, vvals: Array<Value>) -> Object {
 		var decl = t.sdecl;
 		var bytes = if(decl.num_bytes == 0, null, Array<byte>.new(decl.num_bytes));
-		var objs = if(decl.num_refs == 0, null, Array<Object>.new(decl.num_refs));
+		var objs = if(decl.num_refs == 0, null, Array<Exportable>.new(decl.num_refs));
 		var obj = HeapStructPair.new(decl, objs, bytes);
 		for (i < decl.field_types.length) {
 			obj.setFieldValue(u31.view(i), vvals[i]);
