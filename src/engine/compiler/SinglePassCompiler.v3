@@ -93,7 +93,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Abstract state of the value stack
 	def state = SpcState.new(regAlloc);
 	// Other state
-	def trap_labels = Vector<(TrapReason, MasmLabel)>.new();
+	def trap_labels = Vector<(TrapReason, MasmLabel, List<InlineFrame>)>.new();
 	var module: Module;
 	var func: FuncDecl;
 	var sig: SigDecl;
@@ -115,6 +115,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var local_base_sp: u31 = 0;
 	var is_inlined = false;
 	var inline_depth: int = 0;		// track inlining nesting depth
+	var inline_chain: List<InlineFrame> = null;	// immutable list tracking inline call stack
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
@@ -196,9 +197,21 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Emit trap labels.
 		for (i < trap_labels.length) {
 			var e = trap_labels[i];
-			masm.bindLabel(e.1);
-			masm.emit_mov_m_i(xenv.pc_slot, e.1.create_pos);
-			masm.emit_jump_to_trap_at(e.0);
+			var reason = e.0;
+			var label = e.1;
+			var chain = e.2;
+
+			masm.bindLabel(label);
+
+			// If trap occurred in inlined function, reconstruct frames
+			if (chain != null && chain.tail != null) {
+				emitReconstructStackFrames(chain, reason);
+			} else {
+				// otherwise, put pc as before
+				masm.emit_mov_m_i(xenv.pc_slot, label.create_pos);
+			}
+
+			masm.emit_jump_to_trap_at(reason);
 		}
 
 		// Emit handler stubs.
@@ -480,6 +493,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var prev_sig = this.sig;
 		var prev_local_base_sp = this.local_base_sp;
 		var prev_is_inlined = this.is_inlined;
+		var prev_inline_chain = inline_chain;
+
+		// Push current frame onto inline chain
+		inline_chain = List.new(InlineFrame(this.func, it.pc), inline_chain);
+		if (Trace.compiler) Trace.OUT.put1("it.pc: %d\n", it.pc);
 
 		// Switch to callee context
 		it = BytecodeIterator.new().reset(func);
@@ -514,6 +532,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		this.sig = prev_sig;
 		this.local_base_sp = prev_local_base_sp;
 		this.is_inlined = prev_is_inlined;
+		inline_chain = prev_inline_chain;
 		inline_depth--;
 
 		// Clean up stack:
@@ -2171,9 +2190,65 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_addw_r_i(regs.sp, frame.frameSize);
 		masm.emit_ret();
 	}
+	def getTrapStubIp(reason: TrapReason) -> long;
+	def emitReconstructStackFrames(chain: List<InlineFrame>, reason: TrapReason) {
+		// Emit code to materialize stack frames for each inlined function.
+		// This allows the trap handler to see the full call stack including inlined calls.
+		//
+		// The chain contains a list of functions that have been inlined but
+		// also including the original function at the end, with its pc
+		// referring to the point of the initial inline.
+		def inline_funcs = Lists.toArray(chain);
+
+		def real_frame = inline_funcs[inline_funcs.length - 1];
+		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+
+		// Get trap stub IP to use as return address for reconstructed frames
+		// This ensures accessor.pc() reads PC from frame.pc_slot instead of calling lookupPc()
+		var stub_ip = getTrapStubIp(reason);
+
+		// Process only the inlined frames (skip the outermost which already exists)
+		for (i = inline_funcs.length - 2; i >= 0; i--) {
+			var frame_info = inline_funcs[i];
+
+			// Load instance from the previous frame
+			masm.emit_mov_r_m(ValueKind.REF, regs.instance, frame.instance_slot);
+
+			// Load instance.functions and then functions[func_index] into regs.func_arg
+			masm.emit_v3_Instance_functions_r_r(regs.scratch, regs.instance);
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.func_arg, regs.scratch, frame_info.func.func_index);
+
+			// Push trap stub address as return address
+			masm.emit_subw_r_i(regs.sp, 8);
+			masm.emit_mov_m_l(MasmAddr(regs.sp, 0), stub_ip);
+
+			// Allocate concrete stack frame for inlined function
+			masm.emit_subw_r_i(regs.sp, frame.frameSize);
+
+			// Save WasmFunction to frame.wasm_func_slot
+			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
+
+			// Save instance to frame.instance_slot
+			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
+
+			// Save PC to frame.pc_slot
+			masm.emit_mov_m_i(frame.pc_slot, frame_info.pc);
+
+			// Clear FrameAccessor and inlined_instance_slot (?)
+			masm.emit_mov_m_l(frame.accessor_slot, 0);
+			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+		}
+
+		// XXX some frame slots are not set:
+		// - vsp_slot
+		// - vfp_slot
+		// - mem0_base_slot
+	}
 	def newTrapLabel(reason: TrapReason) -> MasmLabel {
 		var label = masm.newLabel(it.pc);
-		trap_labels.put(reason, label);
+		// Capture current inline chain + current function/PC
+		var chain = List.new(InlineFrame(this.func, it.pc), inline_chain);
+		trap_labels.put((reason, label, chain));
 		return label;
 	}
 	def unsupported() {
@@ -3370,6 +3445,9 @@ def regularFuncCanInline(decl: FuncDecl) -> InlineConfig {
 	}
 	return InlineConfig(swap_membase, swap_instance, true);
 }
+
+// Represents a frame in the inline call chain - records which function made an inlined call and at what PC
+type InlineFrame(func: FuncDecl, pc: int);
 
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
