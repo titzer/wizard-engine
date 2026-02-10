@@ -114,6 +114,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// in the current context.
 	var local_base_sp: u31 = 0;
 	var is_inlined = false;
+	var inline_depth: int = 0;		// track inlining nesting depth
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
@@ -458,6 +459,111 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
 		emit_reload_regs();
 		if (!spillMode.free_regs) state.emitRestoreAll(resolver);
+	}
+
+	// Emit code for an inlined regular function call
+	def emitInlinedCall(func: FuncDecl) {
+		var sig = func.sig;
+		var params_count = u32.view(sig.params.length);
+		var results_count = u32.view(sig.results.length);
+		var orig_sp = state.sp;
+
+		// Arguments are already on stack
+		// Stack: [..., arg0, arg1, ..., argN] <- sp
+		// We want callee's local 0 = arg0, so:
+		var new_local_base_sp = orig_sp - params_count;
+
+		// Save compilation context
+		var prev_it = it;
+		var prev_module = module;
+		var prev_func = this.func;
+		var prev_sig = this.sig;
+		var prev_local_base_sp = this.local_base_sp;
+		var prev_is_inlined = this.is_inlined;
+
+		// Switch to callee context
+		it = BytecodeIterator.new().reset(func);
+		this.module = module;  // Same module for intra-module calls
+		this.func = func;
+		this.sig = sig;
+		this.local_base_sp = u31.view(new_local_base_sp);
+		this.is_inlined = true;
+		inline_depth++;
+
+		// Allocate callee's non-parameter locals
+		it.dispatchLocalDecls(this);
+
+		// Compile callee's bytecode
+		if (Trace.compiler) Trace.OUT.puts("  Start inlined function body").ln();
+		while (it.more() && success) {
+			if (Trace.compiler) traceOpcodeAndStack(false);
+			last_probe = 0;
+			masm.source_loc = it.pc;
+			it.dispatch(this);
+			unrefRegs();
+			if (Debug.compiler) checkRegAlloc();
+			it.next();
+			if (skip_to_end) doSkipToEndOfBlock();
+		}
+		if (Trace.compiler) Trace.OUT.puts("  End inlined function body").ln();
+
+		// Restore caller context
+		it = prev_it;
+		this.module = prev_module;
+		this.func = prev_func;
+		this.sig = prev_sig;
+		this.local_base_sp = prev_local_base_sp;
+		this.is_inlined = prev_is_inlined;
+		inline_depth--;
+
+		// Clean up stack:
+		// Before: [..., arg0, arg1, ..., argN, local0, local1, ..., localM, result0, ..., resultK]
+		// After:  [..., result0, ..., resultK]
+
+		var total_callee_slots = state.sp - new_local_base_sp;  // All callee state
+		var slots_to_drop = total_callee_slots - results_count;
+
+		if (slots_to_drop > 0 && results_count > 0) {
+			// Need to move results down over parameters and locals
+			for (i < results_count) {
+				var result_slot = state.sp - results_count + u32.view(i);
+				var target_slot = new_local_base_sp + u32.view(i);
+				if (Trace.compiler) {
+					Trace.OUT.put3("    Moving result %d: slot %d -> slot %d", i, result_slot, target_slot).ln();
+				}
+				if (result_slot != target_slot) {
+					var rv = state.state[result_slot];
+					if (Trace.compiler) {
+						Trace.OUT.put2("      rv: flags=%x, const=%d", rv.flags, rv.const).ln();
+					}
+					if (rv.inReg()) {
+						regAlloc.reassign(rv.reg, int.!(result_slot), int.!(target_slot));
+					} else {
+						// Move in memory (rarely needed if results are in regs)
+						resolver.addMove((target_slot, rv), (result_slot, rv));
+					}
+					state.state[target_slot] = rv;
+				} else {
+					// Result already in the right place
+					if (Trace.compiler) Trace.OUT.puts("      (already in place)").ln();
+				}
+			}
+			resolver.emitMoves();
+
+			// Drop everything above results
+			for (slot = new_local_base_sp + results_count; slot < state.sp; slot++) {
+				unrefSlot(slot);
+			}
+			state.sp = new_local_base_sp + results_count;
+		} else if (slots_to_drop > 0) {
+			// No results, just drop everything
+			dropN(u32.view(slots_to_drop));
+		}
+		// If slots_to_drop <= 0, results are already in the right place
+
+		if (Trace.compiler) {
+			Trace.OUT.put1("  Inlined call complete, sp=%d", state.sp).ln();
+		}
 	}
 
 	// saves the overhead of using a runtime call by directly invoking the wasm function associated with the whamm probe
@@ -837,6 +943,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def visitCallDirect(op: Opcode, index: u31, tailCall: bool) {
 		var func = module.functions[index];
+
+		// Try inlining for intra-module, non-tail calls
+		if (!tailCall && SpcTuning.inlineRegularCalls && shouldInline(this, func)) {
+			if (Trace.compiler) {
+				Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
+			}
+			emitInlinedCall(func);
+			return;
+		}
+
+		// Existing non-inlined call path
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Load the instance (which must happen before frame is unwound).
 		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
@@ -3168,6 +3285,28 @@ class MoveNode {
 	var dstNext: MoveNode;	// next in a list of successors
 }
 
+// Determine if a regular function call should be inlined
+def shouldInline(spc: SinglePassCompiler, func: FuncDecl) -> bool {
+	// Don't inline imported functions
+	if (func.imp != null) return false;
+
+	// Don't inline if we're already inlining (prevent unbounded recursion)
+	if (spc.inline_depth >= SpcTuning.maxInlineDepth) return false;
+
+	// Don't inline recursive calls (detect caller == callee)
+	if (func == spc.func) return false;
+
+	// Check general inlining heuristic
+	var config = regularFuncCanInline(func);
+	if (!config.can_inline) return false;
+
+	// For intra-module calls, we shouldn't need instance swap
+	// (unless accessing globals/tables, which we disallow for now)
+	if (config.swap_instance) return false;
+
+	return true;
+}
+
 // checks function bytecode to see if it can be inlined based on
 // simple heuristics: length <= 50 and straightline code.
 def funcCanInline(decl: FuncDecl) -> InlineConfig {
@@ -3200,6 +3339,37 @@ def funcCanInline(decl: FuncDecl) -> InlineConfig {
 }
 
 type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
+
+// checks if a regular (non-probe) function can be inlined based on
+// simple heuristics: length <= 50 and straightline code.
+def regularFuncCanInline(decl: FuncDecl) -> InlineConfig {
+	var default = InlineConfig(false, false, false);
+	if (decl.orig_bytecode.length > SpcTuning.maxInlineBytecodeSize || decl.sig.params.length > SpcTuning.maxInlineParams) return default;
+	var bi = BytecodeIterator.new().reset(decl);
+	var swap_instance = false;
+	var swap_membase = false;
+	while (bi.more()) {
+		var op = bi.current();
+		match (op) {
+			// Cannot handle control flow yet.
+			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN => return default;
+			// These opcodes require swapping the instance.
+			THROW, CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
+			ELEM_DROP, TABLE_INIT, TABLE_SIZE, TABLE_COPY, TABLE_GROW, GLOBAL_SET, GLOBAL_GET, TABLE_SET, TABLE_GET => swap_instance = true;
+			// Load/store opcodes require either the memory base or the instance.
+			I32_STORE, I64_STORE, F32_STORE, F64_STORE, I32_STORE8, I32_STORE16, I64_STORE8, I64_STORE16, I64_STORE32,
+			V128_STORE, I32_LOAD, I64_LOAD, F32_LOAD, F64_LOAD, I32_LOAD8_S, I32_LOAD8_U, I32_LOAD16_S, I32_LOAD16_U,
+			I64_LOAD8_S, I64_LOAD8_U, I64_LOAD16_S, I64_LOAD16_U, I64_LOAD32_S, I64_LOAD32_U, V128_LOAD => {
+				var memarg = bi.immptr().read_MemArg();
+				if (memarg.memory_index == 0) swap_membase = true;
+				else swap_instance = true;
+			}
+			_ => ;
+		}
+		bi.next();
+	}
+	return InlineConfig(swap_membase, swap_instance, true);
+}
 
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
