@@ -78,7 +78,6 @@ def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
-	var it = BytecodeIterator.new();
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def config = masm.regConfig;
 	def regs = xenv;
@@ -93,10 +92,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Abstract state of the value stack
 	def state = SpcState.new(regAlloc);
 	// Other state
-	def trap_labels = Vector<(TrapReason, MasmLabel, List<InlineFrame>)>.new();
+	def trap_labels = Vector<(TrapReason, MasmLabel, Array<SpcFrame>)>.new();
+
+	// Frame state (refers to the fields in the top SpcFrame in SpcState)
+	var it = BytecodeIterator.new();
 	var module: Module;
 	var func: FuncDecl;
 	var sig: SigDecl;
+	var num_locals: int;
+	var local_base_sp: u31; // TODO could use a Range so that all offsets are from 0 again
+
 	var success = true;
 	var osr_pc: int;
 	var osr_offset: int;
@@ -109,13 +114,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
-	// when function is inlined, we continue using caller's abstract state, and
-	// push callee's params/locals as needed, thus we need to track the base sp of the locals
-	// in the current context.
-	var local_base_sp: u31 = 0;
-	var is_inlined = false;
-	var inline_depth: int = 0;		// track inlining nesting depth
-	var inline_chain: List<InlineFrame> = null;	// immutable list tracking inline call stack
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
@@ -124,6 +122,47 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	new() {
 		masm.unimplemented = unsupported;
 		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
+	}
+
+	// Manage inlined frames stack
+	def pushFrame(frame: SpcFrame) {
+		state.frame_stack.push(frame);
+		// Update cached copies from new top frame
+		it = frame.it;
+		module = frame.module;
+		func = frame.func;
+		sig = frame.sig;
+		num_locals = frame.num_locals;
+		local_base_sp = frame.local_base_sp;
+	}
+	def popFrame() -> SpcFrame {
+		var frame = state.frame_stack.pop();
+		// Restore cached copies from new top frame
+		var current = state.frame_stack.peek();
+		it = current.it;
+		module = current.module;
+		func = current.func;
+		sig = current.sig;
+		num_locals = current.num_locals;
+		local_base_sp = current.local_base_sp;
+		return frame;
+	}
+	def isInlined() -> bool {
+		return state.frame_stack.top > 1;
+	}
+	def inlineDepth() -> int {
+		return state.frame_stack.top - 1;
+	}
+	def snapshotFrames() -> Array<SpcFrame> {
+		var frames = Array<SpcFrame>.new(state.frame_stack.top);
+		for (i < state.frame_stack.top) {
+			var f = state.frame_stack.elems[i];
+			// update pc of SpcFrame to current pc in that frame
+			var pc_to_use = f.it.pc; 
+			frames[i] = SpcFrame.new(f.func, f.sig, f.module, null,
+				f.local_base_sp, f.ctl_base_sp, f.num_locals, pc_to_use);
+		}
+		return frames;
 	}
 
 	def gen(module: Module, func: FuncDecl, err: ErrorGen) -> bool {
@@ -143,10 +182,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var before_data_bytes = masm.curDataBytes();
 
 		// Reset internal state.
-		this.module = module;
-		this.func = func;
-		it.reset(func);
-		sig = func.sig;
 		regAlloc.clear();
 		trap_labels.resize(0);
 		success = true;
@@ -157,8 +192,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
-		state.reset(sig, end_label);
-		state.num_locals = func.num_slots();
+		state.reset(func.sig, end_label);
+
+		// Push initial frame for top-level function
+		state.frame_stack.clear();
+		it.reset(func);  // Reset iterator before creating frame
+		var initial_frame = SpcFrame.new(func, func.sig, module, it, 0, 0, func.num_slots(), 0);
+		pushFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
@@ -199,13 +239,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var e = trap_labels[i];
 			var reason = e.0;
 			var label = e.1;
-			var chain = e.2;
+			var frames = e.2;
 
 			masm.bindLabel(label);
 
 			// If trap occurred in inlined function, reconstruct frames
-			if (chain != null && chain.tail != null) {
-				emitReconstructStackFrames(chain, reason);
+			if (frames.length > 1) {
+				emitReconstructStackFrames(frames, reason);
 			} else {
 				// otherwise, put pc as before
 				masm.emit_mov_m_i(xenv.pc_slot, label.create_pos);
@@ -475,8 +515,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 
 	// Emit code for an inlined regular function call
-	def emitInlinedCall(func: FuncDecl) {
-		var sig = func.sig;
+	def emitInlinedCall(callee_func: FuncDecl) {
+		var sig = callee_func.sig;
 		var params_count = u32.view(sig.params.length);
 		var results_count = u32.view(sig.results.length);
 		var orig_sp = state.sp;
@@ -484,29 +524,20 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Arguments are already on stack
 		// Stack: [..., arg0, arg1, ..., argN] <- sp
 		// We want callee's local 0 = arg0, so:
-		var new_local_base_sp = orig_sp - params_count;
+		var new_local_base_sp = u31.view(orig_sp - params_count);
+		var new_ctl_base_sp = u31.view(state.ctl_stack.top);
 
-		// Save compilation context
-		var prev_it = it;
-		var prev_module = module;
-		var prev_func = this.func;
-		var prev_sig = this.sig;
-		var prev_local_base_sp = this.local_base_sp;
-		var prev_is_inlined = this.is_inlined;
-		var prev_inline_chain = inline_chain;
+		// Create and push frame for inlined function
+		var callee_frame = SpcFrame.new(callee_func, sig, module,
+				BytecodeIterator.new().reset(callee_func),
+				new_local_base_sp, new_ctl_base_sp,
+				callee_func.num_slots(),
+				0); // start at pc=0
 
-		// Push current frame onto inline chain
-		inline_chain = List.new(InlineFrame(this.func, it.pc), inline_chain);
+		if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", callee_func.func_index, callee_func.cur_bytecode.length).ln();
 		if (Trace.compiler) Trace.OUT.put1("it.pc: %d\n", it.pc);
 
-		// Switch to callee context
-		it = BytecodeIterator.new().reset(func);
-		this.module = module;  // Same module for intra-module calls
-		this.func = func;
-		this.sig = sig;
-		this.local_base_sp = u31.view(new_local_base_sp);
-		this.is_inlined = true;
-		inline_depth++;
+		pushFrame(callee_frame);  // Updates cached fields
 
 		// Allocate callee's non-parameter locals
 		it.dispatchLocalDecls(this);
@@ -528,15 +559,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Check if the inlined function is unreachable (e.g., ended with UNREACHABLE, RETURN, THROW)
 		var inlined_reachable = state.ctl_stack.peek().reachable;
 
-		// Restore caller context
-		it = prev_it;
-		this.module = prev_module;
-		this.func = prev_func;
-		this.sig = prev_sig;
-		this.local_base_sp = prev_local_base_sp;
-		this.is_inlined = prev_is_inlined;
-		inline_chain = prev_inline_chain;
-		inline_depth--;
+		// Restore caller context by popping frame
+		popFrame();  // Automatically restores cached fields
+
+		// Clean up control stack entries from inlined function
+		while (state.ctl_stack.top > new_ctl_base_sp) {
+			state.ctl_stack.pop();
+		}
 
 		// If inlined function is unreachable, no results to clean up
 		if (!inlined_reachable) {
@@ -785,10 +814,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			this.module = whamm_module;
 			this.func = whamm_func_decl;
 			this.sig = whamm_func_decl.sig;
+			this.num_locals = whamm_func_decl.num_slots();
 
 			// inline codegen
 			it.dispatchLocalDecls(this);
-			this.is_inlined = true;
 			if (Trace.compiler) Trace.OUT.puts("Start compiling inlined whamm probe").ln();
 			while (it.more() && success) {
 				if (Trace.compiler) traceOpcodeAndStack(false);
@@ -810,10 +839,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			// restore spc after inlining
 			it  = prev_it;
 			this.local_base_sp = 0;
-			this.is_inlined = false;
 			this.module = orig_module;
 			this.func = it.func;
 			this.sig = it.func.sig;
+			this.num_locals = it.func.num_slots();
 			masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
 
 			// clear callee params/locals from abstract state
@@ -913,7 +942,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
-		if (!this.is_inlined) {
+		if (!isInlined()) {
 			var ctl_top = state.ctl_stack.peek();
 			if (ctl_top.opcode == Opcode.LOOP.code) {
 				state.ctl_stack.pop();
@@ -2209,25 +2238,22 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_ret();
 	}
 	def getTrapStubIp(reason: TrapReason) -> long;
-	def emitReconstructStackFrames(chain: List<InlineFrame>, reason: TrapReason) {
+	def emitReconstructStackFrames(frames: Array<SpcFrame>, reason: TrapReason) {
 		// Emit code to materialize stack frames for each inlined function.
 		// This allows the trap handler to see the full call stack including inlined calls.
 		//
-		// The chain contains a list of functions that have been inlined but
-		// also including the original function at the end, with its pc
-		// referring to the point of the initial inline.
-		def inline_funcs = Lists.toArray(chain);
+		// The frames array is in the same order as frame_stack: outermost first, innermost last.
 
-		def real_frame = inline_funcs[inline_funcs.length - 1];
+		def real_frame = frames[0];
 		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
 		// Get trap stub IP to use as return address for reconstructed frames
 		// This ensures accessor.pc() reads PC from frame.pc_slot instead of calling lookupPc()
 		var stub_ip = getTrapStubIp(reason);
 
-		// Process only the inlined frames (skip the outermost which already exists)
-		for (i = inline_funcs.length - 2; i >= 0; i--) {
-			var frame_info = inline_funcs[i];
+		// Process the inlined frames (skip the outermost which already exists on native stack)
+		for (i = 1; i < frames.length; i++) {
+			var frame_info = frames[i];
 
 			// Load instance from the previous frame
 			masm.emit_mov_r_m(ValueKind.REF, regs.instance, frame.instance_slot);
@@ -2264,9 +2290,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def newTrapLabel(reason: TrapReason) -> MasmLabel {
 		var label = masm.newLabel(it.pc);
-		// Capture current inline chain + current function/PC
-		var chain = List.new(InlineFrame(this.func, it.pc), inline_chain);
-		trap_labels.put((reason, label, chain));
+		// Snapshot frame_stack for trap reconstruction
+		var frames = snapshotFrames();
+		trap_labels.put((reason, label, frames));
 		return label;
 	}
 	def unsupported() {
@@ -2363,7 +2389,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
-			if (is_inlined) {
+			if (isInlined()) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
 			} else {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
@@ -2371,7 +2397,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emit_load_instance(reg: Reg) {
-		if (is_inlined) { // inline compilation
+		if (isInlined()) { // inline compilation
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
 		} else {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.instance_slot);
@@ -2800,6 +2826,20 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	}
 }
 
+// A frame in the compilation frame stack (for inlining).
+class SpcFrame {
+	var func: FuncDecl;
+	var sig: SigDecl;
+	var module: Module;
+	var it: BytecodeIterator;
+	var local_base_sp: u31;  // Base index into SpcState.state
+	var ctl_base_sp: u31;    // Base index into SpcState.ctl_stack
+	var num_locals: int;
+	var pc: int;   // XXX pc only initialized during snapshots
+
+	new(func, sig, module, it, local_base_sp, ctl_base_sp, num_locals, pc) {}
+}
+
 // An entry in the abstract control stack.
 class SpcControl {
 	var opcode: u16;
@@ -2837,11 +2877,12 @@ def trueToOne(z: bool) -> int { return if(z, 1, 0); }
 
 // Contains both the abstract control and abstract value stack.
 class SpcState(regAlloc: RegAlloc) {
-	// Abstract state of the value stack
+	// Abstract state of the value stack (shared across frames)
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
 	var sp: u32;
 	var ctl_stack = ArrayStack<SpcControl>.new();
-	var num_locals: int;
+	// Frame management (for inlining)
+	var frame_stack = ArrayStack<SpcFrame>.new();
 
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
@@ -2890,12 +2931,14 @@ class SpcState(regAlloc: RegAlloc) {
 		target.merge_count = 1;
 		var valcount = u32.view(target.params.length);
 		var popcount = 0u;
+		var num_locals = frame_stack.peek().num_locals;
 		target.merge_state = doFirstTransferAndGetMerge(valcount, popcount, resolver);
 		resolver.emitMoves();
-		if (Trace.compiler) trace0("    loop merge = ", target.merge_state, target.merge_state.length);
+		if (Trace.compiler) trace0("    loop merge = ", target.merge_state, target.merge_state.length, num_locals);
 		resetTo(sp, target.merge_state);
 	}
 	def doFirstTransferAndGetMerge(valcount: u32, popcount: u32, resolver: SpcMoveResolver) -> Array<SpcVal> {
+		var num_locals = frame_stack.peek().num_locals;
 		return SpcMerger.new(state, num_locals, sp, regAlloc, resolver).createMerge(valcount, popcount);
 	}
 	// Get a merge that contains the current stack up to {val_stack_top} plus {args}, all stored in memory.
@@ -2961,8 +3004,9 @@ class SpcState(regAlloc: RegAlloc) {
 		if (target.merge_count == 0) {
 			target.merge_count = 1;
 			var popcount = sp - valcount - target.val_stack_top;
+			var num_locals = frame_stack.peek().num_locals;
 			target.merge_state = doFirstTransferAndGetMerge(valcount, popcount, resolver);
-			if (Trace.compiler) trace0("    merge = ", target.merge_state, target.merge_state.length);
+			if (Trace.compiler) trace0("    merge = ", target.merge_state, target.merge_state.length, num_locals);
 		} else {
 			target.merge_count = 2;
 			// XXX: allow matching constants in merges
@@ -3099,9 +3143,10 @@ class SpcState(regAlloc: RegAlloc) {
 		state = Arrays.grow(state, nlength);
 	}
 	def trace() {
-		trace0("", state, int.!(sp));
+		var num_locals = frame_stack.peek().num_locals;
+		trace0("", state, int.!(sp), num_locals);
 	}
-	def trace0(str: string, vals: Array<SpcVal>, sp: int) {
+	def trace0(str: string, vals: Array<SpcVal>, sp: int, num_locals: int) {
 		OUT.puts(str);
 		OUT.puts("|");
 		for (i < num_locals) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
@@ -3384,7 +3429,7 @@ def shouldInline(spc: SinglePassCompiler, func: FuncDecl) -> bool {
 	if (func.imp != null) return false;
 
 	// Don't inline if we're already inlining (prevent unbounded recursion)
-	if (spc.inline_depth >= SpcTuning.maxInlineDepth) return false;
+	if (spc.inlineDepth() >= SpcTuning.maxInlineDepth) return false;
 
 	// Don't inline recursive calls (detect caller == callee)
 	if (func == spc.func) return false;
@@ -3463,9 +3508,6 @@ def regularFuncCanInline(decl: FuncDecl) -> InlineConfig {
 	}
 	return InlineConfig(swap_membase, swap_instance, true);
 }
-
-// Represents a frame in the inline call chain - records which function made an inlined call and at what PC
-type InlineFrame(func: FuncDecl, pc: int);
 
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
