@@ -245,7 +245,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			// If trap occurred in inlined function, reconstruct frames
 			if (frames.length > 1) {
-				emitReconstructStackFrames(frames, reason);
+				emitReconstructStackFrames(frames, true, reason);
 			} else {
 				// otherwise, put pc as before
 				masm.emit_mov_m_i(xenv.pc_slot, label.create_pos);
@@ -533,9 +533,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				new_local_base_sp, new_ctl_base_sp,
 				callee_func.num_slots(),
 				0); // start at pc=0
-
-		if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", callee_func.func_index, callee_func.cur_bytecode.length).ln();
-		if (Trace.compiler) Trace.OUT.put1("it.pc: %d\n", it.pc);
 
 		pushFrame(callee_frame);  // Updates cached fields
 
@@ -1012,12 +1009,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Try inlining for intra-module, non-tail calls
 		if (!tailCall && SpcTuning.inlineRegularCalls && shouldInline(this, func)) {
-			if (Trace.compiler) {
-				Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
-			}
+			if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
 			emitInlinedCall(func);
 			return;
 		}
+		// Reconstruct inlined frames before the call (for accurate stack traces)
+		var reconstructed_space = 0;
+		if (isInlined()) {
+			var frames = snapshotFrames();
+			reconstructed_space = emitReconstructStackFrames(frames, false, TrapReason.NONE);
+		}
+
+
 
 		// Existing non-inlined call path
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
@@ -1032,12 +1035,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, func.func_index);
 
 		emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, tailCall);
+
+		// Clean up reconstructed frames after the call returns
+		if (reconstructed_space > 0) {
+			masm.emit_addw_r_i(regs.sp, reconstructed_space);
+		}
+
 	}
 	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, tailCall: bool) {
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Handle the current stack state.
 		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
 		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
+
 
 		// Compute the value stack pointer.
 		emit_compute_vsp(vsp_reg, state.sp);
@@ -1061,12 +1071,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_jump_r(tmp);
 			setUnreachable();
 		} else {
+
 			masm.emit_call_r(tmp);
 			masm.bindLabel(retpt);
+
 			emit_reload_regs();
 			state.popArgsAndPushResults(sig);
 		}
 	}
+	// TODO this is basically the same logic as "returning" from an inlined function definition
+	// - don't adjust frame
 	def emitMoveTailCallArgs(sig: SigDecl) {
 		var p = sig.params, count = u32.!(p.length);
 		var base = state.sp - count;
@@ -2238,55 +2252,72 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_ret();
 	}
 	def getTrapStubIp(reason: TrapReason) -> long;
-	def emitReconstructStackFrames(frames: Array<SpcFrame>, reason: TrapReason) {
+	// Reconstruct stack frames for inlined functions.
+	// For traps: pass reason and forTrap=true, returns 0 (no cleanup needed)
+	// For out-calls: pass forTrap=false, returns stack space used (must be cleaned up after call)
+	def emitReconstructStackFrames(frames: Array<SpcFrame>, forTrap: bool, reason: TrapReason) -> int {
 		// Emit code to materialize stack frames for each inlined function.
-		// This allows the trap handler to see the full call stack including inlined calls.
-		//
 		// The frames array is in the same order as frame_stack: outermost first, innermost last.
 
 		def real_frame = frames[0];
 		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
-		// Get trap stub IP to use as return address for reconstructed frames
-		// This ensures accessor.pc() reads PC from frame.pc_slot instead of calling lookupPc()
-		var stub_ip = getTrapStubIp(reason);
+		// Determine return address based on context
+		var return_addr = if(forTrap, getTrapStubIp(reason), 0L);
+		var total_space = 0;
+
+		// load instance (same among all inlined calls)
+		var inst_reg = allocTmp(ValueKind.REF);
+		emit_load_instance(inst_reg);
+		var mem_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
+		// Load instance.functions
+		def func_reg = allocTmp(ValueKind.REF);
+		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
+		// use same vfp for all frames
+		def vfp_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
 
 		// Process the inlined frames (skip the outermost which already exists on native stack)
 		for (i = 1; i < frames.length; i++) {
 			var frame_info = frames[i];
 
-			// Load instance from the previous frame
-			masm.emit_mov_r_m(ValueKind.REF, regs.instance, frame.instance_slot);
-
-			// Load instance.functions and then functions[func_index] into regs.func_arg
-			masm.emit_v3_Instance_functions_r_r(regs.scratch, regs.instance);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.func_arg, regs.scratch, frame_info.func.func_index);
-
-			// Push trap stub address as return address
+			// Push return address
 			masm.emit_subw_r_i(regs.sp, 8);
-			masm.emit_mov_m_l(MasmAddr(regs.sp, 0), stub_ip);
+			if (return_addr == 0) {
+				masm.emit_mov_r_m(ValueKind.REF, regs.scratch, MasmAddr(regs.sp, frame.frameSize + 8));
+				masm.emit_mov_m_r(ValueKind.REF, MasmAddr(regs.sp, 0), regs.scratch);
+			} else {
+				masm.emit_mov_m_l(MasmAddr(regs.sp, 0), return_addr);
+			}
+			total_space += 8;
 
 			// Allocate concrete stack frame for inlined function
 			masm.emit_subw_r_i(regs.sp, frame.frameSize);
+			total_space += frame.frameSize;
 
-			// Save WasmFunction to frame.wasm_func_slot
-			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
+			// get functions[func_index] into regs.func_arg and save into frame
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, frame_info.func.func_index);
+			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, func_reg);
 
 			// Save instance to frame.instance_slot
-			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
+			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, inst_reg);
+
+			// Save mem0 base
+			masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, mem_reg);
+
+			// use same vfp for all frames
+			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, vfp_reg);
 
 			// Save PC to frame.pc_slot
-			masm.emit_mov_m_i(frame.pc_slot, frame_info.pc);
+			masm.emit_mov_m_i(frame.pc_slot, frame_info.pc); // exact pc of each frame
 
-			// Clear FrameAccessor and inlined_instance_slot (?)
+			// Clear FrameAccessor and inlined_instance_slot
 			masm.emit_mov_m_l(frame.accessor_slot, 0);
 			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
 		}
 
-		// XXX some frame slots are not set:
-		// - vsp_slot
-		// - vfp_slot
-		// - mem0_base_slot
+		return if(forTrap, 0, total_space);
 	}
 	def newTrapLabel(reason: TrapReason) -> MasmLabel {
 		var label = masm.newLabel(it.pc);
@@ -2389,19 +2420,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
-			if (isInlined()) {
-				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
-			} else {
+			// if (isInlined()) {
+				// masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
+			// } else {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
-			}
+			// }
 		}
 	}
 	def emit_load_instance(reg: Reg) {
-		if (isInlined()) { // inline compilation
-			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
-		} else {
+// 		if (isInlined()) { // inline compilation
+// 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
+// 		} else {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.instance_slot);
-		}
+		// }
 	}
 	def emitLoad(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ())  {
 		var iv = pop();
@@ -3425,23 +3456,43 @@ class MoveNode {
 
 // Determine if a regular function call should be inlined
 def shouldInline(spc: SinglePassCompiler, func: FuncDecl) -> bool {
+	if (Trace.compiler) OUT.put1("deciding on inlining call to func #%d: ", func.func_index);
+
 	// Don't inline imported functions
-	if (func.imp != null) return false;
+	if (func.imp != null) {
+		if (Trace.compiler) OUT.puts("NO (imported)\n");
+		return false;
+	}
 
 	// Don't inline if we're already inlining (prevent unbounded recursion)
-	if (spc.inlineDepth() >= SpcTuning.maxInlineDepth) return false;
+	if (spc.inlineDepth() >= SpcTuning.maxInlineDepth) {
+		if (Trace.compiler) OUT.puts("NO (max inline depth exceeded)\n");
+		return false;
+	}
 
 	// Don't inline recursive calls (detect caller == callee)
-	if (func == spc.func) return false;
+	if (func == spc.func) {
+		if (Trace.compiler) OUT.puts("NO (recursive)\n");
+		return false;
+	}
+
 
 	// Check general inlining heuristic
 	var config = regularFuncCanInline(func);
-	if (!config.can_inline) return false;
+	if (!config.can_inline) {
+		if (Trace.compiler) OUT.puts("NO (failed heuristic)\n");
+		return false;
+	}
 
 	// For intra-module calls, we shouldn't need instance swap
 	// (unless accessing globals/tables, which we disallow for now)
-	if (config.swap_instance) return false;
+	if (config.swap_instance) {
+		if (Trace.compiler) OUT.puts("NO (requires swap of instance)\n");
+		return false;
+	}
 
+
+	if (Trace.compiler) OUT.puts("YES\n");
 	return true;
 }
 
@@ -3490,10 +3541,17 @@ def regularFuncCanInline(decl: FuncDecl) -> InlineConfig {
 		var op = bi.current();
 		match (op) {
 			// Cannot handle control flow yet.
-			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN => return default;
-			// These opcodes require swapping the instance.
-			THROW, CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
-			ELEM_DROP, TABLE_INIT, TABLE_SIZE, TABLE_COPY, TABLE_GROW, GLOBAL_SET, GLOBAL_GET, TABLE_SET, TABLE_GET => swap_instance = true;
+			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => return default;
+			// Cannot handle exception handling instructions.
+			TRY, CATCH, THROW, RETHROW, THROW_REF, DELEGATE, CATCH_ALL, TRY_TABLE => return default;
+			// Cannot handle GC instructions.
+			STRUCT_NEW, STRUCT_NEW_DEFAULT, STRUCT_GET, STRUCT_GET_S, STRUCT_GET_U, STRUCT_SET,
+			ARRAY_NEW, ARRAY_NEW_DEFAULT, ARRAY_NEW_FIXED, ARRAY_NEW_DATA, ARRAY_NEW_ELEM,
+			ARRAY_GET, ARRAY_GET_S, ARRAY_GET_U, ARRAY_SET, ARRAY_LEN, ARRAY_FILL, ARRAY_COPY, ARRAY_INIT_DATA, ARRAY_INIT_ELEM,
+			REF_TEST, REF_TEST_NULL, REF_CAST, REF_CAST_NULL,
+			ANY_CONVERT_EXTERN, EXTERN_CONVERT_ANY, REF_I31, I31_GET_S, I31_GET_U => return default;
+			// Cannot handle stack switching instructions.
+			CONT_NEW, CONT_BIND, SUSPEND, RESUME, RESUME_THROW, RESUME_THROW_REF, SWITCH => return default;
 			// Load/store opcodes require either the memory base or the instance.
 			I32_STORE, I64_STORE, F32_STORE, F64_STORE, I32_STORE8, I32_STORE16, I64_STORE8, I64_STORE16, I64_STORE32,
 			V128_STORE, I32_LOAD, I64_LOAD, F32_LOAD, F64_LOAD, I32_LOAD8_S, I32_LOAD8_U, I32_LOAD16_S, I32_LOAD16_U,
