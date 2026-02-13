@@ -1,0 +1,185 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Represents a compressed frame.
+// {ret_addr} is a pointer into the code of {func}.
+// TODO: make it more compact
+type CompressedFrame(func: WasmFunction, pc: int, n_vals: int, ret_addr: Pointer) #unboxed {
+
+	// {value_slice} should start at the value index of this frame.
+	def render(buf: StringBuilder, value_slice: Range<Value>) -> StringBuilder {
+		// Frame header.
+		buf.put3(
+			"  Frame(func=%q, pc=%d, retip=0x%x):",
+			func.decl.render(null, _), pc, ret_addr - Pointer.NULL
+		).ln();
+		buf.put1("  Values(count=%d):", n_vals).ln();
+
+		// Frame values.
+		if (n_vals > 0) {
+			buf.puts("    ");
+			for (j < n_vals) buf.put1("%q ", Values.render(value_slice[j], _));
+		}
+
+		return buf;
+	}
+}
+
+component X86_64Compression {
+	def collector = StackFrameCollector.new();
+	def builder = CompressedStackBuilder.new();
+
+	def compress(stack: X86_64Stack) -> X86_64CompressedStack {
+		if (Debug.compression) {
+			Trace.OUT.put1(
+				"Compressing X86-64Stack @ 0x%x", Pointer.atObject(stack) - Pointer.NULL
+			).ln();
+			Trace.OUT.put1("Stack info:\n%q", renderStackBounds(stack, _)).ln();
+		}
+
+		collector.reset();
+		stack.walk<void>(collector.visitFrame, void, stack.rsp, false);
+		for (i = collector.frames.length - 1; i >= 0; i--) builder.addFrame(collector.frames[i]);
+
+		var compressed = X86_64CompressedStack.new();
+		builder.build(compressed);
+		if (Debug.compression) compressed.render(Trace.OUT);
+		return compressed;
+	}
+
+	def decompress(to: X86_64Stack, from: X86_64CompressedStack) {
+		if (from.numFrames() == 0) return; // TODO: empty stack behavior?
+		if (Debug.compression) Trace.OUT.put1(
+			"Decompressing into X86-64Stack @ 0x%x", Pointer.atObject(to) - Pointer.NULL
+		).ln();
+
+		to.clear();
+		to.rsp += Pointer.SIZE; // Pop the enter-func-stub off (only needed for first entry).
+		var root_func = from.frames[0].func;
+		var instance = root_func.instance;
+		to.reset(instance.functions[root_func.decl.func_index]);
+		if (Debug.compression) Trace.OUT.put1(
+			"  Root function: %q", root_func.decl.render(null, _)
+		).ln();
+
+		var val_offset = 0;
+		for (frame_index < from.numFrames()) {
+			var f = from.frames[frame_index];
+			var map = SidetableMap.new(f.func.decl);
+			var stp = map[f.pc];
+			if (Debug.compression) Trace.OUT.put1("%q", f.render(_, from.values[val_offset...])).ln();
+
+			// Allocate interpreter stack frame.
+			to.rsp += -X86_64InterpreterFrame.size;
+			setFrameContext(to.rsp, f.func);
+			setNewProgramLocation(to.rsp, f.func.decl, f.pc, stp);
+
+			// Load values.
+			(to.rsp + X86_64InterpreterFrame.vfp.offset).store<Pointer>(to.vsp); // Store %vfp.
+			for (i < f.n_vals) to.push(from.values[val_offset + i]);
+			(to.rsp + X86_64InterpreterFrame.vsp.offset).store<Pointer>(to.vsp); // Store %vsp.
+
+			// Store recorded machine address as retip.
+			to.rsp += -Pointer.SIZE;
+			to.rsp.store<Pointer>(f.ret_addr);
+
+			val_offset += f.n_vals;
+		}
+
+		if (Debug.compression) Trace.OUT.put1("Stack info:\n%q", renderStackBounds(to, _)).ln();
+	}
+
+	private def renderStackBounds(stack: X86_64Stack, buf: StringBuilder) -> StringBuilder {
+		buf.put1("  vsp: 0x%x", stack.vsp - Pointer.NULL).ln();
+		buf.put1("  rsp: 0x%x", stack.rsp - Pointer.NULL).ln();
+		return buf;
+	}
+
+	def setFrameContext(sp: Pointer, wf: WasmFunction) {
+		var module = wf.instance.module;
+		(sp + X86_64InterpreterFrame.wasm_func.offset).store<WasmFunction>(wf);
+		(sp + X86_64InterpreterFrame.instance.offset).store<Instance>(wf.instance);
+		(sp + X86_64InterpreterFrame.sidetable.offset).store<Array<int>>(wf.decl.sidetable.entries);
+
+		// Load instance.memories[0].start into MEM0_BASE
+		if (module.memories.length > 0) {
+			var memory = NativeWasmMemory.!(wf.instance.memories[0]);
+			(sp + X86_64InterpreterFrame.mem0_base.offset).store<Pointer>(memory.start);
+		}
+	}
+
+	// XXX: merge with functionality in FrameAccessor
+	// TODO: forgeRange
+	def setNewProgramLocation(sp: Pointer, func: FuncDecl, pc: int, stp: int) {
+		var code = func.cur_bytecode;
+		(sp + X86_64InterpreterFrame.func_decl.offset)	.store<FuncDecl>(func);
+		(sp + X86_64InterpreterFrame.curpc.offset)	.store<int>(pc);
+		(sp + X86_64InterpreterFrame.code.offset)	.store<Array<byte>>(code);
+		(sp + X86_64InterpreterFrame.ip.offset)		.store<Pointer>(Pointer.atElement(code, pc));
+		(sp + X86_64InterpreterFrame.eip.offset)	.store<Pointer>(Pointer.atContents(code) + code.length);
+		var st_entries = func.sidetable.entries;
+		var st_ptr = if(stp == st_entries.length, Pointer.atContents(st_entries), Pointer.atElement(func.sidetable.entries, stp));
+		(sp + X86_64InterpreterFrame.stp.offset)	.store<Pointer>(st_ptr);
+	}
+}
+
+// Class for collecting and organizing the frames of a {X86_64Stack} during its
+// compression by walking its stack frames.
+// XXX: merge with CompressedStackBuilder
+class StackFrameCollector {
+	def frames = Vector<TargetFrame>.new();
+
+	def reset() { frames.clear(); }
+	def visitFrame(p: Pointer, c: RiUserCode, pos: StackFramePos, v: void) -> bool {
+		if (X86_64InterpreterCode.?(c) || X86_64SpcModuleCode.?(c)) frames.put(pos.frame);
+		return true;
+	}
+}
+
+class CompressedStackBuilder {
+	def frames = Vector<CompressedFrame>.new();
+	def values = Vector<Value>.new();
+
+	def addFrame(frame: TargetFrame) {
+		var accessor = frame.getFrameAccessor();
+		var func = accessor.func();
+		var pc = accessor.pc();
+
+		var n_locals = accessor.numLocals();
+		var n_operands = accessor.numOperands();
+		var n_vals = n_locals + n_operands;
+
+		// XXX: a neater way to access ret_addr pointer?
+		var ret_addr = (frame.sp + (-Pointer.SIZE)).load<Pointer>();
+
+		frames.put(CompressedFrame(func, pc, n_vals, ret_addr));
+		for (i < n_locals) values.put(accessor.getLocal(i));
+		for (i < n_operands) values.put(accessor.getOperand(i - n_operands + 1));
+	}
+
+	def build(to: X86_64CompressedStack) {
+		to.frames = frames.extract();
+		to.values = values.extract();
+	}
+}
+
+// Representation of a compressed stack containing an array of CompressedFrame,
+// with the semantics:
+// type CompressedFrame(func: FuncDecl, pc: int, stp: int, values: Array<Value>)
+class X86_64CompressedStack extends WasmStack {
+	var frames: Array<CompressedFrame>;
+	var values: Array<Value>;
+
+	def numFrames() -> int { return frames.length; }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("CompressedStack(n_frames=%d):", frames.length).ln();
+		var val_offset = 0;
+		for (i < frames.length) {
+			var f = frames[i];
+			buf.put1("%q", f.render(_, values[val_offset...])).ln();
+			val_offset += f.n_vals;
+		}
+		return buf;
+	}
+}
