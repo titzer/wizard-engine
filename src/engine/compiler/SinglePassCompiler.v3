@@ -1,6 +1,14 @@
 // Copyright 2022 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+// Inlining TODO
+// - add control flow
+// - monitors!
+// - fix/merge whamm inlining logic
+// - benchmark inlining improvements
+// - handle OSR/dynamic tier-up
+// - tier down?
+
 // Describes the register and frame configuration for the single-pass compiler.
 class SpcExecEnv {
 	// Frame information.
@@ -528,6 +536,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var new_local_base_sp = u31.view(orig_sp - params_count);
 		var new_ctl_base_sp = u31.view(state.ctl_stack.top);
 
+		// Push an implicit block for the head of the function
+		var end_label = masm.newLabel(callee_func.cur_bytecode.length);
+		state.pushBlock(sig.params, sig.results, end_label);
+
 		// Create and push frame for inlined function
 		var callee_frame = SpcFrame.new(callee_func, sig, module,
 				BytecodeIterator.new().reset(callee_func),
@@ -579,10 +591,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Restore caller context by popping frame
 		popFrame();  // Automatically restores cached fields
 
-		// Clean up control stack entries from inlined function
-		while (state.ctl_stack.top > new_ctl_base_sp) {
-			state.ctl_stack.pop();
-		}
+		// Note: Control stack cleanup (popping implicit BLOCK) is handled by visit_END
 
 		// If inlined function is unreachable, no results to clean up
 		if (!inlined_reachable) {
@@ -959,37 +968,38 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
-		if (!isInlined()) {
-			var ctl_top = state.ctl_stack.peek();
-			if (ctl_top.opcode == Opcode.LOOP.code) {
-				state.ctl_stack.pop();
-				if (!ctl_top.reachable) setUnreachable();
-			} else if (ctl_top.opcode == Opcode.IF.code) {
-				// simulate empty if-true block
-				state.emitFallthru(resolver);
-				masm.emit_br(ctl_top.label);
-				masm.bindLabel(ctl_top.else_label);
-				state.doElse();
-				ctl_top.opcode = Opcode.ELSE.code;
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				state.ctl_stack.pop();
-			} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				state.ctl_stack.pop();
-			} else if (ctl_top.opcode == Opcode.RETURN.code) {
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				emitProbe();
-				if (ctl_top.merge_count > 1) emitReturn(ctl_top);
-				state.ctl_stack.pop();
-			}
+		var frame = state.frame_stack.peek();
+		var is_implicit_function_block = isInlined() && state.ctl_stack.top == frame.ctl_base_sp + 1;
+
+		var ctl_top = state.ctl_stack.peek();
+		if (ctl_top.opcode == Opcode.LOOP.code) {
+			state.ctl_stack.pop();
+			if (!ctl_top.reachable) setUnreachable();
+		} else if (ctl_top.opcode == Opcode.IF.code) {
+			// simulate empty if-true block
+			state.emitFallthru(resolver);
+			masm.emit_br(ctl_top.label);
+			masm.bindLabel(ctl_top.else_label);
+			state.doElse();
+			ctl_top.opcode = Opcode.ELSE.code;
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.RETURN.code) {
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
 			emitProbe();
+			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+			state.ctl_stack.pop();
 		}
+		emitProbe();
 	}
 	def visit_BR(depth: u31) {
 		var target = state.getControl(depth);
@@ -2297,6 +2307,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// use same vfp for all frames
 		def vfp_reg = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
+		var wasm_func_reg = allocTmp(ValueKind.REF);
 
 		// Process the inlined frames (skip the outermost which already exists on native stack)
 		for (i = 1; i < frames.length; i++) {
@@ -2311,9 +2322,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_subw_r_i(regs.sp, frame.frameSize);
 			total_space += frame.frameSize;
 
-			// get functions[func_index] into regs.func_arg and save into frame
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, frame_info.func.func_index);
-			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, func_reg);
+			// get functions[func_index] and save into frame
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, wasm_func_reg, func_reg, frame_info.func.func_index);
+			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, wasm_func_reg);
 
 			// Save instance to frame.instance_slot
 			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, inst_reg);
@@ -3195,9 +3206,11 @@ class SpcState(regAlloc: RegAlloc) {
 	def trace0(str: string, vals: Array<SpcVal>, sp: int, num_locals: int) {
 		OUT.puts(str);
 		OUT.puts("|");
-		for (i < num_locals) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
+		// Don't assume vals.length >= num_locals (e.g., for implicit function blocks in inlined functions)
+		var trace_limit = if(num_locals < vals.length, num_locals, vals.length);
+		for (i < trace_limit) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
 		OUT.puts("  |");
-		for (i = num_locals; i < sp; i++) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
+		for (i = num_locals; i < sp && i < vals.length; i++) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
 		OUT.ln();
 	}
 }
@@ -3545,7 +3558,9 @@ def regularFuncCanInline(decl: FuncDecl) -> InlineConfig {
 		var op = bi.current();
 		match (op) {
 			// Cannot handle control flow yet.
-			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => return default;
+			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL => ;
+			// Do not support return-like instructions
+			RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => return default;
 			// Cannot handle exception handling instructions.
 			TRY, CATCH, THROW, RETHROW, THROW_REF, DELEGATE, CATCH_ALL, TRY_TABLE => return default;
 			// Cannot handle GC instructions.
