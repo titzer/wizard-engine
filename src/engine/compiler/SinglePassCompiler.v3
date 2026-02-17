@@ -119,6 +119,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var ret_label: MasmLabel;
 	var last_probe = 0;
 	var skip_to_end: bool;
+	var is_whamm_inlined: bool;  // compiling an inlined Whamm probe?
+	var whamm_probe_ctl_base: u31; // ctl_stack.top when Whamm probe compilation started
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -847,7 +849,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var whamm_func_decl = callee_func.decl;
 		if (inline_config.can_inline) {
 			var prev_it = it;
-			it = BytecodeIterator.new().reset(whamm_func_decl);
+			var whamm_it = BytecodeIterator.new().reset(whamm_func_decl);
+			it = whamm_it;
 			var orig_module = module;
 
 			// prepare spc for inlining
@@ -856,15 +859,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			this.func = whamm_func_decl;
 			this.sig = whamm_func_decl.sig;
 			this.num_locals = whamm_func_decl.num_slots();
+			this.is_whamm_inlined = true;
 
 			// inline codegen
 			it.dispatchLocalDecls(this);
+			this.whamm_probe_ctl_base = u31.view(state.ctl_stack.top);
 			if (Trace.compiler) Trace.OUT.puts("Start compiling inlined whamm probe").ln();
 			while (it.more() && success) {
 				if (Trace.compiler) traceOpcodeAndStack(false);
 				last_probe = 0;
 				masm.source_loc = it.pc;
 				it.dispatch(this);
+				it = whamm_it;
 				if (Trace.compiler && Trace.asm) {
 					OUT.puts("JIT code: ");
 					masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
@@ -884,6 +890,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			this.func = it.func;
 			this.sig = it.func.sig;
 			this.num_locals = it.func.num_slots();
+			this.is_whamm_inlined = false;
 			masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
 
 			// clear callee params/locals from abstract state
@@ -983,6 +990,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
+		if (is_whamm_inlined && state.ctl_stack.top == whamm_probe_ctl_base) return;
+
 		var frame = state.frame_stack.peek();
 		var is_implicit_function_block = isInlined() && state.ctl_stack.top == frame.ctl_base_sp + 1;
 
@@ -1058,9 +1067,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			emitInlinedCall(func);
 			return;
 		}
-		// Reconstruct inlined frames before the call (for accurate stack traces)
+		// Reconstruct inlined frames before the call, skip whamm probes
 		var reconstructed_space = 0;
-		if (isInlined()) {
+		if (isInlined() && !is_whamm_inlined) {
 			var frames = snapshotFrames();
 			unrefRegs();
 			reconstructed_space = emitReconstructStackFrames(frames, false, TrapReason.NONE);
@@ -2311,9 +2320,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var return_addr = getInlinedFrameStubIp();
 		var total_space = 0;
 
-		// load instance (same among all inlined calls)
+		// load instance from parent
 		var inst_reg = allocTmp(ValueKind.REF);
-		emit_load_instance(inst_reg);
+		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
 		var mem_reg = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
 		// Load instance.functions
@@ -2461,19 +2470,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
-			// if (isInlined()) {
-				// masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
-			// } else {
+			if (is_whamm_inlined) {
+				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
+			} else {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
-			// }
+			}
 		}
 	}
 	def emit_load_instance(reg: Reg) {
-// 		if (isInlined()) { // inline compilation
-// 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
-// 		} else {
+		if (is_whamm_inlined) {
+			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
+		} else {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.instance_slot);
-		// }
+		}
 	}
 	def emitLoad(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ())  {
 		var iv = pop();
