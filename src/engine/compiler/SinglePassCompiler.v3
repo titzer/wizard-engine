@@ -2,12 +2,10 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Inlining TODO
-// - add control flow
-// - monitors!
-// - fix/merge whamm inlining logic
+// - fix hardware traps
+// - reuse tail call logic in abstract stack move
 // - benchmark inlining improvements
-// - handle OSR/dynamic tier-up
-// - tier down?
+// - handle OSR/dynamic tier-up/tier down?
 
 // Describes the register and frame configuration for the single-pass compiler.
 class SpcExecEnv {
@@ -541,7 +539,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 
 	// Emit code for an inlined regular function call
-	def emitInlinedCall(callee_func: FuncDecl) {
+	def emitInlinedCall(callee_func: FuncDecl, whamm: WhammProbe) {
 		var sig = callee_func.sig;
 		var params_count = u32.view(sig.params.length);
 		var results_count = u32.view(sig.results.length);
@@ -550,25 +548,39 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Arguments are already on stack
 		// Stack: [..., arg0, arg1, ..., argN] <- sp
 		// We want callee's local 0 = arg0, so:
-		var new_local_base_sp = u31.view(orig_sp - params_count);
+		var new_local_base_sp: u31 = u31.view(orig_sp - params_count);
 		var new_ctl_base_sp = u31.view(state.ctl_stack.top);
+
+		var num_locals = callee_func.num_slots();
 
 		// Push an implicit block for the head of the function
 		var end_label = masm.newLabel(callee_func.cur_bytecode.length);
 		state.pushBlock(sig.params, sig.results, end_label);
 
-		// Create and push frame for inlined function
-		var callee_frame = SpcFrame.new(callee_func, sig, module,
-				BytecodeIterator.new().reset(callee_func),
-				new_local_base_sp, new_ctl_base_sp,
-				callee_func.num_slots(),
-				0); // start at pc=0
+		var m: Module = module;
+		var new_it = BytecodeIterator.new().reset(callee_func);
 
-		pushFrame(callee_frame);  // Updates cached fields
+		// Whamm probe configuration
+		if (whamm != null) {
+			def whamm_sig = whamm.sig;
+			def whamm_wf = WasmFunction.!(whamm.func);
+			def whamm_instance = whamm_wf.instance;
+			def whamm_func_decl = whamm_wf.decl;
+
+			m = whamm_instance.module;
+			new_local_base_sp = u31.view(state.sp) - u31.view(whamm_sig.length); // XXX
+			new_it = BytecodeIterator.new().reset(whamm_func_decl);
+		}
+
+		// Create and push frame for inlined function
+		var callee_frame = SpcFrame.new(callee_func, sig, // XXX correct for whamm probes?
+			m, new_it, new_local_base_sp, new_ctl_base_sp, num_locals, 0);
+
+		pushFrame(callee_frame);
 
 		// Emit function entry probe, if any.
 		// XXX expensive because frame materialization required
-		if (!FeatureDisable.entryProbes && func.entry_probed) {
+		if (whamm == null && !FeatureDisable.entryProbes && func.entry_probed) {
 			var probe = Instrumentation.getLocalProbe(module, callee_func.func_index, 0);
 
 			// Reconstruct inlined frames before emitting probe
@@ -595,6 +607,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			last_probe = 0;
 			masm.source_loc = it.pc;
 			it.dispatch(this);
+			if (Trace.compiler && Trace.asm) {
+				OUT.puts("JIT code: ");
+				masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
+				codegen_offset = masm.curCodeBytes();
+				OUT.ln();
+			}
 			unrefRegs();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
@@ -632,6 +650,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var total_callee_slots = state.sp - new_local_base_sp;  // All callee state
 		var slots_to_drop = total_callee_slots - results_count;
 
+		// for whamm probes, results_count SHOULD be zero
 		if (slots_to_drop > 0 && results_count > 0) {
 			// Need to move results down over parameters and locals
 			for (i < results_count) {
@@ -666,6 +685,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			state.sp = new_local_base_sp + results_count;
 		} else if (slots_to_drop > 0) {
 			// No results, just drop everything
+			if (Trace.compiler) Trace.OUT.put1("dropping %d slots\n", slots_to_drop);
 			dropN(u32.view(slots_to_drop));
 		}
 		// If slots_to_drop <= 0, results are already in the right place
@@ -680,7 +700,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// set up args and push to frame slots.
 		var whamm_sig = probe.sig;
 		var inline_config = InlineConfig(false, false, false);
-		var new_local_base_sp = 0;
 		var orig_sp = state.sp;
 		var callee_func = WasmFunction.!(probe.func);
 
@@ -703,14 +722,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			if (inline_config.swap_membase) {
 				var membase = callee_func.instance.memories[0].getMemBase64();
 				masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
-				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
 			}
+			masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
 		}
 
 		if (!inline_config.can_inline) {
 			state.emitSaveAll(resolver, probeSpillMode);
-		} else {
-			new_local_base_sp = int.view(state.sp);
 		}
 
 		for (i < whamm_sig.length) {
@@ -848,53 +865,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var whamm_module = whamm_instance.module;
 		var whamm_func_decl = callee_func.decl;
 		if (inline_config.can_inline) {
-			var prev_it = it;
-			var whamm_it = BytecodeIterator.new().reset(whamm_func_decl);
-			it = whamm_it;
-			var orig_module = module;
-
-			// prepare spc for inlining
-			this.local_base_sp = u31.view(new_local_base_sp);
-			this.module = whamm_module;
-			this.func = whamm_func_decl;
-			this.sig = whamm_func_decl.sig;
-			this.num_locals = whamm_func_decl.num_slots();
-			this.is_whamm_inlined = true;
-
-			// inline codegen
-			it.dispatchLocalDecls(this);
-			this.whamm_probe_ctl_base = u31.view(state.ctl_stack.top);
-			if (Trace.compiler) Trace.OUT.puts("Start compiling inlined whamm probe").ln();
-			while (it.more() && success) {
-				if (Trace.compiler) traceOpcodeAndStack(false);
-				last_probe = 0;
-				masm.source_loc = it.pc;
-				it.dispatch(this);
-				it = whamm_it;
-				if (Trace.compiler && Trace.asm) {
-					OUT.puts("JIT code: ");
-					masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
-					codegen_offset = masm.curCodeBytes();
-					OUT.ln();
-				}
-				unrefRegs();
-				if (Debug.compiler) checkRegAlloc();
-				it.next();
-			}
-			if (Trace.compiler) Trace.OUT.puts("Finished compiling inlined whamm probe").ln();
-
-			// restore spc after inlining
-			it  = prev_it;
-			this.local_base_sp = 0;
-			this.module = orig_module;
-			this.func = it.func;
-			this.sig = it.func.sig;
-			this.num_locals = it.func.num_slots();
-			this.is_whamm_inlined = false;
-			masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
-
-			// clear callee params/locals from abstract state
-			dropN(state.sp - orig_sp);
+			is_whamm_inlined = true;
+			emitInlinedCall(whamm_func_decl, probe);
+			is_whamm_inlined = false;
 		} else {
 			var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
 			var func_reg = allocTmpFixed(ValueKind.REF, regs.func_arg);
@@ -990,8 +963,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
-		if (is_whamm_inlined && state.ctl_stack.top == whamm_probe_ctl_base) return;
-
 		var frame = state.frame_stack.peek();
 		var is_implicit_function_block = isInlined() && state.ctl_stack.top == frame.ctl_base_sp + 1;
 
@@ -1064,7 +1035,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Try inlining for intra-module, non-tail calls
 		if (!tailCall && SpcTuning.inlineRegularCalls && shouldInline(this, func)) {
 			if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
-			emitInlinedCall(func);
+			emitInlinedCall(func, null);
 			return;
 		}
 		// Reconstruct inlined frames before the call, skip whamm probes
@@ -2320,8 +2291,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var return_addr = getInlinedFrameStubIp();
 		var total_space = 0;
 
-		// load instance from parent
+		// load instance
 		var inst_reg = allocTmp(ValueKind.REF);
+		//emit_load_instance(inst_reg);
 		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
 		var mem_reg = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
@@ -2332,6 +2304,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		def vfp_reg = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
 		var wasm_func_reg = allocTmp(ValueKind.REF);
+
+		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+		if (is_whamm_inlined) {
+			inl_inst_reg = allocTmp(ValueKind.REF);
+			inl_mem0_reg = allocTmp(ValueKind.REF);
+			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
+			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
+		}
 
 		// Process the inlined frames (skip the outermost which already exists on native stack)
 		for (i = 1; i < frames.length; i++) {
@@ -2364,7 +2344,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			// Clear FrameAccessor and inlined_instance_slot
 			masm.emit_mov_m_l(frame.accessor_slot, 0);
-			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+
+			// if an inlined whamm probe, also grab inlined slots
+			if (is_whamm_inlined) {
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, inl_inst_reg);
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, inl_mem0_reg);
+			} else {
+				masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+				masm.emit_mov_m_l(frame.inlined_mem0_base_slot, 0);
+			}
 		}
 
 		return if(forTrap, 0, total_space);
