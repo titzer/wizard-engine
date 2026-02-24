@@ -1,131 +1,151 @@
 
 python
 import gdb
-import os
+from enum import Enum
+
+import sys
+sys.path.insert(0, "gdb")
+import gdbgen
 
 
-class CheckProt(gdb.Command):
+class FieldType(Enum):
+    LONG = "long"
+    INT = "int"
+    UINT = "unsigned int"
+    UCHAR = "unsigned char"
 
-    def __init__(self):
-        super().__init__("checkprot", gdb.COMMAND_USER)
 
-    def invoke(self, arg, from_tty):
-        try:
-            addr = int(arg, 0)
-        except ValueError:
-            print("Usage: checkprot ADDRESS (in hex or decimal)")
-            return
+# Value stack layout constants
+VALUE_SLOT_SIZE = 32
+TAG_TO_VALUE_OFFSET = 16
 
-        with open(f"/proc/{os.getpid()}/maps") as f:
-            for line in f:
-                parts = line.split()
-                rng = parts[0].split('-')
-                start, end = int(rng[0], 16), int(rng[1], 16)
-                if start <= addr < end:
-                    print(f"0x{addr:x} is in: {line.strip()}")
-                    return
-        print(f"Address 0x{addr:x} not found in /proc/self/maps")
+FRAME_FIELDS = {
+    "wasm_func":  (0,  FieldType.LONG),
+    "mem0_base":  (8,  FieldType.LONG),
+    "vfp":        (16, FieldType.LONG),
+    "vsp":        (24, FieldType.LONG),
+    "sidetable":  (32, FieldType.LONG),
+    "stp":        (40, FieldType.LONG),
+    "code":       (48, FieldType.LONG),
+    "ip":         (56, FieldType.LONG),
+    "eip":        (64, FieldType.LONG),
+    "func_decl":  (72, FieldType.LONG),
+    "instance":   (80, FieldType.LONG),
+    "curpc":      (88, FieldType.INT),
+    "accessor":   (96, FieldType.LONG),
+}
+
+
+def read_mem(addr, field_type):
+    """Read a value at addr with the given type."""
+    return gdb.Value(addr).cast(gdb.lookup_type(field_type.value).pointer()).dereference()
+
+
+def read_frame_field(frame_addr, field_name):
+    """Read a frame field by name, returning the integer value."""
+    offset, field_type = FRAME_FIELDS[field_name]
+    return int(read_mem(frame_addr + offset, field_type))
+
+
+def parse_addr(arg):
+    """Parse a gdb expression into an integer address."""
+    return int(gdb.parse_and_eval(arg))
 
 
 class PrintFrame(gdb.Command):
     """Print the contents of an X86_64InterpreterFrame at the given address."""
 
-    FIELDS = [
-        (0,  "wasm_func",  "long"),
-        (8,  "mem0_base",  "long"),
-        (16, "vfp",        "long"),
-        (24, "vsp",        "long"),
-        (32, "sidetable",  "long"),
-        (40, "stp",        "long"),
-        (48, "code",       "long"),
-        (56, "ip",         "long"),
-        (64, "eip",        "long"),
-        (72, "func_decl",  "long"),
-        (80, "instance",   "long"),
-        (88, "curpc",      "int"),
-        (96, "accessor",   "long"),
-    ]
-
     def __init__(self):
-        super(PrintFrame, self).__init__("printframe", gdb.COMMAND_USER)
-
-    def read_field(self, addr, offset, typ):
-        """Read a field at addr+offset with the given type."""
-        try:
-            val = gdb.Value(addr + offset).cast(gdb.lookup_type(typ).pointer()).dereference()
-            return hex(val) if typ == 'long' else val
-        except gdb.error as e:
-            return f"<error: {e}>"
+        super().__init__("printframe", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         try:
-            addr = int(gdb.parse_and_eval(arg))
+            addr = parse_addr(arg)
         except Exception as e:
             print(f"Invalid address: {e}")
             return
 
-        for offset, name, typ in self.FIELDS:
-            val = self.read_field(addr, offset, typ)
+        for name, (offset, field_type) in FRAME_FIELDS.items():
+            try:
+                val = read_mem(addr + offset, field_type)
+                val = hex(val) if field_type == FieldType.LONG else int(val)
+            except gdb.error as e:
+                val = f"<error: {e}>"
             print(f"{name:<12} @ +{offset:>2} = {val}")
+
+
+def print_value_stack(vfp, vsp):
+    """Print the contents of the value stack between vfp and vsp."""
+    n_elems = (vsp - vfp) // VALUE_SLOT_SIZE
+    print(f"VFP = {hex(vfp)}, VSP = {hex(vsp)}")
+
+    if n_elems < 0 or n_elems > 10:
+        print(f"Invalid number of elements {n_elems}, aborting")
+        return
+
+    print(f"Printing {n_elems} stack values\n")
+    # Loop from VSP to VFP in reverse, by value slot size
+    # TODO: compatibility with untagged mode
+    for slot_addr in range(vsp - VALUE_SLOT_SIZE, vfp - VALUE_SLOT_SIZE, -VALUE_SLOT_SIZE):
+        try:
+            tag = int(read_mem(slot_addr, FieldType.UCHAR))
+            print(f"@ {hex(slot_addr)}:")
+            print(f"  Tag:   {hex(tag)}")
+            print(f"  Value: ", end="")
+
+            val_addr = slot_addr + TAG_TO_VALUE_OFFSET
+            for i in range(4):
+                val = int(read_mem(val_addr + i * 4, FieldType.UINT))
+                print(f"0x{val:08x}", end=" ")
+            print()
+        except gdb.error as e:
+            print(f"Error reading at {hex(slot_addr)}: {e}")
+            break
 
 
 class VSFrame(gdb.Command):
     """Print the contents of the value stack, based on the given frame address."""
 
     def __init__(self):
-        super(VSFrame, self).__init__("vsframe", gdb.COMMAND_USER)
+        super().__init__("vsframe", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         try:
-            addr = int(gdb.parse_and_eval(arg))
+            addr = parse_addr(arg)
+            vfp = read_frame_field(addr, "vfp")
+            vsp = read_frame_field(addr, "vsp")
         except Exception as e:
-            print(f"Invalid address: {e}")
+            print(f"Error reading frame: {e}")
             return
 
-        VFP_OFFSET = 16
-        VSP_OFFSET = 24
+        print_value_stack(vfp, vsp)
+
+
+class VSReg(gdb.Command):
+    """Print the contents of the value stack, given vfp and vsp directly."""
+
+    def __init__(self):
+        super().__init__("vsreg", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        args = arg.split()
+        if len(args) != 2:
+            print("Usage: vsreg <vfp> <vsp>")
+            return
 
         try:
-            VFP_ADDR = gdb.Value(addr + VFP_OFFSET).cast(gdb.lookup_type("long").pointer()).dereference()
-            VSP_ADDR = gdb.Value(addr + VSP_OFFSET).cast(gdb.lookup_type("long").pointer()).dereference()
-
-            vfp = int(VFP_ADDR)
-            vsp = int(VSP_ADDR)
-            n_elems = (vsp - vfp) // 32
-
-            print(f"VFP = {hex(vfp)}, VSP = {hex(vsp)}")
-
-            if n_elems < 0 or n_elems > 10:
-                print(f"Invalid number of elements {n_elems}, aborting")
-                return
-
-            print(f"Printing {n_elems} stack values\n")
-            # Loop from VSP_ADDR to VFP_ADDR in reverse, 32-byte value slot increments
-            # TODO: compatibility with untagged mode
-            for i in range(vsp - 32, vfp - 32, -32):
-                try:
-                    tag = gdb.Value(i).cast(gdb.lookup_type("unsigned char").pointer()).dereference()
-
-                    print(f"@ {hex(i)}:")
-                    print(f"  Tag:   {hex(tag)}")
-                    print(f"  Value: ", end="")
-
-                    val_start = i + 16
-                    for offset in range(4):
-                        at = val_start + offset * 4
-                        val = gdb.Value(at).cast(gdb.lookup_type("unsigned int").pointer()).dereference()
-                        print(f"0x{int(val):08x}", end=" ")
-                    print()
-                except gdb.error as e:
-                    print(f"Error reading at {hex(i)}: {e}")
-                    break
+            vfp = parse_addr(args[0])
+            vsp = parse_addr(args[1])
         except Exception as e:
             print(f"Invalid address: {e}")
             return
 
+        print_value_stack(vfp, vsp)
+
+
 PrintFrame()
-CheckProt()
 VSFrame()
+VSReg()
 
 end
 
