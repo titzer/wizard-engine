@@ -7,7 +7,7 @@
 )
 ;; Test that v128.load8_lane replaces the target lane instead of ORing.
 ;; Memory[0] = 0x02. Lane 7 of v128 input has 0x01.
-;; Correct: lane 7 = 0x02 (replaced). Bug: lane 7 = 0x03 (ORed).
+;; Correct: lane 7 = 0x02 (replaced)
 (assert_return
   (invoke "load8_lane_replace"
     (i32.const 0)
