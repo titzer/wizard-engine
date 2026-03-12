@@ -4,17 +4,13 @@
 // Inlining TODO
 // - reuse tail call logic in abstract stack move
 // - inline intra-module calls only
-// - bug fixes
-//   * hardware trap
-//   * reconstruct stack on runtime calls
-//   * -O3 selfhost
 // - revert change that always swaps membase and instance in whamm
 // - whamm, keep track of swapping instance/membase as part of SpcFrame
+// - FIXME whamm bugs, wrong value created in abstract state
 // - benchmark inlining improvements
 // - handle OSR/dynamic tier-up/tier down?
+// - pre-bump rsp
 // - compilation hints proposal
-// - add tests (wizeng)
-// - make even more tests
 
 // Describes the register and frame configuration for the single-pass compiler.
 class SpcExecEnv {
@@ -109,8 +105,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Other state
 	def trap_labels = Vector<(TrapReason, MasmLabel, Array<SpcFrame>)>.new();
 
+	def it = BytecodeIterator.new();
+
 	// Frame state (refers to the fields in the top SpcFrame in SpcState)
-	var it = BytecodeIterator.new();
 	var module: Module;
 	var func: FuncDecl;
 	var sig: SigDecl;
@@ -146,9 +143,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (func != null)
 			masm.pushInlineContext(func.func_index);
 
+		def current = state.frame_stack.peek();
+		if (current != null)
+			current.pc = it.pc;
 		state.frame_stack.push(frame);
 		// Update cached copies from new top frame
-		it = frame.it;
+		it.reset(frame.func).at(frame.pc, -1);
 		module = frame.module;
 		func = frame.func;
 		sig = frame.sig;
@@ -161,7 +161,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var frame = state.frame_stack.pop();
 		// Restore cached copies from new top frame
 		var current = state.frame_stack.peek();
-		it = current.it;
+		it.reset(current.func).at(current.pc, -1);
+		it.current(); // position codeptr.pos past the instruction at current.pc so it.next() advances correctly
 		module = current.module;
 		func = current.func;
 		sig = current.sig;
@@ -179,10 +180,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var frames = Array<SpcFrame>.new(state.frame_stack.top);
 		for (i < state.frame_stack.top) {
 			var f = state.frame_stack.elems[i];
-			// update pc of SpcFrame to current pc in that frame
-			var pc_to_use = f.it.pc; 
-			frames[i] = SpcFrame.new(f.func, f.sig, f.module, null,
-				f.local_base_sp, f.ctl_base_sp, f.num_locals, pc_to_use);
+			var pc = if(i == state.frame_stack.top - 1, it.pc, f.pc);
+			frames[i] = SpcFrame.new(f.func, f.sig, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc);
 		}
 		return frames;
 	}
@@ -213,7 +212,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		handler_dest_info.resize(func.handlers.handler_dests.length);
 
 		// Reset frame state
-		this.it = BytecodeIterator.new();
 		this.module = null;
 		this.func = null;
 		this.sig = null;
@@ -226,8 +224,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
-		it.reset(func);  // Reset iterator before creating frame
-		var initial_frame = SpcFrame.new(func, func.sig, module, it, 0, 0, func.num_slots(), 0);
+		var initial_frame = SpcFrame.new(func, func.sig, module, 0, 0, func.num_slots(), 0);
 
 		pushFrame(initial_frame);
 
@@ -582,7 +579,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.pushBlock(sig.params, sig.results, end_label);
 
 		var m: Module = module;
-		var new_it = BytecodeIterator.new().reset(callee_func);
 
 		// Whamm probe configuration
 		if (whamm != null) {
@@ -593,12 +589,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			m = whamm_instance.module;
 			new_local_base_sp = u31.view(state.sp) - u31.view(whamm_sig.length); // XXX
-			new_it = BytecodeIterator.new().reset(whamm_func_decl);
 		}
 
 		// Create and push frame for inlined function
 		var callee_frame = SpcFrame.new(callee_func, sig, // XXX correct for whamm probes?
-			m, new_it, new_local_base_sp, new_ctl_base_sp, num_locals, 0);
+			m, new_local_base_sp, new_ctl_base_sp, num_locals, 0);
 
 		pushFrame(callee_frame);
 
@@ -2947,13 +2942,12 @@ class SpcFrame {
 	var func: FuncDecl;
 	var sig: SigDecl;
 	var module: Module;
-	var it: BytecodeIterator;
 	var local_base_sp: u31;  // Base index into SpcState.state
 	var ctl_base_sp: u31;    // Base index into SpcState.ctl_stack
 	var num_locals: int;
 	var pc: int;   // XXX pc only initialized during snapshots
 
-	new(func, sig, module, it, local_base_sp, ctl_base_sp, num_locals, pc) {}
+	new(func, sig, module, local_base_sp, ctl_base_sp, num_locals, pc) {}
 }
 
 // An entry in the abstract control stack.
