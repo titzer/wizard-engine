@@ -1133,6 +1133,7 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 }
 
 def ucontext_rip_offset = 168;
+def ucontext_rsp_offset = 160;
 def SIGFPE  = 8;
 def SIGBUS  = 10;
 def SIGSEGV = 11;
@@ -1185,7 +1186,7 @@ class X86_64SpcCode extends RiUserCode {
 class X86_64SpcModuleCode extends X86_64SpcCode {
 	def mapping: Mapping;
 	var codeEnd: int;			// for dynamically adding code to the end
-	var sourcePcs: Vector<(int, int)>;
+	var sourcePcs: Vector<(int, List<(int, int)>)>;
 	var embeddedRefOffsets: Vector<int>;
 
 	new(mapping) super("spc-module", mapping.range.start, mapping.range.end) {
@@ -1229,35 +1230,49 @@ class X86_64SpcModuleCode extends X86_64SpcCode {
 		return false;
 	}
 	// Updates the siginfo's {ucontext} to set the handler %rip and to write the PC of the fault location
-	// into the stack frame for the handler.
+	// into the stack frame for the handler, along with any inlined frames at the program location.
 	private def updateUContextToTrapsStub(ucontext: Pointer, reason: TrapReason) {
 		var p_rip = ucontext + ucontext_rip_offset;
 		var p_rsp = RiOs.getSp(ucontext);
 		if (!RiRuntime.inStackRedZone(p_rsp)) {
 			// Update the current PC in the JIT frame, if it is accessible.
 			var ip = p_rip.load<Pointer>();
-			var pc = lookupPc(ip, false);
-			(p_rsp + X86_64InterpreterFrame.curpc.offset).store<int>(pc);
+			var inline_ctx = lookupPc(ip, false);
+			if (inline_ctx == null) {
+				// old case: lookupPc failed (returned -1)
+				(p_rsp + X86_64InterpreterFrame.curpc.offset).store<int>(-1);
+			} else if (inline_ctx.tail == null) {
+				// old case: store pc directly into stack
+				(p_rsp + X86_64InterpreterFrame.curpc.offset).store<int>(inline_ctx.head.1);
+			} else {
+				// new case: reconstruct inlined frames
+				p_rsp = reconstructInlinedFramesForTrap(p_rsp, inline_ctx);
+				(ucontext + ucontext_rsp_offset).store<Pointer>(p_rsp);
+			}
 		}
 
 		var handler_ip = TRAPS_STUB.getIpForReason(reason);
 		(p_rip).store<Pointer>(handler_ip);
 	}
+	// Reconstructs inlined interpreter frames for an inlined hardware trap context.
+	// Returns the new rsp to write into the ucontext (top of stack).
+	private def reconstructInlinedFramesForTrap(r_rsp: Pointer, inline_ctx: List<(int, int)>) -> Pointer;
 	// Look up the source {pc} of a location {i} in this code. Returns {-1} if no exact entry is found.
 	// Return addresses are treated differently than other addresses in the code.
-	def lookupPc(ip: Pointer, isRetAddr: bool) -> int {
+	def lookupPc(ip: Pointer, isRetAddr: bool) -> List<(int, int)> {
 		if (Trace.compiler) Trace.OUT.put2("SpcCode.lookupPc(0x%x, ret=%z)", (ip - Pointer.NULL), isRetAddr).ln();
-		if (sourcePcs == null) return -1;
-		if (!mapping.range.contains(ip)) return -1;
+		if (sourcePcs == null) return null;
+		if (!mapping.range.contains(ip)) return null;
 		var offset = ip - mapping.range.start - if(isRetAddr, 1);
 		// XXX: use binary search for looking up source PCs in SPC code
 		if (Trace.compiler) Trace.OUT.put1(" looking for offset=%d", offset).ln();
 		for (i < sourcePcs.length) {
 			var entry = sourcePcs[i];
-			if (Trace.compiler) Trace.OUT.put2("  (offset=%d, pc=%d)", entry.0, entry.1).ln();
+			if (Trace.compiler) Lists.render(Trace.OUT.put1("  (offset=%d, ctx=[", entry.0),
+				fun (e: (int, int), buf: StringBuilder) => buf.put2("(func=%d,pc=%d)", e.0, e.1), entry.1).puts("])").ln();
 			if (offset == entry.0) return entry.1;
 		}
-		return -1;
+		return null;
 	}
 	// Appends code to the end of this module.
 	def appendCode(masm: X86_64MacroAssembler) -> Pointer {
