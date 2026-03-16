@@ -112,7 +112,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var func: FuncDecl;
 	var sig: SigDecl;
 	var num_locals: int;
-	var local_base_sp: u31; // TODO could use a Range so that all offsets are from 0 again
+	var local_base_sp: u31; // can use a Range for 0-indexing instead of from offset
 
 	var success = true;
 	var osr_pc: int;
@@ -136,54 +136,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	new() {
 		masm.unimplemented = unsupported;
 		masm.newTrapLabel = newTrapLabel; // trap labels are per-pc
-	}
-
-	// Manage inlined frames stack
-	def pushFrame(frame: SpcFrame) {
-		if (func != null)
-			masm.pushInlineContext(func.func_index);
-
-		def current = state.frame_stack.peek();
-		if (current != null)
-			current.pc = it.pc;
-		state.frame_stack.push(frame);
-		// Update cached copies from new top frame
-		it.reset(frame.func).at(frame.pc, -1);
-		module = frame.module;
-		func = frame.func;
-		sig = frame.sig;
-		num_locals = frame.num_locals;
-		local_base_sp = frame.local_base_sp;
-	}
-	def popFrame() -> SpcFrame {
-		masm.popInlineContext();
-
-		var frame = state.frame_stack.pop();
-		// Restore cached copies from new top frame
-		var current = state.frame_stack.peek();
-		it.reset(current.func).at(current.pc, -1);
-		it.current(); // position codeptr.pos past the instruction at current.pc so it.next() advances correctly
-		module = current.module;
-		func = current.func;
-		sig = current.sig;
-		num_locals = current.num_locals;
-		local_base_sp = current.local_base_sp;
-		return frame;
-	}
-	def isInlined() -> bool {
-		return state.frame_stack.top > 1;
-	}
-	def inlineDepth() -> int {
-		return state.frame_stack.top - 1;
-	}
-	def snapshotFrames() -> Array<SpcFrame> {
-		var frames = Array<SpcFrame>.new(state.frame_stack.top);
-		for (i < state.frame_stack.top) {
-			var f = state.frame_stack.elems[i];
-			var pc = if(i == state.frame_stack.top - 1, it.pc, f.pc);
-			frames[i] = SpcFrame.new(f.func, f.sig, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc);
-		}
-		return frames;
 	}
 
 	def gen(module: Module, func: FuncDecl, err: ErrorGen) -> bool {
@@ -224,9 +176,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
-		var initial_frame = SpcFrame.new(func, func.sig, module, 0, 0, func.num_slots(), 0);
-
-		pushFrame(initial_frame);
+		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0);
+		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
@@ -280,7 +231,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				// otherwise, put pc as before
 				masm.emit_mov_m_i(xenv.pc_slot, label.create_pos);
 			}
-
 			masm.emit_jump_to_trap_at(reason);
 		}
 
@@ -592,10 +542,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 
 		// Create and push frame for inlined function
-		var callee_frame = SpcFrame.new(callee_func, sig, // XXX correct for whamm probes?
+		var callee_frame = SpcFrame.new(callee_func, 
 			m, new_local_base_sp, new_ctl_base_sp, num_locals, 0);
 
-		pushFrame(callee_frame);
+		pushSpcFrame(callee_frame);
 
 		// Emit function entry probe, if any.
 		// XXX expensive because frame materialization required
@@ -644,7 +594,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var inlined_reachable = state.ctl_stack.peek().reachable;
 
 		// Restore caller context by popping frame
-		popFrame();  // Automatically restores cached fields
+		popSpcFrame();  // Automatically restores cached fields
 
 		// Note: Control stack cleanup (popping implicit BLOCK) is handled by visit_END
 
@@ -867,7 +817,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					if (inline_config.can_inline) {
 						visit_LOCAL_GET(u31.view(i));
 					} else {
-						masm.emit_mov_m_m(ValueKind.REF, slot_addr, masm.slotAddr(u32.view(i)));
+						masm.emit_mov_m_m(state.state[u31.view(i)].kind(), slot_addr, masm.slotAddr(u32.view(i)));
 					}
 					kind = state.state[u31.view(i)].kind().code;
 				}
@@ -2828,6 +2778,52 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		);
 		return func.handlers.handler_pc_index_map[start].1[inline_index];
 	}
+
+	//====================================================================
+	// frame stack (for inlining) operations
+	//====================================================================
+	def pushSpcFrame(frame: SpcFrame) {
+		def current = state.frame_stack.peek();
+		if (current != null)
+			current.pc = it.pc;
+		state.frame_stack.push(frame);
+		// Update cached copies from new top frame
+		it.reset(frame.func).at(frame.pc, -1);
+		module = frame.module;
+		func = frame.func;
+		sig = func.sig;
+		num_locals = frame.num_locals;
+		local_base_sp = frame.local_base_sp;
+	}
+	// inlining is not supported, so popping is not either
+	def popSpcFrame() -> SpcFrame {
+		var frame = state.frame_stack.pop();
+		// Restore cached copies from new top frame
+		var current = state.frame_stack.peek();
+		it.reset(current.func).at(current.pc, -1).current();
+		module = current.module;
+		func = current.func;
+		sig = func.sig;
+		num_locals = current.num_locals;
+		local_base_sp = current.local_base_sp;
+		return frame;
+	}
+
+	def isInlined() -> bool {
+		return state.frame_stack.top > 1;
+	}
+	def inlineDepth() -> int {
+		return state.frame_stack.top - 1;
+	}
+	def snapshotFrames() -> Array<SpcFrame> {
+		var frames = Array<SpcFrame>.new(state.frame_stack.top);
+		for (i < state.frame_stack.top) {
+			var f = state.frame_stack.elems[i];
+			var pc = if(i == state.frame_stack.top - 1, it.pc, f.pc);
+			frames[i] = SpcFrame.new(f.func, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc);
+		}
+		return frames;
+	}
 }
 // Different branch instructions have different repush
 enum BrRepush(taken: bool, not_taken: bool) {
@@ -2938,16 +2934,17 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 }
 
 // A frame in the compilation frame stack (for inlining).
+// TODO keep track of which instance state is cached? (cache immutable things, globals)
+// - clear cache on snapshot
 class SpcFrame {
 	var func: FuncDecl;
-	var sig: SigDecl;
 	var module: Module;
 	var local_base_sp: u31;  // Base index into SpcState.state
 	var ctl_base_sp: u31;    // Base index into SpcState.ctl_stack
 	var num_locals: int;
 	var pc: int;   // XXX pc only initialized during snapshots
 
-	new(func, sig, module, local_base_sp, ctl_base_sp, num_locals, pc) {}
+	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc) {}
 }
 
 // An entry in the abstract control stack.
@@ -2985,9 +2982,7 @@ class SpcControl {
 def isNotZero = int.!=(0, _);
 def trueToOne(z: bool) -> int { return if(z, 1, 0); }
 
-// Contains both the abstract control and abstract value stack.
-// TODO keep track of which instance state is cached? (cache immutable things, globals)
-// - clear cache on snapshot
+// Contains both the abstract control, value, and frame stack.
 class SpcState(regAlloc: RegAlloc) {
 	// Abstract state of the value stack (shared across frames)
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
