@@ -1,1 +1,4 @@
+wizeng/inline_test_arithmetic.wasm
+wizeng/inline_test_locals_control.wasm
+wizeng/inline_test_nesting.wasm
 wizeng/add.wasm
