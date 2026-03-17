@@ -122,7 +122,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var ret_label: MasmLabel;
 	var last_probe = 0;
 	var skip_to_end: bool;
-	var is_whamm_inlined: bool;  // compiling an inlined Whamm probe?
+	var whamm_config: WhammInlineConfig;
 	var whamm_probe_ctl_base: u31; // ctl_stack.top when Whamm probe compilation started
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
@@ -680,16 +680,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			swap_instance = probe.swap_instance;
 			swap_membase = probe.swap_membase;
 
-			// FIXME Always swap instance into inlined_instance_slot
-			masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
-			masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, regs.scratch);
-
-			// FIXME Always swap membase into inlined_memo0_base_slot
-			if (callee_func.instance.memories.length > 0) {
-				var membase = callee_func.instance.memories[0].getMemBase64();
-				masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
+			if (swap_instance) {
+				masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, regs.scratch);
 			}
-			masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
+			if (swap_membase) {
+				if (callee_func.instance.memories.length > 0) {
+					var membase = callee_func.instance.memories[0].getMemBase64();
+					masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
+				}
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
+			}
 		} else {
 			state.emitSaveAll(resolver, probeSpillMode);
 		}
@@ -829,9 +830,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var whamm_module = whamm_instance.module;
 		var whamm_func_decl = callee_func.decl;
 		if (inline_decision) {
-			is_whamm_inlined = true;
+			whamm_config = WhammInlineConfig(swap_membase, swap_instance, true);
 			emitInlinedCall(whamm_func_decl, probe);
-			is_whamm_inlined = false;
+			whamm_config = WhammInlineConfig(false, false, false);
 			// Restore mem0_base after probe
 			if (module.memories.length > 0) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
@@ -1015,7 +1016,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (op == Opcode.CALL) masm.emit_inc_metric(Metrics.spc_dynamic_calls);
 		// Reconstruct inlined frames before the call, skip whamm probes
 		var reconstructed_space = 0;
-		if (isInlined() && !is_whamm_inlined) {
+		if (isInlined() && !whamm_config.is_inlined) {
 			var frames = snapshotFrames();
 			unrefRegs();
 			reconstructed_space = emitReconstructStackFrames(frames);
@@ -2294,7 +2295,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var wasm_func_reg = allocTmp(ValueKind.REF);
 
 		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
-		if (is_whamm_inlined) {
+		if (whamm_config.is_inlined) {
 			inl_inst_reg = allocTmp(ValueKind.REF);
 			inl_mem0_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
@@ -2335,7 +2336,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_m_l(frame.accessor_slot, 0);
 
 			// if an inlined whamm probe, also grab inlined slots
-			if (is_whamm_inlined) {
+			if (whamm_config.is_inlined) {
 				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, inl_inst_reg);
 				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, inl_mem0_reg);
 			} else {
@@ -2447,7 +2448,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
-			if (is_whamm_inlined) {
+			if (whamm_config.swap_membase) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
 			} else {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
@@ -2455,7 +2456,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emit_load_instance(reg: Reg) {
-		if (is_whamm_inlined) {
+		if (whamm_config.swap_instance) {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
 		} else {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.instance_slot);
@@ -3579,6 +3580,8 @@ def shouldInline(spc: SinglePassCompiler, func: FuncDecl) -> bool {
 	if (Trace.compiler) OUT.puts("YES\n");
 	return true;
 }
+type WhammInlineConfig(swap_membase: bool, swap_instance: bool, is_inlined: bool);
+
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
 //
