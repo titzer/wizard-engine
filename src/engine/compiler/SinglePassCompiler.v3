@@ -667,19 +667,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 	// saves the overhead of using a runtime call by directly invoking the wasm function associated with the whamm probe
 	def emitWhammProbe(probe: WhammProbe) {
+		if (Trace.compiler) Trace.OUT.puts("emitting whamm probe\n");
 		// set up args and push to frame slots.
 		var whamm_sig = probe.sig;
-		var inline_config = InlineConfig(false, false, false);
 		var orig_sp = state.sp;
 		var callee_func = WasmFunction.!(probe.func);
+		def inline_decision = shouldInline(this, callee_func.decl) && SpcTuning.inlineWhammProbes; // TODO move to shouldInline
+		var swap_instance = false;
+		var swap_membase = false;
 
-		if (SpcTuning.inlineWhammProbes) {
-			inline_config = InlineConfig(false, false, probe.spc_inline_func);
-			if (!probe.inline_heuristic_checked) {
-				inline_config = funcCanInline(callee_func.decl);
-				probe.inline_heuristic_checked = true;
-				probe.spc_inline_func = inline_config.can_inline;
-			}
+		if (inline_decision) {
+			probe.checkSwap();
+			swap_instance = probe.swap_instance;
+			swap_membase = probe.swap_membase;
 
 			// FIXME Always swap instance into inlined_instance_slot
 			masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
@@ -691,9 +691,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
 			}
 			masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
-		}
-
-		if (!inline_config.can_inline) {
+		} else {
 			state.emitSaveAll(resolver, probeSpillMode);
 		}
 
@@ -703,13 +701,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var kind: byte;
 			match(whamm_sig[i]) {
 				FrameAccessor => {
-					if (inline_config.can_inline) state.emitSaveAll(resolver, probeSpillMode); // spill entire value stack.
+					if (inline_decision) state.emitSaveAll(resolver, probeSpillMode); // spill entire value stack.
 					masm.emit_call_runtime_getFrameAccessorMetaRef();
 					emit_reload_regs();
-					if (inline_config.can_inline && !probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+					if (inline_decision && !probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 
 					// move result to mem slot or reg, depending on inlining
-					if (inline_config.can_inline) {
+					if (inline_decision) {
 						var reg = allocRegTos(ValueKind.REF);
 						masm.emit_mov_r_r(ValueKind.REF, reg, xenv.runtime_ret0);
 						state.push(KIND_REF | IN_REG, reg, 0);
@@ -721,7 +719,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				Val(val) => {
 					match (val) {
 						I31(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF);
 								masm.emit_mov_r_i(reg, i32.view(v) << 1);
 								state.push(KIND_REF | IN_REG, reg, 0);
@@ -731,7 +729,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.REF.code;
 						}
 						I32(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
 							} else {
 								masm.emit_mov_m_d(slot_addr, v);
@@ -739,7 +737,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.I32.code;
 						}
 						I64(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.I64);
 								masm.emit_mov_r_l(reg, i64.view(v));
 								state.push(KIND_I64 | IN_REG, reg, 0);
@@ -749,7 +747,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.I64.code;
 						}
 						F32(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.F32);
 								masm.emit_mov_r_f32(reg, v);
 								state.push(KIND_F32 | IN_REG, reg, 0);
@@ -759,7 +757,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.F32.code;
 						}
 						F64(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.F64);
 								masm.emit_mov_r_d64(reg, v);
 								state.push(KIND_F64 | IN_REG, reg, 0);
@@ -769,7 +767,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.F64.code;
 						}
 						V128(l, h) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.V128);
 								masm.emit_mov_r_q(reg, l, h);
 								state.push(KIND_V128 | IN_REG, reg, 0);
@@ -780,7 +778,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.V128.code;
 						}
 						Ref(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF);
 								masm.emit_mov_r_Object(reg, v);
 								state.push(KIND_REF | IN_REG, reg, 0);
@@ -791,7 +789,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.REF.code;
 						}
 						Cont(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF_U64);
 								masm.emit_mov_r_Cont(reg, v);
 								state.push(KIND_REF_U64 | IN_REG, reg, 0);
@@ -806,7 +804,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				}
 				Operand(_, i) => {
 					var index = orig_sp + u32.view(i) - 1;
-					if (inline_config.can_inline) {
+					if (inline_decision) {
 						visit_LOCAL_GET(u31.view(index - local_base_sp));
 					} else {
 						masm.emit_mov_m_m(state.state[index].kind(), slot_addr, masm.slotAddr(index));
@@ -814,7 +812,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					kind = state.state[index].kind().code;
 				}
 				Local(_, i) => {
-					if (inline_config.can_inline) {
+					if (inline_decision) {
 						visit_LOCAL_GET(u31.view(i));
 					} else {
 						masm.emit_mov_m_m(state.state[u31.view(i)].kind(), slot_addr, masm.slotAddr(u32.view(i)));
@@ -823,7 +821,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				}
 				Null => System.error("whamm", "null whamm arg!");
 			}
-			if (!inline_config.can_inline) {
+			if (!inline_decision) {
 				masm.emit_mov_m_i(slot_tag_addr, kind);
 			}
 		}
@@ -831,7 +829,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var func_id = callee_func.decl.func_index;
 		var whamm_module = whamm_instance.module;
 		var whamm_func_decl = callee_func.decl;
-		if (inline_config.can_inline) {
+		if (inline_decision) {
 			is_whamm_inlined = true;
 			emitInlinedCall(whamm_func_decl, probe);
 			is_whamm_inlined = false;
@@ -3582,40 +3580,6 @@ def shouldInline(spc: SinglePassCompiler, func: FuncDecl) -> bool {
 	if (Trace.compiler) OUT.puts("YES\n");
 	return true;
 }
-
-// checks function bytecode to see if it can be inlined based on
-// simple heuristics: length <= maxInlineBytecodeSize and straightline code.
-def funcCanInline(decl: FuncDecl) -> InlineConfig {
-	var default = InlineConfig(false, false, false);
-	if (decl.orig_bytecode.length > SpcTuning.maxInlineBytecodeSize || decl.sig.params.length > SpcTuning.maxInlineParams) return default;
-	var bi = BytecodeIterator.new().reset(decl);
-	var swap_instance = false;
-	var swap_membase = false;
-	while (bi.more()) {
-		var op = bi.current();
-		match (op) {
-			// Cannot handle control flow yet.
-			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN => return default;
-			// These opcodes require swapping the instance.
-			THROW, CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
-			ELEM_DROP, TABLE_INIT, TABLE_SIZE, TABLE_COPY, TABLE_GROW, GLOBAL_SET, GLOBAL_GET, TABLE_SET, TABLE_GET => swap_instance = true;
-			// Load/store opcodes require either the memory base or the instance.
-			I32_STORE, I64_STORE, F32_STORE, F64_STORE, I32_STORE8, I32_STORE16, I64_STORE8, I64_STORE16, I64_STORE32,
-			V128_STORE, I32_LOAD, I64_LOAD, F32_LOAD, F64_LOAD, I32_LOAD8_S, I32_LOAD8_U, I32_LOAD16_S, I32_LOAD16_U,
-			I64_LOAD8_S, I64_LOAD8_U, I64_LOAD16_S, I64_LOAD16_U, I64_LOAD32_S, I64_LOAD32_U, V128_LOAD => {
-				var memarg = bi.immptr().read_MemArg();
-				if (memarg.memory_index == 0) swap_membase = true;
-				else swap_instance = true;
-			}
-			_ => ;
-		}
-		bi.next();
-	}
-	return InlineConfig(swap_membase, swap_instance, true);
-}
-
-type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
-
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
 //
