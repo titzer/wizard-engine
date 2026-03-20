@@ -31,6 +31,39 @@ class SpcExecEnv {
 	var runtime_ret1: Reg;
 	var ret_throw: Reg;
 	var scratch: Reg;
+
+	def dup() -> SpcExecEnv {
+		def env = SpcExecEnv.new();
+
+		env.frameSize              = this.frameSize;
+		env.vsp_slot               = this.vsp_slot;
+		env.vfp_slot               = this.vfp_slot;
+		env.pc_slot                = this.pc_slot;
+		env.instance_slot          = this.instance_slot;
+		env.inlined_instance_slot  = this.inlined_instance_slot;
+		env.wasm_func_slot         = this.wasm_func_slot;
+		env.mem0_base_slot         = this.mem0_base_slot;
+		env.inlined_mem0_base_slot = this.inlined_mem0_base_slot;
+		env.accessor_slot          = this.accessor_slot;
+
+		env.sp                     = this.sp;
+		env.func_arg               = this.func_arg;
+		env.vsp                    = this.vsp;
+		env.vfp                    = this.vfp;
+		env.mem0_base              = this.mem0_base;
+		env.instance               = this.instance;
+		env.runtime_arg0           = this.runtime_arg0;
+		env.runtime_arg1           = this.runtime_arg1;
+		env.runtime_arg2           = this.runtime_arg2;
+		env.runtime_arg3           = this.runtime_arg3;
+		env.runtime_arg4           = this.runtime_arg4;
+		env.runtime_ret0           = this.runtime_ret0;
+		env.runtime_ret1           = this.runtime_ret1;
+		env.ret_throw              = this.ret_throw;
+		env.scratch                = this.scratch;
+
+		return env;
+	}
 }
 
 def INITIAL_VALUE_STACK_SIZE = 16;
@@ -77,7 +110,7 @@ def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
-class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
+class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits, fast: bool) extends BytecodeVisitor {
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def config = masm.regConfig;
 	def regs = xenv;
@@ -131,12 +164,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def gen(module: Module, func: FuncDecl, err: ErrorGen) -> bool {
 		this.osr_pc = -1;
 		this.err = err;
-		return Metrics.spc_time_us.run(gen0, (module, func));
+		return Metrics.spc_time_us.run(gen0(_, _), (module, func));
 	}
 	def genOsr(module: Module, func: FuncDecl, pc: int, err: ErrorGen) -> MasmLabel {
 		this.osr_pc = pc;
 		this.err = err;
-		var ok = Metrics.spc_time_us.run(gen0, (module, func));
+		var ok = Metrics.spc_time_us.run(gen0(_, _), (module, func));
 		return if(ok, osr_entry_label);
 	}
 	private def gen0(module: Module, func: FuncDecl) -> bool {
@@ -170,7 +203,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
-		emitPrologue();
+		if (fast) {
+			emitFastPrologue();
+		} else {
+			emitPrologue();
+		}
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -813,12 +850,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.bindLabel(ctl_top.label);
 				state.resetToMerge(ctl_top);
 				state.ctl_stack.pop();
+			// case for END for fallthrough at end of function?
 			} else if (ctl_top.opcode == Opcode.RETURN.code) {
 				state.emitFallthru(resolver);
 				masm.bindLabel(ctl_top.label);
 				state.resetToMerge(ctl_top);
 				emitProbe();
-				if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+				if (ctl_top.merge_count > 1) emitReturn(ctl_top); // emitReturn !
 				state.ctl_stack.pop();
 			}
 			emitProbe();
@@ -857,7 +895,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_br(ret_label);
 		setUnreachable();
 	}
-	def visitCallDirect(op: Opcode, index: u31, tailCall: bool) {
+	// for CALL, FAST_CALL, and RETURN_CALL
+	def visitCallDirect(op: Opcode, index: u31, prop: CallProperty) {
 		var func = module.functions[index];
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Load the instance (which must happen before frame is unwound).
@@ -870,12 +909,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Instance_functions_r_r(func_reg, tmp);
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, func.func_index);
 
-		emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, tailCall);
+		emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, prop);
 	}
-	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, tailCall: bool) {
+	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, prop: CallProperty) {
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Handle the current stack state.
-		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
+		if (prop == CallProperty.TAIL) emitMoveTailCallArgs(sig); // transfer tail call args
 		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
 
 		// Compute the value stack pointer.
@@ -883,7 +922,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (checkHostCall) {
 			// A call to imported function must first check for WasmFunction.
 			masm.emit_br_r(func_reg, MasmBrCond.IS_WASM_FUNC, wasmcall_label);
-			if (tailCall) {
+			if (prop == CallProperty.TAIL) {
 				masm.emit_jump_HostCallStub(); // XXX: stub relies on func_arg and VSP
 			} else {
 				masm.emit_call_HostCallStub(); // XXX: stub relies on func_arg and VSP
@@ -896,7 +935,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_FuncDecl_target_code_r_r(tmp, tmp);
 
 		// Call or jump to the entrypoint.
-		if (tailCall) {
+		if (prop == CallProperty.TAIL) {
 			masm.emit_jump_r(tmp);
 			setUnreachable();
 		} else {
@@ -920,7 +959,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// adjust frame
 		masm.emit_addw_r_i(regs.sp, frame.frameSize);
 	}
-	def visitCallIndirect(op: Opcode, sig_index: u31, table_index: u31, tailCall: bool) {
+	def visitCallIndirect(op: Opcode, sig_index: u31, table_index: u31, prop: CallProperty) {
 		var sig = SigDecl.!(module.heaptypes[sig_index]);
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
@@ -977,9 +1016,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(end);
 		}
 
-		emitCallToReg(sig, func_reg, vsp_reg, tmp_reg, true, tailCall);
+		emitCallToReg(sig, func_reg, vsp_reg, tmp_reg, true, prop);
 	}
-	def visitCallRef(op: Opcode, index: u31, tailCall: bool) {
+	def visitCallRef(op: Opcode, index: u31, prop: CallProperty) {
 		var sig = SigDecl.!(module.heaptypes[index]);
 		var sv = state.peek();
 		if (sv.isConst() && sv.const == 0) {
@@ -992,7 +1031,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var tmp = allocTmp(ValueKind.REF);
 		var func_reg = sv.reg;
 
-		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, tailCall);
+		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, prop);
 	}
 	def visit_DROP() {
 		dropN(1);
@@ -2030,13 +2069,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_br(target.label);
 		}
 	}
+	// Return includes epilogue
 	def emitReturn(ctl: SpcControl) {
 		// All explicit RETURN instructions branch here.
 		if (ret_label != null) {
 			masm.bindLabel(ret_label);
 			ret_label = null;
 		}
+		emitFastEpilogue1();
+
 		var results = sig.results;
+		// fix values?
 		if (masm.valuerep.tagged) {
 			// update mismatched value tags
 			var params = sig.params;
@@ -2047,13 +2090,22 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 		}
 		// Compute VSP = VFP + state.sp
-		emit_compute_vsp(regs.vsp, state.sp);
-		// Return to caller
-		masm.emit_mov_r_i(regs.ret_throw, 0);
-		// Deallocate stack frame
-		masm.emit_addw_r_i(regs.sp, frame.frameSize);
-		masm.emit_ret();
+		emit_compute_vsp(regs.vsp, state.sp); 
+		if (!fast) {
+			// Return to caller                           // \ fast context: do not emit these instructions 
+			masm.emit_mov_r_i(regs.ret_throw, 0);         // | instead, emit the dispatch sequence from the interpreter
+			// Deallocate stack frame                     // | 
+			masm.emit_addw_r_i(regs.sp, frame.frameSize); // | 
+			masm.emit_ret();                              // / 
+		} else {
+			emitFastEpilogue2();
+			emitFastDispatch();
+		}
 	}
+	def emitFastDispatch() -> void;
+	def emitFastPrologue() -> void;
+	def emitFastEpilogue1() -> void;
+	def emitFastEpilogue2() -> void;
 	def emitOsrEntry(osr_entry_label: MasmLabel, state: Array<SpcVal>) {
 		if (Trace.compiler) Trace.OUT.put1("  OSR (+%d)", osr_entry_label.create_pos).ln();
 		masm.bindLabel(osr_entry_label);
@@ -3272,7 +3324,7 @@ def funcCanInline(decl: FuncDecl) -> InlineConfig {
 			// Cannot handle control flow yet.
 			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN => return default;
 			// These opcodes require swapping the instance.
-			THROW, CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
+			THROW, CALL, FAST_CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
 			ELEM_DROP, TABLE_INIT, TABLE_SIZE, TABLE_COPY, TABLE_GROW, GLOBAL_SET, GLOBAL_GET, TABLE_SET, TABLE_GET => swap_instance = true;
 			// Load/store opcodes require either the memory base or the instance.
 			I32_STORE, I64_STORE, F32_STORE, F64_STORE, I32_STORE8, I32_STORE16, I64_STORE8, I64_STORE16, I64_STORE32,
