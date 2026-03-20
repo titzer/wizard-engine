@@ -22,6 +22,9 @@ class X86_64Stack extends WasmStack {
 	var return_results: Array<ValueType>;
 	var state_: StackState;
 
+	// Single-linked list for stack manager cache.
+	var next_stack: X86_64Stack;
+
 	new(size) {
 		mapping = Target.mmap_reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) fatal("out of memory allocating value stack");
@@ -769,8 +772,18 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
 	// mov [%stack.parent_rsp_ptr], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp_ptr), 0);
+	
 	// l_return:
 	masm.bindLabel(l_return);
+	
+	// recycle %stack (already set at this point)
+	masm.emit_mov_m_m(
+		ValueKind.REF,
+		MasmAddr(r_stack, masm.offsets.X86_64Stack_next_stack),
+		MasmAddr(Reg(0), int.!(masm.offsets.X86_64StackManager_cache - Pointer.NULL))
+	);
+	masm.emit_mov_m_r(ValueKind.REF, MasmAddr(Reg(0), int.!(masm.offsets.X86_64StackManager_cache - Pointer.NULL)), r_stack);
+	
 	// mov [cur_stack], %parent
 	masm.emit_set_curstack(r_parent);
 	// pop %rsp
@@ -1153,29 +1166,37 @@ private class X86_64FrameWriter extends FrameWriter {
 component X86_64StackManager {
 	var cache: X86_64Stack;
 
-	def getFreshStack() -> X86_64Stack {
-		var result: X86_64Stack;
-		if (cache == null) {
-			result = X86_64Stack.new(EngineOptions.STACK_SIZE.get());
-		} else {
-			result = cache;
-			cache = null;
+	def allocStackBatch() {
+		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", StackTuning.stackCacheSize).ln();
+		for (i < StackTuning.stackCacheSize) {
+			var curr = X86_64Stack.new(EngineOptions.STACK_SIZE.get());
+			curr.next_stack = cache;
+			cache = curr;
 		}
-		if (Trace.stack) Trace.OUT.put1(
-			"Requested fresh x86_stack @ 0x%x", Pointer.atObject(result) - Pointer.NULL
-		).ln();
-		return result;
 	}
+
+	def getFreshStack() -> X86_64Stack {
+		if (cache == null) allocStackBatch();
+
+		var result = cache;
+		cache = cache.next_stack;
+		result.next_stack = null;
+
+		if (Trace.stack) Trace.OUT.put1("Requested fresh x86_stack @ 0x%x", Pointer.atObject(result) - Pointer.NULL).ln();
+		return result.clear();
+	}
+
 	def recycleStack(stack: X86_64Stack) {
-		if (cache == null) cache = stack; // XXX: save the larger/smaller of the stacks?
+		stack.next_stack = cache;
+		cache = stack;
 	}
+
 	def runOnFreshStack(f: Function, args: Range<Value>) -> Result {
 		// Always run functions on a separate, fresh stack.
 		var prev = X86_64Runtime.curStack; // handle reentrancy
 		var stack = X86_64StackManager.getFreshStack();
 		var result = stack.reset(f).bind(args).resume();
 		X86_64Runtime.curStack = prev;
-		X86_64StackManager.recycleStack(stack.clear());
 		return result;
 	}
 }
