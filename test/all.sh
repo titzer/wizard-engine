@@ -119,6 +119,25 @@ for target in $TEST_TARGETS; do
     do_script monitors/whamm/monitors/correctness/test
 done
 
+# Inlining tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" != "x86-64-linux" ]; then
+        skip inline "no JIT support"
+        continue
+    fi
+    if [[ $DEFAULT_MODES = 1 ]]; then
+        TEST_MODE=jit $SCRIPT_LOC/inline/test.sh || exit_if_failure $?
+        TEST_MODE=lazy $SCRIPT_LOC/inline/test.sh || exit_if_failure $?
+        TEST_MODE=dyn $SCRIPT_LOC/inline/test.sh || exit_if_failure $?
+        TEST_MODE=spc $SCRIPT_LOC/inline/test.sh || exit_if_failure $?
+    elif [[ "$TEST_MODE" = "jit" || "$TEST_MODE" = "lazy" || "$TEST_MODE" = "dyn" || "$TEST_MODE" = "spc" ]]; then
+        $SCRIPT_LOC/inline/test.sh || exit_if_failure $?
+    else
+        skip inline "requires JIT mode"
+    fi
+done
+
 # Self-hosted (unit) tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
