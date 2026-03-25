@@ -102,6 +102,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var sig: SigDecl;
 	var num_locals: int;
 	var local_base_sp: u31; // can use a Range for 0-indexing instead of from offset
+	var ctl_base_sp: u31;   // index of the RETURN control in ctl_stack for the current frame
 
 	var success = true;
 	var osr_pc: int;
@@ -164,7 +165,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
-		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0);
+		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0, masm.newLabel(func.cur_bytecode.length));
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
@@ -393,18 +394,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visitProbe(orig_op: Opcode) {
 		last_probe = it.pc;
 		if (orig_op != Opcode.LOOP && orig_op != Opcode.END) emitProbe();
-	}
-	// Guards compiler code with frame reconstruction (if necessary).
-	def withReconstructedInlinedFrames(emit: void -> void) {
-		if (isInlined()) {
-			unrefRegs();
-			def space = emitReconstructStackFrames(snapshotFrames());
-			emit();
-			if (space > 0) masm.emit_addw_r_i(regs.sp, space);
-		} else {
-			emit();
-		}
-
 	}
 	def emitProbe() {
 		if (last_probe == 0) return;
@@ -789,6 +778,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			emitProbe();
 			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
 			state.ctl_stack.pop();
+			return;
 		}
 		emitProbe();
 	}
@@ -819,9 +809,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_RETURN() {
-		var target = state.ctl_stack.elems[0];
+		var target = state.ctl_stack.elems[ctl_base_sp];
 		state.emitTransfer(target, resolver);
-		if (ret_label == null) ret_label = masm.newLabel(func.cur_bytecode.length);
 		masm.emit_br(ret_label);
 		setUnreachable();
 	}
@@ -872,9 +861,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		var num_locals = callee_func.num_slots();
 
-		// Push an implicit block for the head of the function
+		// Push a RETURN control for the inlined callee's function body.
 		var end_label = masm.newLabel(callee_func.cur_bytecode.length);
-		state.pushBlock(sig.params, sig.results, end_label);
+		var func_body_ctl = state.pushFuncBody(sig.params, sig.results, end_label);
+		func_body_ctl.merge_state = state.getInMemoryMergeWithArgs(int.view(func_body_ctl.val_stack_top), sig.results); // preserve outer frame state below callee's results
+		func_body_ctl.merge_count = 1;
 
 		var m: Module = module;
 
@@ -890,8 +881,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 
 		// Create and push frame for inlined function
-		var callee_frame = SpcFrame.new(callee_func, 
-			m, new_local_base_sp, new_ctl_base_sp, num_locals, 0);
+		var callee_frame = SpcFrame.new(callee_func,
+			m, new_local_base_sp, new_ctl_base_sp, num_locals, 0, masm.newLabel(callee_func.cur_bytecode.length));
 
 		pushSpcFrame(callee_frame);
 
@@ -960,53 +951,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			setUnreachable();
 			return;
 		}
-
-		// Clean up stack:
-		// Before: [..., arg0, arg1, ..., argN, local0, local1, ..., localM, result0, ..., resultK]
-		// After:  [..., result0, ..., resultK]
-
-		var total_callee_slots = state.sp - new_local_base_sp;  // All callee state
-		var slots_to_drop = total_callee_slots - results_count;
-
-		// for whamm probes, results_count SHOULD be zero
-		if (slots_to_drop > 0 && results_count > 0) {
-			// Need to move results down over parameters and locals
-			for (i < results_count) {
-				var result_slot = state.sp - results_count + u32.view(i);
-				var target_slot = new_local_base_sp + u32.view(i);
-				if (Trace.compiler) {
-					Trace.OUT.put3("    Moving result %d: slot %d -> slot %d", i, result_slot, target_slot).ln();
-				}
-				if (result_slot != target_slot) {
-					var rv = state.state[result_slot];
-					if (Trace.compiler) {
-						Trace.OUT.put2("      rv: flags=%x, const=%d", rv.flags, rv.const).ln();
-					}
-					if (rv.inReg()) {
-						regAlloc.reassign(rv.reg, int.!(result_slot), int.!(target_slot));
-					} else {
-						// Move in memory (rarely needed if results are in regs)
-						resolver.addMove((target_slot, rv), (result_slot, rv));
-					}
-					state.state[target_slot] = rv;
-				} else {
-					// Result already in the right place
-					if (Trace.compiler) Trace.OUT.puts("      (already in place)").ln();
-				}
-			}
-			resolver.emitMoves();
-
-			// Drop everything above results
-			for (slot = new_local_base_sp + results_count; slot < state.sp; slot++) {
-				unrefSlot(slot);
-			}
-			state.sp = new_local_base_sp + results_count;
-		} else if (slots_to_drop > 0) {
-			// No results, just drop everything
-			if (Trace.compiler) Trace.OUT.put1("dropping %d slots\n", slots_to_drop);
-			dropN(u32.view(slots_to_drop));
-		}
-		// If slots_to_drop <= 0, results are already in the right place
 
 		if (Trace.compiler) {
 			Trace.OUT.put1("  Inlined call complete, sp=%d", state.sp).ln();
@@ -2188,10 +2132,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitReturn(ctl: SpcControl) {
 		// All explicit RETURN instructions branch here.
-		if (ret_label != null) {
-			masm.bindLabel(ret_label);
-			ret_label = null;
-		}
+		masm.bindLabel(ret_label);
+
 		var results = sig.results;
 		if (masm.valuerep.tagged) {
 			// update mismatched value tags
@@ -2202,6 +2144,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_mov_m_i(masm.tagAddr(state.sp - u32.view(results.length) + u32.view(i)), rtag.code);
 			}
 		}
+
+		if (isInlined()) return;
+
 		// Compute VSP = VFP + state.sp
 		emit_compute_vsp(regs.vsp, state.sp);
 		// Return to caller
@@ -2315,6 +2260,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 
 		return total_space;
+	}
+	// Guards compiler code with frame reconstruction (if necessary).
+	def withReconstructedInlinedFrames(emit: void -> void) {
+		if (isInlined()) {
+			unrefRegs();
+			def space = emitReconstructStackFrames(snapshotFrames());
+			emit();
+			if (space > 0) masm.emit_addw_r_i(regs.sp, space);
+		} else {
+			emit();
+		}
+
 	}
 	def unsupported() {
 		success = false; // XXX: add opcode
@@ -2746,7 +2703,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (func != null) masm.pushInlineContext(func.func_index);
 
 		def current = state.frame_stack.peek();
-		if (current != null) current.pc = it.pc;
+		if (current != null) {
+			current.pc = it.pc;
+			current.ret_label = ret_label;
+		}
 		state.frame_stack.push(frame);
 		// Update cached copies from new top frame
 		it.reset(frame.func).at(frame.pc, -1);
@@ -2755,6 +2715,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		sig = func.sig;
 		num_locals = frame.num_locals;
 		local_base_sp = frame.local_base_sp;
+		ctl_base_sp = frame.ctl_base_sp;
+		ret_label = frame.ret_label;
 	}
 	def popSpcFrame() -> SpcFrame {
 		masm.popInlineContext();
@@ -2768,6 +2730,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		sig = func.sig;
 		num_locals = current.num_locals;
 		local_base_sp = current.local_base_sp;
+		ctl_base_sp = current.ctl_base_sp;
+		ret_label = current.ret_label;
 		return frame;
 	}
 
@@ -2782,7 +2746,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		for (i < state.frame_stack.top) {
 			var f = state.frame_stack.elems[i];
 			var pc = if(i == state.frame_stack.top - 1, it.pc, f.pc);
-			frames[i] = SpcFrame.new(f.func, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc);
+			frames[i] = SpcFrame.new(f.func, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc, null);
 		}
 		return frames;
 	}
@@ -2799,7 +2763,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var bi = BytecodeIterator.new().reset(func);
 		while (bi.more()) {
 			match (bi.current()) {
-				RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => 
+				RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => 
 					return no("uses return instruction");
 				TRY, CATCH, THROW, RETHROW, THROW_REF, DELEGATE, CATCH_ALL, TRY_TABLE =>
 					return no("uses exception handling instruction");
@@ -2970,8 +2934,9 @@ class SpcFrame {
 	var ctl_base_sp: u31;    // Base index into SpcState.ctl_stack
 	var num_locals: int;
 	var pc: int;
+	var ret_label: MasmLabel;
 
-	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc) {}
+	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc, ret_label) {}
 }
 
 class SpcState(regAlloc: RegAlloc) {
@@ -2988,7 +2953,7 @@ class SpcState(regAlloc: RegAlloc) {
 		ctl_stack.clear();
 		// manually set up first control entry and return merge state
 		var results = sig.results;
-		var ctl = pushControl(Opcode.RETURN.code, ValueTypes.NONE, results, ret_label);
+		var ctl = pushFuncBody(ValueTypes.NONE, results, ret_label);
 		var merge_state = Array<SpcVal>.new(results.length);
 		for (i < results.length) {
 			// request the merged values be stored to the stack, but don't require tags
@@ -3019,6 +2984,9 @@ class SpcState(regAlloc: RegAlloc) {
 	}
 	def pushBlock(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl {
 		return pushControl(Opcode.BLOCK.code, params, results, end_label);
+	}
+	def pushFuncBody(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl {
+		return pushControl(Opcode.RETURN.code, params, results, end_label);
 	}
 	def pushLoop(params: Array<ValueType>, results: Array<ValueType>, start_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.LOOP.code, params, results, start_label);
