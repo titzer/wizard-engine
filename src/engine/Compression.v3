@@ -1,0 +1,124 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Generalized- relocatable representation of a stack frame that can be serialized.
+type RelocatableFrame(func: WasmFunction, pc: int, reentry: TargetReentryLabel, vals: Array<Value>) #unboxed {
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		// Frame header.
+		buf.put2("  Frame(func=%q, pc=%d):", func.decl.render(null, _), pc).ln();
+		buf.put1("  Values(count=%d):", vals.length).ln();
+
+		// Frame values.
+		if (vals.length > 0) {
+			buf.puts("    ");
+			for (v in vals) Values.render(v, buf).puts(" ");
+		}
+		return buf;
+	}
+}
+
+class CompressionStrategy<C> {
+	def compress(frames: Range<RelocatableFrame>) -> C;
+	def decompress(comp: C) -> Array<RelocatableFrame>;
+}
+
+class NaiveCompressionStrategy extends CompressionStrategy<NaiveCompressedStack> {
+	def compress(frames: Range<RelocatableFrame>) -> NaiveCompressedStack {
+		var frames_builder = Vector<FrameHeader>.new();
+		var values_builder = Vector<Value>.new();
+		for (frame in frames) {
+			var header = FrameHeader(frame.func, frame.pc, frame.reentry, frame.vals.length);
+			frames_builder.put(header);
+			values_builder.puta(frame.vals);
+		}
+
+		// XXX: reuse stack (maybe pass one in?)
+		var result = NaiveCompressedStack.new();
+		result.frames = frames_builder.extract();
+		result.values = values_builder.extract();
+		return result;
+	}
+
+	def decompress(comp: NaiveCompressedStack) -> Array<RelocatableFrame> {
+		var builder = Vector<RelocatableFrame>.new();
+		var val_offset = 0;
+		for (header in comp.frames) {
+			var vals = Arrays.range(comp.values, val_offset, val_offset + header.n_vals);
+			builder.put(RelocatableFrame(header.func, header.pc, header.reentry, vals));
+			val_offset += header.n_vals;
+		}
+
+		return builder.extract();
+	}
+}
+
+class PackedCompressionStrategy extends CompressionStrategy<PackedCompressedStack> {
+	def frames_builder = Vector<FrameHeader>.new();
+	def refs_builder = Vector<Object>.new();
+	def w = DataWriter.new();
+	def r = DataReader.new(null);
+
+	def reset() { frames_builder.clear(); refs_builder.clear(); w.clear(); }
+
+	def writeValue(value: Value) {
+		match (value) {
+			Ref(v) => { w.putb(Value.Ref.tag).put_uleb32(u32.!(refs_builder.length)); refs_builder.put(v); }
+			I31(v) => w.putb(Value.I31.tag).put_uleb32(v);
+			I32(v) => w.putb(Value.I32.tag).put_uleb32(v);
+			I64(v) => w.putb(Value.I64.tag).put_sleb64(i64.view(v));
+			F32(v) => w.putb(Value.F32.tag).put_uleb32(v);
+			F64(v) => w.putb(Value.F64.tag).put_sleb64(i64.view(v));
+			V128(l, h) => w.putb(Value.V128.tag).put_sleb64(i64.view(l)).put_sleb64(i64.view(h));
+			Cont(c) => {
+				// TODO: omit {version} if boxed-continuation is enabled
+				var obj = Continuations.getStoredObject(c);
+				var version = Continuations.getStoredVersion(c);
+				w.putb(Value.Cont.tag).put_uleb32(u32.!(refs_builder.length)).put_sleb64(i64.view(version));
+				refs_builder.put(obj);
+			}
+		}
+	}
+
+	def compress(frames: Range<RelocatableFrame>) -> PackedCompressedStack {
+		for (frame in frames) {
+			var header = FrameHeader(frame.func, frame.pc, frame.reentry, frame.vals.length);
+			frames_builder.put(header);
+			for (v in frame.vals) writeValue(v);
+		}
+
+		// XXX: reuse stack (maybe pass one in?)
+		var result = PackedCompressedStack.new();
+		result.frames = frames_builder.extract();
+		result.packed = w.extract();
+		result.refs = refs_builder.extract();
+		return result;
+	}
+
+	def decompress(comp: PackedCompressedStack) -> Array<RelocatableFrame> {
+		r.reset(comp.packed, 0, comp.packed.length);
+		// TODO[rv]: finish this
+	}
+}
+
+// Compressed stack representation.
+
+type FrameHeader(func: WasmFunction, pc: int, reentry: TargetReentryLabel, n_vals: int) #unboxed;
+
+class CompressedStack {
+	def size() -> u64;
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
+class NaiveCompressedStack extends CompressedStack {
+	var frames: Array<FrameHeader>;
+	var values: Array<Value>;
+}
+
+class PackedCompressedStack extends CompressedStack {
+	var frames: Array<FrameHeader>;
+
+	// Packed value stack representation.
+	var packed: Array<byte>;
+	var refs: Array<Object>;
+}
