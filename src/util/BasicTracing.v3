@@ -2,11 +2,13 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def OUT = Trace.OUT;
-// Implements basic tracing functionality such as --trace-interpreter, --trace-calls, --trace-memory.
+// Implements basic tracing functionality such as tracing instructions, calls, memory, etc.
+// This component is typically configured by command-line options; see {TraceOptions}.
 component BasicTracing {
 	var moduleFilter: DeclFilter;
 	var callsFilter: DeclFilter;
 	var memoryFilter: DeclFilter;
+	var points: List<PointFilter>;
 
 	def reset() {
 		if (Trace.interpreter) Instrumentation.probes.add(TRACE_INTERP_PROBE);
@@ -15,23 +17,30 @@ component BasicTracing {
 	def enableTraceInt() {
 		Instrumentation.probes.add(TRACE_INTERP_PROBE);
 	}
+	// Returns {true} if any basic tracing functionality is enabled.
 	def requiresInstrumentation() -> bool {
-		return callsFilter != null || memoryFilter != null;
+		return callsFilter != null || memoryFilter != null || points != null;
 	}
+	// Instruments a single function.
 	def instrumentFunc(module: Module, func: FuncDecl) {
-		// Add a call and memory tracing if the global options are turned on.
-		if (callsFilter != null && callsFilter.matches(module, func)) addTraceCallsProbes(module, func);
-		if (memoryFilter != null && memoryFilter.matches(module, func)) addTraceMemoryProbes(module, func);
+		var ranges: List<(u32, u32)>;
+		for (pl = points; pl != null; pl = pl.tail) {
+			var point = pl.head;
+			if (!point.decl.matches(module, func)) continue;
+			ranges = List.new((point.min, point.max), ranges);
+		}
+		if (ranges != null) TracePointInstrumenter.new(module, ranges).runOne(func);
+		if (callsFilter != null && callsFilter.matches(module, func)) {
+			Instrumentation.insertFuncEntryProbe(module, func.func_index, CALL_TRACE_PROBE);
+		}
+		if (memoryFilter != null && memoryFilter.matches(module, func)) {
+			TraceMemoryInstrumenter.new(module).runOne(func);
+		}
 	}
+	// Instruments an entire module.
 	def instrumentModule(module: Module) {
-		if (callsFilter == null && memoryFilter == null) return;
+		if (callsFilter == null && memoryFilter == null && points == null) return;
 		for (i < module.functions.length) instrumentFunc(module, module.functions[i]);
-	}
-	def addTraceCallsProbes(module: Module, func: FuncDecl) {
-		Instrumentation.insertFuncEntryProbe(module, func.func_index, CALL_TRACE_PROBE);
-	}
-	def addTraceMemoryProbes(module: Module, func: FuncDecl) {
-		TraceMemoryInstrumenter.new(module).runOne(func);
 	}
 }
 
@@ -223,7 +232,23 @@ def outputOpAndAddr(op: Opcode, memory_index: u31, offset: u64, index: Value) ->
 	return result;
 }
 
-// A tracing probe similar to 
+class TracePointInstrumenter extends BytecodeInstrumenter {
+	def ranges: List<(u32, u32)>;
+	
+	new(module: Module, ranges) super(module) { }
+
+	def visitOp(op: Opcode) {
+		for (rl = ranges; rl != null; rl = rl.tail) {
+			if (bi.pc >= rl.head.0 && bi.pc < rl.head.1) {
+				insertProbeHere(TRACE_POINT_PROBE);
+				return; // only insert the trace probe once, even if multiple ranges match.
+			}
+		}
+	}
+}
+
+// A tracing probe which prints out the instruction and optionally operands.
+def TRACE_POINT_PROBE = TracePointProbe.new(OUT);
 class TracePointProbe(out: TraceBuilder) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
 		var func = dynamicLoc.func;
