@@ -40,7 +40,7 @@ More advanced instrumentation and analysis is supported via [monitors](./Monitor
 ### Tracing Wizard
 
 The first kind of basic tracing traces *the Wizard Engine*'s implementation.
-This is useful if you are debugging the engine itself.
+This is useful for debugging the engine itself.
 You first must build Wizard for the `v3i` target by running `make v3i` (or, e.g. `make bin/unittest.v3i), which generates a script in the `bin/` directory that runs the engine from source on the Virgil interpreter.
 Each script respects the `V3C_OPTS` environment variable, which you can then set to include `-trace-calls=<pat>`, which is an option built into the Virgil interpreter that traces calls to specified methods.
 
