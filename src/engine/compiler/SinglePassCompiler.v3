@@ -2109,8 +2109,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		def real_frame = frames[0];
 		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
+		// Use inlined frame stub IP as return address for all reconstructed frames
+		var return_addr = getSpcInlinedFrameIp();
+
 		// load instance
 		var inst_reg = allocTmp(ValueKind.REF);
+		//emit_load_instance(inst_reg);
 		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
 		var mem_reg = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
@@ -2136,64 +2140,57 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Process the inlined frames (skip the outermost which already exists on native stack)
 		for (i = 1; i < frames.length; i++) {
-			def frame_info = frames[i];
+			var frame_info = frames[i];
+			def frame_offset = (frames.length - i) * (frame.frameSize + 8);
+
+			// Write inlined frame stub IP as return address
+			def retaddr_slot = MasmAddr(regs.sp, frame_offset + frame.frameSize);
+			masm.emit_mov_m_l(retaddr_slot, return_addr);
+
+			// get functions[func_index] and save into frame
+			def wasm_func_slot = frame.wasm_func_slot.plus(frame_offset);
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, wasm_func_reg, func_reg, frame_info.func.func_index);
+			masm.emit_mov_m_r(ValueKind.REF, wasm_func_slot, wasm_func_reg);
+
+			// Save instance
+			def instance_slot = frame.instance_slot.plus(frame_offset);
+			masm.emit_mov_m_r(ValueKind.REF, instance_slot, inst_reg);
+
+			// Save mem0 base
+			def mem0_base_slot = frame.mem0_base_slot.plus(frame_offset);
+			masm.emit_mov_m_r(ValueKind.REF, mem0_base_slot, mem_reg);
+
+			// Step vfp_reg by change in local_base_sp from previous frame and save
+			def vfp_slot = frame.vfp_slot.plus(frame_offset);
 			def cur_base_sp = int.view(frame_info.local_base_sp);
-			def delta = (cur_base_sp - prev_base_sp) * masm.valuerep.slot_size;
-			emitReconstructStackFrame(frame_info, frames.length - 1, delta,
-					wasm_func_reg, func_reg, inst_reg, mem_reg, vfp_reg, inl_inst_reg, inl_mem0_reg);
+			var delta = (cur_base_sp - prev_base_sp) * masm.valuerep.slot_size;
+			if (delta != 0) masm.emit_addw_r_i(vfp_reg, delta);
+			masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
 			prev_base_sp = cur_base_sp;
+
+			// Save PC
+			def pc_slot = frame.pc_slot.plus(frame_offset);
+			masm.emit_mov_m_i(pc_slot, frame_info.pc);
+
+			// Clear FrameAccessor
+			def accessor_slot = frame.accessor_slot.plus(frame_offset);
+			masm.emit_mov_m_l(accessor_slot, 0);
+
+			// if an inlined whamm probe, also grab inlined slots
+			if (is_inlined) {
+				def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
+				masm.emit_mov_m_r(ValueKind.REF, inl_instance_slot, inl_inst_reg);
+				def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
+				masm.emit_mov_m_r(ValueKind.REF, inl_mem0_base_slot, inl_mem0_reg);
+			} else {
+				def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
+				masm.emit_mov_m_l(inl_instance_slot, 0);
+				def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
+				masm.emit_mov_m_l(inl_mem0_base_slot, 0);
+			}
 		}
 
 		return total_space;
-	}
-	def emitReconstructStackFrame(spcFrame: SpcFrame, offset: int, vfp_delta: int,
-			wasm_func_reg: Reg, func_reg: Reg, inst_reg: Reg, mem_reg: Reg, vfp_reg: Reg, inl_inst_reg: Reg, inl_mem0_reg: Reg) {
-		// Use inlined frame stub IP as return address for all reconstructed frames
-		def return_addr = getSpcInlinedFrameIp();
-
-		def frame_offset = offset * (frame.frameSize + 8);
-		// Write inlined frame stub IP as return address
-		def retaddr_slot = MasmAddr(regs.sp, frame_offset + frame.frameSize);
-		masm.emit_mov_m_l(retaddr_slot, return_addr);
-
-		// get functions[func_index] and save into frame
-		def wasm_func_slot = frame.wasm_func_slot.plus(frame_offset);
-		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, wasm_func_reg, func_reg, spcFrame.func.func_index);
-		masm.emit_mov_m_r(ValueKind.REF, wasm_func_slot, wasm_func_reg);
-
-		// Save instance
-		def instance_slot = frame.instance_slot.plus(frame_offset);
-		masm.emit_mov_m_r(ValueKind.REF, instance_slot, inst_reg);
-
-		// Save mem0 base
-		def mem0_base_slot = frame.mem0_base_slot.plus(frame_offset);
-		masm.emit_mov_m_r(ValueKind.REF, mem0_base_slot, mem_reg);
-
-		// Step vfp_reg by change in local_base_sp from previous frame and save
-		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
-		def vfp_slot = frame.vfp_slot.plus(frame_offset);
-		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
-
-		// Save PC
-		def pc_slot = frame.pc_slot.plus(frame_offset);
-		masm.emit_mov_m_i(pc_slot, spcFrame.pc);
-
-		// Clear FrameAccessor
-		def accessor_slot = frame.accessor_slot.plus(frame_offset);
-		masm.emit_mov_m_l(accessor_slot, 0);
-
-		// if an inlined whamm probe, also grab inlined slots
-		if (is_inlined) {
-			def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
-			masm.emit_mov_m_r(ValueKind.REF, inl_instance_slot, inl_inst_reg);
-			def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
-			masm.emit_mov_m_r(ValueKind.REF, inl_mem0_base_slot, inl_mem0_reg);
-		} else {
-			def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
-			masm.emit_mov_m_l(inl_instance_slot, 0);
-			def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
-			masm.emit_mov_m_l(inl_mem0_base_slot, 0);
-		}
 	}
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
