@@ -203,11 +203,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
-		if (fast) {
-			emitFastPrologue();
-		} else {
-			emitPrologue();
-		}
+		emitPrologue();
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -384,36 +380,43 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (!cond) bailout(Strings.format3(msg, p1, p2, p3));
 	}
 	def emitPrologue() {
-		// Allocate stack frame
-		masm.emit_subw_r_i(regs.sp, frame.frameSize);
+		if (!fast) {
+			// Allocate stack frame
+			masm.emit_subw_r_i(regs.sp, frame.frameSize);
 
-		// Spill VSP
-		emit_spill_vsp(regs.vsp); // XXX: track VSP-spilled state
-		// Spill wf: WasmFunction
-		masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
-		// Load wf.instance and spill
-		masm.emit_v3_WasmFunction_instance_r_r(regs.instance, regs.func_arg);
-		masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
-		// Clear FrameAccessor
-		masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
-		// Clear inlined whamm instance
-		if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
-			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+			// Spill VSP
+			emit_spill_vsp(regs.vsp); // XXX: track VSP-spilled state
+			// Spill wf: WasmFunction
+			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
+			// Load wf.instance and spill
+			masm.emit_v3_WasmFunction_instance_r_r(regs.instance, regs.func_arg);
+			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
+			// Clear FrameAccessor
+			masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
+			// Clear inlined whamm instance
+			if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
+				masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+			}
+		} else {
+			masm.emit_addw_r_i(X86_64MasmRegs.INT_EXEC_ENV.ip, uleb_size(func.func_index));
 		}
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
-		// XXX: skip spilling of VFP
-		masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
 
-		// Load instance.memories[0].start into MEM0_BASE and spill
-		if (module.memories.length > 0) {
-			// XXX: skip loading memory base if function doesn't access memory
-			masm.emit_v3_Instance_memories_r_r(regs.mem0_base, regs.instance);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.mem0_base, regs.mem0_base, 0);
-			masm.emit_v3_Memory_start_r_r(regs.mem0_base, regs.mem0_base);
-			masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
+		if (!fast) {
+			// XXX: skip spilling of VFP
+			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
+
+			// Load instance.memories[0].start into MEM0_BASE and spill
+			if (module.memories.length > 0) {
+				// XXX: skip loading memory base if function doesn't access memory
+				masm.emit_v3_Instance_memories_r_r(regs.mem0_base, regs.instance);
+				masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.mem0_base, regs.mem0_base, 0);
+				masm.emit_v3_Memory_start_r_r(regs.mem0_base, regs.mem0_base);
+				masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
+			}
 		}
 	}
 	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
@@ -2178,7 +2181,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(ret_label);
 			ret_label = null;
 		}
-		emitFastEpilogue1();
 
 
 
@@ -2205,14 +2207,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_addw_r_i(regs.sp, frame.frameSize); // |
 			masm.emit_ret();                              // /
 		} else {
-			emitFastEpilogue2();
+			// Restore VFP from interpreter frame
+			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 			emitFastDispatch();
 		}
 	}
 	def emitFastDispatch() -> void;
-	def emitFastPrologue() -> void;
-	def emitFastEpilogue1() -> void;
-	def emitFastEpilogue2() -> void;
 	def emitOsrEntry(osr_entry_label: MasmLabel, state: Array<SpcVal>) {
 		if (Trace.compiler) Trace.OUT.put1("  OSR (+%d)", osr_entry_label.create_pos).ln();
 		masm.bindLabel(osr_entry_label);
@@ -3586,3 +3586,9 @@ type WhammInlineConfig(swap_membase: bool, swap_instance: bool, is_inlined: bool
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
 type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
+
+def uleb_size(v: int) -> int {
+	var n = 1, data = u32.view(v);
+	while (data >= 0x80) { data = data >> 7; n++; }
+	return n;
+}
