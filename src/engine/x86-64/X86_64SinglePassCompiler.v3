@@ -1410,8 +1410,6 @@ class X86_64SpcCompileStub extends RiUserCode {
 
 def V3_SPC_ENTRY_FUNC = X86_64PreGenFunc<(WasmFunction, Pointer, Pointer), Throwable>.new("v3-spc-entry", null, genSpcEntryFunc);
 def LAZY_COMPILE_STUB = X86_64PreGenStub.new("spc-lazy-compile", X86_64SpcCompileStub.new("lazy"), genLazyCompileStub);
-def FAST_COMPILE_STUB = X86_64PreGenStub.new("spc-fast-compile", X86_64SpcCompileStub.new("fast"), genFastCompileStub);
-def FAST_CALL_NOP = X86_64PreGenStub.new("spc-fast-nop", X86_64SpcCompileStub.new("fast"), genFastNopStub);
 def TIERUP_COMPILE_STUB = X86_64PreGenStub.new("spc-tierup-compile", X86_64SpcCompileStub.new("tierup"), genTierUpCompileStub);
 def TRAPS_STUB = X86_64SpcTrapsStub.new();
 def TRAPS_PREGEN = X86_64PreGenStub.new("spc-trap", TRAPS_STUB, genTrapsStub);
@@ -1466,141 +1464,6 @@ def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	asm.bind(unwind);
 	asm.movq_r_r(G(Target.V3_RET_GPRS[0]), G(Target.V3_RET_GPRS[2]));
 	asm.ret();
-}
-/* This stub should:
- * - save program state (i.e. an epilogue as if it was a call/new frame)
- * - compile the function (given register constraints imposed by fast int)
- * - rewrite the `fast_target_code` field with this new function
- * - restore program state
- * - jump into the new `fast_target_code` (or re-dispatch on itself)
- */
-def genFastCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
- 	if (SpcTuning.disable) return;
- 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
- 	var asm = X86_64Assembler.!(masm.asm);
- 	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
-	var func_arg = G(regs.func_arg);
-
- 	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
-
-	// TODO ensure that register use is compatible with fast-int usage
-	def r_mem0_base		= G(xenv.mem0_base);
-	def r_vfp			= G(xenv.vfp);
-	def r_vsp			= G(xenv.vsp);
-	def r_stp			= G(xenv.stp);
-	def r_ip			= G(xenv.ip);
-	def r_eip			= G(xenv.eip);
-	def r_func_decl		= G(xenv.func_decl);
-	def r_instance		= G(xenv.instance);
-	def r_curpc			= G(xenv.curpc);
-
-	def m_mem0_base 	= R.RSP.plus(X86_64InterpreterFrame.mem0_base.offset);
-	def m_vfp 			= R.RSP.plus(X86_64InterpreterFrame.vfp.offset);
-	def m_vsp 			= R.RSP.plus(X86_64InterpreterFrame.vsp.offset);
-	def m_stp 			= R.RSP.plus(X86_64InterpreterFrame.stp.offset);
-	def m_ip 			= R.RSP.plus(X86_64InterpreterFrame.ip.offset);
-	def m_eip 			= R.RSP.plus(X86_64InterpreterFrame.eip.offset);
-	def m_func_decl 	= R.RSP.plus(X86_64InterpreterFrame.func_decl.offset);
-	def m_instance 		= R.RSP.plus(X86_64InterpreterFrame.instance.offset);
-	def m_curpc 		= R.RSP.plus(X86_64InterpreterFrame.curpc.offset);
-
-	def ivar_MEM0_BASE	= (r_mem0_base, m_mem0_base);
-	def ivar_VFP		= (r_vfp, m_vfp);
-	def ivar_VSP		= (r_vsp, m_vsp);
-	def ivar_STP		= (r_stp, m_stp);
-	def ivar_IP			= (r_ip, m_ip);
-	def ivar_EIP		= (r_eip, m_eip);
-	def ivar_FUNC_DECL	= (r_func_decl, m_func_decl);
-	def ivar_INSTANCE	= (r_instance, m_instance);
-	def ivar_CURPC		= (r_curpc, m_curpc);
-
-	def all_ivars = [
-		ivar_MEM0_BASE,
-		ivar_VFP,
-		ivar_VSP,
-		ivar_STP,
-		ivar_IP,
-		ivar_EIP,
-		ivar_FUNC_DECL,
-		ivar_INSTANCE,
-		ivar_CURPC
-	];
-
-	masm.emit_debugger_breakpoint();
-	//for (i < all_ivars.length) {
-	//	asm.pushq_r(all_ivars[i].0);
-	//}
-	masm.saveCallerIVars(r_ip, r_stp, r_curpc, all_ivars);
-	asm.pushq_r(G(regs.func_arg));					// push function onto stack
-	// saveCallerIVars (move to macro assembler)
-	// look at runtime calls in int, and int->spc calls
-	masm.emit_store_curstack_vsp(regs.vsp);
-	masm.emit_debugger_breakpoint();
-
-	asm.movq_r_r(G(Target.V3_PARAM_GPRS[1]), G(regs.func_arg));	// function (rdx)
-	asm.movq_r_i(G(Target.V3_PARAM_GPRS[2]), int.!(Pointer.atObject(ic) - Pointer.NULL)); // load into rdx
-	// dispatch is in r14 (don't overwrite, just access directly)
-	// Load {null} for the receiver.
-	asm.movq_r_i(G(Target.V3_PARAM_GPRS[0]), 0);
-	// Call {X86_64Spc.fastCompile} directly.
-	//masm.emit_debugger_breakpoint();
-	masm.emit_call_abs(codePointer(X86_64Spc.fastCompile));
-	masm.emit_debugger_breakpoint();
-	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
-	// Check for non-null abrupt return.
-	var unwind = X86_64Label.new();
-	asm.q.cmp_r_i(G(Target.V3_RET_GPRS[2]), 0);
-	asm.jc_rel_near(C.NZ, unwind);
-	// Tail-call the result of the compile.
-	var scratch = X86_64Regs.R9;
- 	asm.movq_r_r(scratch, G(Target.V3_RET_GPRS[1]));			// entrypoint
- 	asm.movq_r_r(G(regs.func_arg), G(Target.V3_RET_GPRS[0]));		// function
-
-	//for (i < all_ivars.length) {
-	//	asm.popq_r(all_ivars[all_ivars.length - i - 1].0);
-	//}
-	masm.restoreCallerIVars(r_ip, r_stp, r_eip, r_instance, r_func_decl, r_mem0_base, r_vfp, all_ivars);
- 	masm.emit_load_curstack_vsp(regs.vsp);
-
-	masm.emit_debugger_breakpoint();
- 	asm.ijmp_r(scratch);						// jump to entrypoint
-
-	asm.invalid();
-	asm.ret();
-
-	// Simply return the {Throwable} object. ??
-	asm.bind(unwind);
-	asm.movq_r_r(G(Target.V3_RET_GPRS[0]), G(Target.V3_RET_GPRS[2]));
-	asm.ret();
-}
-def genFastNopStub(ic: X86_64InterpreterCode, w: DataWriter) {
- 	if (SpcTuning.disable) return;
- 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
- 	var asm = X86_64Assembler.!(masm.asm);
- 	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
- 	var func_arg = G(regs.func_arg);
-
-	def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
-	def r_ip       = G(xenv.ip);
-	def r_dispatch = G(xenv.dispatch);
-	def r_tmp0     = G(xenv.tmp0);		// RCX
-	def r_tmp1     = G(xenv.tmp1);		// RDX
-	def ip_ptr     = r_ip.plus(0);
-
-	// simplified dispatch sequence
-
-	var opcode = r_tmp0;
-	var base = r_tmp1;
-
-	asm.movbzx_r_m(opcode, ip_ptr);
-	asm.inc_r(r_ip);
-
-	// flattened 4 case
-	var addr = ic.start + ic.header.fastDispatchTableOffset;
-	asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
-	asm.ijmp_r(base);
-
-	asm.invalid();
 }
 def genTierUpCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	if (SpcTuning.disable) return;
@@ -1671,10 +1534,6 @@ component X86_64Spc {
 	def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
 		return V3_SPC_ENTRY_FUNC.get()(wf, sp, wf.decl.target_code.spc_entry);
 	}
-	def setFastCompileFor(module: Module, decl: FuncDecl) {
-		if (Debug.runtime) Trace.OUT.put1("setFastCompile %q", decl.render(module.names, _)).ln();
-		decl.fast_target_code = TargetCode(FAST_COMPILE_STUB.getEntry());
-	}
 	def setLazyCompileFor(module: Module, decl: FuncDecl) {
 		if (Debug.runtime) Trace.OUT.put1("setLazyCompile %q", decl.render(module.names, _)).ln();
 		decl.target_code = TargetCode(LAZY_COMPILE_STUB.getEntry());
@@ -1698,14 +1557,6 @@ component X86_64Spc {
 		// The global stub simply consults the execution strategy.
 		var result = X86_64SpcStrategy.!(Execute.tiering).lazyCompile(wf);
 		return (result.wf, result.entrypoint, result.thrown);
-	}
-	private def fastCompile(wf: WasmFunction, ic: X86_64InterpreterCode) -> (WasmFunction, Pointer, Throwable) {
-		// The global stub simply consults the execution strategy.
-		var result = X86_64ExecutionStrategy.!(Execute.tiering).fastCompile(wf, ic); // no condition that tiering uses SPC (int => fast SPC)
-		return (result.wf, result.entrypoint, result.thrown);
-		// need to compute _a_ new vfp
-		// bump the stack pointer?
-		// goal: avoid having to make new frame entirely
 	}
 	private def tierupCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.
