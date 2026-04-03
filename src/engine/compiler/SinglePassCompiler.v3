@@ -76,6 +76,10 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
+// Unlike frame.frameSize, where it is 0 for fast contexts. These are always the
+// true frame size (for stack reconstruction methods).
+def FRAME_SIZE = X86_64InterpreterFrame.size;
+
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits, fast: bool) extends BytecodeVisitor {
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
@@ -166,6 +170,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
+		if (fast) {
+			// push a SpcFrame representing the interpreter frame already on the stack
+			var interp_frame = SpcFrame.new(null, module, 0, 0, 0, -1, null);
+			pushSpcFrame(interp_frame);
+		}
 		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0, masm.newLabel(func.cur_bytecode.length));
 		pushSpcFrame(initial_frame);
 
@@ -765,7 +774,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
-		if (!isInlined()) {
+		if (needsEpilogue()) {
 			var ctl_top = state.ctl_stack.peek();
 			if (ctl_top.opcode == Opcode.LOOP.code) {
 				state.ctl_stack.pop();
@@ -2163,7 +2172,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 		}
 
-		if (isInlined()) return;
+		if (!needsEpilogue()) return;
 
 		// Compute VSP = VFP + state.sp
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -2247,7 +2256,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 
 		// Pre-allocate stack space for all reconstructed frames at once.
-		def total_space = (frames.length - 1) * (frame.frameSize + 8);
+		def total_space = (frames.length - 1) * (FRAME_SIZE + 8);
 		masm.emit_subw_r_i(regs.sp, total_space);
 
 		// Process the inlined frames (skip the outermost which already exists on native stack)
@@ -2267,9 +2276,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Use inlined frame stub IP as return address for all reconstructed frames
 		def return_addr = getSpcInlinedFrameIp();
 
-		def frame_offset = offset * (frame.frameSize + 8);
+		def frame_offset = offset * (FRAME_SIZE + 8);
 		// Write inlined frame stub IP as return address
-		def retaddr_slot = MasmAddr(regs.sp, frame_offset + frame.frameSize);
+		def retaddr_slot = MasmAddr(regs.sp, frame_offset + FRAME_SIZE);
 		masm.emit_mov_m_l(retaddr_slot, return_addr);
 
 		// get functions[func_index] and save into frame
@@ -2324,6 +2333,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 			unrefRegs();
 			frames_reconstructed = true;
+			if (Trace.compiler) Trace.OUT.puts("performing frame reconstruction\n");
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
 			frames_reconstructed = false;
@@ -2775,10 +2785,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		state.frame_stack.push(frame);
 		// Update cached copies from new top frame
-		it.reset(frame.func).at(frame.pc, -1);
+		if (frame.func != null) it.reset(frame.func).at(frame.pc, -1);
 		module = frame.module;
 		func = frame.func;
-		sig = func.sig;
+		sig = if(func != null, func.sig);
 		num_locals = frame.num_locals;
 		local_base_sp = frame.local_base_sp;
 		ctl_base_sp = frame.ctl_base_sp;
@@ -2803,6 +2813,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 	def isInlined() -> bool {
 		return state.frame_stack.top > 1;
+	}
+	def needsEpilogue() -> bool {
+		// inlined callees will fallthrough and don't need epilogue to be emitted
+		return !isInlined() || ctl_base_sp == 0;
 	}
 	def inlineDepth() -> int {
 		return state.frame_stack.top - 1;
