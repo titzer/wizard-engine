@@ -41,13 +41,20 @@ def X_ = registerAll([
 	("multi_frames", test_multi_frames),
 	("single_val_per_frame", test_single_val_per_frame),
 	("cont", test_cont),
-	("frame_metadata", test_frame_metadata)
+	("frame_metadata", test_frame_metadata),
+	("repeated_vals", test_repeated_vals),
+	("repeated_across_frames", test_repeated_across_frames),
+	("many_diverse_vals", test_many_diverse_vals),
+	("many_frames_diverse", test_many_frames_diverse),
+	("refs_mixed", test_refs_mixed),
+	("refs_shared_across_frames", test_refs_shared_across_frames),
+	("large_uniform_frames", test_large_uniform_frames)
 ]);
 
 def registerAll(tests: Array<(string, CompressionTester -> void)>) {
 	for (t in tests) {
 		for (s in strategies) {
-			var name = Strings.format2("compression:%s_%s", s.0, t.0);
+			var name = Strings.format2("compression:%s:%s", s.0, t.0);
 			var adapter = s.1;
 			UnitTests.registerT(name, "", CompressionTester.new(_, adapter), t.1);
 		}
@@ -245,4 +252,144 @@ def test_frame_metadata(t: CompressionTester) {
 	if (got[0].func != func) t.t.fail("func not preserved");
 	if (got[0].pc != 42) t.t.fail1("expected pc=42, got pc=%d", got[0].pc);
 	t.assert_vals_eq([Value.I32(99)], got[0].vals);
+}
+
+// === Part 5: Repeated values ===
+
+// Many identical values within a single frame.
+def test_repeated_vals(t: CompressionTester) {
+	var vals = Array<Value>.new(100);
+	for (i < vals.length) vals[i] = Value.I32(0xCAFEBABEu);
+	t.assert_roundtrip_vals(vals);
+
+	// Repeat with i64.
+	for (i < vals.length) vals[i] = Value.I64(0xDEADBEEF00000000uL);
+	t.assert_roundtrip_vals(vals);
+
+	// Repeat with the same ref object.
+	var obj = HeapObject.new(null, []);
+	for (i < vals.length) vals[i] = Value.Ref(obj);
+	t.assert_roundtrip_vals(vals);
+}
+
+// Same repeating value pattern across multiple frames.
+def test_repeated_across_frames(t: CompressionTester) {
+	var frames = Array<RelocatableFrame>.new(20);
+	var shared_vals: Array<Value> = [Value.I32(42), Value.I64(42), Value.F32(42)];
+	for (i < frames.length) frames[i] = t.make_frame(i, shared_vals);
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// === Part 6: Many diverse values ===
+
+// Single frame with many values of varying types and magnitudes.
+def test_many_diverse_vals(t: CompressionTester) {
+	var vals = Vector<Value>.new();
+	for (i < 50) {
+		vals.put(Value.I32(u32.view(i * 7)));
+		vals.put(Value.I64(u64.view(i) * 0x100000001uL));
+		vals.put(Value.F32(u32.view(i * 31)));
+		vals.put(Value.F64(u64.view(i) * 0x123456789uL));
+	}
+	t.assert_roundtrip_vals(vals.extract());
+}
+
+// Many frames, each with distinct values and varying sizes.
+def test_many_frames_diverse(t: CompressionTester) {
+	var frames = Vector<RelocatableFrame>.new();
+	for (i < 30) {
+		var n_vals = (i % 5) + 1; // 1 to 5 values per frame
+		var vals = Array<Value>.new(n_vals);
+		for (j < n_vals) {
+			var k = i * 5 + j;
+			match (k % 4) {
+				0 => vals[j] = Value.I32(u32.view(k * 13));
+				1 => vals[j] = Value.I64(u64.view(k) * 0xABCDuL);
+				2 => vals[j] = Value.F32(u32.view(k * 97));
+				_ => vals[j] = Value.F64(u64.view(k) * 0x1111111111uL);
+			}
+		}
+		frames.put(t.make_frame(i * 3, vals));
+	}
+	var input = frames.extract();
+	var got = t.roundtrip(input);
+	t.assert_frames_eq(input, got);
+}
+
+// === Part 7: Complex reference objects ===
+
+// Multiple distinct reference types in a single frame.
+def test_refs_mixed(t: CompressionTester) {
+	var heap_obj = HeapObject.new(null, []);
+	var host_obj = HostObject.new();
+	var host_fn = HostFunction.new("test_fn", SigCache.v_v, nop_host);
+	var vals: Array<Value> = [
+		Value.Ref(heap_obj),
+		Value.Ref(host_obj),
+		Value.Ref(host_fn),
+		Value.Ref(null),
+		Value.Ref(heap_obj), // same object again
+		Value.Ref(host_obj)  // same object again
+	];
+	var frames = [t.make_frame(0, vals)];
+	var got = t.roundtrip(frames);
+	t.assert_length(1, got.length, "frames");
+	t.assert_length(vals.length, got[0].vals.length, "values");
+	// Verify identity for each ref.
+	for (i < vals.length) {
+		match (vals[i]) {
+			Ref(expected) => match (got[0].vals[i]) {
+				Ref(actual) => if (expected != actual) t.t.fail1("ref[%d]: identity not preserved", i);
+				_ => t.t.fail1("ref[%d]: expected Ref", i);
+			}
+			_ => ;
+		}
+	}
+}
+
+def nop_host(args: Range<Value>) -> HostResult { return HostResult.Value0; }
+
+// Shared reference objects across multiple frames.
+def test_refs_shared_across_frames(t: CompressionTester) {
+	var obj_a = HeapObject.new(null, [Value.I32(1)]);
+	var obj_b = HostObject.new();
+	var frames = [
+		t.make_frame(0, [Value.Ref(obj_a), Value.I32(10)]),
+		t.make_frame(1, [Value.Ref(obj_b), Value.Ref(obj_a)]),
+		t.make_frame(2, [Value.Ref(obj_a), Value.Ref(obj_b), Value.Ref(null)])
+	];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+	// Verify cross-frame identity: obj_a in frame 0 == obj_a in frame 1 and 2.
+	var get_ref = get_ref_val;
+	var a0 = get_ref(got[0].vals[0]);
+	var a1 = get_ref(got[1].vals[1]);
+	var a2 = get_ref(got[2].vals[0]);
+	if (a0 != a1) t.t.fail("obj_a identity not preserved across frames 0 and 1");
+	if (a0 != a2) t.t.fail("obj_a identity not preserved across frames 0 and 2");
+	var b1 = get_ref(got[1].vals[0]);
+	var b2 = get_ref(got[2].vals[1]);
+	if (b1 != b2) t.t.fail("obj_b identity not preserved across frames 1 and 2");
+}
+
+def get_ref_val(v: Value) -> Object {
+	match (v) {
+		Ref(obj) => return obj;
+		_ => return null;
+	}
+}
+
+// Many frames with uniform large value counts.
+def test_large_uniform_frames(t: CompressionTester) {
+	var n_frames = 20;
+	var n_vals = 50;
+	var frames = Array<RelocatableFrame>.new(n_frames);
+	for (i < n_frames) {
+		var vals = Array<Value>.new(n_vals);
+		for (j < n_vals) vals[j] = Value.I64(u64.view(i * n_vals + j));
+		frames[i] = t.make_frame(i, vals);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
 }
