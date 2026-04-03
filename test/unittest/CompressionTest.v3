@@ -2,10 +2,10 @@
 // See LICENSE for details of Apache 2.0 license.
 
 // Zero-initialized reentry label used as a placeholder in test frames.
+// TODO: fuzz this for testing
 var DUMMY_REENTRY: TargetReentryLabel;
 
-// A strategy adapter that erases the compressed stack type, providing a uniform
-// roundtrip interface for testing all compression strategies.
+// An adapter that erases the compressed stack type to perform strategy-agnostic roundtrip tests.
 class CompressionStrategyAdapter {
 	def roundtrip: Array<RelocatableFrame> -> Array<RelocatableFrame>;
 	new(roundtrip) { }
@@ -26,7 +26,7 @@ def packedRoundtrip(frames: Array<RelocatableFrame>) -> Array<RelocatableFrame> 
 	return packed.decompress(packed.compress(frames));
 }
 
-// Register all tests across all strategies.
+// Register all tests across all strategies: for each test, register it once for every strategy.
 def X_ = registerAll([
 	("i32", test_i32),
 	("i64", test_i64),
@@ -118,7 +118,7 @@ class CompressionTester(t: Tester, adapter: CompressionStrategyAdapter) {
 	}
 }
 
-// === Part 1: Individual value type round-trips ===
+// ===== Compression roundtrip tests =====
 
 def test_i32(t: CompressionTester) {
 	t.assert_roundtrip_vals([Value.I32(0)]);
@@ -169,8 +169,6 @@ def test_ref(t: CompressionTester) {
 		_ => t.t.fail("expected Ref value");
 	}
 }
-
-// === Part 2: Edge cases and multi-frame ===
 
 def test_empty_frames(t: CompressionTester) {
 	var got = t.roundtrip([]);
@@ -224,8 +222,6 @@ def test_single_val_per_frame(t: CompressionTester) {
 	t.assert_frames_eq(frames, got);
 }
 
-// === Part 3: Continuation values ===
-
 def test_cont(t: CompressionTester) {
 	var stack = Target.newWasmStack();
 	var cont = Continuations.makeContinuation(stack);
@@ -242,8 +238,6 @@ def test_cont(t: CompressionTester) {
 	}
 }
 
-// === Part 4: Frame metadata preservation ===
-
 def test_frame_metadata(t: CompressionTester) {
 	var func = t.getDummyFunc();
 	var frame = RelocatableFrame(func, 42, DUMMY_REENTRY, DUMMY_REENTRY, [Value.I32(99)]);
@@ -253,8 +247,6 @@ def test_frame_metadata(t: CompressionTester) {
 	if (got[0].pc != 42) t.t.fail1("expected pc=42, got pc=%d", got[0].pc);
 	t.assert_vals_eq([Value.I32(99)], got[0].vals);
 }
-
-// === Part 5: Repeated values ===
 
 // Many identical values within a single frame.
 def test_repeated_vals(t: CompressionTester) {
@@ -280,8 +272,6 @@ def test_repeated_across_frames(t: CompressionTester) {
 	var got = t.roundtrip(frames);
 	t.assert_frames_eq(frames, got);
 }
-
-// === Part 6: Many diverse values ===
 
 // Single frame with many values of varying types and magnitudes.
 def test_many_diverse_vals(t: CompressionTester) {
@@ -316,8 +306,6 @@ def test_many_frames_diverse(t: CompressionTester) {
 	var got = t.roundtrip(input);
 	t.assert_frames_eq(input, got);
 }
-
-// === Part 7: Complex reference objects ===
 
 // Multiple distinct reference types in a single frame.
 def test_refs_mixed(t: CompressionTester) {
@@ -392,4 +380,72 @@ def test_large_uniform_frames(t: CompressionTester) {
 	}
 	var got = t.roundtrip(frames);
 	t.assert_frames_eq(frames, got);
+}
+
+// ===== Stack capture tests =====
+
+// Host function callback. Set {stack} before resuming; {invoke} serves as the imported host function body.
+class FrameCapturer {
+	var stack: WasmStack;
+
+	def invoke(args: Range<Value>) -> HostResult {
+		return HostResult.Value0;
+	}
+}
+
+// Tester that builds Wasm functions and captures stack frames during execution.
+class StackCaptureTester extends ExeTester {
+	var capturer = FrameCapturer.new();
+	var import_index: int;
+
+	new(t: Tester, tiering: ExecutionStrategy) super(t, tiering) { }
+
+	// Adds an imported v_v host function to the module and sets up the import binding.
+	// Must be called before codev/makeFunc.
+	def addHostImport() {
+		var import_sig = addSig(SigCache.v_v);
+		var import_decl = FuncDecl.new(import_sig.heaptype_index);
+		module.addImport("test", "capture", import_decl);
+		import_index = import_decl.func_index;
+		imports = [HostFunction.new("capture", import_sig, capturer.invoke)];
+	}
+
+	// Builds a validated function that pushes all params onto the value stack and calls the imported v_v host function,
+	// This ensures the value stack holds exactly the bound param values during the host call.
+	def buildCaptureFunc(param_types: Array<ValueType>) -> Function {
+		addHostImport();
+		var main_sig = SigDecl.new(true, ValueTypes.NO_HEAPTYPES, param_types, SigCache.arr_v);
+		sig(main_sig);
+		var bc = BinBuilder.new();
+		for (i < param_types.length) {
+			bc.put(u8.!(Opcode.LOCAL_GET.code));
+			bc.put_u32leb(u32.!(i));
+		}
+		bc.put(u8.!(Opcode.CALL.code));
+		bc.put_u32leb(u32.!(import_index));
+		for (i < param_types.length) {
+			bc.put(u8.!(Opcode.DROP.code));
+		}
+		codev(bc.extract());
+		return makeFunc();
+	}
+}
+
+// TODO: add more tests, after stack capture utils are done
+def S = StackCaptureTester.new;
+def unused_stack_ = TestTiers.addTests2([
+	("stack_capture_smoke", S, test_stack_capture_smoke)
+]);
+
+def test_stack_capture_smoke(t: StackCaptureTester) {
+	var f = t.buildCaptureFunc([ValueType.I32, ValueType.I64]);
+	if (f == null) return;
+
+	var s = Target.newWasmStack();
+	s.reset(f);
+	s.bind([Value.I32(42), Value.I64(99)]);
+	var r = s.resume();
+
+	// The function should complete normally with no return values.
+	t.assert_req(r, Result.Value(Values.NONE));
 }
