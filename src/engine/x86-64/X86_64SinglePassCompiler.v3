@@ -23,15 +23,101 @@ def KIND_F64 = SpcConsts.KIND_F64;
 def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 
+def xenv: IntExecEnv = X86_64MasmRegs.INT_EXEC_ENV;
+
+def r_mem0_base	= G(xenv.mem0_base);
+def r_vfp	= G(xenv.vfp);
+def r_vsp	= G(xenv.vsp);
+def r_stp	= G(xenv.stp);
+def r_ip	= G(xenv.ip);
+def r_eip	= G(xenv.eip);
+def r_func_decl	= G(xenv.func_decl);
+def r_instance	= G(xenv.instance);
+def r_curpc	= G(xenv.curpc);
+def ip_ptr    	= r_ip.plus(0);
+def r_dispatch 	= G(xenv.dispatch);
+def r_tmp0     	= G(xenv.tmp0);		// RCX
+def r_tmp1     	= G(xenv.tmp1);		// RDX
+
+def m_mem0_base 	= R.RSP.plus(X86_64InterpreterFrame.mem0_base.offset);
+def m_vfp 		= R.RSP.plus(X86_64InterpreterFrame.vfp.offset);
+def m_vsp 		= R.RSP.plus(X86_64InterpreterFrame.vsp.offset);
+def m_stp 		= R.RSP.plus(X86_64InterpreterFrame.stp.offset);
+def m_ip 		= R.RSP.plus(X86_64InterpreterFrame.ip.offset);
+def m_eip 		= R.RSP.plus(X86_64InterpreterFrame.eip.offset);
+def m_func_decl 	= R.RSP.plus(X86_64InterpreterFrame.func_decl.offset);
+def m_instance 		= R.RSP.plus(X86_64InterpreterFrame.instance.offset);
+def m_curpc 		= R.RSP.plus(X86_64InterpreterFrame.curpc.offset);
+
+def ivar_MEM0_BASE	= (r_mem0_base, m_mem0_base);
+def ivar_VFP		= (r_vfp, m_vfp);
+def ivar_VSP		= (r_vsp, m_vsp);
+def ivar_STP		= (r_stp, m_stp);
+def ivar_IP		= (r_ip, m_ip);
+def ivar_EIP		= (r_eip, m_eip);
+def ivar_FUNC_DECL	= (r_func_decl, m_func_decl);
+def ivar_INSTANCE	= (r_instance, m_instance);
+def ivar_CURPC		= (r_curpc, m_curpc);
+
+def all_ivars = [
+	ivar_MEM0_BASE,
+	ivar_VFP,
+	ivar_VSP,
+	ivar_STP,
+	ivar_IP,
+	ivar_EIP,
+	ivar_FUNC_DECL,
+	ivar_INSTANCE,
+	ivar_CURPC
+];
+
 // Implements the target-specific parts of the single-pass compiler for X86-64.
 class X86_64SinglePassCompiler extends SinglePassCompiler {
 	def w = DataWriter.new();
 	def mmasm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	def asm = mmasm.asm;
+	var ic: X86_64InterpreterCode;
 
-	new(extensions: Extension.set, limits: Limits, config: RegConfig)
-		super(X86_64MasmRegs.SPC_EXEC_ENV, mmasm, X86_64MasmRegs.SPC_ALLOC.copy(), extensions, limits) {
+	new(ic, extensions: Extension.set, limits: Limits, config: RegConfig, fast: bool)
+		super(if(fast, X86_64MasmRegs.FAST_SPC_EXEC_ENV, X86_64MasmRegs.SPC_EXEC_ENV), mmasm, 
+				if(fast, X86_64MasmRegs.INT_ALLOC.copy(), X86_64MasmRegs.SPC_ALLOC.copy()), 
+				extensions, limits, fast) {
 		mmasm.trap_stubs = TRAPS_STUB;
+	}
+	def emitFastDispatch() {
+		mmasm.emit_int_dispatch(r_tmp0, r_tmp1, r_ip, r_dispatch, ip_ptr, 
+				if(ic != null, IcCodeRef.new(ic.header.fastDispatchTableOffset)), true, ic);
+	}
+	private def saveIVar(r: X86_64Gpr) {
+		for (t in all_ivars) {
+			if (t.0 == r) asm.movq_m_r(t.1, r);
+		}
+	}
+	def saveCallerIVars() {
+		saveIVar(r_ip);
+		saveIVar(r_stp);
+		if (!FeatureDisable.stacktraces) saveIVar(r_curpc);
+	}
+	def restoreDispatchTableReg() {
+		if (!FeatureDisable.globalProbes) {
+			// restore dispatch table from Interpreter.dispatchTable
+			def offsets = masm.getOffsets();
+			asm.movq_r_m(r_dispatch, mmasm.absPointer(offsets.Interpreter_dispatchTable));
+		}
+	}
+	private def restoreReg(r: X86_64Gpr) {
+		for (t in all_ivars) {
+			if (t.0 == r) asm.movq_r_m(r, t.1);
+		}
+	}
+	def restoreCallerIVars() {
+		restoreReg(r_ip);
+		restoreReg(r_stp);
+		restoreReg(r_eip);
+		restoreReg(r_instance);
+		restoreReg(r_func_decl);
+		restoreReg(r_mem0_base);
+		restoreReg(r_vfp);
 	}
 
 	private def visitCompareI(asm: X86_64Assembler, cond: X86_64Cond) -> bool {
@@ -1515,6 +1601,7 @@ def codePointer<P, R>(f: P -> R) -> Pointer {
 
 // Global functionality associated with the single-pass compiler for X86-64.
 component X86_64Spc {
+	var ic: X86_64InterpreterCode;
 	// A handy chokepoint for entering JIT code from V3.
 	def invoke(wf: WasmFunction, sp: Pointer) -> Throwable {
 		return V3_SPC_ENTRY_FUNC.get()(wf, sp, wf.decl.target_code.spc_entry);
@@ -1535,7 +1622,8 @@ component X86_64Spc {
 		return addr;
 	}
 	def estimateCodeSizeFor(decl: FuncDecl) -> int {
-		return 60 + decl.orig_bytecode.length * 20; // TODO: huge overestimate
+		// TODO: very imprecise estimate
+		return 60 + decl.orig_bytecode.length * 20 * (4 << byte.view(SpcTuning.maxInlineDepth));
 	}
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.
