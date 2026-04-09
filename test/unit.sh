@@ -11,6 +11,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 . $HERE/common.sh unit
 
 make_binary unittest || exit $?
+base64 $BINARY
 
 CMD="$BINARY $WIZENG_OPTS --expected=$WIZENG_LOC/test/unittest.failures --expected=$WIZENG_LOC/test/unittest.failures.${TEST_TARGET}"
 
