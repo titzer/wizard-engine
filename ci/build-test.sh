@@ -42,7 +42,6 @@ export WIZENG_OPTS="$WIZENG_OPTS $WIZENG_RUNTIME_ARGS"
 
 # Set up wizard
 make -j $TEST_TARGET
-base64 bin/wizeng.x86-64-linux
 
 # Install Opam for specification tests
 sudo apt install -y opam
