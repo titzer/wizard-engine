@@ -1,0 +1,138 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def valuerep = Target.tagging;
+
+component X86_64Compression {
+	def collector = StackFrameCollector.new();
+
+	def loadTargetFrame(frame: TargetFrame, next_vfp: Pointer) -> RelocatableFrame {
+		var accessor = frame.getFrameAccessor();
+		var func = accessor.func();
+		var pc = accessor.pc();
+		var values = Vector<Value>.new();
+		var bytecode_ip = (accessor.sp + X86_64InterpreterFrame.ip.offset).load<Pointer>();
+
+		// XXX: a neater way to access ret_addr pointer?
+		var ret_addr = (frame.sp + (-Pointer.SIZE)).load<Pointer>();
+
+		if (Debug.compression) {
+			var vfp_ptr = accessor.sp + X86_64InterpreterFrame.vfp.offset - Pointer.NULL;
+			var vfp_val = accessor.vfp() - Pointer.NULL;
+			Trace.OUT.put2("vfp (at compression) *(0x%x) = 0x%x", vfp_ptr, vfp_val).ln();
+		}
+		
+		var offset = 0;
+		for (this_vfp = accessor.vfp(); this_vfp < next_vfp; this_vfp += valuerep.slot_size) {
+			var value = accessor.getValue(offset);
+			values.put(value);
+			offset++;
+		}
+
+		return RelocatableFrame(func, pc, TargetReentryLabel(ret_addr), TargetReentryLabel(bytecode_ip), values.extract());
+	}
+
+	def readFrames(stack: X86_64Stack) -> Array<RelocatableFrame> {
+		if (Debug.compression) Trace.OUT.put1("Reading stack info:\n%q", renderStackBounds(stack, _)).ln();
+		var collector = StackFrameCollector.new();
+		var result = Vector<RelocatableFrame>.new();
+		stack.walk<void>(collector.visitFrame, void, stack.rsp, false);
+
+		for (i = collector.frames.length - 1; i >= 0; i--) {
+			var next_vfp = stack.vsp;
+			if (i != 0) {
+				next_vfp = collector.frames[i-1].getFrameAccessor().vfp();
+			}
+
+			result.put(loadTargetFrame(collector.frames[i], next_vfp));
+		}
+
+		return result.extract();
+	}
+
+	def writeFrames(to: X86_64Stack, frames: Array<RelocatableFrame>) {
+		to.clear();
+		var root_func = frames[0].func;
+		var instance = root_func.instance;
+		to.reset(instance.functions[root_func.decl.func_index]);
+		to.rsp += Pointer.SIZE; // Pop the enter-func-stub off (only needed for first entry).
+		if (Debug.compression) Trace.OUT.put1(
+			"  Root function: %q", root_func.decl.render(null, _)
+		).ln();
+
+		for (f in frames) {
+			var map = SidetableMap.new(f.func.decl);
+			var stp = map[f.pc];
+			if (Debug.compression) Trace.OUT.put2("pc[%d] -> stp[%d]", f.pc, stp).ln();
+
+			// Allocate interpreter stack frame.
+			to.rsp += -X86_64InterpreterFrame.size;
+			setFrameContext(to.rsp, f.func);
+			setNewProgramLocation(to.rsp, f.func.decl, f.pc, stp, f.bytecode_ip.ret_addr);
+
+			// Load values.
+			(to.rsp + X86_64InterpreterFrame.vfp.offset).store<Pointer>(to.vsp); // Store %vfp.
+			for (val in f.vals) to.push(val);
+			(to.rsp + X86_64InterpreterFrame.vsp.offset).store<Pointer>(to.vsp); // Store %vsp.
+
+			if (Debug.compression) {
+				var vfp_ptr = to.rsp + X86_64InterpreterFrame.vfp.offset - Pointer.NULL;
+				var vfp_val = (to.rsp + X86_64InterpreterFrame.vfp.offset).load<Pointer>() - Pointer.NULL;
+				Trace.OUT.put2("vfp (at decompression) *(0x%x) = 0x%x", vfp_ptr, vfp_val).ln();
+			}
+
+			// Store recorded machine address as retip.
+			to.rsp += -Pointer.SIZE;
+			to.rsp.store<Pointer>(f.reentry.ret_addr);
+		}
+
+		if (Debug.compression) Trace.OUT.put1("Stack info:\n%q", renderStackBounds(to, _)).ln();
+	}
+
+	private def renderStackBounds(stack: X86_64Stack, buf: StringBuilder) -> StringBuilder {
+		buf.put1("  vsp: 0x%x", stack.vsp - Pointer.NULL).ln();
+		buf.put1("  rsp: 0x%x", stack.rsp - Pointer.NULL).ln();
+		return buf;
+	}
+
+	def setFrameContext(sp: Pointer, wf: WasmFunction) {
+		var module = wf.instance.module;
+		(sp + X86_64InterpreterFrame.wasm_func.offset).store<WasmFunction>(wf);
+		(sp + X86_64InterpreterFrame.instance.offset).store<Instance>(wf.instance);
+		(sp + X86_64InterpreterFrame.sidetable.offset).store<Array<int>>(wf.decl.sidetable.entries);
+		(sp + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(null);
+
+		// Load instance.memories[0].start into MEM0_BASE
+		if (module.memories.length > 0) {
+			var memory = NativeWasmMemory.!(wf.instance.memories[0]);
+			(sp + X86_64InterpreterFrame.mem0_base.offset).store<Pointer>(memory.start);
+		}
+	}
+
+	// XXX: merge with functionality in FrameAccessor
+	// TODO: forgeRange
+	def setNewProgramLocation(sp: Pointer, func: FuncDecl, pc: int, stp: int, bytecode_ip: Pointer) {
+		var code = func.cur_bytecode;
+
+		(sp + X86_64InterpreterFrame.func_decl.offset)	.store<FuncDecl>(func);
+		(sp + X86_64InterpreterFrame.curpc.offset)	.store<int>(pc);
+		(sp + X86_64InterpreterFrame.code.offset)	.store<Array<byte>>(code);
+		(sp + X86_64InterpreterFrame.ip.offset)		.store<Pointer>(bytecode_ip);
+		(sp + X86_64InterpreterFrame.eip.offset)	.store<Pointer>(Pointer.atContents(code) + code.length);
+		var st_entries = func.sidetable.entries;
+		var st_ptr = if(stp == st_entries.length, Pointer.atContents(st_entries), Pointer.atElement(func.sidetable.entries, stp));
+		(sp + X86_64InterpreterFrame.stp.offset)	.store<Pointer>(st_ptr);
+	}
+}
+
+// Class for collecting and organizing the frames of a {X86_64Stack} during its
+// compression by walking its stack frames.
+class StackFrameCollector {
+	def frames = Vector<TargetFrame>.new();
+
+	def reset() { frames.clear(); }
+	def visitFrame(p: Pointer, c: RiUserCode, pos: StackFramePos, v: void) -> bool {
+		if (X86_64InterpreterCode.?(c) || X86_64SpcModuleCode.?(c)) frames.put(pos.frame);
+		return true;
+	}
+}
