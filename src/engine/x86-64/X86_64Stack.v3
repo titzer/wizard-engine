@@ -188,7 +188,7 @@ class X86_64Stack extends WasmStack {
 			Trace.OUT.put1("searching for handler on stack[rsp=0x%x]", rsp - Pointer.NULL).ln();
 		}
 		// Increment by {Pointer.SIZE} to skip the return address pushed by {resume}.
-		var h = X86_64FrameHandlers.from(rsp + Pointer.SIZE);
+		var h = X86_64FrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSuspensionHandler(func.instance, tag, h.computePc());
 		if (handler.handler_pc < 0) { // not found
@@ -200,9 +200,10 @@ class X86_64Stack extends WasmStack {
 			Trace.OUT.put1(" stp=%d", handler.sidetable_pos).ln();
 		}
 		// Reset current stack to handler position.
-		if (h.isSpc()) {
-			h.writeSpcState(handler.handler_pc);
-			h.redirectToHandlerStub(func.decl, handler);
+		if (X86_64FrameHandle.Spc.?(h)) {
+			var sh = X86_64FrameHandle.Spc.!(h);
+			sh.writeSpcState(handler.handler_pc);
+			sh.redirectToHandlerStub(func.decl, handler);
 		} else {
 			h.writeInterpreterState(func.decl, handler.handler_pc, handler.sidetable_pos);
 			// Set top address to suspension entry stub.
@@ -225,7 +226,7 @@ class X86_64Stack extends WasmStack {
 	}
 	def tryHandleSwitch(tag: Tag) -> ExHandler {
 		// Increment by {Pointer.SIZE} to skip the return address.
-		var h = X86_64FrameHandlers.from(rsp + Pointer.SIZE);
+		var h = X86_64FrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSwitchHandler(func.instance, tag, h.computePc());
 		if (handler.handler_pc < 0) { // not found
@@ -238,17 +239,18 @@ class X86_64Stack extends WasmStack {
 	private def findExHandler(ip: Pointer, code: RiUserCode, pos: StackFramePos, ex: Exception) -> bool {
 		var stack = pos.stack;
 		var frame = pos.frame;
-		var h = X86_64FrameHandlers.fromCode(frame.sfp, code);
+		var h = X86_64FrameHandles.fromCode(frame.sfp, code);
 		var func = h.wasm_func();
 		var pc = h.computePcFromCode(code);
 		var handler = func.decl.findExHandler(func.instance, ex.tag, pc);
 		if (handler.handler_pc >= 0) {
 			if (Trace.exception) Trace.OUT.put2("  walk found handler: pc=%d, stp=%d", handler.handler_pc, handler.sidetable_pos).ln();
-			
+
 			// Write frame state and redirect the control flow.
-			if (h.isSpc()) {
-				h.writeSpcState(handler.handler_pc);
-				h.redirectToHandlerStub(func.decl, handler);
+			if (X86_64FrameHandle.Spc.?(h)) {
+				var sh = X86_64FrameHandle.Spc.!(h);
+				sh.writeSpcState(handler.handler_pc);
+				sh.redirectToHandlerStub(func.decl, handler);
 			} else {
 				h.writeInterpreterState(func.decl, handler.handler_pc, handler.sidetable_pos);
 				h.redirectToInterpreter();
@@ -276,7 +278,7 @@ class X86_64Stack extends WasmStack {
 		return true;
 	}
 	private def addFrameToTrace(ip: Pointer, code: RiUserCode, pos: StackFramePos, trace: Vector<(WasmFunction, int)>) -> bool {
-		var h = X86_64FrameHandlers.fromCode(pos.frame.sfp, code);
+		var h = X86_64FrameHandles.fromCode(pos.frame.sfp, code);
 		trace.put(h.wasm_func(), h.computePcFromCode(code));
 		return true;
 	}
@@ -598,29 +600,30 @@ component X86_64Stacks {
 	def getFrameAccessor(sfp: Pointer) -> X86_64FrameAccessor {
 		var retip = (sfp + -RETADDR_SIZE).load<Pointer>();
 		var code = RiRuntime.findUserCode(retip);
-		var h: X86_64FrameHandler;
-		var decl: FuncDecl;
 		match (code) {
 			x: X86_64InterpreterCode => {
-				h = X86_64FrameHandler.Interpreter(sfp);
+				var h = X86_64FrameHandle.Interpreter(sfp);
 				var prev = h.accessor();
 				if (prev != null) return prev;
 				// Interpreter frames store the {WasmFunction} _and_ {FuncDecl}.
-				decl = h.func_decl();
+				var decl = h.func_decl();
+				var n = X86_64FrameAccessor.new(X86_64Runtime.curStack, h, decl);
+				h.set_accessor(n);
+				return n;
 			}
 			x: X86_64SpcCode => {
-				h = X86_64FrameHandler.Spc(sfp);
+				var h = X86_64FrameHandle.Spc(sfp);
 				var prev = h.accessor();
 				if (prev != null) return prev;
 				// SPC frames only store the {WasmFunction}.
 				// TODO: assert wf.decl == x.decl()
-				decl = h.wasm_func().decl;
+				var decl = h.wasm_func().decl;
+				var n = X86_64FrameAccessor.new(X86_64Runtime.curStack, h, decl);
+				h.set_accessor(n);
+				return n;
 			}
 			_ => return null;
 		}
-		var n = X86_64FrameAccessor.new(X86_64Runtime.curStack, h, decl);
-		h.set_accessor(n);
-		return n;
 	}
 	def traceIpAndSp(ip: Pointer, sfp: Pointer, out: Range<byte> -> void) {
 		var buf = X86_64Runtime.globalFrameDescriptionBuf;
@@ -961,14 +964,87 @@ layout X86_64SpcFrame {
 	=104;
 }
 
-// Frame handler for interpreter and SPC stack frames; a lightweight wrapper for frame slot accesses.
-type X86_64FrameHandler {
+// Frame handle for interpreter and SPC stack frames; a lightweight wrapper for frame slot accesses.
+type X86_64FrameHandle #unboxed {
 	case Interpreter(sfp_: Pointer) {
 		def sfp() -> Pointer { return sfp_; }
+
+		// Interpreter-only field getters.
+		def sidetable() -> Array<int> {
+			return (sfp_ + X86_64InterpreterFrame.sidetable.offset).load<Array<int>>();
+		}
+		def stp() -> Pointer {
+			return (sfp_ + X86_64InterpreterFrame.stp.offset).load<Pointer>();
+		}
+		def code() -> Array<byte> {
+			return (sfp_ + X86_64InterpreterFrame.code.offset).load<Array<byte>>();
+		}
+		// XXX: rename into a non-ambiguous name with the return address returned by `X86_64FrameAccessor.readIp()`.
+		def ip() -> Pointer {
+			return (sfp_ + X86_64InterpreterFrame.ip.offset).load<Pointer>();
+		}
+		def eip() -> Pointer {
+			return (sfp_ + X86_64InterpreterFrame.eip.offset).load<Pointer>();
+		}
+		def func_decl() -> FuncDecl {
+			return (sfp_ + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
+		}
+
+		// Interpreter-only field setters.
+		def set_func_decl(val: FuncDecl) {
+			(sfp_ + X86_64InterpreterFrame.func_decl.offset).store<FuncDecl>(val);
+		}
+		def set_code(val: Array<byte>) {
+			(sfp_ + X86_64InterpreterFrame.code.offset).store<Array<byte>>(val);
+		}
+		def set_ip(val: Pointer) {
+			(sfp_ + X86_64InterpreterFrame.ip.offset).store<Pointer>(val);
+		}
+		def set_eip(val: Pointer) {
+			(sfp_ + X86_64InterpreterFrame.eip.offset).store<Pointer>(val);
+		}
+		def set_stp(val: Pointer) {
+			(sfp_ + X86_64InterpreterFrame.stp.offset).store<Pointer>(val);
+		}
+		def set_sidetable(val: Array<int>) {
+			(sfp_ + X86_64InterpreterFrame.sidetable.offset).store<Array<int>>(val);
+		}
 	}
 	case Spc(sfp_: Pointer) {
 		def sfp() -> Pointer { return sfp_; }
+
+		// SPC-only field getters.
+		def inlined_instance() -> Instance {
+			return (sfp_ + X86_64SpcFrame.inlined_instance.offset).load<Instance>();
+		}
+		def inlined_mem0_base() -> Pointer {
+			return (sfp_ + X86_64SpcFrame.inlined_mem0_base.offset).load<Pointer>();
+		}
+
+		// SPC-only field setters.
+		def set_inlined_instance(val: Instance) {
+			(sfp_ + X86_64SpcFrame.inlined_instance.offset).store<Instance>(val);
+		}
+		def set_inlined_mem0_base(val: Pointer) {
+			(sfp_ + X86_64SpcFrame.inlined_mem0_base.offset).store<Pointer>(val);
+		}
+
+		// Write SPC execution state fields needed when an SPC frame transitions to a new
+		// program location (e.g., jumping to an exception/suspension handler stub).
+		def writeSpcState(new_pc: int) {
+			set_curpc(new_pc);
+			set_accessor(null);
+		}
+
+		// Redirect return address {*(%srp)} to an SPC exception/suspension handler stub.
+		def redirectToHandlerStub(func: FuncDecl, handler: ExHandler) {
+			var dest_id = func.handlers.handler_dest_map[handler.index];
+			var dest = func.handlers.handler_dests[dest_id];
+			var offset = X86_64MasmLabel.!(dest.stub_label).label.pos;
+			srp().store<Pointer>(func.target_code.spc_entry + offset);
+		}
 	}
+
 	def sfp() -> Pointer;
 	def srp() -> Pointer { return sfp() + -RETADDR_SIZE; }
 
@@ -1009,86 +1085,6 @@ type X86_64FrameHandler {
 		(sfp() + X86_64InterpreterFrame.accessor.offset).store<X86_64FrameAccessor>(val);
 	}
 
-	// Guards.
-	def isSpc() -> bool { return X86_64FrameHandler.Spc.?(this); }
-	def isInterpreter() -> bool { return X86_64FrameHandler.Interpreter.?(this); }
-
-	def checkInterpreter() { if (!isInterpreter()) X86_64FrameHandlers.fatal("interpreter"); }
-	def checkSpc() { if (!isSpc()) X86_64FrameHandlers.fatal("spc"); }
-
-	// Interpreter-only field getters (trap on Spc).
-	def sidetable() -> Array<int> {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.sidetable.offset).load<Array<int>>();
-	}
-	def stp() -> Pointer {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.stp.offset).load<Pointer>();
-	}
-	def code() -> Array<byte> {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.code.offset).load<Array<byte>>();
-	}
-	// XXX: rename into a non-ambiguous name with the return address returned by `X86_64FrameAccessor.readIp()`.
-	def ip() -> Pointer {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.ip.offset).load<Pointer>();
-	}
-	def eip() -> Pointer {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.eip.offset).load<Pointer>();
-	}
-	def func_decl() -> FuncDecl {
-		checkInterpreter();
-		return (sfp() + X86_64InterpreterFrame.func_decl.offset).load<FuncDecl>();
-	}
-
-	// Interpreter-only field setters (trap on Spc).
-	def set_func_decl(val: FuncDecl) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.func_decl.offset).store<FuncDecl>(val);
-	}
-	def set_code(val: Array<byte>) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.code.offset).store<Array<byte>>(val);
-	}
-	def set_ip(val: Pointer) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.ip.offset).store<Pointer>(val);
-	}
-	def set_eip(val: Pointer) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.eip.offset).store<Pointer>(val);
-	}
-	def set_stp(val: Pointer) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.stp.offset).store<Pointer>(val);
-	}
-	def set_sidetable(val: Array<int>) {
-		checkInterpreter();
-		(sfp() + X86_64InterpreterFrame.sidetable.offset).store<Array<int>>(val);
-	}
-
-	// SPC-only field getters (trap on Interpreter).
-	def inlined_instance() -> Instance {
-		checkSpc();
-		return (sfp() + X86_64SpcFrame.inlined_instance.offset).load<Instance>();
-	}
-	def inlined_mem0_base() -> Pointer {
-		checkSpc();
-		return (sfp() + X86_64SpcFrame.inlined_mem0_base.offset).load<Pointer>();
-	}
-
-	// SPC-only field setters (trap on Interpreter).
-	def set_inlined_instance(val: Instance) {
-		checkSpc();
-		(sfp() + X86_64SpcFrame.inlined_instance.offset).store<Instance>(val);
-	}
-	def set_inlined_mem0_base(val: Pointer) {
-		checkSpc();
-		(sfp() + X86_64SpcFrame.inlined_mem0_base.offset).store<Pointer>(val);
-	}
-
 	// Compound operations.
 
 	// Compute the program counter for this frame.
@@ -1110,7 +1106,7 @@ type X86_64FrameHandler {
 
 	// Write all interpreter execution state fields for resuming at (func, new_pc, stp_val).
 	// Called on both frame types. For SPC frames, this overwrites SPC-only slots
-	// with interpreter state in preparation for an deopt reentry.
+	// with interpreter state in preparation for a deopt reentry.
 	def writeInterpreterState(func: FuncDecl, new_pc: int, stp_val: int) {
 		var p = sfp();
 		var bytecode = func.cur_bytecode;
@@ -1124,21 +1120,6 @@ type X86_64FrameHandler {
 		(p + X86_64InterpreterFrame.stp.offset).store<Pointer>(st_ptr);
 	}
 
-	// Write SPC execution state fields needed when an SPC frame transitions to a new
-	// program location (e.g., jumping to an exception/suspension handler stub)
-	def writeSpcState(new_pc: int) {
-		set_curpc(new_pc);
-		set_accessor(null);
-	}
-
-	// Redirect return address {*(%srp)} to an SPC exception/suspension handler stub.
-	def redirectToHandlerStub(func: FuncDecl, handler: ExHandler) {
-		var dest_id = func.handlers.handler_dest_map[handler.index];
-		var dest = func.handlers.handler_dests[dest_id];
-		var offset = X86_64MasmLabel.!(dest.stub_label).label.pos;
-		srp().store<Pointer>(func.target_code.spc_entry + offset);
-	}
-
 	// Redirect return address to the interpreter's deopt reentry point.
 	def redirectToInterpreter() {
 		var ic = X86_64PreGenStubs.getInterpreterCode();
@@ -1146,23 +1127,20 @@ type X86_64FrameHandler {
 	}
 }
 
-// Factory for constructing {X86_64FrameHandler} from a stack frame pointer.
-component X86_64FrameHandlers {
+// Factory for constructing {X86_64FrameHandle} from a stack frame pointer.
+component X86_64FrameHandles {
 	// Construct from an sfp by inspecting the return address.
-	def from(sfp: Pointer) -> X86_64FrameHandler {
+	def from(sfp: Pointer) -> X86_64FrameHandle {
 		var retip = (sfp + -RETADDR_SIZE).load<Pointer>();
 		var code = RiRuntime.findUserCode(retip);
 		return fromCode(sfp, code);
 	}
 	// Construct from an sfp and a code object.
-	def fromCode(sfp: Pointer, code: RiUserCode) -> X86_64FrameHandler {
-		if (X86_64InterpreterCode.?(code)) return X86_64FrameHandler.Interpreter(sfp);
-		if (X86_64SpcCode.?(code)) return X86_64FrameHandler.Spc(sfp);
-		System.error("X86_64FrameHandlerError", "unknown frame type");
-		return X86_64FrameHandler.Interpreter(sfp); // unreachable
-	}
-	def fatal(ftype: string) {
-		System.error("X86_64FrameHandlerError", Strings.format1("field not available on frame type %s", ftype));
+	def fromCode(sfp: Pointer, code: RiUserCode) -> X86_64FrameHandle {
+		if (X86_64InterpreterCode.?(code)) return X86_64FrameHandle.Interpreter(sfp);
+		if (X86_64SpcCode.?(code)) return X86_64FrameHandle.Spc(sfp);
+		System.error("X86_64FrameHandleError", "unknown frame type");
+		return X86_64FrameHandle.Interpreter(sfp); // unreachable
 	}
 }
 
@@ -1174,27 +1152,27 @@ enum X86_64FrameState {
 }
 // Implements access to interpreter and SPC frames.
 // TODO: (stack) parent method
-class X86_64FrameAccessor(stack: X86_64Stack, handler: X86_64FrameHandler, decl: FuncDecl) extends FrameAccessor {
+class X86_64FrameAccessor(stack: X86_64Stack, handle: X86_64FrameHandle, decl: FuncDecl) extends FrameAccessor {
 	var writer: X86_64FrameWriter; // non-null if any writes have been made
 	var cached_depth = -1;
 	var cached_pc: int;
 
-	def sfp() -> Pointer { return handler.sfp(); }
+	def sfp() -> Pointer { return handle.sfp(); }
 
 	// Returns {true} if this frame has been unwound, either due to returning, a trap, or exception.
 	def isUnwound() -> bool {
 		if (FeatureDisable.frameAccess) return false; // TODO: proper is-frame-unwound check
-		return this != handler.accessor();
+		return this != handle.accessor();
 	}
 	// Returns the Wasm function in this frame.
 	def func() -> WasmFunction {
 		checkNotUnwound();
-		return handler.wasm_func();
+		return handle.wasm_func();
 	}
 	// Returns the current program counter.
 	def pc() -> int {
 		checkNotUnwound();
-		cached_pc = handler.computePc();
+		cached_pc = handle.computePc();
 		return cached_pc;
 	}
 	// Returns {true} if this frame is currently the top executing frame, {false} if the
@@ -1234,8 +1212,8 @@ class X86_64FrameAccessor(stack: X86_64Stack, handler: X86_64FrameHandler, decl:
 	}
 	def stp() -> int {
 		checkNotUnwound();
-		if (!handler.isInterpreter()) return -1;
-		var stp = handler.stp();
+		if (!X86_64FrameHandle.Interpreter.?(handle)) return -1;
+		var stp = X86_64FrameHandle.Interpreter.!(handle).stp();
 		var stp0 = Pointer.atContents(func().decl.sidetable.entries);
 		return int.!((stp - stp0) / 4);
 	}
@@ -1253,24 +1231,24 @@ class X86_64FrameAccessor(stack: X86_64Stack, handler: X86_64FrameHandler, decl:
 	def getLocal(i: int) -> Value {
 		checkNotUnwound();
 		checkLocalBounds(i);
-		return stack.readValue(handler.vfp(), i);
+		return stack.readValue(handle.vfp(), i);
 	}
 	// Get the value of frame variable {i}.
 	def getFrameVar(i: int) -> Value {
 		checkNotUnwound();
 		checkFrameVarBounds(i);
-		return stack.readValue(handler.vfp(), i + decl.num_locals);
+		return stack.readValue(handle.vfp(), i + decl.num_locals);
 	}
 	// Get the number of operand stack elements.
 	def numOperands() -> int {
 		checkNotUnwound();
-		var diff = int.!((handler.vsp() - handler.vfp()) / Target.tagging.slot_size);
+		var diff = int.!((handle.vsp() - handle.vfp()) / Target.tagging.slot_size);
 		return diff - decl.num_locals;
 	}
 	// Get operand at depth {i}, with 0 being the top of the stack, -1 being one lower, etc.
 	def getOperand(i: int) -> Value {
 		checkNotUnwound();
-		return stack.readValue(handler.vsp(), i - 1);
+		return stack.readValue(handle.vsp(), i - 1);
 	}
 	// Get the frame writer.
 	def getWriter() -> X86_64FrameWriter {
@@ -1283,14 +1261,14 @@ class X86_64FrameAccessor(stack: X86_64Stack, handler: X86_64FrameHandler, decl:
 	}
 	// Read the instruction pointer from the frame.
 	def readIp() -> Pointer {
-		return handler.srp().load<Pointer>();
+		return handle.srp().load<Pointer>();
 	}
 	// Compute the caller frame's stack frame pointer.
 	def callerSfp() -> Pointer {
 		return sfp() + X86_64InterpreterFrame.size + RETADDR_SIZE;
 	}
 	def isSpc() -> bool {
-		return handler.isSpc();
+		return X86_64FrameHandle.Spc.?(handle);
 	}
 
 	private def checkNotUnwound() {
@@ -1310,8 +1288,8 @@ class X86_64FrameAccessor(stack: X86_64Stack, handler: X86_64FrameHandler, decl:
 		var pc = this.pc();
 		var map = SidetableMap.new(func); // TODO: cache in FuncDecl?
 		var stp = map[pc];
-		handler.writeInterpreterState(func, pc, stp);
-		handler.redirectToInterpreter();
+		handle.writeInterpreterState(func, pc, stp);
+		handle.redirectToInterpreter();
 	}
 }
 private class X86_64FrameWriter extends FrameWriter {
@@ -1323,14 +1301,14 @@ private class X86_64FrameWriter extends FrameWriter {
 	def setLocal(i: int, v: Value) {
 		accessor.checkNotUnwound();
 		accessor.checkLocalBounds(i);
-		accessor.stack.overwriteValue(accessor.handler.vfp(), i, v);
+		accessor.stack.overwriteValue(accessor.handle.vfp(), i, v);
 		if (accessor.isSpc()) accessor.deoptToInterpreter();
 	}
 	// Set the value of a frame variable. (dynamically typechecked).
 	def setFrameVar(i: int, v: Value) {
 		accessor.checkNotUnwound();
 		accessor.checkFrameVarBounds(i);
-		accessor.stack.overwriteValue(accessor.handler.vfp(), i + accessor.decl.num_locals, v);
+		accessor.stack.overwriteValue(accessor.handle.vfp(), i + accessor.decl.num_locals, v);
 		if (accessor.isSpc()) accessor.deoptToInterpreter();
 	}
 }
