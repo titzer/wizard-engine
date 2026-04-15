@@ -14,7 +14,6 @@ class SpcExecEnv {
 	var mem0_base_slot: MasmAddr;
 	var inlined_mem0_base_slot: MasmAddr;
 	var accessor_slot: MasmAddr;
-	var saved_fast_vfp_slot: MasmAddr;	// scratch slot for saving fast VFP across frame reconstruction
 
 	// Register information.
 	var sp: Reg;
@@ -2155,8 +2154,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (!needsEpilogue()) return;
 
 		// Compute VSP = VFP + state.sp
-		// In fast mode this must happen before reloading VFP from the interpreter frame,
-		// because frame.vfp_slot holds the caller's VFP (not the fast handler's VFP).
 		emit_compute_vsp(regs.vsp, state.sp);
 		if (!fast) {
 			// Return to caller                           // \ fast context: do not emit these instructions
@@ -2219,25 +2216,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 		}
 
-		// In fast mode, interpreter ivars are live in their registers throughout the handler body
-		// (INT_ALLOC never allocates them), so use them directly instead of stale frame slots.
+		// NOTE we could use interpreter-backed registers for these instead of allocating new regs
 		// load instance
-		var inst_reg: Reg;
-		var mem_reg: Reg;
-		if (fast) {
-			inst_reg = regs.instance;
-			mem_reg = regs.mem0_base;
-		} else {
-			inst_reg = allocTmp(ValueKind.REF);
-			masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
-			mem_reg = allocTmp(ValueKind.REF);
-			masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
-		}
+		var inst_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
+		var mem_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
 		// Load instance.functions
 		def func_reg = allocTmp(ValueKind.REF);
 		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
-		def vfp_reg = if(fast, regs.vfp, allocTmp(ValueKind.REF));
-		if (!fast) masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
+		def vfp_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
 		var prev_base_sp = int.view(frames[0].local_base_sp);
 		var wasm_func_reg = allocTmp(ValueKind.REF);
 
@@ -2248,14 +2237,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
 		}
-
-		// In fast mode, save the fast handler's VFP before allocating child frames.
-		// emit_reload_regs() (inside emitCallToReg) would otherwise load the innermost
-		// child frame's VFP into regs.vfp, which is not the fast handler's own VFP.
-		// We use frame.vsp_slot as scratch storage. The save goes to [original_rsp+vsp_offset]
-		// before sub_rsp; emit_spill_vsp runs after sub_rsp and writes to [new_rsp+vsp_offset],
-		// which is a different address, so there is no collision.
-		if (fast) masm.emit_mov_m_r(ValueKind.REF, frame.vsp_slot, regs.vfp);
 
 		// Pre-allocate stack space for all reconstructed frames at once.
 		def total_space = (frames.length - 1) * (FRAME_SIZE + 8);
@@ -2341,18 +2322,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			frames_reconstructed = false;
 			if (space > 0) {
 				masm.emit_addw_r_i(regs.sp, space);
-			}
-			if (fast) {
-				// In fast mode, emitReconstructStackFrames saved the fast handler's VFP
-				// to frame.vsp_slot (before sub_rsp, so at [original_rsp+vsp_offset]).
-				// After add_rsp restores RSP, frame.vsp_slot refers to that same address.
-				// Restore interpreter ivars (which clobbers regs.vfp with the interpreter's
-				// saved VFP), then reload the fast handler's VFP from the saved slot.
-				restoreCallerIVars();
-				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vsp_slot);
-				restoreDispatchTableReg();
-			} else if (space > 0) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+				if (fast) {
+					// In fast mode, frame.vfp_slot is the caller's ($main's) VFP, not $f's.
+					// restoreCallerIVars restores r_vfp from the interpreter frame correctly.
+					restoreCallerIVars();
+					restoreDispatchTableReg();
+				}
 			}
 		} else {
 			emit();
