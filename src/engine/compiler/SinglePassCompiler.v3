@@ -382,15 +382,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		} else {
 			// Advance IP past the fast-call opcode and spill it
 			def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
-			def ip_slot = X86_64MasmRegs.INT_EXEC_ENV.ip_slot;
-			masm.emit_addw_r_i(r_ip, fast_operand_size);
-			masm.emit_mov_m_r(ValueKind.REF, ip_slot, r_ip);
-			computePc(-(fast_operand_size + 1));
-			saveCallerIVars();
-			// XXX why do we have to spill? because div will clobber rax
-			// XXX now saving IVars because it will fail in a div-by-zero (or any HW trap)
-			// In a single pass, we don't know at this point if a div will be used
-			// add as a property picked up during validation?
+			masm.emit_addw_r_i(r_ip, fast_operand_size);      // increment ip
+			computePc(-(fast_operand_size + 1));              // compute r_curpc
+			saveCallerIVars();                                // save r_ip and r_curpc
+			// XXX why do we have to save?
+			// 1. r_ip    = rax (clobbered by `div`)
+			// 2. m_curpc = HW trap reads this
 		}
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
@@ -2207,35 +2204,39 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
-		if (fast) {
-			computePc(-(fast_operand_size + 1));
-			saveCallerIVars();
-			restoreDispatchTableReg();
-		} else {
-			def real_frame = frames[0];
-			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
-		}
 
-		// NOTE we could use interpreter-backed registers for these instead of allocating new regs
-		// load instance
 		var inst_reg = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
 		var mem_reg = allocTmp(ValueKind.REF);
+		def func_reg = allocTmp(ValueKind.REF);
+		def vfp_reg = allocTmp(ValueKind.REF);
+		var wasm_func_reg = allocTmp(ValueKind.REF);
+		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+
+		var prev_base_sp = int.view(frames[0].local_base_sp);
+
+		// TODO in fast mode, could use those registers (if not previously reset!--invalidated by future opt)
+
+		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
 		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
 		// Load instance.functions
-		def func_reg = allocTmp(ValueKind.REF);
 		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
-		def vfp_reg = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
-		var prev_base_sp = int.view(frames[0].local_base_sp);
-		var wasm_func_reg = allocTmp(ValueKind.REF);
 
-		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
 		if (whamm_config.is_inlined) { // XXX check individual configs?
 			inl_inst_reg = allocTmp(ValueKind.REF);
 			inl_mem0_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
+		}
+
+		if (fast) {
+			// the stuff that would need to be saved should be already saved
+			// (only restore required later) -- as an optimization, should only restore once at epilogue if there is a reconstrcution
+			masm.emit_mov_r_r(ValueKind.REF, vfp_reg, regs.vfp);
+		} else {
+			def real_frame = frames[0];
+			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+
+			masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
 		}
 
 		// Pre-allocate stack space for all reconstructed frames at once.
@@ -2281,6 +2282,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
 		def vfp_slot = frame.vfp_slot.plus(frame_offset);
 		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
+		//masm.emit_mov_m_i(vfp_slot, 1);
 
 		// Save PC
 		def pc_slot = frame.pc_slot.plus(frame_offset);
@@ -2305,7 +2307,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
+		//masm.emit_debugger_breakpoint();
 		if (isInlined()) {
+			//masm.emit_debugger_breakpoint();
 			if (frames_reconstructed) {
 				// FIXME this should not happen (but does):
 				// - in the case of deep nesting when one layer is a Whamm probe
@@ -2321,15 +2325,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			emit();
 			frames_reconstructed = false;
 			if (space > 0) {
-				masm.emit_addw_r_i(regs.sp, space);
-				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 				if (fast) {
-					// In fast mode, frame.vfp_slot is the caller's ($main's) VFP, not $f's.
-					// restoreCallerIVars restores r_vfp from the interpreter frame correctly.
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - FRAME_SIZE));
+					//masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+					masm.emit_addw_r_i(regs.sp, space);
 					restoreCallerIVars();
 					restoreDispatchTableReg();
+				} else {
+					masm.emit_addw_r_i(regs.sp, space);
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 				}
 			}
+			//masm.emit_debugger_breakpoint();
 		} else {
 			emit();
 		}
@@ -2426,7 +2433,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emit_reload_regs() {
 		// XXX: recompute VFP from VSP - #slots?
-		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+		if (!fast) masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
 			if (whamm_config.is_inlined) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
