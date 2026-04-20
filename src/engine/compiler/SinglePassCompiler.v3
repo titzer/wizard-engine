@@ -148,6 +148,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).ln();
 		var before_code_bytes = masm.curCodeBytes();
 		var before_data_bytes = masm.curDataBytes();
+		
+		//masm.emit_debugger_breakpoint();
 
 		if (fast) {
 			fast_operand_size = uleb_size(func.func_index);
@@ -362,6 +364,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (!cond) bailout(Strings.format3(msg, p1, p2, p3));
 	}
 	def emitPrologue() {
+		//masm.emit_debugger_breakpoint();
 		if (!fast) {
 			// Allocate stack frame
 			masm.emit_subw_r_i(regs.sp, frame.frameSize);
@@ -388,11 +391,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			// XXX why do we have to save?
 			// 1. r_ip    = rax (clobbered by `div`)
 			// 2. m_curpc = HW trap reads this
+
+			// spill VFP?
+			//masm.emit_debugger_breakpoint();
+			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
 		}
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
+		//masm.emit_debugger_breakpoint();
 
 
 		if (!fast) {
@@ -2163,7 +2171,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_ret();
 		} else {
 			// Restore VFP from interpreter frame
-			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+			//masm.emit_debugger_breakpoint();
+			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot); // don't need to deallocate before? frame is interpreter's frame?
+			//masm.emit_debugger_breakpoint();
+			restoreCallerIVars();
+			restoreDispatchTableReg();
 			emitFastDispatch();
 		}
 	}
@@ -2210,19 +2222,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		var inst_reg: Reg, mem_reg: Reg, func_reg: Reg, vfp_reg: Reg, wasm_func_reg: Reg;
 		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
-		inst_reg = allocTmp(ValueKind.REF);
-		mem_reg = allocTmp(ValueKind.REF);
-		func_reg = allocTmp(ValueKind.REF);
-		wasm_func_reg = allocTmp(ValueKind.REF);
 
 		var prev_base_sp = int.view(frames[0].local_base_sp);
 
 		// TODO in fast mode, could use those registers (if not previously reset!--invalidated by future opt)
 
-		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
-		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
-		// Load instance.functions
-		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
 
 		if (whamm_config.is_inlined) { // XXX check individual configs?
 			inl_inst_reg = allocTmp(ValueKind.REF);
@@ -2234,15 +2238,29 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (fast) {
 			// the stuff that would need to be saved should be already saved
 			// (only restore required later) -- as an optimization, should only restore once at epilogue if there is a reconstrcution
-			vfp_reg = regs.vfp;
+			vfp_reg       = regs.vfp;
+			inst_reg      = regs.instance;
+			mem_reg       = regs.mem0_base;
 		} else {
-			vfp_reg = allocTmp(ValueKind.REF);
+			vfp_reg       = allocTmp(ValueKind.REF);
+			inst_reg      = allocTmp(ValueKind.REF);
+			mem_reg       = allocTmp(ValueKind.REF);
+
+			masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
+			masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
+			// Load instance.functions
+			masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
 
 			def real_frame = frames[0];
 			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
 			masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
 		}
+
+		// Load instance.functions
+		func_reg      = allocTmp(ValueKind.REF);
+		wasm_func_reg = allocTmp(ValueKind.REF);
+		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
 
 		// Pre-allocate stack space for all reconstructed frames at once.
 		def total_space = (frames.length - 1) * (FRAME_SIZE + 8);
@@ -2286,7 +2304,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Step vfp_reg by change in local_base_sp from previous frame and save
 		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
 		def vfp_slot = frame.vfp_slot.plus(frame_offset);
-		masm.emit_debugger_breakpoint();
+		//masm.emit_debugger_breakpoint();
 		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
 		//masm.emit_mov_m_l(vfp_slot, 1);
 
@@ -2314,7 +2332,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
 		if (isInlined()) {
-			masm.emit_debugger_breakpoint();
+			//masm.emit_debugger_breakpoint();
 			if (frames_reconstructed) {
 				// FIXME this should not happen (but does):
 				// - in the case of deep nesting when one layer is a Whamm probe
@@ -2331,21 +2349,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			frames_reconstructed = false;
 			if (space > 0) {
 				if (fast) {
-					Trace.OUT.put2("space: %d, %d\n", space - FRAME_SIZE - 8, space);
-					masm.emit_debugger_breakpoint();
-					//masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - FRAME_SIZE));
-					masm.emit_addw_r_i(regs.sp, space - FRAME_SIZE - 8);
+					masm.emit_addw_r_i(regs.sp, space - (FRAME_SIZE + 8));
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
-					//masm.emit_subw_r_i(regs.vfp, 0x20);
-					masm.emit_addw_r_i(regs.sp, FRAME_SIZE);
-					restoreCallerIVars();
-					restoreDispatchTableReg();
+					masm.emit_addw_r_i(regs.sp, FRAME_SIZE + 8);
+					//restoreCallerIVars();
+					//restoreDispatchTableReg();
 				} else {
 					masm.emit_addw_r_i(regs.sp, space);
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 				}
 			}
-			masm.emit_debugger_breakpoint();
+			//masm.emit_debugger_breakpoint();
 		} else {
 			emit();
 		}
