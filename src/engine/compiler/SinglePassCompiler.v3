@@ -394,8 +394,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
 
+
 		if (!fast) {
-			// XXX: skip spilling of VFP
+			// Spill VFP so emit_reload_regs can restore R11 after calls
 			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
 
 			// Load instance.memories[0].start into MEM0_BASE and spill
@@ -813,7 +814,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(ctl_top.label);
 			state.resetToMerge(ctl_top);
 			emitProbe();
-			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+			if (ctl_top.merge_count > 1) {
+				emitReturn(ctl_top);
+			}
 			state.ctl_stack.pop();
 		}
 		emitProbe();
@@ -2153,11 +2156,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Compute VSP = VFP + state.sp
 		emit_compute_vsp(regs.vsp, state.sp);
 		if (!fast) {
-			// Return to caller                           // \ fast context: do not emit these instructions
-			masm.emit_mov_r_i(regs.ret_throw, 0);         // | instead, emit the dispatch sequence from the interpreter
-			// Deallocate stack frame                     // |
-			masm.emit_addw_r_i(regs.sp, frame.frameSize); // |
-			masm.emit_ret();                              // /
+			// Return to caller
+			masm.emit_mov_r_i(regs.ret_throw, 0);
+			// Deallocate stack frame
+			masm.emit_addw_r_i(regs.sp, frame.frameSize);
+			masm.emit_ret();
 		} else {
 			// Restore VFP from interpreter frame
 			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
@@ -2205,12 +2208,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
 
-		var inst_reg = allocTmp(ValueKind.REF);
-		var mem_reg = allocTmp(ValueKind.REF);
-		def func_reg = allocTmp(ValueKind.REF);
-		def vfp_reg = allocTmp(ValueKind.REF);
-		var wasm_func_reg = allocTmp(ValueKind.REF);
+		var inst_reg: Reg, mem_reg: Reg, func_reg: Reg, vfp_reg: Reg, wasm_func_reg: Reg;
 		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+		inst_reg = allocTmp(ValueKind.REF);
+		mem_reg = allocTmp(ValueKind.REF);
+		func_reg = allocTmp(ValueKind.REF);
+		wasm_func_reg = allocTmp(ValueKind.REF);
 
 		var prev_base_sp = int.view(frames[0].local_base_sp);
 
@@ -2231,8 +2234,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (fast) {
 			// the stuff that would need to be saved should be already saved
 			// (only restore required later) -- as an optimization, should only restore once at epilogue if there is a reconstrcution
-			masm.emit_mov_r_r(ValueKind.REF, vfp_reg, regs.vfp);
+			vfp_reg = regs.vfp;
 		} else {
+			vfp_reg = allocTmp(ValueKind.REF);
+
 			def real_frame = frames[0];
 			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
@@ -2281,8 +2286,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Step vfp_reg by change in local_base_sp from previous frame and save
 		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
 		def vfp_slot = frame.vfp_slot.plus(frame_offset);
+		masm.emit_debugger_breakpoint();
 		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
-		//masm.emit_mov_m_i(vfp_slot, 1);
+		//masm.emit_mov_m_l(vfp_slot, 1);
 
 		// Save PC
 		def pc_slot = frame.pc_slot.plus(frame_offset);
@@ -2307,9 +2313,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
-		//masm.emit_debugger_breakpoint();
 		if (isInlined()) {
-			//masm.emit_debugger_breakpoint();
+			masm.emit_debugger_breakpoint();
 			if (frames_reconstructed) {
 				// FIXME this should not happen (but does):
 				// - in the case of deep nesting when one layer is a Whamm probe
@@ -2326,9 +2331,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			frames_reconstructed = false;
 			if (space > 0) {
 				if (fast) {
-					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - FRAME_SIZE));
-					//masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
-					masm.emit_addw_r_i(regs.sp, space);
+					Trace.OUT.put2("space: %d, %d\n", space - FRAME_SIZE - 8, space);
+					masm.emit_debugger_breakpoint();
+					//masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - FRAME_SIZE));
+					masm.emit_addw_r_i(regs.sp, space - FRAME_SIZE - 8);
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+					//masm.emit_subw_r_i(regs.vfp, 0x20);
+					masm.emit_addw_r_i(regs.sp, FRAME_SIZE);
 					restoreCallerIVars();
 					restoreDispatchTableReg();
 				} else {
@@ -2336,7 +2345,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 				}
 			}
-			//masm.emit_debugger_breakpoint();
+			masm.emit_debugger_breakpoint();
 		} else {
 			emit();
 		}
