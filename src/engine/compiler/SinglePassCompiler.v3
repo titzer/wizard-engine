@@ -136,25 +136,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def gen(module: Module, func: FuncDecl, err: ErrorGen) -> bool {
 		this.osr_pc = -1;
 		this.err = err;
-		return Metrics.spc_time_us.run(gen0(_, _), (module, func));
+		return Metrics.spc_time_us.run(gen0, (module, func));
 	}
 	def genOsr(module: Module, func: FuncDecl, pc: int, err: ErrorGen) -> MasmLabel {
 		this.osr_pc = pc;
 		this.err = err;
-		var ok = Metrics.spc_time_us.run(gen0(_, _), (module, func));
+		var ok = Metrics.spc_time_us.run(gen0, (module, func));
 		return if(ok, osr_entry_label);
 	}
 	private def gen0(module: Module, func: FuncDecl) -> bool {
 		if (Trace.compiler) OUT.put1("==== begin compile: %q ========================", func.render(module.names, _)).ln();
 		var before_code_bytes = masm.curCodeBytes();
 		var before_data_bytes = masm.curDataBytes();
-		
-		//masm.emit_debugger_breakpoint();
-
-		if (fast) {
-			fast_operand_size = uleb_size(func.func_index);
-			if (Trace.compiler) Trace.OUT.put1("fast operand size: %d\n", fast_operand_size);
-		}
 
 		// Reset internal state.
 		regAlloc.clear();
@@ -179,7 +172,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
 		if (fast) {
-			// push a SpcFrame representing the interpreter frame already on the stack
+			// push an SpcFrame representing the calling interpreter
 			var interp_frame = SpcFrame.new(null, module, 0, 0, 0, -1, null);
 			pushSpcFrame(interp_frame);
 		}
@@ -187,7 +180,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
-		emitPrologue();
+		if (fast) emitFastPrologue(); else emitPrologue();
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -364,58 +357,59 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (!cond) bailout(Strings.format3(msg, p1, p2, p3));
 	}
 	def emitPrologue() {
-		//masm.emit_debugger_breakpoint();
-		if (!fast) {
-			// Allocate stack frame
-			masm.emit_subw_r_i(regs.sp, frame.frameSize);
+		// Allocate stack frame
+		masm.emit_subw_r_i(regs.sp, frame.frameSize);
 
-			// Spill VSP
-			emit_spill_vsp(regs.vsp); // XXX: track VSP-spilled state
-			// Spill wf: WasmFunction
-			masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
-			// Load wf.instance and spill
-			masm.emit_v3_WasmFunction_instance_r_r(regs.instance, regs.func_arg);
-			masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
-			// Clear FrameAccessor
-			masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
-			// Clear inlined whamm instance
-			if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
-				masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
-			}
-		} else {
-			// Advance IP past the fast-call opcode and spill it
-			def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
-			masm.emit_addw_r_i(r_ip, fast_operand_size);      // increment ip
-			computePc(-(fast_operand_size + 1));              // compute r_curpc
-			saveCallerIVars();                                // save r_ip and r_curpc
-			// XXX why do we have to save?
-			// 1. r_ip    = rax (clobbered by `div`)
-			// 2. m_curpc = HW trap reads this
-
-			// spill VFP?
-			//masm.emit_debugger_breakpoint();
-			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
+		// Spill VSP
+		emit_spill_vsp(regs.vsp); // XXX: track VSP-spilled state
+		// Spill wf: WasmFunction
+		masm.emit_mov_m_r(ValueKind.REF, frame.wasm_func_slot, regs.func_arg);
+		// Load wf.instance and spill
+		masm.emit_v3_WasmFunction_instance_r_r(regs.instance, regs.func_arg);
+		masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
+		// Clear FrameAccessor
+		masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
+		// Clear inlined whamm instance
+		if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
+			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
 		}
+		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
+		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
+		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
+		// XXX: skip spilling of VFP
+		masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
+
+		// Load instance.memories[0].start into MEM0_BASE and spill
+		if (module.memories.length > 0) {
+			// XXX: skip loading memory base if function doesn't access memory
+			masm.emit_v3_Instance_memories_r_r(regs.mem0_base, regs.instance);
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.mem0_base, regs.mem0_base, 0);
+			masm.emit_v3_Memory_start_r_r(regs.mem0_base, regs.mem0_base);
+			masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
+		}
+	}
+	def emitFastPrologue() {
+		// compute fast operand size to skip over
+		// XXX this assumes the func index is stored in bytecode as its most compact LEB
+		fast_operand_size = 1;
+		var n = func.func_index;
+		while (n >= 0x80) {
+			fast_operand_size++;
+			n >>= 7;
+		}
+		// Advance IP past the fast-call opcode and spill it
+		def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
+		masm.emit_addw_r_i(r_ip, fast_operand_size); // increment ip
+		computePc(-(fast_operand_size + 1));         // compute r_curpc
+		saveCallerIVars();                           // save r_ip and r_curpc
+		// Why do we have to compute and save?
+		// 1. r_ip    = rax (clobbered by HW `div`) |\ can validation catch this?
+		// 2. m_curpc = HW trap reads this          |/ or hidden by arbitrary outcalls?
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
-		//masm.emit_debugger_breakpoint();
 
-
-		if (!fast) {
-			// Spill VFP so emit_reload_regs can restore R11 after calls
-			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
-
-			// Load instance.memories[0].start into MEM0_BASE and spill
-			if (module.memories.length > 0) {
-				// XXX: skip loading memory base if function doesn't access memory
-				masm.emit_v3_Instance_memories_r_r(regs.mem0_base, regs.instance);
-				masm.emit_v3_Array_elem_r_ri(ValueKind.REF, regs.mem0_base, regs.mem0_base, 0);
-				masm.emit_v3_Memory_start_r_r(regs.mem0_base, regs.mem0_base);
-				masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
-			}
-		}
 	}
 	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
 		var vt = vtc.toAbstractValueType(module);
@@ -816,16 +810,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(ctl_top.label);
 			state.resetToMerge(ctl_top);
 			state.ctl_stack.pop();
-		// case for END for fallthrough at end of function?
 		} else if (ctl_top.opcode == Opcode.RETURN.code) {
 			state.emitFallthru(resolver);
 			masm.bindLabel(ctl_top.label);
 			state.resetToMerge(ctl_top);
 			emitProbe();
-			if (ctl_top.merge_count > 1) {
-				emitReturn(ctl_top);
-			}
+			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
 			state.ctl_stack.pop();
+			return;
 		}
 		emitProbe();
 	}
@@ -861,7 +853,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_br(ret_label);
 		setUnreachable();
 	}
-	// for CALL, FAST_CALL, and RETURN_CALL
 	def visitCallDirect(op: Opcode, index: u31, prop: CallProperty) {
 		if (op == Opcode.CALL) {
 			Metrics.spc_static_calls.val++;
@@ -2143,7 +2134,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_br(target.label);
 		}
 	}
-	// Return includes epilogue
 	def emitReturn(ctl: SpcControl) {
 		// All explicit RETURN instructions branch here.
 		masm.bindLabel(ret_label);
@@ -2172,9 +2162,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		} else {
 			// Restore VFP from interpreter frame
 			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
-			// In fast mode, caller ivars (stp, eip, func_decl, instance, mem0_base) were
-			// never clobbered and need no restoration — only r_ip is reloaded by emitFastDispatch.
-			restoreDispatchTableReg();
 			emitFastDispatch();
 		}
 	}
@@ -2212,14 +2199,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def restoreDispatchTableReg();
 	def restoreCallerIVars();
 	def computePc(delta: int);
-	def computeCurIpForTrap(delta: int);
-	def computeCurIpFromIp(delta: int);
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
 
-		var inst_reg: Reg, mem_reg: Reg, func_reg: Reg, vfp_reg: Reg, wasm_func_reg: Reg;
+		var inst_reg: Reg, mem_reg: Reg, func_reg: Reg, wasm_func_reg: Reg;
+		def vfp_reg: Reg = allocTmp(ValueKind.REF);
 		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
 
 		var prev_base_sp = int.view(frames[0].local_base_sp);
@@ -2231,25 +2217,24 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
 		}
 
-		vfp_reg = allocTmp(ValueKind.REF);
 		if (fast) {
-			masm.emit_mov_r_r(ValueKind.REF, vfp_reg, regs.vfp); // copy so reconstruction can step without clobbering live vfp
-			inst_reg      = regs.instance;
-			mem_reg       = regs.mem0_base;
-		} else {
-			inst_reg      = allocTmp(ValueKind.REF);
-			mem_reg       = allocTmp(ValueKind.REF);
+			masm.emit_mov_r_r(ValueKind.REF, vfp_reg, regs.vfp);
 
+			inst_reg = regs.instance;  // |\ use regs from interpreter
+			mem_reg  = regs.mem0_base; // |/
+		} else {
 			def real_frame = frames[0];
 			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
 			masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
-			// load instance
+
+			inst_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
+			mem_reg  = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
 		}
 
-		// Load instance.functions
+		// Load Instance.functions
 		func_reg      = allocTmp(ValueKind.REF);
 		wasm_func_reg = allocTmp(ValueKind.REF);
 		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
@@ -2296,9 +2281,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Step vfp_reg by change in local_base_sp from previous frame and save
 		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
 		def vfp_slot = frame.vfp_slot.plus(frame_offset);
-		//masm.emit_debugger_breakpoint();
 		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
-		//masm.emit_mov_m_l(vfp_slot, 1);
 
 		// Save PC
 		def pc_slot = frame.pc_slot.plus(frame_offset);
@@ -2324,7 +2307,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
 		if (isInlined()) {
-			//masm.emit_debugger_breakpoint();
 			if (frames_reconstructed) {
 				// FIXME this should not happen (but does):
 				// - in the case of deep nesting when one layer is a Whamm probe
@@ -2335,23 +2317,22 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 			unrefRegs();
 			frames_reconstructed = true;
-			if (Trace.compiler) Trace.OUT.puts("performing frame reconstruction\n");
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
 			frames_reconstructed = false;
 			if (space > 0) {
 				if (fast) {
-					masm.emit_addw_r_i(regs.sp, space - (FRAME_SIZE + 8));
-					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
-					masm.emit_addw_r_i(regs.sp, FRAME_SIZE + 8);
-					//restoreCallerIVars();
-					//restoreDispatchTableReg();
+					// reload VFP from the deepest inlined frame
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - FRAME_SIZE - 8));
+					masm.emit_addw_r_i(regs.sp, space);
+
+					restoreCallerIVars();
+					restoreDispatchTableReg();
 				} else {
 					masm.emit_addw_r_i(regs.sp, space);
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 				}
 			}
-			//masm.emit_debugger_breakpoint();
 		} else {
 			emit();
 		}
@@ -2792,7 +2773,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		state.frame_stack.push(frame);
 		// Update cached copies from new top frame
-		if (frame.func != null) it.reset(frame.func).at(frame.pc, -1);
+		if (frame.func != null) it.reset(frame.func).at(frame.pc, -1); // null = func in int
 		module = frame.module;
 		func = frame.func;
 		sig = if(func != null, func.sig);
@@ -2826,7 +2807,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return !isInlined() || ctl_base_sp == 0;
 	}
 	def inlineDepth() -> int {
-		// subtract extra 1 in the fastcall case
 		return if(fast, state.frame_stack.top - 2, state.frame_stack.top - 1);
 	}
 	def snapshotFrames() -> Array<SpcFrame> {
@@ -3587,9 +3567,3 @@ type WhammInlineConfig(swap_membase: bool, swap_instance: bool, is_inlined: bool
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
 type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
-
-def uleb_size(v: int) -> int {
-	var n = 1, data = u32.view(v);
-	while (data >= 0x80) { data = data >> 7; n++; }
-	return n;
-}
