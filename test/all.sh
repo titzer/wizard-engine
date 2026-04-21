@@ -164,6 +164,12 @@ for target in $TEST_TARGETS; do
     do_script wasi/test
 done
 
+# Wave tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    do_script wave/test
+done
+
 # linker tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
