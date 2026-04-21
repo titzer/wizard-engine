@@ -853,7 +853,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_br(ret_label);
 		setUnreachable();
 	}
-	def visitCallDirect(op: Opcode, index: u31, prop: CallProperty) {
+	def visitCallDirect(op: Opcode, index: u31, tailCall: bool) {
 		if (op == Opcode.CALL) {
 			Metrics.spc_static_calls.val++;
 			masm.emit_inc_metric(Metrics.spc_dynamic_calls);
@@ -861,7 +861,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var func = module.functions[index];
 
 		// Try inlining for intra-module, non-tail calls
-		if (prop != CallProperty.TAIL && shouldInline(func)) {
+		if (!tailCall && shouldInline(func)) {
 			if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
 			if (op == Opcode.CALL) {
 				Metrics.spc_static_inlined_calls.val++;
@@ -879,12 +879,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var tmp = allocTmp(ValueKind.REF);
 			emit_load_instance(tmp);
 
-
 			// Load the function, XXX: skip and compute function from instance + code on stack?
 			masm.emit_v3_Instance_functions_r_r(func_reg, tmp);
 			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, func.func_index);
 
-			emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, prop);
+			emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, tailCall);
 		});
 	}
 	def emitInlinedCall(callee_func: FuncDecl, whamm: WhammProbe) {
@@ -913,7 +912,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			m = whamm_instance.module;
 			new_local_base_sp = u31.view(state.sp) - u31.view(whamm_sig.length); // XXX
-			func_body_ctl.val_stack_top = new_local_base_sp; // correct val_stack_top for whamm arg count
+			func_body_ctl.val_stack_top = new_local_base_sp; // correct val_stack_top for whamm arg count 
 		}
 
 		// create merge state based on outer function's base sp given inlined function's results
@@ -960,21 +959,21 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Restore caller spc context
 		popSpcFrame();
 	}
-	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, prop: CallProperty) {
+	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, tailCall: bool) {
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Handle the current stack state.
-		if (prop == CallProperty.TAIL) emitMoveTailCallArgs(sig); // transfer tail call args
+		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
 		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
 
 		// Compute VSP below the args passed into callee function and spill it
 		emit_compute_vsp(vsp_reg, state.sp - u32.!(sig.params.length));
-		if (prop != CallProperty.TAIL) emit_spill_vsp(vsp_reg);
+		if (!tailCall) emit_spill_vsp(vsp_reg);
 		// Add params to VSP
 		if (sig.params.length > 0) masm.emit_addw_r_i(vsp_reg, sig.params.length * masm.valuerep.slot_size);
 		if (checkHostCall) {
 			// A call to imported function must first check for WasmFunction.
 			masm.emit_br_r(func_reg, MasmBrCond.IS_WASM_FUNC, wasmcall_label);
-			if (prop == CallProperty.TAIL) {
+			if (tailCall) {
 				masm.emit_jump_HostCallStub(); // XXX: stub relies on func_arg and VSP
 			} else {
 				masm.emit_call_HostCallStub(); // XXX: stub relies on func_arg and VSP
@@ -987,7 +986,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_FuncDecl_target_code_r_r(tmp, tmp);
 
 		// Call or jump to the entrypoint.
-		if (prop == CallProperty.TAIL) {
+		if (tailCall) {
 			masm.emit_jump_r(tmp);
 			setUnreachable();
 		} else {
@@ -1011,7 +1010,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// adjust frame
 		masm.emit_addw_r_i(regs.sp, frame.frameSize);
 	}
-	def visitCallIndirect(op: Opcode, sig_index: u31, table_index: u31, prop: CallProperty) {
+	def visitCallIndirect(op: Opcode, sig_index: u31, table_index: u31, tailCall: bool) {
 		var sig = SigDecl.!(module.heaptypes[sig_index]);
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
@@ -1068,9 +1067,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(end);
 		}
 
-		emitCallToReg(sig, func_reg, vsp_reg, tmp_reg, true, prop);
+		emitCallToReg(sig, func_reg, vsp_reg, tmp_reg, true, tailCall);
 	}
-	def visitCallRef(op: Opcode, index: u31, prop: CallProperty) {
+	def visitCallRef(op: Opcode, index: u31, tailCall: bool) {
 		var sig = SigDecl.!(module.heaptypes[index]);
 		var sv = state.peek();
 		if (sv.isConst() && sv.const == 0) {
@@ -1083,7 +1082,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var tmp = allocTmp(ValueKind.REF);
 		var func_reg = sv.reg;
 
-		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, prop);
+		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, tailCall);
 	}
 	def visit_DROP() {
 		dropN(1);
