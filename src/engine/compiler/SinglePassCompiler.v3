@@ -76,8 +76,9 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
+
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
-class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
+class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits, fast: bool) extends BytecodeVisitor {
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def config = masm.regConfig;
 	def regs = xenv;
@@ -115,6 +116,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var skip_to_end: bool;
 	var whamm_config: WhammInlineConfig;
 	var frames_reconstructed = false;
+	var fast_operand_size: int;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -166,11 +168,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Push initial frame for top-level function
 		state.frame_stack.clear();
+		if (fast) {
+			// push an SpcFrame representing the calling interpreter
+			var interp_frame = SpcFrame.new(null, module, 0, 0, 0, -1, null);
+			pushSpcFrame(interp_frame);
+		}
 		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0, masm.newLabel(func.cur_bytecode.length));
 		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
-		emitPrologue();
+		if (fast) emitFastPrologue(); else emitPrologue();
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -363,7 +370,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
 			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
 		}
-
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
 		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
@@ -378,6 +384,28 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_v3_Memory_start_r_r(regs.mem0_base, regs.mem0_base);
 			masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
 		}
+	}
+	def emitFastPrologue() {
+		// compute fast operand size to skip over
+		// XXX this assumes the func index is stored in bytecode as its most compact LEB
+		fast_operand_size = 1;
+		var n = func.func_index;
+		while (n >= 0x80) {
+			fast_operand_size++;
+			n >>= 7;
+		}
+		// Advance IP past the fast-call opcode and spill it
+		def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
+		masm.emit_addw_r_i(r_ip, fast_operand_size); // increment ip
+		computePc(-(fast_operand_size + 1));         // compute r_curpc
+		saveCallerIVars();                           // save r_ip and r_curpc
+		// Why do we have to compute and save?
+		// 1. r_ip    = rax (clobbered by HW `div`) |\ can validation catch this?
+		// 2. m_curpc = HW trap reads this          |/ or hidden by arbitrary outcalls?
+
+		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
+		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
+		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
 	}
 	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
 		var vt = vtc.toAbstractValueType(module);
@@ -976,7 +1004,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		resolver.emitMoves();
 		state.sp = count;
 		// adjust frame
-		masm.emit_addw_r_i(regs.sp, frame.frameSize);
+		if (!fast) masm.emit_addw_r_i(regs.sp, frame.frameSize);
 	}
 	def visitCallIndirect(op: Opcode, sig_index: u31, table_index: u31, tailCall: bool) {
 		var sig = SigDecl.!(module.heaptypes[sig_index]);
@@ -2005,7 +2033,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_call_runtime_op(op);
 		};
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
- 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
+		if (canTrap || fast) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
 		dropN(args);
@@ -2029,7 +2057,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_call_runtime_op(op);
 		};
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
- 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
+		if (canTrap || fast) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
 		dropN(args);
@@ -2116,16 +2144,23 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 		}
 
-		if (isInlined()) return;
+		if (!needsEpilogue()) return;
 
 		// Compute VSP = VFP + state.sp
 		emit_compute_vsp(regs.vsp, state.sp);
-		// Return to caller
-		masm.emit_mov_r_i(regs.ret_throw, 0);
-		// Deallocate stack frame
-		masm.emit_addw_r_i(regs.sp, frame.frameSize);
-		masm.emit_ret();
+		if (!fast) {
+			// Return to caller
+			masm.emit_mov_r_i(regs.ret_throw, 0);
+			// Deallocate stack frame
+			masm.emit_addw_r_i(regs.sp, frame.frameSize);
+			masm.emit_ret();
+		} else {
+			// Restore VFP from interpreter frame
+			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+			emitFastDispatch();
+		}
 	}
+	def emitFastDispatch() -> void;
 	def emitOsrEntry(osr_entry_label: MasmLabel, state: Array<SpcVal>) {
 		if (Trace.compiler) Trace.OUT.put1("  OSR (+%d)", osr_entry_label.create_pos).ln();
 		masm.bindLabel(osr_entry_label);
@@ -2145,7 +2180,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def emitTrapReturn(label: MasmLabel, reason: TrapReason) {
 		if (label != null) masm.bindLabel(label);
 		masm.emit_mov_r_trap(regs.ret_throw, reason);
-		masm.emit_addw_r_i(regs.sp, frame.frameSize);
+		if (!fast) masm.emit_addw_r_i(regs.sp, frame.frameSize);
 		masm.emit_ret();
 	}
 	def newTrapLabel(reason: TrapReason) -> MasmLabel {
@@ -2155,33 +2190,50 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
+	def saveCallerIVars();
+	def saveReconstructCallerIVars();
+	def restoreDispatchTableReg();
+	def restoreCallerIVars();
+	def computePc(delta: int);
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
-		def real_frame = frames[0];
-		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
 
-		// load instance
-		var inst_reg = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
-		var mem_reg = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
-		// Load instance.functions
-		def func_reg = allocTmp(ValueKind.REF);
-		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
-		def vfp_reg = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
-		var prev_base_sp = int.view(frames[0].local_base_sp);
-		var wasm_func_reg = allocTmp(ValueKind.REF);
-
+		var inst_reg: Reg, mem_reg: Reg, func_reg: Reg, wasm_func_reg: Reg;
+		def vfp_reg: Reg = allocTmp(ValueKind.REF);
 		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+
+		var prev_base_sp = int.view(frames[0].local_base_sp);
+
 		if (whamm_config.is_inlined) { // XXX check individual configs?
 			inl_inst_reg = allocTmp(ValueKind.REF);
 			inl_mem0_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
 		}
+
+		if (fast) {
+			masm.emit_mov_r_r(ValueKind.REF, vfp_reg, regs.vfp);
+
+			inst_reg = regs.instance;  // |\ use regs from interpreter
+			mem_reg  = regs.mem0_base; // |/
+		} else {
+			def real_frame = frames[0];
+			masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+
+			masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
+
+			inst_reg = allocTmp(ValueKind.REF);
+			masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
+			mem_reg  = allocTmp(ValueKind.REF);
+			masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
+		}
+
+		// Load Instance.functions
+		func_reg      = allocTmp(ValueKind.REF);
+		wasm_func_reg = allocTmp(ValueKind.REF);
+		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
 
 		// Pre-allocate stack space for all reconstructed frames at once.
 		def total_space = (frames.length - 1) * (frame.frameSize + 8);
@@ -2259,19 +2311,30 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				emit();
 				return;
 			}
+			if (fast) {
+				saveReconstructCallerIVars();
+			}
 			unrefRegs();
 			frames_reconstructed = true;
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
 			frames_reconstructed = false;
 			if (space > 0) {
-				masm.emit_addw_r_i(regs.sp, space);
-				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+				if (fast) {
+					// reload VFP from the deepest inlined frame
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - frame.frameSize - 8));
+					masm.emit_addw_r_i(regs.sp, space);
+
+					restoreCallerIVars();
+					restoreDispatchTableReg();
+				} else {
+					masm.emit_addw_r_i(regs.sp, space);
+					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+				}
 			}
 		} else {
 			emit();
 		}
-
 	}
 	def unsupported() {
 		success = false; // XXX: add opcode
@@ -2365,7 +2428,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emit_reload_regs() {
 		// XXX: recompute VFP from VSP - #slots?
-		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+		if (!fast) masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
 			if (whamm_config.is_inlined) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
@@ -2709,10 +2772,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		state.frame_stack.push(frame);
 		// Update cached copies from new top frame
-		it.reset(frame.func).at(frame.pc, -1);
+		if (frame.func != null) it.reset(frame.func).at(frame.pc, -1); // null = func in int
 		module = frame.module;
 		func = frame.func;
-		sig = func.sig;
+		sig = if(func != null, func.sig);
 		num_locals = frame.num_locals;
 		local_base_sp = frame.local_base_sp;
 		ctl_base_sp = frame.ctl_base_sp;
@@ -2738,8 +2801,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def isInlined() -> bool {
 		return state.frame_stack.top > 1;
 	}
+	def needsEpilogue() -> bool {
+		// inlined callees will fallthrough and don't need epilogue to be emitted
+		return !isInlined() || ctl_base_sp == 0;
+	}
 	def inlineDepth() -> int {
-		return state.frame_stack.top - 1;
+		return if(fast, state.frame_stack.top - 2, state.frame_stack.top - 1);
 	}
 	def snapshotFrames() -> Array<SpcFrame> {
 		var frames = Array<SpcFrame>.new(state.frame_stack.top);
