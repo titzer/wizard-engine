@@ -35,6 +35,9 @@ make
 # remaining arguments are appended to V3C_OPTS
 export V3C_OPTS="$V3C_OPTS $@"
 popd
+
+# runtime arguments are passed to wizeng via WIZENG_OPTS
+export WIZENG_OPTS="$WIZENG_OPTS $WIZENG_RUNTIME_ARGS"
 #############################################################################
 
 # Set up wizard

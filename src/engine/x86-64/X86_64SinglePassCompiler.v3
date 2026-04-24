@@ -1130,9 +1130,13 @@ class X86_64SinglePassCompiler extends SinglePassCompiler {
 		state.push(b.kindFlagsMatching(kind, IN_REG), b.reg, 0);
 		return true;
 	}
+	def getSpcInlinedFrameIp() -> long {
+		return long.view(INLINED_FRAME_STUB.start);
+	}
 }
 
 def ucontext_rip_offset = 168;
+def ucontext_rsp_offset = 160;
 def SIGFPE  = 8;
 def SIGBUS  = 10;
 def SIGSEGV = 11;
@@ -1155,8 +1159,9 @@ class X86_64SpcCode extends RiUserCode {
 		out(msg);
 		msg = "] ";
 		out(msg);
-		var instance = (sp + X86_64InterpreterFrame.instance.offset).load<Instance>();
-		var wf = (sp + X86_64InterpreterFrame.wasm_func.offset).load<WasmFunction>();
+		var h = X86_64FrameHandle.Spc(sp);
+		var instance = h.instance();
+		var wf = h.wasm_func();
 		// TODO: lazy parse of names section may allocate; must avoid this in OOM situation
 		var buf = X86_64Runtime.globalFrameDescriptionBuf;
 		wf.decl.render(instance.module.names, buf);
@@ -1172,11 +1177,11 @@ class X86_64SpcCode extends RiUserCode {
 	// V3-runtime callback: when the garbage collector needs to scan a JIT stack frame.
 	def scanFrame(ip: Pointer, sp: Pointer) {
 		// Handle other roots in the frame
-		RiGc.rescanRoot(sp + X86_64InterpreterFrame.wasm_func.offset);
-		RiGc.rescanRoot(sp + X86_64InterpreterFrame.instance.offset);
-		RiGc.rescanRoot(sp + X86_64InterpreterFrame.accessor.offset);
-		if (SpcTuning.inlineSmallFunc && SpcTuning.intrinsifyWhammProbe) {
-			RiGc.rescanRoot(sp + X86_64InterpreterFrame.stp.offset); // TODO: define X86_64SpcFrame and use dedicated slot
+		RiGc.rescanRoot(sp + X86_64SpcFrame.wasm_func.offset);
+		RiGc.rescanRoot(sp + X86_64SpcFrame.instance.offset);
+		RiGc.rescanRoot(sp + X86_64SpcFrame.accessor.offset);
+		if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
+			RiGc.rescanRoot(sp + X86_64SpcFrame.inlined_instance.offset);
 		}
 	}
 }
@@ -1185,7 +1190,7 @@ class X86_64SpcCode extends RiUserCode {
 class X86_64SpcModuleCode extends X86_64SpcCode {
 	def mapping: Mapping;
 	var codeEnd: int;			// for dynamically adding code to the end
-	var sourcePcs: Vector<(int, int)>;
+	var sourcePcs: Vector<(int, List<FuncLoc>)>;
 	var embeddedRefOffsets: Vector<int>;
 
 	new(mapping) super("spc-module", mapping.range.start, mapping.range.end) {
@@ -1229,35 +1234,80 @@ class X86_64SpcModuleCode extends X86_64SpcCode {
 		return false;
 	}
 	// Updates the siginfo's {ucontext} to set the handler %rip and to write the PC of the fault location
-	// into the stack frame for the handler.
+	// into the stack frame for the handler, along with any inlined frames at the program location.
 	private def updateUContextToTrapsStub(ucontext: Pointer, reason: TrapReason) {
 		var p_rip = ucontext + ucontext_rip_offset;
 		var p_rsp = RiOs.getSp(ucontext);
 		if (!RiRuntime.inStackRedZone(p_rsp)) {
 			// Update the current PC in the JIT frame, if it is accessible.
 			var ip = p_rip.load<Pointer>();
-			var pc = lookupPc(ip, false);
-			(p_rsp + X86_64InterpreterFrame.curpc.offset).store<int>(pc);
+			var inline_ctx = lookupPc(ip, false);
+			var h = X86_64FrameHandle.Spc(p_rsp);
+			if (inline_ctx == null) {
+				h.set_curpc(-1);
+			} else if (inline_ctx.tail == null) {
+				h.set_curpc(inline_ctx.head.pc);
+			} else {
+				p_rsp = reconstructInlinedFramesForTrap(p_rsp, inline_ctx);
+				(ucontext + ucontext_rsp_offset).store<Pointer>(p_rsp);
+			}
 		}
 
 		var handler_ip = TRAPS_STUB.getIpForReason(reason);
 		(p_rip).store<Pointer>(handler_ip);
 	}
+	// Reconstructs inlined interpreter frames for an inlined hardware trap context.
+	// Returns the new rsp to write into the ucontext (top of stack).
+	private def reconstructInlinedFramesForTrap(r_rsp: Pointer, inline_ctx: List<FuncLoc>) -> Pointer {
+		def frames: Array<FuncLoc> = Lists.toArray(inline_ctx);
+		def outer = frames[frames.length - 1];
+		def inlined = frames[0 ... (frames.length - 1)];
+		def count = inlined.length;
+
+		// set outermost pc in the real frame; read instance (shared across all inlined frames)
+		var outer_h = X86_64FrameHandle.Spc(r_rsp);
+		outer_h.set_curpc(outer.pc);
+		var instance = outer_h.instance();
+
+		// Push inlined frames
+		for (i = count - 1; i >= 0; i--) {
+			var fid = inlined[i].func_index;
+			var pc  = inlined[i].pc;
+
+			r_rsp += -8;
+			r_rsp.store<Pointer>(INLINED_FRAME_STUB.start);
+
+			r_rsp += -X86_64InterpreterFrame.size;  // move rsp?
+			var h = X86_64FrameHandle.Spc(r_rsp);
+			
+			// write func, pc, frame accessor
+			var wasm_func = WasmFunction.!(instance.functions[fid]);
+			h.set_wasm_func(wasm_func);
+			h.set_curpc(pc);
+			h.set_accessor(null);
+		}
+		return r_rsp;
+	}
 	// Look up the source {pc} of a location {i} in this code. Returns {-1} if no exact entry is found.
 	// Return addresses are treated differently than other addresses in the code.
-	def lookupPc(ip: Pointer, isRetAddr: bool) -> int {
+	def lookupPc(ip: Pointer, isRetAddr: bool) -> List<FuncLoc> {
 		if (Trace.compiler) Trace.OUT.put2("SpcCode.lookupPc(0x%x, ret=%z)", (ip - Pointer.NULL), isRetAddr).ln();
-		if (sourcePcs == null) return -1;
-		if (!mapping.range.contains(ip)) return -1;
+		if (sourcePcs == null) return null;
+		if (!mapping.range.contains(ip)) return null;
 		var offset = ip - mapping.range.start - if(isRetAddr, 1);
 		// XXX: use binary search for looking up source PCs in SPC code
 		if (Trace.compiler) Trace.OUT.put1(" looking for offset=%d", offset).ln();
 		for (i < sourcePcs.length) {
 			var entry = sourcePcs[i];
-			if (Trace.compiler) Trace.OUT.put2("  (offset=%d, pc=%d)", entry.0, entry.1).ln();
+			if (Trace.compiler) Lists.render(Trace.OUT.put1("  (offset=%d, ctx=[", entry.0),
+				fun (e: FuncLoc, buf: StringBuilder) => buf.put2("(func=%d,pc=%d)", e.func_index, e.pc), entry.1).puts("])").ln();
 			if (offset == entry.0) return entry.1;
 		}
-		return -1;
+		return null;
+	}
+	def lookupTopPc(ip: Pointer, isRetAddr: bool) -> int {
+		def chain = lookupPc(ip, isRetAddr); 
+		return if(chain != null, chain.head.pc, -1); 
 	}
 	// Appends code to the end of this module.
 	def appendCode(masm: X86_64MacroAssembler) -> Pointer {
@@ -1307,6 +1357,10 @@ class X86_64SpcTrapsStub extends X86_64SpcCode {
 	}
 }
 
+// Marker for reconstructed inlined frames in stack traces.
+// Tells the stalk walker that it should look inside the frame to find the function's pc.
+class X86_64SpcInlinedFrame extends X86_64SpcCode("inlined-frame", Pointer.NULL, Pointer.NULL) { }
+
 // The lazy-compile stub needs special handling in the Virgil runtime because it has
 // a frame that stores the function being compiled.
 class X86_64SpcCompileStub extends RiUserCode {
@@ -1348,6 +1402,8 @@ def LAZY_COMPILE_STUB = X86_64PreGenStub.new("spc-lazy-compile", X86_64SpcCompil
 def TIERUP_COMPILE_STUB = X86_64PreGenStub.new("spc-tierup-compile", X86_64SpcCompileStub.new("tierup"), genTierUpCompileStub);
 def TRAPS_STUB = X86_64SpcTrapsStub.new();
 def TRAPS_PREGEN = X86_64PreGenStub.new("spc-trap", TRAPS_STUB, genTrapsStub);
+def INLINED_FRAME_STUB = X86_64SpcInlinedFrame.new();
+def INLINED_FRAME_PREGEN = X86_64PreGenStub.new("spc-inlined-frame", INLINED_FRAME_STUB, genSpcInlinedFrame);
 
 def genSpcEntryFunc(ic: X86_64InterpreterCode, w: DataWriter) {
 	if (SpcTuning.disable) return;
@@ -1355,17 +1411,17 @@ def genSpcEntryFunc(ic: X86_64InterpreterCode, w: DataWriter) {
 	var asm = X86_64Assembler.!(masm.asm);
 	var regs = X86_64MasmRegs.SPC_EXEC_ENV;
 	var func_arg = G(regs.func_arg);
-	if (func_arg == Target.V3_PARAM_GPRS[2]) {
+	if (func_arg == G(Target.V3_PARAM_GPRS[2])) {
 		// XXX: use macro assembler to order moves
 		var scratch = masm.scratch;
 		asm.movq_r_r(scratch, func_arg);
-		asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
+		asm.movq_r_r(func_arg, G(Target.V3_PARAM_GPRS[1]));	// function
 		asm.movq_r_r(G(regs.vsp), scratch);			// vsp
 	} else {
-		asm.movq_r_r(func_arg, Target.V3_PARAM_GPRS[1]);	// function
-		asm.movq_r_r(G(regs.vsp), Target.V3_PARAM_GPRS[2]);	// vsp
+		asm.movq_r_r(func_arg, G(Target.V3_PARAM_GPRS[1]));	// function
+		asm.movq_r_r(G(regs.vsp), G(Target.V3_PARAM_GPRS[2]));	// vsp
 	}
-	asm.ijmp_r(Target.V3_PARAM_GPRS[3]);				// tail-call entrypoint
+	asm.ijmp_r(G(Target.V3_PARAM_GPRS[3]));				// tail-call entrypoint
 	asm.invalid();
 }
 def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
@@ -1376,26 +1432,26 @@ def genLazyCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	var func_arg = G(regs.func_arg);
 	asm.pushq_r(G(regs.func_arg));					// push function onto stack
 	masm.emit_store_curstack_vsp(regs.vsp);
-	asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
+	asm.movq_r_r(G(Target.V3_PARAM_GPRS[1]), G(regs.func_arg));	// function
 	// Load {null} for the receiver.
-	asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+	asm.movq_r_i(G(Target.V3_PARAM_GPRS[0]), 0);
 	// Call {X86_64Spc.lazyCompile} directly.
 	masm.emit_call_abs(codePointer(X86_64Spc.lazyCompile));
 	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
 	// Check for non-null abrupt return.
 	var unwind = X86_64Label.new();
-	asm.q.cmp_r_i(Target.V3_RET_GPRS[2], 0);
+	asm.q.cmp_r_i(G(Target.V3_RET_GPRS[2]), 0);
 	asm.jc_rel_near(C.NZ, unwind);
 	// Tail-call the result of the compile.
 	var scratch = X86_64Regs.R15;
-	asm.movq_r_r(scratch, Target.V3_RET_GPRS[1]);			// entrypoint
-	asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
+	asm.movq_r_r(scratch, G(Target.V3_RET_GPRS[1]));			// entrypoint
+	asm.movq_r_r(G(regs.func_arg), G(Target.V3_RET_GPRS[0]));		// function
 	masm.emit_load_curstack_vsp(regs.vsp);
 	asm.ijmp_r(scratch);						// jump to entrypoint
 	asm.invalid();
 	// Simply return the {Throwable} object.
 	asm.bind(unwind);
-	asm.movq_r_r(Target.V3_RET_GPRS[0], Target.V3_RET_GPRS[2]);
+	asm.movq_r_r(G(Target.V3_RET_GPRS[0]), G(Target.V3_RET_GPRS[2]));
 	asm.ret();
 }
 def genTierUpCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
@@ -1414,15 +1470,15 @@ def genTierUpCompileStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	// Call compiler
 	asm.pushq_r(G(regs.func_arg));					// push function onto stack
 	masm.emit_store_curstack_vsp(regs.vsp);
-	asm.movq_r_r(Target.V3_PARAM_GPRS[1], G(regs.func_arg));	// function
+	asm.movq_r_r(G(Target.V3_PARAM_GPRS[1]), G(regs.func_arg));	// function
 	// Load {null} for the receiver.
-	asm.movq_r_i(Target.V3_PARAM_GPRS[0], 0);
+	asm.movq_r_i(G(Target.V3_PARAM_GPRS[0]), 0);
 	// Call {X86_64Spc.tierupCompile} directly.
 	masm.emit_call_abs(codePointer(X86_64Spc.tierupCompile));
 	asm.q.add_r_i(R.RSP, Pointer.SIZE);				// pop function off stack
 	// Tail-call the result of the compile (which could be interpreter entry).
-	asm.movq_r_r(G(scratch), Target.V3_RET_GPRS[1]);		// entrypoint
-	asm.movq_r_r(G(regs.func_arg), Target.V3_RET_GPRS[0]);		// function
+	asm.movq_r_r(G(scratch), G(Target.V3_RET_GPRS[1]));		// entrypoint
+	asm.movq_r_r(G(regs.func_arg), G(Target.V3_RET_GPRS[0]));		// function
 	masm.emit_load_curstack_vsp(regs.vsp);
 	asm.ijmp_r(G(scratch));						// jump to entrypoint
 	asm.invalid();
@@ -1440,9 +1496,9 @@ def genTrapsStub(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_get_curstack(regs.runtime_arg0);	// stack
 			masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
 			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
-			asm.movq_r_m(Target.V3_PARAM_GPRS[2], m_wasm_func);	// wasm_func
-			asm.movq_r_i(Target.V3_PARAM_GPRS[3], -1);		// pc
-			asm.movd_r_i(Target.V3_PARAM_GPRS[4], reason.tag);	// reason
+			asm.movq_r_m(G(Target.V3_PARAM_GPRS[2]), m_wasm_func);	// wasm_func
+			asm.movq_r_i(G(Target.V3_PARAM_GPRS[3]), -1);		// pc
+			asm.movd_r_i(G(Target.V3_PARAM_GPRS[4]), reason.tag);	// reason
 			masm.emit_call_runtime_TRAP();
 		}
 		asm.q.add_r_i(R.RSP, X86_64InterpreterFrame.size); // pop caller frame
@@ -1451,6 +1507,10 @@ def genTrapsStub(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (skip < 0) System.error("TrapsStubError", "handler size too big");
 		w.skipN(skip);
 	}
+}
+def genSpcInlinedFrame(ic: X86_64InterpreterCode, w: DataWriter) {
+       var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
+       masm.emit_intentional_crash(); // do not execute this
 }
 def codePointer<P, R>(f: P -> R) -> Pointer {
 	return CiRuntime.unpackClosure<X86_64Spc, P, R>(f).0;
@@ -1478,7 +1538,8 @@ component X86_64Spc {
 		return addr;
 	}
 	def estimateCodeSizeFor(decl: FuncDecl) -> int {
-		return 60 + decl.orig_bytecode.length * 20; // TODO: huge overestimate
+		// TODO: very imprecise estimate
+		return 60 + decl.orig_bytecode.length * 20 * (4 << byte.view(SpcTuning.maxInlineDepth));
 	}
 	private def lazyCompile(wf: WasmFunction) -> (WasmFunction, Pointer, Throwable) {
 		// The global stub simply consults the execution strategy.

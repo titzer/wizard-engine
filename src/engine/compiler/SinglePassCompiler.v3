@@ -78,7 +78,6 @@ def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
-	var it = BytecodeIterator.new();
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def config = masm.regConfig;
 	def regs = xenv;
@@ -93,10 +92,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Abstract state of the value stack
 	def state = SpcState.new(regAlloc);
 	// Other state
-	def trap_labels = Vector<(TrapReason, MasmLabel)>.new();
+	def trap_labels = Vector<(TrapReason, MasmLabel, Array<SpcFrame>)>.new();
+
+	var it = BytecodeIterator.new();
+
+	// Frame state (refers to the fields in the top SpcFrame in SpcState)
 	var module: Module;
 	var func: FuncDecl;
 	var sig: SigDecl;
+	var num_locals: int;
+	var local_base_sp: u31; // can use a Range for 0-indexing instead of from offset
+	var ctl_base_sp: u31;   // index of the RETURN control in ctl_stack for the current frame
+
 	var success = true;
 	var osr_pc: int;
 	var osr_offset: int;
@@ -106,14 +113,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var ret_label: MasmLabel;
 	var last_probe = 0;
 	var skip_to_end: bool;
+	var whamm_config: WhammInlineConfig;
+	var frames_reconstructed = false;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
-	// when function is inlined, we continue using caller's abstract state, and
-	// push callee's params/locals as needed, thus we need to track the base sp of the locals
-	// in the current context.
-	var local_base_sp: u31 = 0;
-	var is_inlined = false;
 	// tracks the last masm writer offset to generate instruction trace for each bytecode.
 	var codegen_offset: u64 = 0;
 
@@ -141,10 +145,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var before_data_bytes = masm.curDataBytes();
 
 		// Reset internal state.
-		this.module = module;
-		this.func = func;
-		it.reset(func);
-		sig = func.sig;
 		regAlloc.clear();
 		trap_labels.resize(0);
 		success = true;
@@ -153,10 +153,21 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		handler_dest_info.clear();
 		handler_dest_info.resize(func.handlers.handler_dests.length);
 
+		// Reset frame state
+		this.module = null;
+		this.func = null;
+		this.sig = null;
+		this.num_locals = 0;
+		this.local_base_sp = 0;
+
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
-		state.reset(sig, end_label);
-		state.num_locals = func.num_slots();
+		state.reset(func.sig, end_label);
+
+		// Push initial frame for top-level function
+		state.frame_stack.clear();
+		var initial_frame = SpcFrame.new(func, module, 0, 0, func.num_slots(), 0, masm.newLabel(func.cur_bytecode.length));
+		pushSpcFrame(initial_frame);
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
@@ -171,9 +182,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Emit function entry probe, if any.
 		if (!FeatureDisable.entryProbes && func.entry_probed) {
 			var probe = Instrumentation.getLocalProbe(module, func.func_index, 0);
-			emitProbe0(0, probe);
+			withReconstructedInlinedFrames(fun =>
+				emitProbe0(0, probe));
 		}
 
+		masm.current_fid = func.func_index;
 		// Emit instructions.
 		while (it.more() && success) {
 			if (Trace.compiler) traceOpcodeAndStack(false);
@@ -195,9 +208,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Emit trap labels.
 		for (i < trap_labels.length) {
 			var e = trap_labels[i];
-			masm.bindLabel(e.1);
-			masm.emit_mov_m_i(xenv.pc_slot, e.1.create_pos);
-			masm.emit_jump_to_trap_at(e.0);
+			var reason = e.0;
+			var label = e.1;
+			var frames = e.2;
+
+			masm.bindLabel(label);
+
+			if (frames.length > 1) {
+				unrefRegs();
+				emitReconstructStackFrames(frames);
+			} else {
+				masm.emit_mov_m_i(xenv.pc_slot, label.create_pos);
+			}
+			masm.emit_jump_to_trap_at(reason);
 		}
 
 		// Emit handler stubs.
@@ -230,7 +253,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					var from_slot = to_slot + func.num_locals;
 					var sv = info.merge_state[to_slot];
 					var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
-					var tv = SpcVal(typeToKindFlags(func.sig.results[i]) | IS_STORED, NO_REG, 0);
+					var tv = SpcVal(typeToKindFlags(func.sig.results[to_slot]) | IS_STORED, NO_REG, 0);
 					resolver.addMove((to_slot, tv), (from_slot, fv));
 				}
 			} else {
@@ -337,7 +360,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Clear FrameAccessor
 		masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
 		// Clear inlined whamm instance
-		if (SpcTuning.inlineSmallFunc && SpcTuning.intrinsifyWhammProbe) {
+		if (SpcTuning.inlineWhammProbes && SpcTuning.intrinsifyWhammProbe) {
 			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
 		}
 
@@ -377,7 +400,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (last_probe == 0) return;
 		var probe = Instrumentation.getLocalProbe(module, func.func_index, last_probe);
 		last_probe = 0;
-		emitProbe0(it.pc, probe);
+		withReconstructedInlinedFrames(fun =>
+			emitProbe0(it.pc, probe));
 		if (Trace.compiler) traceOpcodeAndStack(true);
 	}
 	def emitProbe0(pc: int, probe: Probe) {
@@ -462,40 +486,33 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 	// saves the overhead of using a runtime call by directly invoking the wasm function associated with the whamm probe
 	def emitWhammProbe(probe: WhammProbe) {
+		if (Trace.compiler) Trace.OUT.puts("emitting whamm probe\n");
 		// set up args and push to frame slots.
 		var whamm_sig = probe.sig;
-		var inline_config = InlineConfig(false, false, false);
-		var new_local_base_sp = 0;
 		var orig_sp = state.sp;
 		var callee_func = WasmFunction.!(probe.func);
+		def inline_decision = shouldInline(callee_func.decl) && SpcTuning.inlineWhammProbes; // TODO move to shouldInline
+		var swap_instance = false;
+		var swap_membase = false;
 
-		if (SpcTuning.inlineSmallFunc) {
-			inline_config = InlineConfig(probe.spc_swap_membase, probe.spc_swap_instance, probe.spc_inline_func);
-			if (!probe.inline_heuristic_checked) {
-				inline_config = funcCanInline(callee_func.decl);
-				probe.inline_heuristic_checked = true;
-				probe.spc_swap_instance = inline_config.swap_instance;
-				probe.spc_swap_membase = inline_config.swap_membase;
-				probe.spc_inline_func = inline_config.can_inline;
-			}
+		if (inline_decision) {
+			probe.checkSwap();
+			swap_instance = probe.swap_instance;
+			swap_membase = probe.swap_membase;
 
-			if (inline_config.swap_instance) { // push whamm instance onto abstract stack directly
+			if (swap_instance) {
 				masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
 				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, regs.scratch);
 			}
-
-			// overwrite mem0_base with whamm instance's memory base, restore from frame slot later
-			if (inline_config.swap_membase) {
-				var membase = callee_func.instance.memories[0].getMemBase64();
-				masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
+			if (swap_membase) {
+				if (callee_func.instance.memories.length > 0) {
+					var membase = callee_func.instance.memories[0].getMemBase64();
+					masm.emit_mov_r_l(regs.mem0_base, i64.view(membase));
+				}
 				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_mem0_base_slot, regs.mem0_base);
 			}
-		}
-
-		if (!inline_config.can_inline) {
-			state.emitSaveAll(resolver, probeSpillMode);
 		} else {
-			new_local_base_sp = int.view(state.sp);
+			state.emitSaveAll(resolver, probeSpillMode);
 		}
 
 		for (i < whamm_sig.length) {
@@ -504,13 +521,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var kind: byte;
 			match(whamm_sig[i]) {
 				FrameAccessor => {
-					if (inline_config.can_inline) state.emitSaveAll(resolver, probeSpillMode); // spill entire value stack.
+					if (inline_decision) state.emitSaveAll(resolver, probeSpillMode); // spill entire value stack.
 					masm.emit_call_runtime_getFrameAccessorMetaRef();
 					emit_reload_regs();
-					if (inline_config.can_inline && !probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+					if (inline_decision && !probeSpillMode.free_regs) state.emitRestoreAll(resolver);
 
 					// move result to mem slot or reg, depending on inlining
-					if (inline_config.can_inline) {
+					if (inline_decision) {
 						var reg = allocRegTos(ValueKind.REF);
 						masm.emit_mov_r_r(ValueKind.REF, reg, xenv.runtime_ret0);
 						state.push(KIND_REF | IN_REG, reg, 0);
@@ -522,7 +539,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				Val(val) => {
 					match (val) {
 						I31(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF);
 								masm.emit_mov_r_i(reg, i32.view(v) << 1);
 								state.push(KIND_REF | IN_REG, reg, 0);
@@ -532,7 +549,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.REF.code;
 						}
 						I32(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
 							} else {
 								masm.emit_mov_m_d(slot_addr, v);
@@ -540,7 +557,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.I32.code;
 						}
 						I64(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.I64);
 								masm.emit_mov_r_l(reg, i64.view(v));
 								state.push(KIND_I64 | IN_REG, reg, 0);
@@ -550,7 +567,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.I64.code;
 						}
 						F32(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.F32);
 								masm.emit_mov_r_f32(reg, v);
 								state.push(KIND_F32 | IN_REG, reg, 0);
@@ -560,7 +577,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.F32.code;
 						}
 						F64(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.F64);
 								masm.emit_mov_r_d64(reg, v);
 								state.push(KIND_F64 | IN_REG, reg, 0);
@@ -570,7 +587,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.F64.code;
 						}
 						V128(l, h) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.V128);
 								masm.emit_mov_r_q(reg, l, h);
 								state.push(KIND_V128 | IN_REG, reg, 0);
@@ -581,7 +598,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.V128.code;
 						}
 						Ref(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF);
 								masm.emit_mov_r_Object(reg, v);
 								state.push(KIND_REF | IN_REG, reg, 0);
@@ -592,7 +609,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 							kind = ValueKind.REF.code;
 						}
 						Cont(v) => {
-							if (inline_config.can_inline) {
+							if (inline_decision) {
 								var reg = allocRegTos(ValueKind.REF_U64);
 								masm.emit_mov_r_Cont(reg, v);
 								state.push(KIND_REF_U64 | IN_REG, reg, 0);
@@ -607,24 +624,24 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				}
 				Operand(_, i) => {
 					var index = orig_sp + u32.view(i) - 1;
-					if (inline_config.can_inline) {
-						visit_LOCAL_GET(u31.view(index));
+					if (inline_decision) {
+						visit_LOCAL_GET(u31.view(index - local_base_sp));
 					} else {
-						masm.emit_mov_m_m(ValueKind.REF, slot_addr, masm.slotAddr(index));
+						masm.emit_mov_m_m(state.state[index].kind(), slot_addr, masm.slotAddr(index));
 					}
 					kind = state.state[index].kind().code;
 				}
 				Local(_, i) => {
-					if (inline_config.can_inline) {
+					if (inline_decision) {
 						visit_LOCAL_GET(u31.view(i));
 					} else {
-						masm.emit_mov_m_m(ValueKind.REF, slot_addr, masm.slotAddr(u32.view(i)));
+						masm.emit_mov_m_m(state.state[u31.view(i)].kind(), slot_addr, masm.slotAddr(u32.view(i)));
 					}
 					kind = state.state[u31.view(i)].kind().code;
 				}
 				Null => System.error("whamm", "null whamm arg!");
 			}
-			if (!inline_config.can_inline) {
+			if (!inline_decision) {
 				masm.emit_mov_m_i(slot_tag_addr, kind);
 			}
 		}
@@ -632,49 +649,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var func_id = callee_func.decl.func_index;
 		var whamm_module = whamm_instance.module;
 		var whamm_func_decl = callee_func.decl;
-		if (inline_config.can_inline) {
-			var prev_it = it;
-			it = BytecodeIterator.new().reset(whamm_func_decl);
-			var orig_module = module;
-
-			// prepare spc for inlining
-			this.local_base_sp = u31.view(new_local_base_sp);
-			this.module = whamm_module;
-			this.func = whamm_func_decl;
-			this.sig = whamm_func_decl.sig;
-
-			// inline codegen
-			it.dispatchLocalDecls(this);
-			this.is_inlined = true;
-			if (Trace.compiler) Trace.OUT.puts("Start compiling inlined whamm probe").ln();
-			while (it.more() && success) {
-				if (Trace.compiler) traceOpcodeAndStack(false);
-				last_probe = 0;
-				masm.source_loc = it.pc;
-				it.dispatch(this);
-				if (Trace.compiler && Trace.asm) {
-					OUT.puts("JIT code: ");
-					masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
-					codegen_offset = masm.curCodeBytes();
-					OUT.ln();
-				}
-				unrefRegs();
-				if (Debug.compiler) checkRegAlloc();
-				it.next();
+		if (inline_decision) {
+			whamm_config = WhammInlineConfig(swap_membase, swap_instance, true);
+			masm.emit_mov_m_r(ValueKind.REF, frame.vfp_slot, regs.vfp);
+			emitInlinedCall(whamm_func_decl, probe);
+			whamm_config = WhammInlineConfig(false, false, false);
+			// Restore mem0_base after probe
+			if (module.memories.length > 0) {
+				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
 			}
-			if (Trace.compiler) Trace.OUT.puts("Finished compiling inlined whamm probe").ln();
-
-			// restore spc after inlining
-			it  = prev_it;
-			this.local_base_sp = 0;
-			this.is_inlined = false;
-			this.module = orig_module;
-			this.func = it.func;
-			this.sig = it.func.sig;
-			masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
-
-			// clear callee params/locals from abstract state
-			dropN(state.sp - orig_sp);
 		} else {
 			var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
 			var func_reg = allocTmpFixed(ValueKind.REF, regs.func_arg);
@@ -684,8 +667,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_r_Function(func_reg, whamm_instance.functions[func_id]);
 			masm.emit_v3_WasmFunction_decl_r_r(tmp, func_reg);
 			masm.emit_v3_FuncDecl_target_code_r_r(tmp, tmp);
-			// adjust vsp_reg to compute the "true" VSP, accounting for args to WhammProbe's WasmFunction
-			emit_compute_vsp(vsp_reg, state.sp + u32.view(whamm_sig.length));
+			// Spill caller's VSP into frame (before args are pushed)
+			emit_compute_vsp(vsp_reg, state.sp);
+			emit_spill_vsp(vsp_reg);
+			// Adjust VSP to be above whamm args
+			if (whamm_sig.length > 0) masm.emit_addw_r_i(vsp_reg, whamm_sig.length * masm.valuerep.slot_size);
 			// Call to the entrypoint.
 			masm.emit_call_r(tmp);
 			emit_reload_regs();
@@ -717,7 +703,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.prepareLoop(resolver);
 		masm.bindLabel(ctl_top.label);
 		emitProbe();
-		if (it.pc == osr_pc) {
+		if (it.pc == osr_pc && !isInlined()) {
 			osr_state = state.ctl_stack.peek().copyMerge();
 			osr_loop_label = masm.newLabel(it.pc);
 			masm.bindLabel(osr_loop_label);
@@ -747,6 +733,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_THROW(tag_index: u31) {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
@@ -761,6 +748,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_THROW_REF() {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
 		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
@@ -770,37 +758,36 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_END() {
-		if (!this.is_inlined) {
-			var ctl_top = state.ctl_stack.peek();
-			if (ctl_top.opcode == Opcode.LOOP.code) {
-				state.ctl_stack.pop();
-				if (!ctl_top.reachable) setUnreachable();
-			} else if (ctl_top.opcode == Opcode.IF.code) {
-				// simulate empty if-true block
-				state.emitFallthru(resolver);
-				masm.emit_br(ctl_top.label);
-				masm.bindLabel(ctl_top.else_label);
-				state.doElse();
-				ctl_top.opcode = Opcode.ELSE.code;
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				state.ctl_stack.pop();
-			} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				state.ctl_stack.pop();
-			} else if (ctl_top.opcode == Opcode.RETURN.code) {
-				state.emitFallthru(resolver);
-				masm.bindLabel(ctl_top.label);
-				state.resetToMerge(ctl_top);
-				emitProbe();
-				if (ctl_top.merge_count > 1) emitReturn(ctl_top);
-				state.ctl_stack.pop();
-			}
+		var ctl_top = state.ctl_stack.peek();
+		if (ctl_top.opcode == Opcode.LOOP.code) {
+			state.ctl_stack.pop();
+			if (!ctl_top.reachable) setUnreachable();
+		} else if (ctl_top.opcode == Opcode.IF.code) {
+			// simulate empty if-true block
+			state.emitFallthru(resolver);
+			masm.emit_br(ctl_top.label);
+			masm.bindLabel(ctl_top.else_label);
+			state.doElse();
+			ctl_top.opcode = Opcode.ELSE.code;
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.BLOCK.code || ctl_top.opcode == Opcode.ELSE.code) {
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
+			state.ctl_stack.pop();
+		} else if (ctl_top.opcode == Opcode.RETURN.code) {
+			state.emitFallthru(resolver);
+			masm.bindLabel(ctl_top.label);
+			state.resetToMerge(ctl_top);
 			emitProbe();
+			if (ctl_top.merge_count > 1) emitReturn(ctl_top);
+			state.ctl_stack.pop();
+			return;
 		}
+		emitProbe();
 	}
 	def visit_BR(depth: u31) {
 		var target = state.getControl(depth);
@@ -829,26 +816,116 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		setUnreachable();
 	}
 	def visit_RETURN() {
-		var target = state.ctl_stack.elems[0];
+		var target = state.ctl_stack.elems[ctl_base_sp];
 		state.emitTransfer(target, resolver);
-		if (ret_label == null) ret_label = masm.newLabel(func.cur_bytecode.length);
 		masm.emit_br(ret_label);
 		setUnreachable();
 	}
 	def visitCallDirect(op: Opcode, index: u31, tailCall: bool) {
+		if (op == Opcode.CALL) {
+			Metrics.spc_static_calls.val++;
+			masm.emit_inc_metric(Metrics.spc_dynamic_calls);
+		}
 		var func = module.functions[index];
-		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
-		// Load the instance (which must happen before frame is unwound).
-		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var func_reg = allocTmpFixed(ValueKind.REF, regs.func_arg);
-		var tmp = allocTmp(ValueKind.REF);
-		emit_load_instance(tmp);
 
-		// Load the function, XXX: skip and compute function from instance + code on stack?
-		masm.emit_v3_Instance_functions_r_r(func_reg, tmp);
-		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, func.func_index);
+		// Try inlining for intra-module, non-tail calls
+		if (!tailCall && shouldInline(func)) {
+			if (Trace.compiler) Trace.OUT.put2("Inlining call to func #%d (%d bytes)", index, func.orig_bytecode.length).ln();
+			if (op == Opcode.CALL) {
+				Metrics.spc_static_inlined_calls.val++;
+				masm.emit_inc_metric(Metrics.spc_dynamic_inlined_calls);
+			}
+			emitInlinedCall(func, null);
+			return;
+		}
 
-		emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, tailCall);
+		withReconstructedInlinedFrames(fun {
+			var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
+			// Load the instance (which must happen before frame is unwound).
+			var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
+			var func_reg = allocTmpFixed(ValueKind.REF, regs.func_arg);
+			var tmp = allocTmp(ValueKind.REF);
+			emit_load_instance(tmp);
+
+			// Load the function, XXX: skip and compute function from instance + code on stack?
+			masm.emit_v3_Instance_functions_r_r(func_reg, tmp);
+			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, func_reg, func_reg, func.func_index);
+
+			emitCallToReg(func.sig, func_reg, vsp_reg, tmp, func.imp != null, tailCall);
+		});
+	}
+	def emitInlinedCall(callee_func: FuncDecl, whamm: WhammProbe) {
+		var sig = callee_func.sig;
+		var params_count = u32.view(sig.params.length);
+		var results_count = u32.view(sig.results.length);
+		var orig_sp = state.sp;
+
+		var new_local_base_sp: u31 = u31.view(orig_sp - params_count);
+		var new_ctl_base_sp = u31.view(state.ctl_stack.top);
+
+		var num_locals = callee_func.num_slots();
+
+		// Push a RETURN control for the inlined callee's function body.
+		var end_label = masm.newLabel(callee_func.cur_bytecode.length);
+		var func_body_ctl = state.pushFuncBody(sig.params, sig.results, end_label);
+
+		var m: Module = module;
+
+		// Whamm probe configuration
+		if (whamm != null) {
+			def whamm_sig = whamm.sig;
+			def whamm_wf = WasmFunction.!(whamm.func);
+			def whamm_instance = whamm_wf.instance;
+			def whamm_func_decl = whamm_wf.decl;
+
+			m = whamm_instance.module;
+			new_local_base_sp = u31.view(state.sp) - u31.view(whamm_sig.length); // XXX
+			func_body_ctl.val_stack_top = new_local_base_sp; // correct val_stack_top for whamm arg count 
+		}
+
+		// create merge state based on outer function's base sp given inlined function's results
+		func_body_ctl.merge_state = state.getInMemoryMergeWithArgs(int.view(new_local_base_sp), sig.results);
+		func_body_ctl.merge_count = 1;
+
+		// Create and push frame for inlined function
+		var callee_frame = SpcFrame.new(callee_func,
+			m, new_local_base_sp, new_ctl_base_sp, num_locals, 0, masm.newLabel(callee_func.cur_bytecode.length));
+
+		pushSpcFrame(callee_frame);
+
+		// Emit function entry probe, if any.
+		if (whamm == null && !FeatureDisable.entryProbes && func.entry_probed) {
+			var probe = Instrumentation.getLocalProbe(module, callee_func.func_index, 0);
+			withReconstructedInlinedFrames(fun =>
+				emitProbe0(0, probe));
+		}
+
+		// Allocate callee's non-parameter locals
+		it.dispatchLocalDecls(this);
+
+		// Compile callee's bytecode
+		if (Trace.compiler) Trace.OUT.puts("  Start inlined function body").ln();
+		while (it.more() && success) {
+			if (Trace.compiler) traceOpcodeAndStack(false);
+			last_probe = 0;
+			masm.source_loc = it.pc;
+			masm.current_fid = func.func_index;
+			it.dispatch(this);
+			if (Trace.compiler && Trace.asm) {
+				OUT.puts("JIT code: ");
+				masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
+				codegen_offset = masm.curCodeBytes();
+				OUT.ln();
+			}
+			unrefRegs();
+			if (Debug.compiler) checkRegAlloc();
+			it.next();
+			if (skip_to_end) doSkipToEndOfBlock();
+		}
+		if (Trace.compiler) Trace.OUT.puts("  End inlined function body").ln();
+
+		// Restore caller spc context
+		popSpcFrame();
 	}
 	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, tailCall: bool) {
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
@@ -856,8 +933,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
 		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
 
-		// Compute the value stack pointer.
-		emit_compute_vsp(vsp_reg, state.sp);
+		// Compute VSP below the args passed into callee function and spill it
+		emit_compute_vsp(vsp_reg, state.sp - u32.!(sig.params.length));
+		if (!tailCall) emit_spill_vsp(vsp_reg);
+		// Add params to VSP
+		if (sig.params.length > 0) masm.emit_addw_r_i(vsp_reg, sig.params.length * masm.valuerep.slot_size);
 		if (checkHostCall) {
 			// A call to imported function must first check for WasmFunction.
 			masm.emit_br_r(func_reg, MasmBrCond.IS_WASM_FUNC, wasmcall_label);
@@ -1761,6 +1841,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var result = allocTmpFixed(ValueKind.REF, regs.runtime_ret0);
 		state.emitSaveAll(resolver, runtimeSpillMode);
 		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		// XXX: if a RT function cannot trap, maybe skip setting {rsp}?
 		masm.emit_get_curstack(regs.runtime_arg0);
@@ -1912,13 +1993,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def emit_call_runtime_op1n(op: Opcode, arg1: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
 		state.emitSaveAll(resolver, runtimeSpillMode);
 		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
-		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_i(regs.runtime_arg2, arg1);
-		masm.emit_call_runtime_op(op);
+
+		def emit = fun {
+			masm.emit_get_curstack(regs.runtime_arg0);
+			masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+			emit_load_instance(regs.runtime_arg1);
+			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
+			masm.emit_call_runtime_op(op);
+		};
+		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
+ 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
 		dropN(args);
@@ -1929,14 +2016,20 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def emit_call_runtime_op2n(op: Opcode, arg1: u31, arg2: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
 		state.emitSaveAll(resolver, runtimeSpillMode);
 		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
-		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_i(regs.runtime_arg2, arg1);
-		masm.emit_mov_r_i(regs.runtime_arg3, arg2);
-		masm.emit_call_runtime_op(op);
+
+		def emit = fun {
+			masm.emit_get_curstack(regs.runtime_arg0);
+			masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+			emit_load_instance(regs.runtime_arg1);
+			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
+			masm.emit_mov_r_i(regs.runtime_arg3, arg2);
+			masm.emit_call_runtime_op(op);
+		};
+		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
+ 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
 		dropN(args);
@@ -2010,10 +2103,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitReturn(ctl: SpcControl) {
 		// All explicit RETURN instructions branch here.
-		if (ret_label != null) {
-			masm.bindLabel(ret_label);
-			ret_label = null;
-		}
+		masm.bindLabel(ret_label);
+
 		var results = sig.results;
 		if (masm.valuerep.tagged) {
 			// update mismatched value tags
@@ -2024,6 +2115,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_mov_m_i(masm.tagAddr(state.sp - u32.view(results.length) + u32.view(i)), rtag.code);
 			}
 		}
+
+		if (isInlined()) return;
+
 		// Compute VSP = VFP + state.sp
 		emit_compute_vsp(regs.vsp, state.sp);
 		// Return to caller
@@ -2056,8 +2150,128 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def newTrapLabel(reason: TrapReason) -> MasmLabel {
 		var label = masm.newLabel(it.pc);
-		trap_labels.put(reason, label);
+		var frames = snapshotFrames();
+		trap_labels.put((reason, label, frames));
 		return label;
+	}
+	def getSpcInlinedFrameIp() -> long;
+	// Emit code to materialize stack frames for each inlined function.
+	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
+		Metrics.spc_static_reconst.val++;
+		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
+		def real_frame = frames[0];
+		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+
+		// load instance
+		var inst_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, inst_reg, frame.instance_slot);
+		var mem_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, mem_reg, frame.mem0_base_slot);
+		// Load instance.functions
+		def func_reg = allocTmp(ValueKind.REF);
+		masm.emit_v3_Instance_functions_r_r(func_reg, inst_reg);
+		def vfp_reg = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, vfp_reg, frame.vfp_slot);
+		var prev_base_sp = int.view(frames[0].local_base_sp);
+		var wasm_func_reg = allocTmp(ValueKind.REF);
+
+		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+		if (whamm_config.is_inlined) { // XXX check individual configs?
+			inl_inst_reg = allocTmp(ValueKind.REF);
+			inl_mem0_reg = allocTmp(ValueKind.REF);
+			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
+			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
+		}
+
+		// Pre-allocate stack space for all reconstructed frames at once.
+		def total_space = (frames.length - 1) * (frame.frameSize + 8);
+		masm.emit_subw_r_i(regs.sp, total_space);
+
+		// Process the inlined frames (skip the outermost which already exists on native stack)
+		for (i = 1; i < frames.length; i++) {
+			def frame_info = frames[i];
+			def cur_base_sp = int.view(frame_info.local_base_sp);
+			def delta = (cur_base_sp - prev_base_sp) * masm.valuerep.slot_size;
+			emitReconstructStackFrame(frame_info, frames.length - i - 1, delta,
+					wasm_func_reg, func_reg, inst_reg, mem_reg, vfp_reg, inl_inst_reg, inl_mem0_reg);
+			prev_base_sp = cur_base_sp;
+		}
+
+		return total_space;
+	}
+	def emitReconstructStackFrame(spcFrame: SpcFrame, offset: int, vfp_delta: int,
+			wasm_func_reg: Reg, func_reg: Reg, inst_reg: Reg, mem_reg: Reg, vfp_reg: Reg, inl_inst_reg: Reg, inl_mem0_reg: Reg) {
+		// Use inlined frame stub IP as return address for all reconstructed frames
+		def return_addr = getSpcInlinedFrameIp();
+
+		def frame_offset = offset * (frame.frameSize + 8);
+		// Write inlined frame stub IP as return address
+		def retaddr_slot = MasmAddr(regs.sp, frame_offset + frame.frameSize);
+		masm.emit_mov_m_l(retaddr_slot, return_addr);
+
+		// get functions[func_index] and save into frame
+		def wasm_func_slot = frame.wasm_func_slot.plus(frame_offset);
+		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, wasm_func_reg, func_reg, spcFrame.func.func_index);
+		masm.emit_mov_m_r(ValueKind.REF, wasm_func_slot, wasm_func_reg);
+
+		// Save instance
+		def instance_slot = frame.instance_slot.plus(frame_offset);
+		masm.emit_mov_m_r(ValueKind.REF, instance_slot, inst_reg);
+
+		// Save mem0 base
+		def mem0_base_slot = frame.mem0_base_slot.plus(frame_offset);
+		masm.emit_mov_m_r(ValueKind.REF, mem0_base_slot, mem_reg);
+
+		// Step vfp_reg by change in local_base_sp from previous frame and save
+		if (vfp_delta != 0) masm.emit_addw_r_i(vfp_reg, vfp_delta);
+		def vfp_slot = frame.vfp_slot.plus(frame_offset);
+		masm.emit_mov_m_r(ValueKind.REF, vfp_slot, vfp_reg);
+
+		// Save PC
+		def pc_slot = frame.pc_slot.plus(frame_offset);
+		masm.emit_mov_m_i(pc_slot, spcFrame.pc);
+
+		// Clear FrameAccessor
+		def accessor_slot = frame.accessor_slot.plus(frame_offset);
+		masm.emit_mov_m_l(accessor_slot, 0);
+
+		// if an inlined whamm probe, also grab inlined slots
+		if (whamm_config.is_inlined) {
+			def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
+			masm.emit_mov_m_r(ValueKind.REF, inl_instance_slot, inl_inst_reg);
+			def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
+			masm.emit_mov_m_r(ValueKind.REF, inl_mem0_base_slot, inl_mem0_reg);
+		} else {
+			def inl_instance_slot = frame.inlined_instance_slot.plus(frame_offset);
+			masm.emit_mov_m_l(inl_instance_slot, 0);
+			def inl_mem0_base_slot = frame.inlined_mem0_base_slot.plus(frame_offset);
+			masm.emit_mov_m_l(inl_mem0_base_slot, 0);
+		}
+	}
+	// Guards compiler code with frame reconstruction (if necessary).
+	def withReconstructedInlinedFrames(emit: void -> void) {
+		if (isInlined()) {
+			if (frames_reconstructed) {
+				// FIXME this should not happen (but does):
+				// - in the case of deep nesting when one layer is a Whamm probe
+				// - when refactoring to avoid `with` clause, GC test fails (inlining depth 2)
+				if (Trace.compiler) Trace.OUT.puts("  nested frame reconstruction inhibited\n");
+				emit();
+				return;
+			}
+			unrefRegs();
+			frames_reconstructed = true;
+			def space = emitReconstructStackFrames(snapshotFrames());
+			emit();
+			frames_reconstructed = false;
+			if (space > 0) {
+				masm.emit_addw_r_i(regs.sp, space);
+				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+			}
+		} else {
+			emit();
+		}
+
 	}
 	def unsupported() {
 		success = false; // XXX: add opcode
@@ -2153,7 +2367,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: recompute VFP from VSP - #slots?
 		masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 		if (module.memories.length > 0) {
-			if (is_inlined) {
+			if (whamm_config.is_inlined) {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.inlined_mem0_base_slot);
 			} else {
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
@@ -2161,7 +2375,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emit_load_instance(reg: Reg) {
-		if (is_inlined) { // inline compilation
+		if (whamm_config.is_inlined) { // inline compilation
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.inlined_instance_slot);
 		} else {
 			masm.emit_mov_r_m(ValueKind.REF, reg, frame.instance_slot);
@@ -2481,6 +2695,92 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		);
 		return func.handlers.handler_pc_index_map[start].1[inline_index];
 	}
+
+	//====================================================================
+	// frame stack (for inlining) operations
+	//====================================================================
+	def pushSpcFrame(frame: SpcFrame) {
+		if (func != null) masm.pushInlineContext(func.func_index);
+
+		def current = state.frame_stack.peek();
+		if (current != null) {
+			current.pc = it.pc;
+			current.ret_label = ret_label;
+		}
+		state.frame_stack.push(frame);
+		// Update cached copies from new top frame
+		it.reset(frame.func).at(frame.pc, -1);
+		module = frame.module;
+		func = frame.func;
+		sig = func.sig;
+		num_locals = frame.num_locals;
+		local_base_sp = frame.local_base_sp;
+		ctl_base_sp = frame.ctl_base_sp;
+		ret_label = frame.ret_label;
+	}
+	def popSpcFrame() -> SpcFrame {
+		masm.popInlineContext();
+
+		var frame = state.frame_stack.pop();
+		// Restore cached copies from new top frame
+		var current = state.frame_stack.peek();
+		it.reset(current.func).at(current.pc, -1).current();
+		module = current.module;
+		func = current.func;
+		sig = func.sig;
+		num_locals = current.num_locals;
+		local_base_sp = current.local_base_sp;
+		ctl_base_sp = current.ctl_base_sp;
+		ret_label = current.ret_label;
+		return frame;
+	}
+
+	def isInlined() -> bool {
+		return state.frame_stack.top > 1;
+	}
+	def inlineDepth() -> int {
+		return state.frame_stack.top - 1;
+	}
+	def snapshotFrames() -> Array<SpcFrame> {
+		var frames = Array<SpcFrame>.new(state.frame_stack.top);
+		for (i < state.frame_stack.top) {
+			var f = state.frame_stack.elems[i];
+			var pc = if(i == state.frame_stack.top - 1, it.pc, f.pc);
+			frames[i] = SpcFrame.new(f.func, f.module, f.local_base_sp, f.ctl_base_sp, f.num_locals, pc, null);
+		}
+		return frames;
+	}
+	// Determine if a regular function call should be inlined
+	def shouldInline(func: FuncDecl) -> bool {
+		if (Trace.compiler) OUT.put1("deciding on inlining call to func #%d: ", func.func_index);
+
+		if (func.imp != null) return no("imported");
+		if (inlineDepth() >= SpcTuning.maxInlineDepth) return no("max inline depth exceeded");
+		if (func.orig_bytecode.length > SpcTuning.maxInlineBytecodeSize) return no("func too large");
+		if (func.sig.params.length > SpcTuning.maxInlineParams) return no("too many parameters");
+
+		// Scan bytecode for unsupported instructions
+		var bi = BytecodeIterator.new().reset(func);
+		while (bi.more()) {
+			match (bi.current()) {
+				RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => 
+					return no("uses return instruction");
+				TRY, CATCH, THROW, RETHROW, THROW_REF, DELEGATE, CATCH_ALL, TRY_TABLE =>
+					return no("uses exception handling instruction");
+				CONT_NEW, CONT_BIND, SUSPEND, RESUME, RESUME_THROW, RESUME_THROW_REF, SWITCH =>
+					return no("uses stack switching instruction");
+				_ => ;
+			}
+			bi.next();
+		}
+
+		if (Trace.compiler) OUT.puts("YES\n");
+		return true;
+	}
+	private def no(reason: string) -> bool {
+		if (Trace.compiler) OUT.puts("NO (").puts(reason).putc(')').ln();
+		return false;
+	}
 }
 // Different branch instructions have different repush
 enum BrRepush(taken: bool, not_taken: bool) {
@@ -2626,12 +2926,26 @@ def isNotZero = int.!=(0, _);
 def trueToOne(z: bool) -> int { return if(z, 1, 0); }
 
 // Contains both the abstract control and abstract value stack.
+// Represents the compiler state for one function frame in the inlining stack.
+class SpcFrame {
+	var func: FuncDecl;
+	var module: Module;
+	var local_base_sp: u31;  // Base index into SpcState.state
+	var ctl_base_sp: u31;    // Base index into SpcState.ctl_stack
+	var num_locals: int;
+	var pc: int;
+	var ret_label: MasmLabel;
+
+	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc, ret_label) {}
+}
+
 class SpcState(regAlloc: RegAlloc) {
-	// Abstract state of the value stack
+	// Abstract state of the value stack (shared across frames)
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
 	var sp: u32;
 	var ctl_stack = ArrayStack<SpcControl>.new();
-	var num_locals: int;
+	// Frame management (for inlining)
+	var frame_stack = ArrayStack<SpcFrame>.new();
 
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
@@ -2639,7 +2953,7 @@ class SpcState(regAlloc: RegAlloc) {
 		ctl_stack.clear();
 		// manually set up first control entry and return merge state
 		var results = sig.results;
-		var ctl = pushControl(Opcode.RETURN.code, ValueTypes.NONE, results, ret_label);
+		var ctl = pushFuncBody(ValueTypes.NONE, results, ret_label);
 		var merge_state = Array<SpcVal>.new(results.length);
 		for (i < results.length) {
 			// request the merged values be stored to the stack, but don't require tags
@@ -2671,6 +2985,9 @@ class SpcState(regAlloc: RegAlloc) {
 	def pushBlock(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl {
 		return pushControl(Opcode.BLOCK.code, params, results, end_label);
 	}
+	def pushFuncBody(params: Array<ValueType>, results: Array<ValueType>, end_label: MasmLabel) -> SpcControl {
+		return pushControl(Opcode.RETURN.code, params, results, end_label);
+	}
 	def pushLoop(params: Array<ValueType>, results: Array<ValueType>, start_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.LOOP.code, params, results, start_label);
 		return ctl;
@@ -2680,12 +2997,14 @@ class SpcState(regAlloc: RegAlloc) {
 		target.merge_count = 1;
 		var valcount = u32.view(target.params.length);
 		var popcount = 0u;
+		var num_locals = frame_stack.peek().num_locals;
 		target.merge_state = doFirstTransferAndGetMerge(valcount, popcount, resolver);
 		resolver.emitMoves();
-		if (Trace.compiler) trace0("    loop merge = ", target.merge_state, target.merge_state.length);
+		if (Trace.compiler) trace0("    loop merge = ", target.merge_state, target.merge_state.length, num_locals);
 		resetTo(sp, target.merge_state);
 	}
 	def doFirstTransferAndGetMerge(valcount: u32, popcount: u32, resolver: SpcMoveResolver) -> Array<SpcVal> {
+		var num_locals = frame_stack.peek().num_locals;
 		return SpcMerger.new(state, num_locals, sp, regAlloc, resolver).createMerge(valcount, popcount);
 	}
 	// Get a merge that contains the current stack up to {val_stack_top} plus {args}, all stored in memory.
@@ -2751,8 +3070,9 @@ class SpcState(regAlloc: RegAlloc) {
 		if (target.merge_count == 0) {
 			target.merge_count = 1;
 			var popcount = sp - valcount - target.val_stack_top;
+			var num_locals = frame_stack.peek().num_locals;
 			target.merge_state = doFirstTransferAndGetMerge(valcount, popcount, resolver);
-			if (Trace.compiler) trace0("    merge = ", target.merge_state, target.merge_state.length);
+			if (Trace.compiler) trace0("    merge = ", target.merge_state, target.merge_state.length, num_locals);
 		} else {
 			target.merge_count = 2;
 			// XXX: allow matching constants in merges
@@ -2889,14 +3209,17 @@ class SpcState(regAlloc: RegAlloc) {
 		state = Arrays.grow(state, nlength);
 	}
 	def trace() {
-		trace0("", state, int.!(sp));
+		var num_locals = frame_stack.peek().num_locals;
+		trace0("", state, int.!(sp), num_locals);
 	}
-	def trace0(str: string, vals: Array<SpcVal>, sp: int) {
+	def trace0(str: string, vals: Array<SpcVal>, sp: int, num_locals: int) {
 		OUT.puts(str);
 		OUT.puts("|");
-		for (i < num_locals) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
+		// Don't assume vals.length >= num_locals (e.g., for implicit function blocks in inlined functions)
+		var trace_limit = if(num_locals < vals.length, num_locals, vals.length);
+		for (i < trace_limit) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
 		OUT.puts("  |");
-		for (i = num_locals; i < sp; i++) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
+		for (i = num_locals; i < sp && i < vals.length; i++) vals[i].renderTrace(OUT, regAlloc.poolMap.regSet);
 		OUT.ln();
 	}
 }
@@ -2954,9 +3277,9 @@ class SpcMerger(state: Array<SpcVal>, num_locals: int, sp: u32, regAlloc: RegAll
 					revokeRegFromRange(from.reg, fi, 0, int.!(end));
 					revokeRegFromRange(from.reg, fi, int.!(sp - valcount), int.!(fi));
 				}
-				to = SpcVal(to.kindFlagsAndTag(IN_REG), from.reg, 0);
+				to = SpcVal(from.kindFlagsAndTag(IN_REG), from.reg, 0);
 			} else {
-				to = SpcVal(to.kindFlagsAndTag(IS_STORED), NO_REG, 0);
+				to = SpcVal(from.kindFlagsAndTag(IS_STORED), NO_REG, 0);
 				resolver.addMove((ti, to), (fi, from));
 			}
 			merge[ti] = to;
@@ -2971,9 +3294,9 @@ class SpcMerger(state: Array<SpcVal>, num_locals: int, sp: u32, regAlloc: RegAll
 					revokeRegFromRange(from.reg, fi, int.!(fi + 1), int.!(end));
 					revokeRegFromRange(from.reg, fi, int.!(sp - valcount), int.!(sp));
 				}
-				to = SpcVal(to.kindFlagsAndTag(IN_REG), from.reg, 0);
+				to = SpcVal(from.kindFlagsAndTag(IN_REG), from.reg, 0);
 			} else {
-				to = SpcVal(to.kindFlagsAndTag(IS_STORED), NO_REG, 0);
+				to = SpcVal(from.kindFlagsAndTag(IS_STORED), NO_REG, 0);
 				resolver.addMove((ti, to), (fi, from));
 			}
 			merge[ti] = to;
@@ -3168,38 +3491,7 @@ class MoveNode {
 	var dstNext: MoveNode;	// next in a list of successors
 }
 
-// checks function bytecode to see if it can be inlined based on
-// simple heuristics: length <= 50 and straightline code.
-def funcCanInline(decl: FuncDecl) -> InlineConfig {
-	var default = InlineConfig(false, false, false);
-	if (decl.orig_bytecode.length > 50 || decl.sig.params.length > 10) return default;
-	var bi = BytecodeIterator.new().reset(decl);
-	var swap_instance = false;
-	var swap_membase = false;
-	while (bi.more()) {
-		var op = bi.current();
-		match (op) {
-			// Cannot handle control flow yet.
-			IF, BR, BR_IF, BR_TABLE, BR_ON_NULL, BR_ON_NON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL, RETURN => return default;
-			// These opcodes require swapping the instance.
-			THROW, CALL, CALL_INDIRECT, MEMORY_INIT, MEMORY_SIZE, MEMORY_GROW, MEMORY_COPY, MEMORY_FILL, REF_FUNC, DATA_DROP,
-			ELEM_DROP, TABLE_INIT, TABLE_SIZE, TABLE_COPY, TABLE_GROW, GLOBAL_SET, GLOBAL_GET, TABLE_SET, TABLE_GET => swap_instance = true;
-			// Load/store opcodes require either the memory base or the instance.
-			I32_STORE, I64_STORE, F32_STORE, F64_STORE, I32_STORE8, I32_STORE16, I64_STORE8, I64_STORE16, I64_STORE32,
-			V128_STORE, I32_LOAD, I64_LOAD, F32_LOAD, F64_LOAD, I32_LOAD8_S, I32_LOAD8_U, I32_LOAD16_S, I32_LOAD16_U,
-			I64_LOAD8_S, I64_LOAD8_U, I64_LOAD16_S, I64_LOAD16_U, I64_LOAD32_S, I64_LOAD32_U, V128_LOAD => {
-				var memarg = bi.immptr().read_MemArg();
-				if (memarg.memory_index == 0) swap_membase = true;
-				else swap_instance = true;
-			}
-			_ => ;
-		}
-		bi.next();
-	}
-	return InlineConfig(swap_membase, swap_instance, true);
-}
-
-type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
+type WhammInlineConfig(swap_membase: bool, swap_instance: bool, is_inlined: bool);
 
 // Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
 // control transfer to its corresponding handler without falling back to fast-int.
