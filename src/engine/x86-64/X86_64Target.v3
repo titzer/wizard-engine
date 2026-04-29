@@ -65,6 +65,43 @@ component Target {
 		f.target_code = TargetCode(addr);
 		Debug.afterCompile(f, u64.view(addr - Pointer.NULL));
 	}
+	def setFastTargetCode(f: FuncDecl, addr: Pointer, end: Pointer) {
+		if (Trace.compiler) {
+			Trace.OUT.put2("func[%d].fast_target_code: break *0x%x", f.func_index, addr - Pointer.NULL)
+				.put2(" disass 0x%x, 0x%x", addr - Pointer.NULL, end - Pointer.NULL).ln();
+			if (Trace.asm) {
+				var cur_byte = addr;
+				Trace.OUT.puts("JIT code: ");
+				while (cur_byte < end) {
+					Trace.OUT.put1("%x ", cur_byte.load<u8>());
+					cur_byte++;
+				}
+				Trace.OUT.ln();
+			}
+		}
+		f.fast_target_code = TargetCode(addr);
+		patchFastCallDispatch(f, addr);
+		Debug.afterCompile(f, u64.view(addr - Pointer.NULL));
+	}
+	def patchFastCallDispatch(f: FuncDecl, addr: Pointer) {
+		if (f.fast_call_idx < 0) return;
+		def opcode = Opcodes.indexToFastCall(f.fast_call_idx);
+		def ic = X86_64PreGenStubs.getInterpreterCode();
+		// XXX Patching only fast (non-probed?) dispatch tables
+		def fast_offset = ic.header.fastDispatchTableOffset;
+		def entry = ic.start + fast_offset + opcode.code * FastIntTuning.dispatchEntrySize;
+		if (Trace.compiler) {
+			Trace.OUT.puts("patching dispatch table\n");
+			Trace.OUT.put1("  start 0x%x\n", u64.view(ic.start));
+			Trace.OUT.put1("  entry 0x%x\n", u64.view(entry));
+			Trace.OUT.put1("  addr 0x%x\n",  u64.view(addr));
+		}
+		match (FastIntTuning.dispatchEntrySize) {
+			4 => entry.store<u32>(u32.view(addr));
+			_ => System.error("patchFastCallDispatch", "unsupported dispatchEntrySize");
+		}
+	}
+
 	def pregenIntoFile(filename: string) -> ErrorBuilder {
 		var data = System.fileLoad(filename);
 		var err = ErrorBuilder.new().puts("interpreter generator: ");
@@ -197,6 +234,95 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 	def disableLazyNameDecodingDuringGC(module: Module) {
 		if (module.names != null) module.names.lazyDecodeDisabled = RiGc.inGC;
 	}
+
+	def installStubForModule(module: Module, set: (Module, FuncDecl) -> void) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
+		// Set all functions to refer to the tier-up compile stub.
+		var codeSize = MINIMUM_CODE_SIZE;
+		for (i < module.functions.length) {
+			var f = module.functions[i];
+			if (f.imported()) continue;
+			set(module, f);
+			codeSize += X86_64Spc.estimateCodeSizeFor(f);
+		}
+		allocateCodeForModule(module, codeSize);
+	}
+
+	def fastCompileEntireModule(module: Module, size: u32, interpreter_fallback: bool, err: ErrorGen, ballast: u32) {
+		// ensure entrypoint and lazy compile stubs are generated
+		X86_64PreGenStubs.gen();
+
+		var compiler = newCompiler(module.filename, true, null);
+		var w = compiler.w;
+
+		// generate code for all fast functions
+		var bounds = Array<(int, int)>.new(module.functions.length);
+		var suberr = if(!interpreter_fallback, err);
+		for (i = 0; err.ok() && i < module.functions.length; i++) {
+			var f = module.functions[i];
+			if (f.fast_call_idx < 0) continue;
+			var start = w.atEnd().pos;
+			var compiled = compiler.gen(module, f, suberr);
+			if (compiled) bounds[i] = (start, w.end());
+			else bounds[i] = (-1, -1);
+		}
+
+		// copy and map code (reserve32 ensures address fits in 32 bits for dispatch table patching)
+		var length = u64.view(w.atEnd().pos) + ballast;
+		var mapping = Mmap.reserve32(length, Mmap.PROT_WRITE), range = mapping.range; // TODO: handle failure
+		var masm = X86_64MacroAssembler.!(compiler.masm);
+		masm.setTargetAddress(u64.view(range.start - Pointer.NULL));
+		Target.copyInto(mapping.range, 0, w);
+		// TODO: for security, move embedded references out of the code region and make it non-writable
+		Mmap.protect(range.start, u64.!(range.end - range.start), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
+		for (i < bounds.length) {
+			var b = bounds[i];
+			if (b.0 >= 0) {
+				var addr = mapping.range.start;
+				var f = module.functions[i];
+				Target.setFastTargetCode(f, addr + b.0, addr + b.1);
+			} else {
+				var f = module.functions[i];
+				if (Trace.compiler) Trace.OUT.put1("func[%d] initial compile failed", f.func_index).ln();
+				X86_64Spc.setInterpreterFallback(f);
+			}
+		}
+		// XXX: reduce duplication with {X86_64SpcModuleCode.appendCode}.
+		var code = X86_64SpcModuleCode.new(mapping);
+		if (masm.source_locs != null) {
+			code.sourcePcs = Vector.new();
+			code.sourcePcs.putv(masm.source_locs);
+		}
+		if (masm.embeddedRefOffsets != null) {
+			if (code.embeddedRefOffsets == null) code.embeddedRefOffsets = Vector.new();
+			code.embeddedRefOffsets.putv(masm.embeddedRefOffsets);
+		}
+
+		module.target_module = TargetModule(code);
+		RiRuntime.registerUserCode(code);
+		module.target_module.spc_code.keepAlive();
+		Debug.afterCompileModule(module);
+		// print out patched dispatch table
+		if (Trace.compiler) {
+			Trace.OUT.puts("Patched fast handlers:\n");
+			for (i < module.fast_funcs.length) {
+				def func: FuncDecl = module.fast_funcs[i];
+				var name: string;
+				for (j < module.exports.length) {
+					def exp = module.exports[j];
+					if (exp.1 == func) {
+						name = exp.0;
+						break;
+					}
+				}
+				Trace.OUT.put2("  FAST_CALL%d: %s (", i, name);
+				func.render(module.names, Trace.OUT);
+				Trace.OUT.puts(")");
+				Trace.OUT.ln();
+			}
+		}
+	}
 }
 
 // One tier: fast-int, modules require no pre-processing.
@@ -207,6 +333,7 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		disableLazyNameDecodingDuringGC(module);
+		if (FastIntTuning.useFastFunctions) fastCompileEntireModule(module, size, false, err, 1024);
 	}
 	def onFuncValidationFinish(module: Module, func: FuncDecl, err: ErrorGen) {
 		if (err != null && !err.ok()) return;
@@ -243,7 +370,7 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 
 		var module = wf.instance.module;
 		var code = module.target_module.spc_code;
-		var compiler = newCompiler(module.filename); // XXX: cache per-thread
+		var compiler = newCompiler(module.filename, false, null); // XXX: cache per-thread
 		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
 		// generate code for the function
@@ -272,19 +399,6 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		}
 		return SpcResultForStub(wf, entrypoint, null);
 	}
-	def installStubForModule(module: Module, set: (Module, FuncDecl) -> void) {
-		// ensure entrypoint and lazy compile stubs are generated
-		X86_64PreGenStubs.gen();
-		// Set all functions to refer to the tier-up compile stub.
-		var codeSize = MINIMUM_CODE_SIZE;
-		for (i < module.functions.length) {
-			var f = module.functions[i];
-			if (f.imported()) continue;
-			set(module, f);
-			codeSize += X86_64Spc.estimateCodeSizeFor(f);
-		}
-		allocateCodeForModule(module, codeSize);
-	}
 }
 
 // One tier: SPC, modules are eagerly compiled.
@@ -298,11 +412,15 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		// defer compilation for AOT mode until after monitors have been installed
-		if (!hasMonitors) compileEntireModule(module, size, interpreter_fallback, err, 1024);
+		if (!hasMonitors) {
+			if (FastIntTuning.useFastFunctions) fastCompileEntireModule(module, size, true, err, 1024);
+			compileEntireModule(module, size, interpreter_fallback, err, 1024);
+		}
 		disableLazyNameDecodingDuringGC(module);
 	}
 	// Called after monitors have processed a module.
 	def onMonitorsFinish(module: Module, err: ErrorGen) {
+		if (FastIntTuning.useFastFunctions) fastCompileEntireModule(module, 0, true, err, 1024);
 		compileEntireModule(module, 0, interpreter_fallback, err, 1024);
 	}
 	// Called before a test function is run.
@@ -320,7 +438,7 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 		// ensure entrypoint and lazy compile stubs are generated
 		X86_64PreGenStubs.gen();
 
-		var compiler = newCompiler(module.filename);
+		var compiler = newCompiler(module.filename, false, null);
 		var w = compiler.w;
 
 		// generate code for all functions
@@ -377,6 +495,7 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		if (FastIntTuning.useFastFunctions) fastCompileEntireModule(module, size, true, err, 1024);
 		installStubForModule(module, X86_64Spc.setLazyCompileFor);
 		disableLazyNameDecodingDuringGC(module);
 	}
@@ -392,6 +511,7 @@ class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		if (FastIntTuning.useFastFunctions) fastCompileEntireModule(module, size, true, err, 1024);
 		installStubForModule(module, X86_64Spc.setTierUpFor);
 		disableLazyNameDecodingDuringGC(module);
 		if (Debug.runtime) {
@@ -413,7 +533,7 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	}
 	def onTierUp(wf: WasmFunction, pc: int) -> TargetOsrInfo {
 		var module = wf.instance.module;
-		var compiler = newCompiler(module.filename);
+		var compiler = newCompiler(module.filename, false, null);
 		if (!applyJitFilter(wf.instance.module, wf.decl, "osr")) {
 			// OSR compile suppressed
 			wf.decl.tierup_trigger = int.max; // no point in trying for a while
@@ -442,10 +562,10 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	}
 }
 
-def newCompiler(filename: string) -> X86_64SinglePassCompiler {
+def newCompiler(filename: string, fast: bool, ic: X86_64InterpreterCode) -> X86_64SinglePassCompiler {
 	var extensions = Extension.set.all; // TODO: all extensions enabled for compilation
 	var limits = Limits.new();
-	var compiler = X86_64SinglePassCompiler.new(extensions, limits, X86_64MasmRegs.CONFIG);
+	var compiler = X86_64SinglePassCompiler.new(ic, extensions, limits, X86_64MasmRegs.CONFIG, fast);
 	return compiler;
 }
 def MINIMUM_CODE_SIZE = PAGE_SIZE_i;
