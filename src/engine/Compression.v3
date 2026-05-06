@@ -1,0 +1,188 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Generalized- relocatable representation of a stack frame that can be serialized.
+// {bytecode_ip} is unused when {is_spc} is true.
+type RelocatableFrame(func: WasmFunction, pc: int, is_spc: bool, reentry: TargetReentryLabel, bytecode_ip: TargetReentryLabel, vals: Array<Value>) #unboxed {
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		// Frame header.
+		buf.put2("  Frame(func=%q, pc=%d):", func.decl.render(null, _), pc).ln();
+		buf.put1("  Values(count=%d):", vals.length).ln();
+
+		// Frame values.
+		if (vals.length > 0) {
+			buf.puts("    ");
+			for (v in vals) Values.render(v, buf).puts(" ");
+		}
+		return buf;
+	}
+}
+
+class CompressionStrategy<C> {
+	def compress(frames: Range<RelocatableFrame>) -> C;
+	def decompress(comp: C) -> Array<RelocatableFrame>;
+}
+
+class NaiveCompressionStrategy extends CompressionStrategy<NaiveCompressedStack> {
+	def compress(frames: Range<RelocatableFrame>) -> NaiveCompressedStack {
+		var frames_builder = Vector<FrameHeader>.new();
+		var values_builder = Vector<Value>.new();
+		for (frame in frames) {
+			var header = FrameHeader(frame.func, frame.pc, frame.is_spc, frame.reentry, frame.bytecode_ip, frame.vals.length);
+			frames_builder.put(header);
+			values_builder.puta(frame.vals);
+		}
+
+		// XXX: reuse stack (maybe pass one in?)
+		var result = NaiveCompressedStack.new();
+		result.frames = frames_builder.extract();
+		result.values = values_builder.extract();
+		return result;
+	}
+
+	def decompress(comp: NaiveCompressedStack) -> Array<RelocatableFrame> {
+		var builder = Vector<RelocatableFrame>.new();
+		var val_offset = 0;
+		for (header in comp.frames) {
+			var vals = Arrays.range(comp.values, val_offset, val_offset + header.n_vals);
+			builder.put(RelocatableFrame(header.func, header.pc, header.is_spc, header.reentry, header.bytecode_ip, vals));
+			val_offset += header.n_vals;
+		}
+
+		return builder.extract();
+	}
+}
+
+class PackedCompressionStrategy extends CompressionStrategy<PackedCompressedStack> {
+	def frames_builder = Vector<FrameHeader>.new();
+	def refs_builder = Vector<Object>.new();
+	def w = DataWriter.new();
+	def r = DataReader.new(null);
+
+	def reset() { frames_builder.clear(); refs_builder.clear(); w.clear(); }
+
+	def writeValue(value: Value) {
+		match (value) {
+			Ref(v) => { w.putb(Value.Ref.tag).put_uleb32(u32.!(refs_builder.length)); refs_builder.put(v); }
+			I31(v) => w.putb(Value.I31.tag).put_uleb32(v);
+			I32(v) => w.putb(Value.I32.tag).put_uleb32(v);
+			I64(v) => w.putb(Value.I64.tag).put_sleb64(i64.view(v));
+			F32(v) => w.putb(Value.F32.tag).put_uleb32(v);
+			F64(v) => w.putb(Value.F64.tag).put_sleb64(i64.view(v));
+			V128(l, h) => w.putb(Value.V128.tag).put_sleb64(i64.view(l)).put_sleb64(i64.view(h));
+			Cont(c) => {
+				// TODO: omit {version} if boxed-continuation is enabled
+				var obj = Continuations.getStoredObject(c);
+				var version = Continuations.getStoredVersion(c);
+				w.putb(Value.Cont.tag).put_uleb32(u32.!(refs_builder.length)).put_sleb64(i64.view(version));
+				refs_builder.put(obj);
+			}
+		}
+	}
+
+	def compress(frames: Range<RelocatableFrame>) -> PackedCompressedStack {
+		for (frame in frames) {
+			var header = FrameHeader(frame.func, frame.pc, frame.is_spc, frame.reentry, frame.bytecode_ip, frame.vals.length);
+			frames_builder.put(header);
+			for (v in frame.vals) writeValue(v);
+		}
+
+		// XXX: reuse stack (maybe pass one in?)
+		var result = PackedCompressedStack.new();
+		result.frames = frames_builder.extract();
+		result.packed = w.extract();
+		result.refs = refs_builder.extract();
+		return result;
+	}
+
+	def readValue(comp: PackedCompressedStack) -> Value {
+		var tag = r.read1();
+		match (tag) {
+			Value.Ref.tag => return Value.Ref(comp.refs[r.read_uleb32()]);
+			Value.I31.tag => return Value.I31(u31.!(r.read_uleb32()));
+			Value.I32.tag => return Value.I32(r.read_uleb32());
+			Value.I64.tag => return Value.I64(u64.view(r.read_sleb64()));
+			Value.F32.tag => return Value.F32(r.read_uleb32());
+			Value.F64.tag => return Value.F64(u64.view(r.read_sleb64()));
+			Value.V128.tag => return Value.V128(u64.view(r.read_sleb64()), u64.view(r.read_sleb64()));
+			Value.Cont.tag => {
+				var obj = comp.refs[r.read_uleb32()];
+				var version = u64.view(r.read_sleb64());
+				return Value.Cont(Continuations.fromStoredObject(obj, version));
+			}
+			_ => return Value.I32(0);
+		}
+	}
+
+	def decompress(comp: PackedCompressedStack) -> Array<RelocatableFrame> {
+		r.reset(comp.packed, 0, comp.packed.length);
+
+		var builder = Vector<RelocatableFrame>.new();
+		for (header in comp.frames) {
+			var vals = Array<Value>.new(header.n_vals);
+			for (i < header.n_vals) vals[i] = readValue(comp);
+			builder.put(RelocatableFrame(header.func, header.pc, header.is_spc, header.reentry, header.bytecode_ip, vals));
+		}
+		return builder.extract();
+	}
+}
+
+// Compressed stack representation.
+
+type FrameHeader(func: WasmFunction, pc: int, is_spc: bool, reentry: TargetReentryLabel, bytecode_ip: TargetReentryLabel, n_vals: int) #unboxed {
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put3("Frame(func=%d, pc=%d, n_vals=%d)", func.decl.func_index, pc, n_vals);
+	}
+}
+
+class CompressedStack {
+	def size() -> u64;
+	def render(buf: StringBuilder) -> StringBuilder;
+}
+
+class NaiveCompressedStack extends CompressedStack {
+	var frames: Array<FrameHeader>;
+	var values: Array<Value>;
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("NaiveCompressedStack(n_frames=%d):", frames.length).ln();
+		for (frame in frames) buf.put1("  %q", frame.render).ln();
+		return buf;
+	}
+}
+
+class PackedCompressedStack extends CompressedStack {
+	var frames: Array<FrameHeader>;
+
+	// Packed value stack representation.
+	var packed: Array<byte>;
+	var refs: Array<Object>;
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("PackedCompressedStack(n_frames=%d):", frames.length).ln();
+		for (frame in frames) buf.put1("  %q", frame.render).ln();
+		return buf;
+	}
+}
+
+component StackCompression {
+	def naive = NaiveCompressionStrategy.new();
+	def packed = PackedCompressionStrategy.new();
+
+	def compress(stack: WasmStack) -> CompressedStack {
+		var frames = Target.readFramesFromStack(stack);
+		var compressed = packed.compress(frames);
+		return compressed;
+	}
+
+	def decompress(to: WasmStack, from: CompressedStack) {
+		var frames: Array<RelocatableFrame>;
+		match (from) {
+			x: NaiveCompressedStack => frames = naive.decompress(x);
+			x: PackedCompressedStack => frames = packed.decompress(x);
+		}
+		Target.writeFramesToStack(to, frames);
+	}
+}

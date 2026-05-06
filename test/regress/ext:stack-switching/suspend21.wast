@@ -1,0 +1,28 @@
+;; Tests for parameter overlaps during stack compression.
+(module
+  (type $f1 (func (result i32)))
+  (type $c1 (cont $f1))
+  (tag $ts)
+
+  (func $top (param f32 f64 i32 i64) (result f64)
+    (suspend $ts)
+    (return (f64.const -99.7))
+  )
+  (func $bot (result i32)
+    (i32.const 67)
+    (call $top (f32.const 4.5) (f64.const 0.1) (i32.const 1) (i64.const 80))
+    (drop)
+    (return)
+  )
+  (elem declare func $bot)
+  (func (export "main") (result i32)
+    (block (result (ref null $c1))
+      (resume $c1 (on $ts 0) (cont.new $c1 (ref.func $bot)))
+      (drop)
+      (ref.null $c1)
+    )
+    (resume $c1)
+  )
+)
+
+(assert_return (invoke "main") (i32.const 67))
