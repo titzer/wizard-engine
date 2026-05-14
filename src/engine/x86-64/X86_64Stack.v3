@@ -1,6 +1,8 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+enum StackWalkAction { TO_PREV_FRAME, TO_PARENT_STACK, FINISH }
+
 // Implements a Wasm stack using native memory in {mapping}. Stores explicitly tagged values
 // and execution frames within the mapping, containing a custom GC scan routine.
 // See diagram at the end of the file for mapping layout.
@@ -126,46 +128,72 @@ class X86_64Stack extends WasmStack {
 	def walk<P>(f: (Pointer, RiUserCode, StackFramePos, P) -> bool, param: P, start_srp: Pointer, continue_to_parent: bool) -> (bool, StackFramePos) {
 		var stack = this;
 		var srp = start_srp;
-		if (Trace.stack && Debug.stack) {
-			Trace.OUT.put1("walk started on stack[rsp=0x%x] (", this.rsp - Pointer.NULL);
-			Trace.OUT.put3("start=0x%x, srp=0x%x, end=0x%x, ", stack.mapping.range.start - Pointer.NULL, start_srp - Pointer.NULL, stack.mapping.range.end - Pointer.NULL);
-			Trace.OUT.put1("continue_to_parent=%s)", if(continue_to_parent, "true", "false")).ln();
+
+		// Tracing.
+		var tableWidth = 0;
+		if (Trace.stack) {
+			Trace.OUT.puts("Stack walk trace:").ln();
+			tableWidth = walkTraceTable.putTableHeader(Trace.OUT);
 		}
 		while (srp < stack.mapping.range.end) {
 			var retip = srp.load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			var sfp = srp + RETADDR_SIZE;
 			var accessor: FrameAccessor;
-			if (Trace.stack && Debug.stack) {
-				Trace.OUT.put1("\tretip=0x%x", retip - Pointer.NULL);
-				if (code != null) code.describeFrame(retip, sfp, Trace.OUT.putr_void);
-				else Trace.OUT.ln();
-				Trace.OUT.flush();
-			}
+
 			var pos = StackFramePos(stack, TargetFrame(sfp));
 			match (code) {
-				null => break;
-				x: X86_64InterpreterCode => if (f != null && !f(retip, code, pos, param)) return (true, pos);
-				x: X86_64SpcModuleCode => if (f != null && !f(retip, code, pos, param)) return (true, pos);
-				x: X86_64SpcInlinedFrame => if (f != null && !f(retip, code, pos, param)) return (true, pos);
-				x: X86_64SpcTrapsStub => if (f != null && !f(retip, code, pos, param)) return (true, pos);
-				x: X86_64ReturnParentStub => {
-					if (stack.parent == null || !continue_to_parent) {
-						if (Trace.stack && Debug.stack) Trace.OUT.puts("walk finished").ln();
-						return (false, pos);
+				x: X86_64InterpreterCode,
+				x: X86_64SpcModuleCode,
+				x: X86_64SpcInlinedFrame,
+				x: X86_64SpcTrapsStub => {
+					if (f != null && !f(retip, code, pos, param)) {
+						// Early termination from frame predicate.
+						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
+						return (true, pos);
 					} else {
-						stack = X86_64Stack.!(stack.parent);
-						if (Trace.stack && Debug.stack) Trace.OUT.put1("walk to parent[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
-						srp = stack.rsp;
-						continue;
+						// Continue to previous frame.
+						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
+						srp = code.nextFrame(retip, srp).1;
 					}
 				}
+				x: X86_64ReturnParentStub => {
+					if (stack.parent == null || !continue_to_parent) {
+						// End of stack frames. Terminate stack walk.
+						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
+						return (false, pos);
+					} else {
+						// Continue to parent stack.
+						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Parent Stack", tableWidth);
+						stack = X86_64Stack.!(stack.parent);
+						srp = stack.rsp;
+					}
+				}
+				null => {
+					if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Unknown", tableWidth);
+					return (false, StackFramePos(this, TargetFrame(Pointer.NULL)));
+				}
+				_ => {
+					// Unrecognized frame: continue to previous frame.
+					if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
+					srp = code.nextFrame(retip, srp).1;
+				}
 			}
-			var t = code.nextFrame(retip, srp);
-			srp = t.1;
 		}
 //TODO		fatal(Strings.format1("invalid stack state: rsp=0x%x", this.rsp - Pointer.NULL));
 		return (false, StackFramePos(this, TargetFrame(Pointer.NULL)));
+	}
+	private def printWalkStep(s: X86_64Stack, retip: Pointer, sfp: Pointer, code: RiUserCode, action: string, sep_length: int) {
+		var C = walkTraceTable.cells;
+		C[0].put1("0x%x", Pointer.atObject(s) - Pointer.NULL);
+		var name = getFrameName(code);
+		if (name != null) C[1].puts(name);
+		else C[1].puts("<unknown>");
+		C[2].put1("0x%x", sfp - Pointer.NULL);
+		C[3].put1("0x%x", retip - Pointer.NULL);
+		C[4].puts(action);
+		walkTraceTable.putTableRow(Trace.OUT);
+		if (sep_length > 0) Trace.OUT.pad('-', Trace.OUT.length + sep_length).ln();
 	}
 	def traceFrames(when: string, sfp: Pointer) {
 		Trace.OUT.puts(when);
@@ -639,6 +667,31 @@ component X86_64Stacks {
 // TODO: clean this up
 def NOP_ENTRY = 1;
 def RETADDR_SIZE = Pointer.SIZE;
+
+// Returns the V3 class name of a {RiUserCode} subclass that {X86_64Stack.walk} recognizes,
+// or {null} if {code} does not match any of those subclasses.
+def getFrameName(code: RiUserCode) -> string {
+	match (code) {
+		x: X86_64InterpreterCode  => return "X86_64InterpreterCode";
+		x: X86_64SpcModuleCode    => return "X86_64SpcModuleCode";
+		x: X86_64SpcInlinedFrame  => return "X86_64SpcInlinedFrame";
+		x: X86_64SpcTrapsStub     => return "X86_64SpcTrapsStub";
+		x: X86_64ReturnParentStub => return "X86_64ReturnParentStub";
+		_ => return null;
+	}
+}
+
+// Trace table for {X86_64Stack.walk} debug output. One row per visited frame.
+def walkTraceTable = initWalkTraceTable();
+def initWalkTraceTable() -> TraceTable {
+	var t = TraceTable.new(["Stack", "Frame Type", "Frame Pointer (%sfp)", "Return IP", "Next Action"]);
+	t.cells[0].set(18, Justification.LEFT,  Color.NONE);
+	t.cells[1].set(24, Justification.LEFT,  Color.NONE);
+	t.cells[2].set(20, Justification.RIGHT, Color.NONE);
+	t.cells[3].set(20, Justification.RIGHT, Color.NONE);
+	t.cells[4].set(16, Justification.LEFT,  Color.NONE);
+	return t;
+}
 def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(X86_64Stack, X86_64Stack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
 def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(), genStackReturnParentStub);
 def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
