@@ -1,0 +1,88 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+type FrameHeader(func: WasmFunction, pc: int, is_spc: bool, ret_addr: u64, bytecode_ip: u64, n_vals: int) #unboxed {}
+
+class PackedCompressionStrategy extends CompressionStrategy<PackedCompressedStack> {
+	def frames_builder = Vector<FrameHeader>.new();
+	def refs_builder = Vector<Object>.new();
+	def w = DataWriter.new();
+	def r = DataReader.new(null);
+
+	def reset() { frames_builder.clear(); refs_builder.clear(); w.clear(); }
+
+	def writeValue(value: Value) {
+		match (value) {
+			Ref(v) => { w.putb(Value.Ref.tag).put_uleb32(u32.!(refs_builder.length)); refs_builder.put(v); }
+			I31(v) => w.putb(Value.I31.tag).put_uleb32(v);
+			I32(v) => w.putb(Value.I32.tag).put_uleb32(v);
+			I64(v) => w.putb(Value.I64.tag).put_sleb64(i64.view(v));
+			F32(v) => w.putb(Value.F32.tag).put_uleb32(v);
+			F64(v) => w.putb(Value.F64.tag).put_sleb64(i64.view(v));
+			V128(l, h) => w.putb(Value.V128.tag).put_sleb64(i64.view(l)).put_sleb64(i64.view(h));
+			Cont(c) => {
+				// TODO: omit {version} if boxed-continuation is enabled
+				var obj = Continuations.getStoredObject(c);
+				var version = Continuations.getStoredVersion(c);
+				w.putb(Value.Cont.tag).put_uleb32(u32.!(refs_builder.length)).put_sleb64(i64.view(version));
+				refs_builder.put(obj);
+			}
+		}
+	}
+
+	def compress(frames: Range<RelocatableFrame>) -> PackedCompressedStack {
+		for (frame in frames) {
+			var header = FrameHeader(frame.data.func, frame.data.pc, frame.is_spc, frame.data.ret_addr, frame.bytecode_ip, frame.data.vals.length);
+			frames_builder.put(header);
+			for (v in frame.data.vals) writeValue(v);
+		}
+
+		// XXX: reuse stack (maybe pass one in?)
+		var result = PackedCompressedStack.new();
+		result.frames = frames_builder.extract();
+		result.packed = w.extract();
+		result.refs = refs_builder.extract();
+		return result;
+	}
+
+	def readValue(comp: PackedCompressedStack) -> Value {
+		var tag = r.read1();
+		match (tag) {
+			Value.Ref.tag => return Value.Ref(comp.refs[r.read_uleb32()]);
+			Value.I31.tag => return Value.I31(u31.!(r.read_uleb32()));
+			Value.I32.tag => return Value.I32(r.read_uleb32());
+			Value.I64.tag => return Value.I64(u64.view(r.read_sleb64()));
+			Value.F32.tag => return Value.F32(r.read_uleb32());
+			Value.F64.tag => return Value.F64(u64.view(r.read_sleb64()));
+			Value.V128.tag => return Value.V128(u64.view(r.read_sleb64()), u64.view(r.read_sleb64()));
+			Value.Cont.tag => {
+				var obj = comp.refs[r.read_uleb32()];
+				var version = u64.view(r.read_sleb64());
+				return Value.Cont(Continuations.fromStoredObject(obj, version));
+			}
+			_ => return Value.I32(0);
+		}
+	}
+
+	def decompress(comp: PackedCompressedStack) -> Array<RelocatableFrame> {
+		r.reset(comp.packed, 0, comp.packed.length);
+
+		var builder = Vector<RelocatableFrame>.new();
+		for (header in comp.frames) {
+			var vals = Array<Value>.new(header.n_vals);
+			for (i < header.n_vals) vals[i] = readValue(comp);
+			builder.put(RelocatableFrame(WasmFrameData(header.func, header.pc, header.ret_addr, vals), header.is_spc, header.bytecode_ip));
+		}
+		return builder.extract();
+	}
+}
+
+class PackedCompressedStack extends CompressedStack {
+	var frames: Array<FrameHeader>;
+
+	// Packed value stack representation.
+	var packed: Array<byte>;
+	var refs: Array<Object>;
+
+	def name() -> string { return "Packed Compressed Stack"; }
+}
