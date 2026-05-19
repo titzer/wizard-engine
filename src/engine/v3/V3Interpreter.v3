@@ -159,16 +159,39 @@ class V3Interpreter extends WasmStack {
 	}
 	def pushLocals(count: u32, vtc: ValueTypeCode) {
 		var val: Value;
-		match (vtc.toValueKind(frame.func.instance)) {
-			I32 => val = Values.I32_0;
-			I64 => val = Values.I64_0;
-			F32 => val = Values.F32_0;
-			F64 => val = Values.F64_0;
-			V128 => val = Values.V128_0;
-			REF => val = Values.REF_NULL;
-			REF_U64 => val = Values.CONT_NULL;
+		// Continuation-typed locals must default to {Value.Cont(NULL)} regardless of
+		// boxed/unboxed mode. The kind dispatch alone isn't enough: in boxed mode
+		// {Continuations.valueKind == REF}, so cont/nocont locals would otherwise
+		// be misclassified as plain {Value.Ref(null)} and break {popContinuation}.
+		if (isContType(vtc, frame.func.instance)) {
+			val = Values.CONT_NULL;
+		} else {
+			match (vtc.toValueKind(frame.func.instance)) {
+				I32 => val = Values.I32_0;
+				I64 => val = Values.I64_0;
+				F32 => val = Values.F32_0;
+				F64 => val = Values.F64_0;
+				V128 => val = Values.V128_0;
+				REF => val = Values.REF_NULL;
+				REF_U64 => val = Values.CONT_NULL; // unreachable when isContType handles cont
+			}
 		}
 		values.pushn(val, int.!(count));
+	}
+	private def isContType(vtc: ValueTypeCode, instance: Instance) -> bool {
+		match (vtc.code) {
+			BpTypeCode.CONTREF.val,
+			BpTypeCode.NULLCONTREF.val => return true;
+			BpTypeCode.REF.val,
+			BpTypeCode.REF_NULL.val => {
+				if (vtc.index < 0) {
+					return vtc.index == BpHeapTypeCode.CONTREF.val
+						|| vtc.index == BpHeapTypeCode.NOCONT.val;
+				}
+				return ContDecl.?(instance.heaptypes[vtc.index]);
+			}
+		}
+		return false;
 	}
 	def copyVals(count: int, dest: int) {
 		var sp = values.top - count;
@@ -187,7 +210,6 @@ class V3Interpreter extends WasmStack {
 				// Enter the function and initialize locals.
 				codeptr.iterate_local_codes(pushLocals);
 				var tags = func.decl.frame_var_tags;
-				// TODO[ss]: cont ref in frame vars
 				if (tags != null) for (t in tags) values.push(tagToValue(t));
 				frame.pc = pc = codeptr.pos; // update pc after decoding locals
 				// Fire entry probe(s).
@@ -713,8 +735,11 @@ class V3Interpreter extends WasmStack {
 
 			REF_NULL => {
 				var index = codeptr.read_sleb32();
-				if (index < 0) push(Values.REF_NULL);
-				else {
+				if (index < 0) {
+					if (index == BpHeapTypeCode.CONTREF.val
+						|| index == BpHeapTypeCode.NOCONT.val) push(Values.CONT_NULL);
+					else push(Values.REF_NULL);
+				} else {
 					var ht = frame.func.instance.heaptypes[index];
 					push(if(ContDecl.?(ht), Values.CONT_NULL, Values.REF_NULL));
 				}
@@ -1788,7 +1813,7 @@ class V3Interpreter extends WasmStack {
 	def popObject() -> Object { return Value.Ref.!(values.pop()).val; }
 	def popArray() -> HeapArray { return HeapArray.!(Value.Ref.!(values.pop()).val); }
 	def popStruct() -> HeapStruct { return HeapStruct.!(Value.Ref.!(values.pop()).val); }
-	def popContinuation() -> Continuation { return Continuation.!(Value.Cont.!(values.pop()).val); }
+	def popContinuation() -> Continuation { return Value.Cont.!(values.pop()).val; }
 	def push(val: Value) { values.push(val); }
 	def pushi(val: i32) { values.push(Value.I32(u32.view(val))); }
 	def pushi8(val: i8) { values.push(Value.I32(u32.view(val))); }
@@ -1825,6 +1850,8 @@ class V3Interpreter extends WasmStack {
 			BpTypeCode.F32.code => return Values.F32_0;
 			BpTypeCode.F64.code => return Values.F64_0;
 			BpTypeCode.V128.code => return Values.V128_0;
+			BpTypeCode.CONTREF.code,
+			BpTypeCode.NULLCONTREF.code => return Values.CONT_NULL;
 			_ => return Values.REF_NULL;
 		}
 	}

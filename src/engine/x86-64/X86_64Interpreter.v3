@@ -639,7 +639,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 		callEntryOffset = w.pos;
 		// Decode locals and initialize them. (XXX: special-case 0 locals)
-		var countGpr = r_tmp0;
+		var countGpr = r_tmp4;
 		genReadUleb32(countGpr);
 		var start = X86_64Label.new(), done = X86_64Label.new();
 		// gen: if (count != 0) do
@@ -662,13 +662,21 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			var type_not_leb = X86_64Label.new();
 			asm.d.test_r_i(typeGpr, LEB_UPPER_BIT);		// check for LEB first
 			asm.jc_rel_near(C.Z, type_not_leb);
-			genSkipLeb0(r_tmp4);
+			genSkipLeb0(r_tmp0);
 			asm.bind(type_not_leb);
 			// check for types that have an immediate
 			var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
 			asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
 			asm.jc_rel_far(C.Z, retpoint);
-			genSkipLeb0(r_tmp4);			// skip offset
+			// {ip} now points at the immediate parameter of the type.
+			// Read the heap-type SLEB tag the slot with CONTREF if it is a continuation type, else REF_NULL.
+			genReadSleb32_inline(r_tmp3);
+			var l_is_cont = X86_64Label.new();
+			genJumpIfContHeapType(xenv.tmp3, xenv.tmp0, l_is_cont);
+			asm.movd_r_i(typeGpr, BpTypeCode.REF_NULL.code);
+			asm.jmp_rel_near(retpoint);
+			asm.bind(l_is_cont);
+			asm.movd_r_i(typeGpr, BpTypeCode.CONTREF.code);
 			asm.jmp_rel_near(retpoint);
 		});
 
@@ -678,7 +686,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.jc_rel_near(C.Z, done2);
 		asm.bind(start2);
 		genTagPushR(typeGpr);			// *(sp) = type
-		asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
+		// TODO[ref_u64]: xmm register
+		asm.movq_m_i(vsph[0].value, 0);		// *(sp).value_low8 = 0
+		asm.movq_m_i(vsph[0].value.plus(8), 0);	// *(sp).value_high8 = 0 (cont version / V128 high)
 		incrementVsp();	// sp += 1 slot
 		// gen: while (--num != 0)
 		asm.d.dec_r(numGpr);
@@ -707,7 +717,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				asm.jc_rel_far(C.GE, retpoint);
 				asm.movbzx_r_m(r_tag, r_start.plus(0));
 				genTagPushR(r_tag);			// *(sp) = type
-				asm.movq_m_i(vsph[0].value, 0);		// *(sp + 8) = 0
+				asm.movq_m_i(vsph[0].value, 0);		// *(sp).value_low8 = 0
+				asm.movq_m_i(vsph[0].value.plus(8), 0);	// *(sp).value_high8 = 0
 				incrementVsp();	// sp += 1 slot
 				// gen: while (--num != 0)
 				asm.q.inc_r(r_start);
@@ -2369,13 +2380,27 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 		}
 		bindHandler(Opcode.REF_NULL); {
-			genSkipLeb();
-			genTagPush(BpTypeCode.REF_NULL.code);
-			asm.movq_m_i(vsph[0].value, 0);
-			// XXX: only clear upper slot when REF is guaranteed a REF_U64
-			asm.movq_m_i(vsph[0].value.plus(8), 0);
-			incrementVsp();
-			endHandler();
+			var l_is_cont = X86_64Label.new();
+			// Read the heap-type SLEB into r_tmp1 and dispatch on cont-ness.
+			genReadSleb32_inline(r_tmp1);
+			genJumpIfContHeapType(xenv.tmp1, xenv.tmp3, l_is_cont);
+
+			// Fallthru: not a continuation -> tag the slot with {REF_NULL}.
+			{
+				genTagPush(BpTypeCode.REF_NULL.code);
+				asm.movq_m_i(vsph[0].value, 0);
+				asm.movq_m_i(vsph[0].value.plus(8), 0);
+				incrementVsp();
+				endHandler();
+			}
+			// If reference type is a continuation, tag the slot with {CONTREF}.
+			asm.bind(l_is_cont); {
+				genTagPush(BpTypeCode.CONTREF.code);
+				asm.movq_m_i(vsph[0].value, 0);
+				asm.movq_m_i(vsph[0].value.plus(8), 0);
+				incrementVsp();
+				endHandler();
+			}
 		}
 		bindHandler(Opcode.REF_IS_NULL); {
 			asm.d.test_m_i(vsph[-1].value, -1);
@@ -2447,9 +2472,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			saveCallerIVars();
 			genReadUleb32(G(cont_id)); // read signature index
 
-			var cont = xenv.xmm0;
+			// {cont} register matches {Continuations.valueKind}: GPR in boxed mode,
+			// XMM in unboxed mode. Pick a free reg of the right class.
+			var cont = if(FeatureDisable.unboxedConts, xenv.tmp3, xenv.xmm0);
 			var contStack = xenv.tmp1;
-			genPopCont(X(cont));
+			genPopCont(cont);
 			masm.emit_validate_and_consume_cont(contStack, cont);
 
 			// move parameter values from %curStack to %cont.top
@@ -2487,9 +2514,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genSkipLeb(); // skip signature index
 			genReadUleb32(G(tag_id)); // read tag index
 
-			var cont = xenv.xmm0;
+			// {cont} register matches {Continuations.valueKind}: GPR in boxed mode,
+			// XMM in unboxed mode.
+			var cont = if(FeatureDisable.unboxedConts, xenv.tmp3, xenv.xmm0);
 			var contStack = xenv.tmp1;
-			genPopCont(X(cont));
+			genPopCont(cont);
 			masm.emit_validate_and_consume_cont(contStack, cont);
 
 			var curStack = xenv.tmp4;
@@ -2500,10 +2529,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			);
 			restoreCallerIVars();
 			/* === only reachable when continuation handles the error === */
-			genPopCont(X(cont)); // XXX: make RT function return {Continuation} directly
-			masm.emit_ref_from_ref_u64(contStack, cont);
-			if (FeatureDisable.unboxedConts) { // boxed continuation
-				masm.emit_mov_r_m(ValueKind.REF, contStack, MasmAddr(contStack, offsets.Continuation_stack));
+			genPopCont(cont); // XXX: make RT function return {Continuation} directly
+			// extract {cont.stack} into contStack; mode-aware as in SPC RESUME_THROW.
+			if (FeatureDisable.unboxedConts) {
+				masm.emit_v3_Continuation_stack_r_r(contStack, cont);
+			} else {
+				masm.emit_ref_from_ref_u64(contStack, cont);
 			}
 
 			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
@@ -2528,9 +2559,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			saveCallerIVars();
 			genSkipLeb(); // skip signature index
 
-			var cont = xenv.xmm0, ex = xenv.tmp0;
+			// {cont} register matches {Continuations.valueKind}: GPR in boxed mode,
+			// XMM in unboxed mode.
+			var cont = if(FeatureDisable.unboxedConts, xenv.tmp3, xenv.xmm0);
+			var ex = xenv.tmp0;
 			var contStack = xenv.tmp1;
-			genPopCont(X(cont));
+			genPopCont(cont);
 			genPopInto(G(ex));
 			masm.emit_validate_and_consume_cont(contStack, cont);
 
@@ -2542,10 +2576,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			);
 			restoreCallerIVars();
 			/* === only reachable when continuation handles the error === */
-			genPopCont(X(cont)); // XXX: make RT function return {Continuation} directly
-			masm.emit_ref_from_ref_u64(contStack, cont);
-			if (FeatureDisable.unboxedConts) { // boxed continuation
-				masm.emit_mov_r_m(ValueKind.REF, contStack, MasmAddr(contStack, offsets.Continuation_stack));
+			genPopCont(cont); // XXX: make RT function return {Continuation} directly
+			// extract {cont.stack} into contStack; mode-aware as in SPC RESUME_THROW_REF.
+			if (FeatureDisable.unboxedConts) {
+				masm.emit_v3_Continuation_stack_r_r(contStack, cont);
+			} else {
+				masm.emit_ref_from_ref_u64(contStack, cont);
 			}
 
 			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
@@ -3886,6 +3922,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 	}
 	// Generate a read of a 32-bit signed LEB.
+	// WARNING: overwrites %rcx (tmp0).
 	def genReadSleb32_inline(dest: X86_64Gpr) {
 		var done = X86_64Label.new(), sext = X86_64Label.new(), loop = X86_64Label.new();
 		asm.movd_r_i(R.RCX, 0);
@@ -4220,14 +4257,37 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		decrementVsp();
 		asm.movq_r_m(reg, vsph[0].value);
 	}
-	private def genPopCont(reg: X86_64Xmmr) {
+	// Pops a continuation value from the value stack into {reg}, which must
+	// match {Continuations.valueKind}'s register class:
+	//   - boxed mode: GPR receives the 8-byte Continuation pointer.
+	//   - unboxed mode: XMM receives the 16-byte (stack, version) pair.
+	private def genPopCont(reg: Reg) {
 		decrementVsp();
-		asm.movq_r_m(r_scratch, vsph[0].value);
-		asm.pinsrq_s_r_i(reg, r_scratch, 0);
-		if (!FeatureDisable.unboxedConts) {
+		if (FeatureDisable.unboxedConts) {
+			asm.movq_r_m(G(reg), vsph[0].value);
+		} else {
+			asm.movq_r_m(r_scratch, vsph[0].value);
+			asm.pinsrq_s_r_i(X(reg), r_scratch, 0);
 			asm.movd_r_m(r_scratch, vsph[0].value.plus(8));
-			asm.pinsrq_s_r_i(reg, r_scratch, 1);
+			asm.pinsrq_s_r_i(X(reg), r_scratch, 1);
 		}
+	}
+	// Given {idx} containing a heap-type SLEB value (negative = abstract heap-type code,
+	// non-negative = index into instance.heaptypes), emits code that jumps to {is_cont_label}
+	// if the encoded type is a continuation, and falls through otherwise.
+	private def genJumpIfContHeapType(idx: Reg, scratch: Reg, is_cont_label: X86_64Label) {
+		var l_done = X86_64Label.new();
+		asm.d.cmp_r_i(G(idx), BpHeapTypeCode.CONTREF.val);
+		asm.jc_rel_near(C.Z, is_cont_label);
+		asm.d.cmp_r_i(G(idx), BpHeapTypeCode.NOCONT.val);
+		asm.jc_rel_near(C.Z, is_cont_label);
+		asm.d.cmp_r_i(G(idx), 0);
+		asm.jc_rel_near(C.S, l_done);
+		masm.emit_v3_Instance_heaptypes_r_r(scratch, xenv.instance);
+		masm.emit_v3_Array_elem_r_rr(ValueKind.REF, scratch, scratch, idx);
+		asm.d.cmp_m_i(G(scratch).plus(0), offsets.ContDecl_typeId);
+		asm.jc_rel_far(C.Z, is_cont_label);
+		asm.bind(l_done);
 	}
 	// generates cleanup code for after a child stack returns
 	private def genOnResumeFinish(skip_tag: bool) {

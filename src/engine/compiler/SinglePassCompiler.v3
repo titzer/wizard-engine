@@ -54,6 +54,7 @@ component SpcConsts {
 	def KIND_V128: byte = kindToFlags(ValueKind.V128);
 	def KIND_REF: byte = kindToFlags(ValueKind.REF);
 	def KIND_REF_U64: byte = kindToFlags(ValueKind.REF_U64);
+	def KIND_CONT: byte = kindToFlags(Continuations.valueKind); // KIND_REF in boxed mode, KIND_REF_U64 in unboxed mode
 	def kinds: Array<ValueKind> = [ValueKind.I32, ValueKind.I64, ValueKind.F32, ValueKind.F64,
 					ValueKind.V128, ValueKind.REF, ValueKind.REF_U64];
 	def kindToFlags(kind: ValueKind) -> byte {
@@ -75,6 +76,7 @@ def KIND_F64 = SpcConsts.KIND_F64;
 def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
+def KIND_CONT = SpcConsts.KIND_CONT;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
@@ -610,15 +612,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 						}
 						Cont(v) => {
 							if (inline_decision) {
-								var reg = allocRegTos(ValueKind.REF_U64);
-								masm.emit_mov_r_Cont(reg, v);
-								state.push(KIND_REF_U64 | IN_REG, reg, 0);
+								var reg = allocRegTos(Continuations.valueKind);
+								masm.emit_mov_r_Continuation(reg, v);
+								state.push(KIND_CONT | IN_REG, reg, 0);
 							} else {
-								// TODO[stack-switching]: designated xmm scratch register
-								// masm.emit_mov_r_Cont(regs.scratch, v);
-								// asm.movdqu_m_s(slot_addr, regs.scratch)
+								// Load the literal Continuation into a kind-correct scratch
+								// (XMM in unboxed mode, GPR in boxed mode), then store to the
+								// slot. emit_mov_m_r dispatches on kind: 16-byte movdqu in
+								// unboxed, 8-byte movq in boxed.
+								var scratch = allocTmp(Continuations.valueKind);
+								masm.emit_mov_r_Continuation(scratch, v);
+								masm.emit_mov_m_r(Continuations.valueKind, slot_addr, scratch);
 							}
-							kind = ValueKind.REF.code;
+							kind = Continuations.valueTag;
 						}
 					}
 				}
@@ -1408,11 +1414,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// constant values must be tagged with the right type as the tag will be
 	// copied over onto the other stack.
 	def visit_REF_NULL(ht_val: int) {
-		if (ht_val >= 0 && ContDecl.?(module.heaptypes[ht_val])) {
-			state.push(KIND_REF_U64 | IS_CONST, NO_REG, 0); // push a REF_U64
-		} else {
-			state.push(KIND_REF | IS_CONST, NO_REG, 0); // push a REF
-		}
+		var is_cont = if(ht_val >= 0,
+			ContDecl.?(module.heaptypes[ht_val]),
+			ht_val == BpHeapTypeCode.CONTREF.val || ht_val == BpHeapTypeCode.NOCONT.val);
+		if (is_cont) state.push(KIND_CONT | IS_CONST, NO_REG, 0);
+		else state.push(KIND_REF | IS_CONST, NO_REG, 0);
 	}
 	def visit_REF_FUNC(func_index: u31) {
 		var reg = allocRegTos(ValueKind.REF);
@@ -1430,13 +1436,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				setUnreachable();
 			}
 		} else if (sv.inReg()) {
-			masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			// Route through {emitBrIfR}, which dispatches on REF_U64 (XMM cont).
+			emitBrIfR(sv, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 		} else {
 			// XXX: use masm.br_m if necessary?
 			var tos = state.sp - 1;
-			var reg = allocReg(ValueKind.REF, tos);
-			masm.emit_mov_r_s(ValueKind.REF, reg, tos);
-			masm.emit_br_r(reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			var kind = sv.kind(); // REF or REF_U64 (cont in unboxed mode)
+			var reg = allocReg(kind, tos);
+			masm.emit_mov_r_s(kind, reg, tos);
+			emitBrIfR(SpcVal(sv.flags | IN_REG, reg, sv.const),
+				MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 			state.overwrite(sv.kindFlagsAndTag(IN_REG | (sv.flags & IS_STORED)), reg, 0);
 		}
 	}
@@ -1468,9 +1477,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var top = popReg();
-		var cont = allocTmp(ValueKind.REF_U64);
+		var cont = allocTmp(Continuations.valueKind);
 		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF_U64, cont, top.reg);
+		masm.emit_mov_r_r(Continuations.valueKind, cont, top.reg);
 		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		// transfer params to child stack
@@ -1620,9 +1629,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var curStack = allocTmp(ValueKind.REF);
 
-		var cont = allocTmp(ValueKind.REF_U64);
+		var cont = allocTmp(Continuations.valueKind);
 		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
 		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
@@ -1639,16 +1648,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(u32.!(tag.fields.length));
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
-		state.push(KIND_REF_U64 | TAG_STORED | IS_STORED, NO_REG, 0);
+		state.push(KIND_CONT | TAG_STORED | IS_STORED, NO_REG, 0);
 
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
-		// contStack = cont.cont
-		masm.emit_ref_from_ref_u64(contStack, cont);
-		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
-		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
+		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
+		// extract {cont.stack} into contStack: in boxed mode {cont} is a {Continuation *}
+		// (load .stack field); in unboxed mode {cont} is XMM with low 8 bytes = stack.
+		if (FeatureDisable.unboxedConts) {
+			masm.emit_v3_Continuation_stack_r_r(contStack, cont);
+		} else {
+			masm.emit_ref_from_ref_u64(contStack, cont);
+		}
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1695,9 +1707,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var curStack = allocTmp(ValueKind.REF);
 
-		var cont = allocTmp(ValueKind.REF_U64);
+		var cont = allocTmp(Continuations.valueKind);
 		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
 		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		popFixedReg(regs.runtime_arg3);
@@ -1718,11 +1730,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
-		// contStack = cont.cont
-		masm.emit_ref_from_ref_u64(contStack, cont);
-		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
-		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
+		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
+		// extract {cont.stack} into contStack: in boxed mode {cont} is a {Continuation *}
+		// (load .stack field); in unboxed mode {cont} is XMM with low 8 bytes = stack.
+		if (FeatureDisable.unboxedConts) {
+			masm.emit_v3_Continuation_stack_r_r(contStack, cont);
+		} else {
+			masm.emit_ref_from_ref_u64(contStack, cont);
+		}
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -3231,7 +3246,10 @@ def typeToKindFlags(vt: ValueType) -> byte {
 		F32 => return KIND_F32;
 		F64 => return KIND_F64;
 		V128 => return KIND_V128;
-		Ref(_, ht) => return if (HeapType.Cont.?(ht), KIND_REF_U64, KIND_REF);
+		Ref(_, ht) => {
+			var is_cont = HeapType.Cont.?(ht) || ht == HeapType.NOCONT;
+			return if(is_cont, KIND_CONT, KIND_REF);
+		}
 		_ => return KIND_REF;
 	}
 }
