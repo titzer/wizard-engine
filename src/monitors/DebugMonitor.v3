@@ -27,11 +27,30 @@ def X_ = MonitorRegistry.add(
 	"debug", "An interactive synchronous debugger with breakpoints and stepping.",
 	DebugMonitor.new());
 
+enum DbgCommand2(fullName: string, shortName: string, help: string) {
+	RUN		("run",		"r",	"Run the program, if not already running."),
+	STEP		("step",	"s",	"Single-step the program if running."),
+	NEXT		("next",	"n",	"Run the program until it reaches the next instruction."),
+	INFO		("info",	"i",	"Show information on breakpoints, locals, or globals."),
+	HELP		("help",	"",	"Print this help."),
+	BREAK		("break",	"b",	"Set at breakpoint the given program location."),
+	DISABLE		("disable",	"d",	"Disable the given breakpoint."),
+	ENABLE		("enable",	"e",	"Enable the given breakpoint."),
+	BACKTRACE	("backtrace",	"bt",	"Show a backtrace of the call stack."),
+	CONTINUE	("continue",	"c",	"Continue execution after a breakpoint."),
+	LIST		("list",	"l",	"Show local variables."),
+	SET		("set",		"s",	"Set the value of a local variable.")
+	EXIT		("exit",	"",	"Exit the debugger.")
+}
+
 type DbgCommand {
+	case Empty;
+	case Unknown(cmd: string);
 	case Run;
 	case Step;
 	case Next;
 	case Info(info: Info);
+	case Help;
 	case Breakpoint(breakpoint: Breakpoint);
 	case DisableBreakpoint(index: int);
 	case EnableBreakpoint(index: int);
@@ -39,7 +58,7 @@ type DbgCommand {
 	case Continue;
 	case List;
 	case Set(local_idx: int, value: Value);
-	case Unknown(cmd: string);
+	case Exit;
 }
 
 type Info {
@@ -75,9 +94,10 @@ class DebuggerParser {
 	def getCommand() -> string {
 		var sb = StringBuilder.new();
 		System.puts("(debugger) ");
-		var ch = byte.!(System.fileRead(STDIN));
+		var ch = System.fileRead(STDIN);
 		while (ch != '\n') {
-			sb.putc(ch);
+			if (ch < 0) return "exit";
+			sb.putc(byte.view(ch));
 			ch = byte.!(System.fileRead(STDIN));
 		}
 		return sb.extract();
@@ -95,20 +115,22 @@ class DebuggerParser {
 			if (i == command.length - 1) name = command;
 		}
 
-		if (name == null) {
-			return DbgCommand.Unknown("");
+		if (name == null || name.length == 0) {
+			return DbgCommand.Empty;
 		} else if (Strings.equal(name, "run") || Strings.equal(name, "r")) {
 			return DbgCommand.Run;
 		} else if (Strings.equal(name, "step") || Strings.equal(name, "s")) {
 			return DbgCommand.Step;
 		} else if (Strings.equal(name, "next") || Strings.equal(name, "n")) {
 			return DbgCommand.Next;
-		} else if (Strings.equal(name, "breakpoint") || Strings.equal(name, "b")) {
+		} else if (Strings.equal(name, "break") || Strings.equal(name, "b")) {
 			return DbgCommand.Breakpoint(parseBreakpoint(args));
 		} else if (Strings.equal(name, "continue") || Strings.equal(name, "c")) {
 			return DbgCommand.Continue;
 		} else if (Strings.equal(name, "list") || Strings.equal(name, "l")) {
 			return DbgCommand.List;
+		} else if (Strings.equal(name, "help") || Strings.equal(name, "h")) {
+			return DbgCommand.Help;
 		} else if (Strings.equal(name, "info")) {
 			return DbgCommand.Info(parseInfo(args));
 		} else if (Strings.equal(name, "disable")) {
@@ -119,6 +141,8 @@ class DebuggerParser {
 			return DbgCommand.Backtrace;
 		} else if (Strings.equal(name, "set")) {
 			return parseSet(args);
+		} else if (Strings.equal(name, "exit")) {
+			return DbgCommand.Exit;
 		}
 		return DbgCommand.Unknown(command);
 	}
@@ -137,7 +161,7 @@ class DebuggerParser {
 	def parseInfo(args: string) -> Info {
 		if (args == null) {
 			return Info.Invalid("");
-		} else if (Strings.equal(args, "break")) {
+		} else if (Strings.equal(args, "breakpoints")) {
 			return Info.Breakpoints;
 		} else if (Strings.equal(args, "locals")) {
 			return Info.Locals;
@@ -212,6 +236,7 @@ component Debugger {
 	def nextProbe: DebugOnceProbe = DebugOnceProbe.new();
 
 	def var running = false;
+	def var repeatCmd: DbgCommand = DbgCommand.Empty;
 	def breakpoints = Vector<(Breakpoint, DebugProbe)>.new();
 	var instance: Instance;
 	var mm: ModuleInstrumenter;
@@ -221,152 +246,159 @@ component Debugger {
 		instance = i;
 		mm = ModuleInstrumenter.new(instance.module);
 	}
-	def query() {
-		var queryAgain = true;
-		while (queryAgain) {
-			var command = parser.parseCommand(parser.getCommand());
-			queryAgain = handleCommand(command);
-		}
-	}
-	def handleCommand(command: DbgCommand) -> bool {
-		if (!running) {
+	def query() -> ProbeAction {
+		while (true) {
+			var input = parser.getCommand();
+			var command = parser.parseCommand(input);
+			if (command == DbgCommand.Empty) command = repeatCmd;
+			
+			if (!running) {
+				match (command) {
+					Step, Next, Backtrace, List, Set, Continue => {
+						OUT.puts("program not running").ln();
+						continue;
+					}
+					_ => ;
+				}
+			}
 			match (command) {
-				Step, Next, Backtrace, List, Set, Continue => {
-					OUT.puts("program not running").ln();
-					return true;
+				Empty => {
+					return ProbeAction.Continue;
 				}
-				_ => ;
-			}
-		}
-		match (command) {
-			Run => {
-				running = true;
-				return false;
-			}
-			Step => {
-				Instrumentation.insertGlobalProbe(stepProbe);
-				OUT.puts("placed step probe");
-				return false;
-			}
-			Continue => return false;
-			Next => {
-				var it = bi.reset(loc.func.decl);
-				it.at(loc.pc, -1);
-				var op = bi.current();
-				match (op) {
-					CALL, CALL_INDIRECT => {
-						it.next();
-						Instrumentation.insertLocalProbe(mm.module, loc.func.decl.func_index, it.pc, nextProbe);
-					}
-					_ => Instrumentation.insertGlobalProbe(stepProbe);
+				Run => {
+					running = true;
+					return ProbeAction.Continue;
 				}
-				return false;
-			}
-			Breakpoint(breakpoint) => {
-				match (breakpoint) {
-					FunctionEnter(func_idx) => {
-						var probe = DebugProbe.new();
-						mm.beforeFuncExec(mm.module.functions[func_idx], probe.fire);
-						breakpoints.put((breakpoint, probe));
-					}
-					FunctionPc(func_idx, pc) => {
-						var probe = DebugProbe.new();
-						mm.beforeInstrExec(mm.module.functions[func_idx], pc, probe.fire);
-						breakpoints.put((breakpoint, probe));
-					}
-					Invalid => ;
+				Step => {
+					Instrumentation.insertGlobalProbe(stepProbe);
+					repeatCmd = command;
+					return ProbeAction.Continue;
 				}
-				return true;
-			}
-			DisableBreakpoint(index) => {
-				var breakpoint = breakpoints[index].0;
-				var probe = breakpoints[index].1;
-				OUT.put1("disable breakpoint at %q", breakpoint.render).ln();
-				probe.disable();
-				return true;
-			}
-			EnableBreakpoint(index) => {
-				var breakpoint = breakpoints[index].0;
-				var probe = breakpoints[index].1;
-				OUT.put1("enable breakpoint at %q", breakpoint.render).ln();
-				probe.enable();
-				return true;
-			}
-			List => {
-				list();
-				return true;
-			}
-			Info(info) => {
-				match (info) {
-					Breakpoints => {
-						for (i < breakpoints.length) {
-							OUT.put2("%d: %q", i, breakpoints[i].0.render).ln();
+				Continue => {
+					repeatCmd = command;
+					return ProbeAction.Continue;
+				}
+				Next => {
+					var it = bi.reset(loc.func.decl);
+					it.at(loc.pc, -1);
+					var op = bi.current();
+					match (op) {
+						CALL, CALL_INDIRECT => {
+							it.next();
+							Instrumentation.insertLocalProbe(mm.module, loc.func.decl.func_index, it.pc, nextProbe);
 						}
+						_ => Instrumentation.insertGlobalProbe(stepProbe);
 					}
-					Locals => {
-						if (loc.func != null) {
-							var accessor = loc.frame.getFrameAccessor();
-							for (i < accessor.numLocals()) {
-								var local = accessor.getLocal(i);
-								OUT.put1("local[%d] = ", i).putv(local).ln();
+					repeatCmd = command;
+					return ProbeAction.Continue;
+				}
+				Breakpoint(breakpoint) => {
+					match (breakpoint) {
+						FunctionEnter(func_idx) => {
+							var probe = DebugProbe.new();
+							mm.beforeFuncExec(mm.module.functions[func_idx], probe.fire);
+							breakpoints.put((breakpoint, probe));
+						}
+						FunctionPc(func_idx, pc) => {
+							var probe = DebugProbe.new();
+							mm.beforeInstrExec(mm.module.functions[func_idx], pc, probe.fire);
+							breakpoints.put((breakpoint, probe));
+						}
+						Invalid => ;
+					}
+				}
+				DisableBreakpoint(index) => {
+					var breakpoint = breakpoints[index].0;
+					var probe = breakpoints[index].1;
+					OUT.put1("disable breakpoint at %q", breakpoint.render).ln();
+					probe.disable();
+				}
+				EnableBreakpoint(index) => {
+					var breakpoint = breakpoints[index].0;
+					var probe = breakpoints[index].1;
+					OUT.put1("enable breakpoint at %q", breakpoint.render).ln();
+					probe.enable();
+				}
+				List => {
+					list();
+				}
+				Help => {
+					printHelp(Trace.OUT);
+				}
+				Info(info) => {
+					match (info) {
+						Breakpoints => {
+							for (i < breakpoints.length) {
+								OUT.put2("%d: %q", i, breakpoints[i].0.render).ln();
 							}
 						}
-					}
-					Globals => {
-						for (i < instance.globals.length) {
-							var val = instance.globals[i].get();
-							OUT.put1("global[%d] = ", i).putv(val).ln();
+						Locals => {
+							if (loc.func != null) {
+								var accessor = loc.frame.getFrameAccessor();
+								for (i < accessor.numLocals()) {
+									var local = accessor.getLocal(i);
+									OUT.put1("local[%d] = ", i).putv(local).ln();
+								}
+							}
 						}
-					}
-					Invalid(args) => {
-						OUT.put1("invalid info args: %s", args).ln();
+						Globals => {
+							for (i < instance.globals.length) {
+								var val = instance.globals[i].get();
+								OUT.put1("global[%d] = ", i).putv(val).ln();
+							}
+						}
+						Invalid(args) => {
+							OUT.put1("invalid info args: %s", args).ln();
+						}
 					}
 				}
-				return true;
-			}
-			Set(local_idx, value) => {
-				var accessor = loc.frame.getFrameAccessor();
-				OUT.put1("set local[%d] := ", local_idx).putv(value).ln();
-				accessor.getWriter().setLocal(local_idx, value);
-				return true;
-			}
-			Backtrace => {
-				var depth = 0;
-				var accessor = loc.frame.getFrameAccessor();
-				var caller = accessor.caller();
-				while (true) {
-					match (caller) {
-						None => break;
-						Wasm(func, pc, frame) => {
-							OUT.put1("%d: ", depth);
-							func.render(OUT);
-							accessor = frame.getFrameAccessor();
-							caller = accessor.caller();
-						}
-						Host(func, frame) => {
-							OUT.put1("%d: ", depth);
-							func.render(OUT);
-							caller = frame.caller();
-						}
-					}
-					OUT.ln();
-					depth++;
+				Set(local_idx, value) => {
+					var accessor = loc.frame.getFrameAccessor();
+					OUT.put1("set local[%d] := ", local_idx).putv(value).ln();
+					accessor.getWriter().setLocal(local_idx, value);
 				}
-				return true;
-			}
-			Unknown(cmd) => {
-				OUT.put1("unknown command: '%s'", cmd).ln();
-				return true;
+				Backtrace => {
+					var depth = 0;
+					var accessor = loc.frame.getFrameAccessor();
+					var caller = accessor.caller();
+					while (true) {
+						match (caller) {
+							None => break;
+							Wasm(func, pc, frame) => {
+								OUT.put1("%d: ", depth);
+								func.render(OUT);
+								accessor = frame.getFrameAccessor();
+								caller = accessor.caller();
+							}
+							Host(func, frame) => {
+								OUT.put1("%d: ", depth);
+								func.render(OUT);
+								caller = frame.caller();
+							}
+						}
+						OUT.ln();
+						depth++;
+					}
+				}
+				Unknown(cmd) => {
+					OUT.put1("unknown command: '%s'", cmd).ln();
+				}
+				Exit => {
+					return ProbeAction.Trap(TrapReason.BREAK, false);
+				}
 			}
 		}
+		return ProbeAction.Continue;
 	}
 	def renderState(loc: DynamicLoc) {
 		codeptr.reset(loc.func.decl.orig_bytecode, loc.pc, loc.func.decl.orig_bytecode.length);
 		OUT.puts(TermColors.CYAN);
 		loc.func.decl.render(mm.module.names, OUT);
 		OUT.puts(TermColors.DEFAULT);
-		OUT.put2(" #%d+%d: ", loc.func.decl.func_index, loc.pc);
-		tracer.putInstr(OUT, mm.module, codeptr);
+		OUT.put2(" #%d: ", loc.func.decl.func_index, loc.pc);
+		if (loc.pc > 0) { // pc == 0 means the start of the function.
+			tracer.putPcAndInstr(OUT, mm.module, loc.func.decl, loc.pc, true);
+		}
 		OUT.puts(TermColors.DEFAULT);
 		OUT.ln();
 	}
@@ -408,6 +440,19 @@ component Debugger {
 			}
 			instrs++;
 			it.next();
+		}
+	}
+	def printHelp(out: TraceBuilder) {
+		var H = out.putsln, L = out.ln;
+		H("Commands available: ");
+		for (c in DbgCommand2) {
+			out.puts("    ");
+			out.puts(c.fullName);
+			out.pad(' ', 16);
+			out.puts(c.shortName);
+			out.pad(' ', 20);
+			out.puts(c.help);
+			L();
 		}
 	}
 }
