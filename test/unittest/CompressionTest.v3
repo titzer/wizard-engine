@@ -1,0 +1,527 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// An adapter that erases the compressed stack type to perform strategy-agnostic roundtrip tests.
+class CompressionStrategyAdapter {
+	def roundtrip: Array<RelocatableFrame> -> Array<RelocatableFrame>;
+	new(roundtrip) { }
+}
+
+def strategies = [
+	("naive", CompressionStrategyAdapter.new(naiveRoundtrip)),
+	("packed", CompressionStrategyAdapter.new(packedRoundtrip))
+];
+
+def naive = NaiveCompressionStrategy.new();
+def packed = PackedCompressionStrategy.new();
+
+def naiveRoundtrip(frames: Array<RelocatableFrame>) -> Array<RelocatableFrame> {
+	var c = naive.compress(frames);
+	return naive.decompress(c);
+}
+def packedRoundtrip(frames: Array<RelocatableFrame>) -> Array<RelocatableFrame> {
+	var c = packed.compress(frames);
+	return packed.decompress(c);
+}
+
+// Register all tests across all strategies: for each test, register it once for every strategy.
+def X_ = registerAll([
+	("i32", test_i32),
+	("i64", test_i64),
+	("f32", test_f32),
+	("f64", test_f64),
+	("v128", test_v128),
+	("ref", test_ref),
+	("empty_frames", test_empty_frames),
+	("single_empty_frame", test_single_empty_frame),
+	("multi_empty_frames", test_multi_empty_frames),
+	("multi_vals", test_multi_vals),
+	("multi_frames", test_multi_frames),
+	("single_val_per_frame", test_single_val_per_frame),
+	("cont", test_cont),
+	("frame_metadata", test_frame_metadata),
+	("repeated_vals", test_repeated_vals),
+	("repeated_across_frames", test_repeated_across_frames),
+	("many_diverse_vals", test_many_diverse_vals),
+	("many_frames_diverse", test_many_frames_diverse),
+	("refs_mixed", test_refs_mixed),
+	("refs_shared_across_frames", test_refs_shared_across_frames),
+	("large_uniform_frames", test_large_uniform_frames),
+	("ret_addr_zero", test_ret_addr_zero),
+	("ret_addr_max", test_ret_addr_max),
+	("ret_addr_alternating_bits", test_ret_addr_alternating_bits),
+	("ret_addr_sequential", test_ret_addr_sequential),
+	("bytecode_ip_zero", test_bytecode_ip_zero),
+	("bytecode_ip_max", test_bytecode_ip_max),
+	("bytecode_ip_alternating_bits", test_bytecode_ip_alternating_bits),
+	("bytecode_ip_sequential", test_bytecode_ip_sequential),
+	("is_spc_true_single", test_is_spc_true_single),
+	("is_spc_all_spc", test_is_spc_all_spc),
+	("is_spc_alternating", test_is_spc_alternating),
+	("peripherals_combined_fuzz", test_peripherals_combined_fuzz)
+]);
+
+def registerAll(tests: Array<(string, CompressionTester -> void)>) {
+	for (t in tests) {
+		for (s in strategies) {
+			var name = Strings.format2("compression:%s:%s", s.0, t.0);
+			var adapter = s.1;
+			UnitTests.registerT(name, "", CompressionTester.new(_, adapter), t.1);
+		}
+	}
+}
+
+// Test helper that wraps a Tester with compression-specific utilities.
+class CompressionTester(t: Tester, adapter: CompressionStrategyAdapter) {
+	def mb = ModuleBuilder.new();
+	var dummy_func: WasmFunction;
+
+	def getDummyFunc() -> WasmFunction {
+		if (dummy_func == null) {
+			mb.sig(SigCache.v_v).code([]);
+			var err = ErrorGen.new("CompressionTest");
+			var instance = Instantiator.new(Extension.set.all, mb.module, [], err).run();
+			if (!err.ok()) { t.fail(err.error_msg); return null; }
+			dummy_func = WasmFunction.!(instance.functions[0]);
+		}
+		return dummy_func;
+	}
+
+	def make_frame_full(pc: int, vals: Array<Value>, ret_addr: u64, bytecode_ip: u64, is_spc: bool) -> RelocatableFrame {
+		var func = getDummyFunc();
+		return RelocatableFrame(WasmFrameData(func, pc, ret_addr, vals), is_spc, bytecode_ip);
+	}
+
+	def make_frame(pc: int, vals: Array<Value>) -> RelocatableFrame {
+		return make_frame_full(pc, vals, 0xCAFEBABEDEADBEEFuL ^ u64.view(pc), 0x1234567890ABCDEFuL ^ ~u64.view(pc), false);
+	}
+
+	def roundtrip(frames: Array<RelocatableFrame>) -> Array<RelocatableFrame> {
+		return adapter.roundtrip(frames);
+	}
+
+	def assert_roundtrip_vals(vals: Array<Value>) {
+		var frames = [make_frame(0, vals)];
+		var got = roundtrip(frames);
+		assert_frames_eq(frames, got);
+	}
+
+	def assert_length(expected: int, got: int, what: string) {
+		if (expected != got) t.fail3("expected %d %s, got %d", expected, what, got);
+	}
+
+	def assert_vals_eq(expected: Array<Value>, got: Array<Value>) {
+		assert_length(expected.length, got.length, "values");
+		for (i < expected.length) {
+			if (expected[i] != got[i]) {
+				t.fail3("value[%d]: expected %q, got %q",
+					i, Values.render(expected[i], _), Values.render(got[i], _));
+			}
+		}
+	}
+
+	def assert_frames_eq(expected: Array<RelocatableFrame>, got: Array<RelocatableFrame>) {
+		assert_length(expected.length, got.length, "frames");
+		for (i < expected.length) {
+			var e = expected[i], g = got[i];
+			if (e.data.func != g.data.func) t.fail1("frame[%d]: func mismatch", i);
+			if (e.data.pc != g.data.pc) t.fail3("frame[%d]: expected pc=%d, got pc=%d", i, e.data.pc, g.data.pc);
+			if (e.is_spc != g.is_spc) t.fail3("frame[%d]: expected is_spc=%z, got is_spc=%z", i, e.is_spc, g.is_spc);
+			if (e.data.ret_addr != g.data.ret_addr) t.fail3("frame[%d]: expected ret_addr=0x%x, got ret_addr=0x%x", i, e.data.ret_addr, g.data.ret_addr);
+			if (e.bytecode_ip != g.bytecode_ip) t.fail3("frame[%d]: expected bytecode_ip=0x%x, got bytecode_ip=0x%x", i, e.bytecode_ip, g.bytecode_ip);
+			assert_vals_eq(e.data.vals, g.data.vals);
+		}
+	}
+}
+
+// ===== Compression roundtrip tests =====
+
+def test_i32(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.I32(0)]);
+	t.assert_roundtrip_vals([Value.I32(1)]);
+	t.assert_roundtrip_vals([Value.I32(0xFFFFFFFFu)]);
+	t.assert_roundtrip_vals([Value.I32(0x80000000u)]);
+	t.assert_roundtrip_vals([Value.I32(42), Value.I32(0), Value.I32(0xDEADBEEFu)]);
+}
+
+def test_i64(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.I64(0)]);
+	t.assert_roundtrip_vals([Value.I64(1)]);
+	t.assert_roundtrip_vals([Value.I64(0xFFFFFFFFFFFFFFFFuL)]);
+	t.assert_roundtrip_vals([Value.I64(0x8000000000000000uL)]);
+	t.assert_roundtrip_vals([Value.I64(42), Value.I64(0xDEADCAFEBEEF0000uL)]);
+}
+
+def test_f32(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.F32(0)]);
+	t.assert_roundtrip_vals([Value.F32(0x3F800000u)]); // 1.0f
+	t.assert_roundtrip_vals([Value.F32(0x7FC00000u)]); // NaN
+	t.assert_roundtrip_vals([Value.F32(0xFF800000u)]); // -Inf
+}
+
+def test_f64(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.F64(0)]);
+	t.assert_roundtrip_vals([Value.F64(0x3FF0000000000000uL)]); // 1.0
+	t.assert_roundtrip_vals([Value.F64(0x7FF8000000000000uL)]); // NaN
+	t.assert_roundtrip_vals([Value.F64(0xFFF0000000000000uL)]); // -Inf
+}
+
+def test_v128(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.V128(0, 0)]);
+	t.assert_roundtrip_vals([Value.V128(1, 2)]);
+	t.assert_roundtrip_vals([Value.V128(0xFFFFFFFFFFFFFFFFuL, 0xFFFFFFFFFFFFFFFFuL)]);
+	t.assert_roundtrip_vals([Value.V128(0xDEADBEEFCAFE0000uL, 0x0123456789ABCDEFuL)]);
+}
+
+def test_ref(t: CompressionTester) {
+	t.assert_roundtrip_vals([Value.Ref(null)]);
+	var obj = HeapObject.new(null, []);
+	t.assert_roundtrip_vals([Value.Ref(obj)]);
+	// Verify identity is preserved.
+	var frames = [t.make_frame(0, [Value.Ref(obj)])];
+	var got = t.roundtrip(frames);
+	match (got[0].data.vals[0]) {
+		Ref(v) => if (v != obj) t.t.fail("ref identity not preserved");
+		_ => t.t.fail("expected Ref value");
+	}
+}
+
+def test_empty_frames(t: CompressionTester) {
+	var got = t.roundtrip([]);
+	t.assert_length(0, got.length, "frames");
+}
+
+def test_single_empty_frame(t: CompressionTester) {
+	var frames = [t.make_frame(7, [])];
+	var got = t.roundtrip(frames);
+	t.assert_length(1, got.length, "frames");
+	t.assert_length(0, got[0].data.vals.length, "values");
+	if (got[0].data.pc != 7) t.t.fail1("expected pc=7, got pc=%d", got[0].data.pc);
+}
+
+def test_multi_empty_frames(t: CompressionTester) {
+	var frames = [t.make_frame(0, []), t.make_frame(1, []), t.make_frame(2, [])];
+	var got = t.roundtrip(frames);
+	t.assert_length(3, got.length, "frames");
+	for (i < 3) {
+		t.assert_length(0, got[i].data.vals.length, "values");
+		if (got[i].data.pc != i) t.t.fail1("expected pc=%d, got wrong pc", i);
+	}
+}
+
+def test_multi_vals(t: CompressionTester) {
+	var vals: Array<Value> = [
+		Value.I32(1), Value.I64(2), Value.F32(3), Value.F64(4),
+		Value.V128(5, 6), Value.Ref(null), Value.I32(0xFFFFFFFFu)
+	];
+	t.assert_roundtrip_vals(vals);
+}
+
+def test_multi_frames(t: CompressionTester) {
+	var f0 = t.make_frame(0, [Value.I32(10), Value.I32(20)]);
+	var f1 = t.make_frame(5, [Value.I64(30)]);
+	var f2 = t.make_frame(10, [Value.F32(40), Value.F64(50), Value.V128(60, 70)]);
+	var frames = [f0, f1, f2];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_single_val_per_frame(t: CompressionTester) {
+	var frames = [
+		t.make_frame(0, [Value.I32(100)]),
+		t.make_frame(1, [Value.I64(200)]),
+		t.make_frame(2, [Value.F32(300)]),
+		t.make_frame(3, [Value.F64(400)]),
+		t.make_frame(4, [Value.V128(500, 600)])
+	];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_cont(t: CompressionTester) {
+	var stack = Target.newWasmStack();
+	var cont = Continuations.makeContinuation(stack);
+	t.assert_roundtrip_vals([Value.Cont(cont)]);
+	// Verify stored object and version are preserved.
+	var frames = [t.make_frame(0, [Value.Cont(cont)])];
+	var got = t.roundtrip(frames);
+	match (got[0].data.vals[0]) {
+		Cont(got_cont) => {
+			if (Continuations.getStoredStack(got_cont) != stack) t.t.fail("cont stack not preserved");
+			if (Continuations.getStoredVersion(got_cont) != Continuations.getStoredVersion(cont)) t.t.fail("cont version not preserved");
+		}
+		_ => t.t.fail("expected Cont value");
+	}
+}
+
+def test_frame_metadata(t: CompressionTester) {
+	var func = t.getDummyFunc();
+	var frame = RelocatableFrame(WasmFrameData(func, 42, 0xFEEDFACECAFEBEEFuL, [Value.I32(99)]), false, 0xABCDEF0123456789uL);
+	var got = t.roundtrip([frame]);
+	t.assert_length(1, got.length, "frames");
+	if (got[0].data.func != func) t.t.fail("func not preserved");
+	if (got[0].data.pc != 42) t.t.fail1("expected pc=42, got pc=%d", got[0].data.pc);
+	t.assert_vals_eq([Value.I32(99)], got[0].data.vals);
+}
+
+// Many identical values within a single frame.
+def test_repeated_vals(t: CompressionTester) {
+	var vals = Array<Value>.new(100);
+	for (i < vals.length) vals[i] = Value.I32(0xCAFEBABEu);
+	t.assert_roundtrip_vals(vals);
+
+	// Repeat with i64.
+	for (i < vals.length) vals[i] = Value.I64(0xDEADBEEF00000000uL);
+	t.assert_roundtrip_vals(vals);
+
+	// Repeat with the same ref object.
+	var obj = HeapObject.new(null, []);
+	for (i < vals.length) vals[i] = Value.Ref(obj);
+	t.assert_roundtrip_vals(vals);
+}
+
+// Same repeating value pattern across multiple frames.
+def test_repeated_across_frames(t: CompressionTester) {
+	var frames = Array<RelocatableFrame>.new(20);
+	var shared_vals: Array<Value> = [Value.I32(42), Value.I64(42), Value.F32(42)];
+	for (i < frames.length) frames[i] = t.make_frame(i, shared_vals);
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// Single frame with many values of varying types and magnitudes.
+def test_many_diverse_vals(t: CompressionTester) {
+	var vals = Vector<Value>.new();
+	for (i < 50) {
+		vals.put(Value.I32(u32.view(i * 7)));
+		vals.put(Value.I64(u64.view(i) * 0x100000001uL));
+		vals.put(Value.F32(u32.view(i * 31)));
+		vals.put(Value.F64(u64.view(i) * 0x123456789uL));
+	}
+	t.assert_roundtrip_vals(vals.extract());
+}
+
+// Many frames, each with distinct values and varying sizes.
+def test_many_frames_diverse(t: CompressionTester) {
+	var frames = Vector<RelocatableFrame>.new();
+	for (i < 30) {
+		var n_vals = (i % 5) + 1; // 1 to 5 values per frame
+		var vals = Array<Value>.new(n_vals);
+		for (j < n_vals) {
+			var k = i * 5 + j;
+			match (k % 4) {
+				0 => vals[j] = Value.I32(u32.view(k * 13));
+				1 => vals[j] = Value.I64(u64.view(k) * 0xABCDuL);
+				2 => vals[j] = Value.F32(u32.view(k * 97));
+				_ => vals[j] = Value.F64(u64.view(k) * 0x1111111111uL);
+			}
+		}
+		frames.put(t.make_frame(i * 3, vals));
+	}
+	var input = frames.extract();
+	var got = t.roundtrip(input);
+	t.assert_frames_eq(input, got);
+}
+
+// Multiple distinct reference types in a single frame.
+def test_refs_mixed(t: CompressionTester) {
+	var heap_obj = HeapObject.new(null, []);
+	var host_obj = HostObject.new();
+	var host_fn = HostFunction.new("test_fn", SigCache.v_v, nop_host);
+	var vals: Array<Value> = [
+		Value.Ref(heap_obj),
+		Value.Ref(host_obj),
+		Value.Ref(host_fn),
+		Value.Ref(null),
+		Value.Ref(heap_obj), // same object again
+		Value.Ref(host_obj)  // same object again
+	];
+	var frames = [t.make_frame(0, vals)];
+	var got = t.roundtrip(frames);
+	t.assert_length(1, got.length, "frames");
+	t.assert_length(vals.length, got[0].data.vals.length, "values");
+	// Verify identity for each ref.
+	for (i < vals.length) {
+		match (vals[i]) {
+			Ref(expected) => match (got[0].data.vals[i]) {
+				Ref(actual) => if (expected != actual) t.t.fail1("ref[%d]: identity not preserved", i);
+				_ => t.t.fail1("ref[%d]: expected Ref", i);
+			}
+			_ => ;
+		}
+	}
+}
+
+def nop_host(args: Range<Value>) -> HostResult { return HostResult.Value0; }
+
+// Shared reference objects across multiple frames.
+def test_refs_shared_across_frames(t: CompressionTester) {
+	var obj_a = HeapObject.new(null, [Value.I32(1)]);
+	var obj_b = HostObject.new();
+	var frames = [
+		t.make_frame(0, [Value.Ref(obj_a), Value.I32(10)]),
+		t.make_frame(1, [Value.Ref(obj_b), Value.Ref(obj_a)]),
+		t.make_frame(2, [Value.Ref(obj_a), Value.Ref(obj_b), Value.Ref(null)])
+	];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+	// Verify cross-frame identity: obj_a in frame 0 == obj_a in frame 1 and 2.
+	var get_ref = get_ref_val;
+	var a0 = get_ref(got[0].data.vals[0]);
+	var a1 = get_ref(got[1].data.vals[1]);
+	var a2 = get_ref(got[2].data.vals[0]);
+	if (a0 != a1) t.t.fail("obj_a identity not preserved across frames 0 and 1");
+	if (a0 != a2) t.t.fail("obj_a identity not preserved across frames 0 and 2");
+	var b1 = get_ref(got[1].data.vals[0]);
+	var b2 = get_ref(got[2].data.vals[1]);
+	if (b1 != b2) t.t.fail("obj_b identity not preserved across frames 1 and 2");
+}
+
+def get_ref_val(v: Value) -> Object {
+	match (v) {
+		Ref(obj) => return obj;
+		_ => return null;
+	}
+}
+
+// Many frames with uniform large value counts.
+def test_large_uniform_frames(t: CompressionTester) {
+	var n_frames = 20;
+	var n_vals = 50;
+	var frames = Array<RelocatableFrame>.new(n_frames);
+	for (i < n_frames) {
+		var vals = Array<Value>.new(n_vals);
+		for (j < n_vals) vals[j] = Value.I64(u64.view(i * n_vals + j));
+		frames[i] = t.make_frame(i, vals);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// ===== Peripheral fuzz tests =====
+// These verify that ret_addr, bytecode_ip, and is_spc round-trip without
+// corruption across both strategies. assert_frames_eq now compares all
+// fields, so any cross-field swap, byte-order issue, or sign-extension bug
+// in either strategy will surface here.
+
+// {ret_addr} fuzz tests.
+
+def test_ret_addr_zero(t: CompressionTester) {
+	var frames = [t.make_frame_full(0, [Value.I32(0)], 0uL, 0uL, false)];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_ret_addr_max(t: CompressionTester) {
+	var frames = [t.make_frame_full(0, [Value.I32(0)], 0xFFFFFFFFFFFFFFFFuL, 0uL, false)];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_ret_addr_alternating_bits(t: CompressionTester) {
+	var frames = [
+		t.make_frame_full(0, [Value.I32(0)], 0xAAAAAAAAAAAAAAAAuL, 0uL, false),
+		t.make_frame_full(1, [Value.I32(1)], 0x5555555555555555uL, 0uL, false)
+	];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_ret_addr_sequential(t: CompressionTester) {
+	var n = 50;
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) {
+		var ret_addr = u64.view(i) * 0x0123456789ABCDEFuL;
+		frames[i] = t.make_frame_full(i, [Value.I32(u32.view(i))], ret_addr, 0uL, false);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// {bytecode_ip} fuzz tests (mirror of ret_addr).
+
+def test_bytecode_ip_zero(t: CompressionTester) {
+	var frames = [t.make_frame_full(0, [Value.I32(0)], 0uL, 0uL, false)];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_bytecode_ip_max(t: CompressionTester) {
+	var frames = [t.make_frame_full(0, [Value.I32(0)], 0uL, 0xFFFFFFFFFFFFFFFFuL, false)];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_bytecode_ip_alternating_bits(t: CompressionTester) {
+	var frames = [
+		t.make_frame_full(0, [Value.I32(0)], 0uL, 0xAAAAAAAAAAAAAAAAuL, false),
+		t.make_frame_full(1, [Value.I32(1)], 0uL, 0x5555555555555555uL, false)
+	];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_bytecode_ip_sequential(t: CompressionTester) {
+	var n = 50;
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) {
+		var bytecode_ip = u64.view(i) * 0x0123456789ABCDEFuL;
+		frames[i] = t.make_frame_full(i, [Value.I32(u32.view(i))], 0uL, bytecode_ip, false);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// {is_spc} fuzz tests.
+
+def test_is_spc_true_single(t: CompressionTester) {
+	var frames = [t.make_frame_full(0, [Value.I32(42)], 0uL, 0uL, true)];
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_is_spc_all_spc(t: CompressionTester) {
+	var n = 20;
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) {
+		frames[i] = t.make_frame_full(i, [Value.I32(u32.view(i))], 0uL, 0uL, true);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+def test_is_spc_alternating(t: CompressionTester) {
+	var n = 20;
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) {
+		var is_spc = (i & 1) == 0;
+		frames[i] = t.make_frame_full(i, [Value.I32(u32.view(i))], 0uL, 0uL, is_spc);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}
+
+// All peripherals varying together. Catches cross-field corruption like
+// accidentally swapping the ret_addr and bytecode_ip slots.
+def test_peripherals_combined_fuzz(t: CompressionTester) {
+	var n = 30;
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) {
+		var ret_addr = u64.view(i) * 0xCAFEBABECAFEBABEuL;
+		var bytecode_ip = u64.view(~i) * 0xDEADBEEFDEADBEEFuL;
+		var is_spc = (i % 3) != 0;
+		var n_vals = (i % 4) + 1;
+		var vals = Array<Value>.new(n_vals);
+		for (j < n_vals) {
+			match (j % 4) {
+				0 => vals[j] = Value.I32(u32.view(i * 7 + j));
+				1 => vals[j] = Value.I64(u64.view(i) * 0xABCDuL + u64.view(j));
+				2 => vals[j] = Value.F32(u32.view(i * 13 + j));
+				_ => vals[j] = Value.F64(u64.view(i) * 0x1111uL + u64.view(j));
+			}
+		}
+		frames[i] = t.make_frame_full(i * 2, vals, ret_addr, bytecode_ip, is_spc);
+	}
+	var got = t.roundtrip(frames);
+	t.assert_frames_eq(frames, got);
+}

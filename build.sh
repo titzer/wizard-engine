@@ -43,7 +43,7 @@ if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
     exit 1
 fi
 
-ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
+ENGINE="src/engine/*.v3 src/engine/compression/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 MONITORS="src/monitors/*.v3"
 TEST_MONITORS="src/monitors/test/*.v3"
 DEBUG_MONITORS="src/monitors/debug/*.v3"
