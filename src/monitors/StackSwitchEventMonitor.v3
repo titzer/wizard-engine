@@ -1,0 +1,114 @@
+// Copyright 2026 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Traces individual stack-switching events in execution order.
+def monitor_ = MonitorRegistry.add(
+	"ssevent", "Traces stack-switching events (suspend/switch/resume) as an ordered table.",
+	StackSwitchEventMonitor.new());
+
+// Static description of a stack-switching site. All recorded fields are constant for a
+// given program-counter, so a runtime event is just an (ordered) reference to one of these.
+class EventSite(module: Module, func: FuncDecl, pc: int, op: StackSwitchOpcode, tag: int, params: int) { }
+
+// Static layout for the event table.
+def eventTable = initEventTable();
+def initEventTable() -> TraceTable {
+	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "Params"]);
+	t.cells[0].set(8,  Justification.RIGHT, Color.COUNT);
+	t.cells[1].set(28, Justification.LEFT,  Color.FUNC);
+	t.cells[2].set(6,  Justification.RIGHT, Color.LINE);
+	t.cells[3].set(18, Justification.LEFT,  Color.NONE);
+	t.cells[4].set(8,  Justification.RIGHT, Color.NONE);
+	t.cells[5].set(8,  Justification.RIGHT, Color.NONE);
+	return t;
+}
+
+// Single global probe: fired on every executed instruction. Looks up the current PC in a
+// precomputed sparse per-function site map and, on a hit, appends the site to the ordered
+// event log. Fast path (non-switch instruction) is one HashMap get + bounds + null check.
+class EventDispatchProbe(monitor: StackSwitchEventMonitor) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		var fsites = monitor.funcSites[dynamicLoc.func.decl];
+		if (fsites != null && dynamicLoc.pc < fsites.length) {
+			var site = fsites[dynamicLoc.pc];
+			if (site != null) monitor.events.put(site);
+		}
+		return ProbeAction.Continue;
+	}
+}
+
+// Records per-PC EventSites for each function.
+class EventSiteVisitor extends StackSwitchSiteVisitor {
+	def monitor: StackSwitchEventMonitor;
+	var pcSites: Array<EventSite>;
+
+	new(monitor, module: Module) super(module) { }
+	def onFunc(func: FuncDecl) { pcSites = null; }
+
+	def record(op: StackSwitchOpcode, tag: int) {
+		if (pcSites == null) {
+			pcSites = Array<EventSite>.new(bi.func.orig_bytecode.length);
+			monitor.funcSites[bi.func] = pcSites;
+		}
+		pcSites[bi.pc] = EventSite.new(module, bi.func, bi.pc, op, tag, StackSwitchUtil.tagParamCount(module, tag));
+	}
+}
+
+class StackSwitchEventMonitor extends Monitor {
+	def funcSites = HashMap<FuncDecl, Array<EventSite>>.new(FuncDecl.func_index, FuncDecl.==);
+	def events = Vector<EventSite>.new();
+	var globalProbeRegistered: bool;
+
+	def onParse(m: Module, err: ErrorGen) {
+		EventSiteVisitor.new(this, m).run();
+		if (!globalProbeRegistered) {
+			Instrumentation.insertGlobalProbe(EventDispatchProbe.new(this));
+			globalProbeRegistered = true;
+		}
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		if (MonitorOptions.CSV.val) reportCSV(out, events);
+		else reportText(out, events);
+	}
+}
+
+def reportText(out: TraceBuilder, events: Vector<EventSite>) {
+	out.beginColor(Color.UNDERLINE).puts("ssevent: stack-switching event trace").endColors().ln();
+	if (events.length == 0) {
+		out.puts("  (no stack-switching events were executed)").ln();
+		return;
+	}
+	eventTable.putTableHeader(out);
+	out.flush();
+	for (i < events.length) {
+		var e = events[i];
+		eventTable.cells[0].putd(i + 1);
+		e.func.render(if(e.module != null, e.module.names), eventTable.cells[1]);
+		eventTable.cells[2].put1("+%d", e.pc);
+		eventTable.cells[3].puts(e.op.mnemonic);
+		putIntOrDash(eventTable.cells[4], e.tag);
+		putIntOrDash(eventTable.cells[5], e.params);
+		eventTable.putTableRow(out);
+		out.flush();
+	}
+	out.ln();
+}
+
+def reportCSV(out: TraceBuilder, events: Vector<EventSite>) {
+	out.puts("seq,function,pc,opcode,tag,params").ln();
+	for (i < events.length) {
+		var e = events[i];
+		out.putd(i + 1).putc(',');
+		out.putd(e.func.func_index).putc(',');
+		out.putd(e.pc).putc(',');
+		out.puts(e.op.mnemonic).putc(',');
+		out.putd(e.tag).putc(',');
+		out.putd(e.params).ln();
+	}
+}
+
+def putIntOrDash(buf: StringBuilder, v: int) {
+	if (v >= 0) buf.putd(v);
+	else buf.puts("-");
+}
