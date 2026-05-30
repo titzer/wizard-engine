@@ -6,33 +6,75 @@ def monitor_ = MonitorRegistry.add(
 	"ssevent", "Traces stack-switching events (suspend/switch/resume) as an ordered table.",
 	StackSwitchEventMonitor.new());
 
+// The kinds of stack-switching opcodes that the monitor observes.
+enum StackSwitchOpcode(mnemonic: string) {
+	SUSPEND		("suspend"),
+	RESUME		("resume"),
+	RESUME_THROW	("resume_throw"),
+	RESUME_THROW_REF("resume_throw_ref"),
+	SWITCH		("switch")
+}
+
+// Base bytecode visitor that locates stack-switching sites. Subclasses override {record},
+// which is called for each stack-switching opcode with the current location available via
+// {bi.func} / {bi.pc}. The {tag} is the static tag index for SUSPEND and SWITCH, or -1 for
+// the resume-family opcodes (which carry no tag).
+class StackSwitchSiteVisitor extends BytecodeInstrumenter {
+	new(module: Module) super(module) { }
+
+	def record(op: StackSwitchOpcode, tag: int);
+
+	def visit_SUSPEND(tag: u31) { record(StackSwitchOpcode.SUSPEND, int.view(tag)); }
+	def visit_SWITCH(cont: u31, tag: u31) { record(StackSwitchOpcode.SWITCH, int.view(tag)); }
+	def visit_RESUME(cont: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME, -1); }
+	def visit_RESUME_THROW(cont: u31, tag: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME_THROW, -1); }
+	def visit_RESUME_THROW_REF(cont: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME_THROW_REF, -1); }
+}
+
+// Returns the number of parameters carried by the tag at index {tag} in {module},
+// or -1 if {tag} is negative (e.g. a resume-family opcode) or out of range.
+def tagParamCount(module: Module, tag: int) -> int {
+	if (tag < 0) return -1;
+	if (u32.view(tag) >= module.tags.length) return -1;
+	return module.tags[tag].fields.length;
+}
+
 // Static description of a stack-switching site. All recorded fields are constant for a
 // given program-counter, so a runtime event is just an (ordered) reference to one of these.
-class EventSite(module: Module, func: FuncDecl, pc: int, op: StackSwitchOpcode, tag: int, params: int) { }
+class EventSite(func_index: int, pc: int, op: StackSwitchOpcode, tag: int, params: int) { }
 
-// Static layout for the event table.
+// Static layout for the event table, shared by the text and CSV renderers.
 def eventTable = initEventTable();
 def initEventTable() -> TraceTable {
-	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "Params"]);
+	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "Params", "Gap"]);
 	t.cells[0].set(8,  Justification.RIGHT, Color.COUNT);
-	t.cells[1].set(28, Justification.LEFT,  Color.FUNC);
+	t.cells[1].set(10, Justification.RIGHT, Color.FUNC);
 	t.cells[2].set(6,  Justification.RIGHT, Color.LINE);
 	t.cells[3].set(18, Justification.LEFT,  Color.NONE);
 	t.cells[4].set(8,  Justification.RIGHT, Color.NONE);
 	t.cells[5].set(8,  Justification.RIGHT, Color.NONE);
+	t.cells[6].set(12, Justification.RIGHT, Color.COUNT);
 	return t;
 }
 
 // Single global probe: fired on every executed instruction. Looks up the current PC in a
-// precomputed sparse per-function site map and, on a hit, appends the site to the ordered
-// event log. Fast path (non-switch instruction) is one HashMap get + bounds + null check.
+// precomputed sparse per-function site map and, on a hit, appends the site (with the number
+// of instructions executed since the last stack-switching op) to the ordered event log.
+// Fast path (non-switch instruction) is one HashMap get + bounds + null check + increment.
 class EventDispatchProbe(monitor: StackSwitchEventMonitor) extends Probe {
+	var gap: u64; // instructions executed since the last stack-switching op
+
 	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
 		var fsites = monitor.funcSites[dynamicLoc.func.decl];
 		if (fsites != null && dynamicLoc.pc < fsites.length) {
 			var site = fsites[dynamicLoc.pc];
-			if (site != null) monitor.events.put(site);
+			if (site != null) {
+				monitor.events.put((site, gap));
+				gap = 0; // do not count the op instruction itself
+				return ProbeAction.Continue;
+			}
 		}
+		gap++;
 		return ProbeAction.Continue;
 	}
 }
@@ -50,13 +92,13 @@ class EventSiteVisitor extends StackSwitchSiteVisitor {
 			pcSites = Array<EventSite>.new(bi.func.orig_bytecode.length);
 			monitor.funcSites[bi.func] = pcSites;
 		}
-		pcSites[bi.pc] = EventSite.new(module, bi.func, bi.pc, op, tag, StackSwitchUtil.tagParamCount(module, tag));
+		pcSites[bi.pc] = EventSite.new(bi.func.func_index, bi.pc, op, tag, tagParamCount(module, tag));
 	}
 }
 
 class StackSwitchEventMonitor extends Monitor {
 	def funcSites = HashMap<FuncDecl, Array<EventSite>>.new(FuncDecl.func_index, FuncDecl.==);
-	def events = Vector<EventSite>.new();
+	def events = Vector<(EventSite, u64)>.new();
 	var globalProbeRegistered: bool;
 
 	def onParse(m: Module, err: ErrorGen) {
@@ -73,7 +115,19 @@ class StackSwitchEventMonitor extends Monitor {
 	}
 }
 
-def reportText(out: TraceBuilder, events: Vector<EventSite>) {
+// Fills the shared event-table cells for one event, numerically (so the text and CSV
+// renderers produce identical values).
+def fillRow(i: int, e: EventSite, gap: u64) {
+	eventTable.cells[0].putd(i + 1);
+	eventTable.cells[1].putd(e.func_index);
+	eventTable.cells[2].putd(e.pc);
+	eventTable.cells[3].puts(e.op.mnemonic);
+	eventTable.cells[4].putd(e.tag);     // -1 for resume-family ops
+	eventTable.cells[5].putd(e.params);  // -1 for resume-family ops
+	eventTable.cells[6].putd(gap);
+}
+
+def reportText(out: TraceBuilder, events: Vector<(EventSite, u64)>) {
 	out.beginColor(Color.UNDERLINE).puts("ssevent: stack-switching event trace").endColors().ln();
 	if (events.length == 0) {
 		out.puts("  (no stack-switching events were executed)").ln();
@@ -82,33 +136,17 @@ def reportText(out: TraceBuilder, events: Vector<EventSite>) {
 	eventTable.putTableHeader(out);
 	out.flush();
 	for (i < events.length) {
-		var e = events[i];
-		eventTable.cells[0].putd(i + 1);
-		e.func.render(if(e.module != null, e.module.names), eventTable.cells[1]);
-		eventTable.cells[2].put1("+%d", e.pc);
-		eventTable.cells[3].puts(e.op.mnemonic);
-		putIntOrDash(eventTable.cells[4], e.tag);
-		putIntOrDash(eventTable.cells[5], e.params);
+		fillRow(i, events[i].0, events[i].1);
 		eventTable.putTableRow(out);
 		out.flush();
 	}
 	out.ln();
 }
 
-def reportCSV(out: TraceBuilder, events: Vector<EventSite>) {
-	out.puts("seq,function,pc,opcode,tag,params").ln();
+def reportCSV(out: TraceBuilder, events: Vector<(EventSite, u64)>) {
+	eventTable.putCsvHeader(out);
 	for (i < events.length) {
-		var e = events[i];
-		out.putd(i + 1).putc(',');
-		out.putd(e.func.func_index).putc(',');
-		out.putd(e.pc).putc(',');
-		out.puts(e.op.mnemonic).putc(',');
-		out.putd(e.tag).putc(',');
-		out.putd(e.params).ln();
+		fillRow(i, events[i].0, events[i].1);
+		eventTable.putCsvRow(out);
 	}
-}
-
-def putIntOrDash(buf: StringBuilder, v: int) {
-	if (v >= 0) buf.putd(v);
-	else buf.puts("-");
 }
