@@ -15,22 +15,6 @@ enum StackSwitchOpcode(mnemonic: string) {
 	SWITCH		("switch")
 }
 
-// Base bytecode visitor that locates stack-switching sites. Subclasses override {record},
-// which is called for each stack-switching opcode with the current location available via
-// {bi.func} / {bi.pc}. The {tag} is the static tag index for SUSPEND and SWITCH, or -1 for
-// the resume-family opcodes (which carry no tag).
-class StackSwitchSiteVisitor extends BytecodeInstrumenter {
-	new(module: Module) super(module) { }
-
-	def record(op: StackSwitchOpcode, tag: int);
-
-	def visit_SUSPEND(tag: u31) { record(StackSwitchOpcode.SUSPEND, int.view(tag)); }
-	def visit_SWITCH(cont: u31, tag: u31) { record(StackSwitchOpcode.SWITCH, int.view(tag)); }
-	def visit_RESUME(cont: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME, -1); }
-	def visit_RESUME_THROW(cont: u31, tag: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME_THROW, -1); }
-	def visit_RESUME_THROW_REF(cont: u31, handlers: Range<SuspensionHandler>) { record(StackSwitchOpcode.RESUME_THROW_REF, -1); }
-}
-
 // Returns the number of parameters carried by the tag at index {tag} in {module},
 // or -1 if {tag} is negative (e.g. a resume-family opcode) or out of range.
 def tagParamCount(module: Module, tag: int) -> int {
@@ -39,11 +23,17 @@ def tagParamCount(module: Module, tag: int) -> int {
 	return module.tags[tag].fields.length;
 }
 
-// Static description of a stack-switching site. All recorded fields are constant for a
-// given program-counter, so a runtime event is just an (ordered) reference to one of these.
-class EventSite(func_index: int, pc: int, op: StackSwitchOpcode, tag: int, params: int) { }
+// A stack-switching site: its static fields are constant for a given program-counter.
+class EventSite(monitor: StackSwitchEventMonitor, gapProbe: GapProbe, func_index: int, pc: int, op: StackSwitchOpcode, tag: int, params: int) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		// The global GapProbe fires first and has already counted this op instruction, thus {gap - 1}.
+		monitor.events.put((this, gapProbe.gap - 1));
+		gapProbe.gap = 0;
+		return ProbeAction.Continue;
+	}
+}
 
-// Static layout for the event table, shared by the text and CSV renderers.
+// Static layout for the event table. Shared by the text and CSV renderers.
 def eventTable = initEventTable();
 def initEventTable() -> TraceTable {
 	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "Params", "Gap"]);
@@ -57,54 +47,40 @@ def initEventTable() -> TraceTable {
 	return t;
 }
 
-// Single global probe: fired on every executed instruction. Looks up the current PC in a
-// precomputed sparse per-function site map and, on a hit, appends the site (with the number
-// of instructions executed since the last stack-switching op) to the ordered event log.
-// Fast path (non-switch instruction) is one HashMap get + bounds + null check + increment.
-class EventDispatchProbe(monitor: StackSwitchEventMonitor) extends Probe {
-	var gap: u64; // instructions executed since the last stack-switching op
-
-	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
-		var fsites = monitor.funcSites[dynamicLoc.func.decl];
-		if (fsites != null && dynamicLoc.pc < fsites.length) {
-			var site = fsites[dynamicLoc.pc];
-			if (site != null) {
-				monitor.events.put((site, gap));
-				gap = 0; // do not count the op instruction itself
-				return ProbeAction.Continue;
-			}
-		}
-		gap++;
-		return ProbeAction.Continue;
-	}
+// Single global probe: fires on every executed instruction and only counts it. Event
+// recording is handled by per-site local probes ({EventSite}), so this needs no site lookup.
+class GapProbe extends Probe {
+	var gap: u64; // Num. instructions executed since the last stack-switching op.
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction { gap++; return ProbeAction.Continue; }
 }
 
-// Records per-PC EventSites for each function.
-class EventSiteVisitor extends StackSwitchSiteVisitor {
+// Installs an {EventSite} local probe at each stack-switching opcode.
+class EventSiteVisitor extends BytecodeInstrumenter {
 	def monitor: StackSwitchEventMonitor;
-	var pcSites: Array<EventSite>;
 
 	new(monitor, module: Module) super(module) { }
-	def onFunc(func: FuncDecl) { pcSites = null; }
 
-	def record(op: StackSwitchOpcode, tag: int) {
-		if (pcSites == null) {
-			pcSites = Array<EventSite>.new(bi.func.orig_bytecode.length);
-			monitor.funcSites[bi.func] = pcSites;
-		}
-		pcSites[bi.pc] = EventSite.new(bi.func.func_index, bi.pc, op, tag, tagParamCount(module, tag));
+	def add(op: StackSwitchOpcode, tag: int) {
+		insertProbeHere(EventSite.new(monitor, monitor.gapProbe,
+			bi.func.func_index, bi.pc, op, tag, tagParamCount(module, tag)));
 	}
+
+	def visit_SUSPEND(tag: u31) { add(StackSwitchOpcode.SUSPEND, int.view(tag)); }
+	def visit_SWITCH(cont: u31, tag: u31) { add(StackSwitchOpcode.SWITCH, int.view(tag)); }
+	def visit_RESUME(cont: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME, -1); }
+	def visit_RESUME_THROW(cont: u31, tag: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME_THROW, -1); }
+	def visit_RESUME_THROW_REF(cont: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME_THROW_REF, -1); }
 }
 
 class StackSwitchEventMonitor extends Monitor {
-	def funcSites = HashMap<FuncDecl, Array<EventSite>>.new(FuncDecl.func_index, FuncDecl.==);
+	def gapProbe = GapProbe.new();
 	def events = Vector<(EventSite, u64)>.new();
 	var globalProbeRegistered: bool;
 
 	def onParse(m: Module, err: ErrorGen) {
 		EventSiteVisitor.new(this, m).run();
 		if (!globalProbeRegistered) {
-			Instrumentation.insertGlobalProbe(EventDispatchProbe.new(this));
+			Instrumentation.insertGlobalProbe(gapProbe);
 			globalProbeRegistered = true;
 		}
 	}
