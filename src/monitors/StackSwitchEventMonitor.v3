@@ -1,0 +1,128 @@
+// Copyright 2026 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Traces individual stack-switching events in execution order.
+def monitor_ = MonitorRegistry.add(
+	"ssevent", "Traces stack-switching events (suspend/switch/resume) as an ordered table.",
+	StackSwitchEventMonitor.new());
+
+// The kinds of stack-switching opcodes that the monitor observes.
+enum StackSwitchOpcode(mnemonic: string) {
+	SUSPEND		("suspend"),
+	RESUME		("resume"),
+	RESUME_THROW	("resume_throw"),
+	RESUME_THROW_REF("resume_throw_ref"),
+	SWITCH		("switch")
+}
+
+// Returns the number of parameters carried by the tag at index {tag} in {module},
+// or -1 if {tag} is negative (e.g. a resume-family opcode) or out of range.
+def tagParamCount(module: Module, tag: int) -> int {
+	if (tag < 0) return -1;
+	if (u32.view(tag) >= module.tags.length) return -1;
+	return module.tags[tag].fields.length;
+}
+
+// A stack-switching site: its static fields are constant for a given program-counter.
+class EventSite(monitor: StackSwitchEventMonitor, gapProbe: GapProbe, func_index: int, pc: int, op: StackSwitchOpcode, tag: int, params: int) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		// The global GapProbe fires first and has already counted this op instruction, thus {gap - 1}.
+		monitor.events.put((this, gapProbe.gap - 1));
+		gapProbe.gap = 0;
+		return ProbeAction.Continue;
+	}
+}
+
+// Static layout for the event table. Shared by the text and CSV renderers.
+def eventTable = initEventTable();
+def initEventTable() -> TraceTable {
+	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "Params", "Gap"]);
+	t.cells[0].set(8,  Justification.RIGHT, Color.COUNT);
+	t.cells[1].set(10, Justification.RIGHT, Color.FUNC);
+	t.cells[2].set(6,  Justification.RIGHT, Color.LINE);
+	t.cells[3].set(18, Justification.LEFT,  Color.NONE);
+	t.cells[4].set(8,  Justification.RIGHT, Color.NONE);
+	t.cells[5].set(8,  Justification.RIGHT, Color.NONE);
+	t.cells[6].set(12, Justification.RIGHT, Color.COUNT);
+	return t;
+}
+
+// Single global probe: fires on every executed instruction and only counts it. Event
+// recording is handled by per-site local probes ({EventSite}), so this needs no site lookup.
+class GapProbe extends Probe {
+	var gap: u64; // Num. instructions executed since the last stack-switching op.
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction { gap++; return ProbeAction.Continue; }
+}
+
+// Installs an {EventSite} local probe at each stack-switching opcode.
+class EventSiteVisitor extends BytecodeInstrumenter {
+	def monitor: StackSwitchEventMonitor;
+
+	new(monitor, module: Module) super(module) { }
+
+	def add(op: StackSwitchOpcode, tag: int) {
+		insertProbeHere(EventSite.new(monitor, monitor.gapProbe,
+			bi.func.func_index, bi.pc, op, tag, tagParamCount(module, tag)));
+	}
+
+	def visit_SUSPEND(tag: u31) { add(StackSwitchOpcode.SUSPEND, int.view(tag)); }
+	def visit_SWITCH(cont: u31, tag: u31) { add(StackSwitchOpcode.SWITCH, int.view(tag)); }
+	def visit_RESUME(cont: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME, -1); }
+	def visit_RESUME_THROW(cont: u31, tag: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME_THROW, -1); }
+	def visit_RESUME_THROW_REF(cont: u31, handlers: Range<SuspensionHandler>) { add(StackSwitchOpcode.RESUME_THROW_REF, -1); }
+}
+
+class StackSwitchEventMonitor extends Monitor {
+	def gapProbe = GapProbe.new();
+	def events = Vector<(EventSite, u64)>.new();
+	var globalProbeRegistered: bool;
+
+	def onParse(m: Module, err: ErrorGen) {
+		EventSiteVisitor.new(this, m).run();
+		if (!globalProbeRegistered) {
+			Instrumentation.insertGlobalProbe(gapProbe);
+			globalProbeRegistered = true;
+		}
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		if (MonitorOptions.CSV.val) reportCSV(out, events);
+		else reportText(out, events);
+	}
+}
+
+// Fills the shared event-table cells for one event, numerically (so the text and CSV
+// renderers produce identical values).
+def fillRow(i: int, e: EventSite, gap: u64) {
+	eventTable.cells[0].putd(i + 1);
+	eventTable.cells[1].putd(e.func_index);
+	eventTable.cells[2].putd(e.pc);
+	eventTable.cells[3].puts(e.op.mnemonic);
+	eventTable.cells[4].putd(e.tag);     // -1 for resume-family ops
+	eventTable.cells[5].putd(e.params);  // -1 for resume-family ops
+	eventTable.cells[6].putd(gap);
+}
+
+def reportText(out: TraceBuilder, events: Vector<(EventSite, u64)>) {
+	out.beginColor(Color.UNDERLINE).puts("ssevent: stack-switching event trace").endColors().ln();
+	if (events.length == 0) {
+		out.puts("  (no stack-switching events were executed)").ln();
+		return;
+	}
+	eventTable.putTableHeader(out);
+	out.flush();
+	for (i < events.length) {
+		fillRow(i, events[i].0, events[i].1);
+		eventTable.putTableRow(out);
+		out.flush();
+	}
+	out.ln();
+}
+
+def reportCSV(out: TraceBuilder, events: Vector<(EventSite, u64)>) {
+	eventTable.putCsvHeader(out);
+	for (i < events.length) {
+		fillRow(i, events[i].0, events[i].1);
+		eventTable.putCsvRow(out);
+	}
+}

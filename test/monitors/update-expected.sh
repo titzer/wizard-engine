@@ -26,7 +26,7 @@ else
         "globals"
         "memstats"
 	    "profile_bytecode{switch_size=16}"
-	    "ssinstr")
+	    "ssevent")
 fi
 
 # generate output files from all .wasm in a folder

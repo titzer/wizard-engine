@@ -1,1 +1,1 @@
-resume_chain3.wasm  ssinstr
+resume_chain3.wasm  ssevent
