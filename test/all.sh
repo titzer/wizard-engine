@@ -138,6 +138,22 @@ for target in $TEST_TARGETS; do
     fi
 done
 
+# Fast call tests
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" != "x86-64-linux" ]; then
+        skip fastcall "no fast interpreter support"
+        continue
+    fi
+    if [[ $DEFAULT_MODES = 1 ]]; then
+        $SCRIPT_LOC/fastcall/test.sh || exit_if_failure $?
+    elif [[ "$TEST_MODE" = "jit" || "$TEST_MODE" = "lazy" || "$TEST_MODE" = "dyn" || "$TEST_MODE" = "spc" ]]; then
+        skip fastcall "requires non-JIT mode"
+    else
+        $SCRIPT_LOC/fastcall/test.sh || exit_if_failure $?
+    fi
+done
+
 # Self-hosted (unit) tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
