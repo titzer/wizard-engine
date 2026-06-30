@@ -10,7 +10,9 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 . $HERE/common.sh regress
 
-make_binary wizeng || exit $?
+if [ "$BINARY" = "" ]; then
+    make_binary wizeng || exit $?
+fi
 
 CMD="$BINARY $WIZENG_OPTS --expected=$WIZENG_LOC/test/regress.failures --expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET} --expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET}.${TEST_MODE}"
 

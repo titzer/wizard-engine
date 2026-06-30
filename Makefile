@@ -34,6 +34,13 @@ WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
 	vctags -e $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(WALI_X86_64_LINUX) $(JIT) $(X86_64)
 
+# Docker targets
+bin/wizeng.docker: docker/wizeng.docker bin/wizeng.x86-64-linux
+	cp docker/wizeng.docker bin/
+
+bin/unittest.docker: docker/wizeng.docker bin/unittest.x86-64-linux
+	cp docker/unittest.docker bin/
+
 # JVM targets
 bin/unittest.jvm: $(UNITTEST) build.sh
 	./build.sh unittest jvm
