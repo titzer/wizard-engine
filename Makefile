@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave docker
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -14,6 +14,8 @@ jvm: bin/wizeng.jvm bin/unittest.jvm
 wasm-wave: bin/wizeng.wasm bin/unittest.wasm
 
 v3i: bin/wizeng.v3i bin/unittest.v3i
+
+docker: bin/wizeng.docker bin/unittest.docker
 
 WIZENG_BUILD_SH_ARGS ?=
 
@@ -38,7 +40,7 @@ TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LI
 bin/wizeng.docker: docker/wizeng.docker bin/wizeng.x86-64-linux
 	cp docker/wizeng.docker bin/
 
-bin/unittest.docker: docker/wizeng.docker bin/unittest.x86-64-linux
+bin/unittest.docker: docker/unittest.docker bin/unittest.x86-64-linux
 	cp docker/unittest.docker bin/
 
 # JVM targets
