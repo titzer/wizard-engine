@@ -147,7 +147,7 @@ for target in $TEST_TARGETS; do
     fi
     if [[ $DEFAULT_MODES = 1 ]]; then
         $SCRIPT_LOC/fastcall/test.sh || exit_if_failure $?
-    elif [[ "$TEST_MODE" = "jit" || "$TEST_MODE" = "lazy" || "$TEST_MODE" = "dyn" || "$TEST_MODE" = "spc" ]]; then
+    elif [[ "$TEST_MODE" = "lazy" || "$TEST_MODE" = "dyn" || "$TEST_MODE" = "spc" ]]; then
         skip fastcall "requires non-JIT mode"
     else
         $SCRIPT_LOC/fastcall/test.sh || exit_if_failure $?
