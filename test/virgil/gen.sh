@@ -18,7 +18,7 @@ for D in $TEST_DIRS; do
     cp $VIRGIL_LOC/test/$D/*.v3 src/
 done
 
-CMD="v3c -target=wasm-spec-test -output=bin/ -multiple src/*.v3"
+CMD="v3c -target=wasm-test -output=bin/ -multiple src/*.v3"
 
 printf "Compiling ${CYAN}virgil${NORM} tests: "
 
