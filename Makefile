@@ -7,6 +7,8 @@ clean:
 
 x86-linux: bin/wizeng.x86-linux bin/unittest.x86-linux
 
+arm64-linux: bin/wizeng.arm64-linux bin/unittest.arm64-linux
+
 x86-64-linux: bin/wizeng.x86-64-linux bin/unittest.x86-64-linux
 
 jvm: bin/wizeng.jvm bin/unittest.jvm
@@ -63,6 +65,16 @@ bin/wizeng.x86-linux: $(WIZENG) $(MONITORS) build.sh
 
 bin/objdump.x86-linux: $(OBJDUMP) build.sh
 	./build.sh objdump x86-linux
+
+# arm64-linux targets
+bin/unittest.arm64-linux: $(UNITTEST) build.sh
+	./build.sh unittest arm64-linux
+
+bin/wizeng.arm64-linux: $(WIZENG) $(MONITORS) build.sh
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng arm64-linux
+
+bin/objdump.arm64-linux: $(OBJDUMP) build.sh
+	./build.sh objdump arm64-linux
 
 # x86-64-linux targets
 bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
