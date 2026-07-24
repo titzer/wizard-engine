@@ -223,6 +223,42 @@ component Runtime {
 		if (!r) return stack.trap(TrapReason.ARRAY_OOB);
 		return null;
 	}
+	def FUNC_NEW(stack: ExecStack, outer: Instance, mem_index: u31, sig_index: u31, env_index: u31) -> Throwable {
+		// Get new code from outer module's memory.
+		var memory = outer.memories[mem_index], sc = memory.decl.size;
+		var size = stack.popa(sc);
+		var src = stack.popa(sc);
+		var r = memory.range_ol_64(src, size).then(Ranges.dup<byte>); // copy the code to avoid data races if multiple threads
+		if (r.reason != TrapReason.NONE) return stack.trap(r.reason); // trap if out-of-bounds
+		var instance = outer.environments[env_index], module = instance.module;
+		// Create a new function.
+		var func = FuncDecl.new(sig_index);
+		func.setOrigCode(r.result);
+		func.sig = SigDecl.!(outer.heaptypes[sig_index]);
+		func.func_index = module.functions.length + module.new_funcs++;
+		// Get the environment and create or use cached CodeValidator.
+		var env = outer.module.environments[env_index], validator = env.validator;
+		if (validator == null) {
+			env.validator = validator = CodeValidator.new(env.extensions, env.limits, module,
+				ErrorGen.new(module.filename));
+		}
+		var err = validator.err.reset();
+		// Inform the tiering configuration of new code, prior to validation.
+		Execute.tiering.onFuncBody(module, u32.!(func.func_index), func.orig_bytecode, err);
+		// Run validation and handle errors.
+		match (validator.validateFunc(func, 0)) {
+			Ok => ;
+			Error(error_code, error_pos, error_msg) => {
+// TODO				Trace.OUT.put3("error[%s]: %s @ +%d", error_code.name, error_msg, error_pos).ln();
+				return stack.trap(TrapReason.FUNC_INVALID); // trap if validation failed
+			}
+		}
+		// Create a new function instance wrapping the innner instance.
+		var wf = WasmFunction.new(instance, func);
+		Execute.tiering.onNewFunction(wf, err); // inform tiering a new function is validated and finished
+		stack.push(Value.Ref(wf));  // return funcref result
+		return null;
+	}
 	// --- Table operations -----------------------------------------------------------------------------------------
 	def TABLE_INIT(stack: ExecStack, instance: Instance, elem_index: u31, table_index: u31) -> Throwable {
 		var evals = instance.getElems(elem_index);

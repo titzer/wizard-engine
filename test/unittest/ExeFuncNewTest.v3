@@ -1,0 +1,288 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// ext:jit-interface: execution tests for the {func.new} bytecode, which compiles a
+// function body out of a memory and binds it to the declarations of an environment.
+def X_ = TestTiers.addTests([
+	("func.new", test_func_new),
+	("func.new_args", test_func_new_args),
+	("func.new_offset", test_func_new_offset),
+	("func.new_twice", test_func_new_twice),
+	("func.new_env_func", test_func_new_env_func),
+	("func.new_env_global", test_func_new_env_global),
+	("func.new_env_memory", test_func_new_env_memory),
+	("func.new_env_no_memory", test_func_new_env_no_memory),
+	("func.new_two_memories", test_func_new_two_memories),
+	("func.new_env_isolated", test_func_new_env_isolated),
+	("func.new_oob", test_func_new_oob),
+	("func.new_invalid", test_func_new_invalid),
+	("func.new_sig_mismatch", test_func_new_sig_mismatch),
+	("func.new_recompile", test_func_new_recompile)
+]);
+
+def I32C = u8.!(Opcode.I32_CONST.code);
+def END = u8.!(Opcode.END.code);
+def OFFSET = 16;	// where the generated code is placed in memory
+
+// Wraps {code} as a complete function body: an empty local declaration vector, the code,
+// and a terminating {end}. Note that, unlike an entry in the code section, the body given
+// to {func.new} has no size prefix.
+def body(code: Array<byte>) -> Array<byte> {
+	var b = BinBuilder.new();
+	b.put_u32leb(0);	// no local declaration groups
+	b.puta(code);
+	b.put(END);
+	return b.extract();
+}
+
+// Emits `i32.const {start}; i32.const {length}; func.new 0 {mem} {sig} {env}`.
+def emit_func_new(start: int, length: int, mem: byte, sig: SigDecl, env: EnvironDecl) -> BinBuilder {
+	var b = BinBuilder.new();
+	b.put(I32C).put_s32leb(start);
+	b.put(I32C).put_s32leb(length);
+	return emit_func_new0(b, mem, sig, env);
+}
+def emit_func_new0(b: BinBuilder, mem: byte, sig: SigDecl, env: EnvironDecl) -> BinBuilder {
+	b.put(Opcode.FUNC_NEW.prefix).put_u32leb(Opcode.FUNC_NEW.code);
+	b.put(0);		// reserved flags
+	b.put(mem);		// memory index, in the index space of the enclosing module
+	b.put_u32leb(u32.!(sig.heaptype_index));
+	b.put_u32leb(u32.!(env.environ_index));
+	return b;
+}
+def emit_call_ref(b: BinBuilder, sig: SigDecl) -> BinBuilder {
+	b.put(u8.!(Opcode.CALL_REF.code)).put_u32leb(u32.!(sig.heaptype_index));
+	return b;
+}
+
+// Gives {i} a one-page memory containing the generated function {code} at {OFFSET}.
+def add_code(i: ExeTester, code: Array<byte>) {
+	// ext:jit-interface implies ext:function-references, which {call_ref} on the result of
+	// {func.new} needs. Implications are applied when parsing engine options, not by the
+	// tests, so apply them here.
+	i.extensions |= Extensions.setImplications(Extension.JIT_INTERFACE);
+	i.addMemory(1, Max.Set(1));
+	i.addData(OFFSET, code);
+}
+// Declares an environment. Like the environment section of a binary module, this must come
+// after the declarations it maps into scope. Note that the memory holding the code need not
+// be mapped: the memory index immediate of {func.new} names a memory of the enclosing module.
+def new_env(i: ExeTester) -> EnvironDecl {
+	return i.newEnviron();
+}
+
+// Creates a function from the code at {OFFSET} of memory 0 and immediately calls it.
+def new_and_call(i: ExeTester, length: int, sig: SigDecl, env: EnvironDecl) {
+	i.codev(emit_call_ref(emit_func_new(OFFSET, length, 0, sig, env), sig).extract());
+}
+
+// A generated function that simply returns a constant.
+def test_func_new(i: ExeTester) {
+	var code = body([I32C, 42]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(42);
+}
+
+// A generated function that takes and returns arguments.
+def test_func_new_args(i: ExeTester) {
+	var code = body([u8.!(Opcode.LOCAL_GET.code), 1]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig(SigCache.ii_i);
+	var sig = i.newSig([ValueType.I32, ValueType.I32], [ValueType.I32]);
+
+	var b = BinBuilder.new();
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(0);
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(1);
+	b.put(I32C).put_s32leb(OFFSET);
+	b.put(I32C).put_s32leb(code.length);
+	i.codev(emit_call_ref(emit_func_new0(b, 0, sig, env), sig).extract());
+
+	i.args_ii(11, 22).assert2_i(22);
+	i.args_ii(33, 44).assert2_i(44);
+}
+
+// Only the requested range of memory is compiled; surrounding bytes are ignored.
+def test_func_new_offset(i: ExeTester) {
+	var code = body([I32C, 7]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.addData(OFFSET - 4, [0xFF, 0xFF, 0xFF, 0xFF]);		// garbage before
+	i.addData(OFFSET + code.length, [0xFF, 0xFF, 0xFF, 0xFF]);	// garbage after
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(7);
+}
+
+// The same code compiled twice yields two distinct, independently callable functions.
+def test_func_new_twice(i: ExeTester) {
+	var code = body([I32C, 5]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+
+	var b = emit_call_ref(emit_func_new(OFFSET, code.length, 0, sig, env), sig);
+	b.puta(emit_call_ref(emit_func_new(OFFSET, code.length, 0, sig, env), sig).extract());
+	b.put(u8.!(Opcode.I32_ADD.code));
+	i.codev(b.extract());
+	i.noargs().assert2_i(10);
+}
+
+// A generated function can call a function mapped into its environment.
+def test_func_new_env_func(i: ExeTester) {
+	var code = body([u8.!(Opcode.CALL.code), 0]);
+	add_code(i, code);
+	var callee = i.newFunction(SigCache.v_i, [I32C, 45]);
+	var env = new_env(i);
+	env.refOuterFunc(callee);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(45);
+}
+
+// A generated function can read a global mapped into its environment.
+def test_func_new_env_global(i: ExeTester) {
+	var code = body([u8.!(Opcode.GLOBAL_GET.code), 0]);
+	add_code(i, code);
+	var global = i.newImmGlobal(ValueType.I32, InitExpr.I32(1234));
+	var env = new_env(i);
+	env.refOuterGlobal(global);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(1234);
+}
+
+// A generated function can access the memory mapped into its environment, and sees the
+// same memory contents as the enclosing instance.
+def test_func_new_env_memory(i: ExeTester) {
+	var code = body([I32C, 0, u8.!(Opcode.I32_LOAD.code), /*align=*/2, /*offset=*/8]);
+	add_code(i, code);
+	i.addData(8, [0x44, 0x33, 0x22, 0x11]);
+	var env = new_env(i);
+	env.refOuterMemory(i.module.memories[0]);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(0x11223344);
+}
+
+// The environment's index spaces are renumbered from 0 and do not include declarations of
+// the enclosing module that were not mapped. Here the enclosing module has two functions,
+// but only the second is in scope, at environment index 0.
+def test_func_new_env_isolated(i: ExeTester) {
+	var code = body([u8.!(Opcode.CALL.code), 0]);
+	add_code(i, code);
+	i.newFunction(SigCache.v_i, [I32C, 1]);
+	var second = i.newFunction(SigCache.v_i, [I32C, 2]);
+	var env = new_env(i);
+	env.refOuterFunc(second);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(2);
+}
+
+// An out-of-bounds code range traps rather than compiling.
+def test_func_new_oob(i: ExeTester) {
+	var code = body([I32C, 42]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig0([ValueType.I32, ValueType.I32], SigCache.arr_v);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+
+	var b = BinBuilder.new();
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(0);
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(1);
+	emit_func_new0(b, 0, sig, env);
+	b.put(u8.!(Opcode.DROP.code));
+	i.codev(b.extract());
+
+	i.args_uu(u32.!(OFFSET), u32.view(code.length)).assert2_none();
+	i.args_uu(65536, 1).assert2_trap(TrapReason.MEMORY_OOB);
+	i.args_uu(65535, 2).assert2_trap(TrapReason.MEMORY_OOB);
+	i.args_uu(0, 65537).assert2_trap(TrapReason.MEMORY_OOB);
+	i.args_uu(0xFFFFFFFF, 1).assert2_trap(TrapReason.MEMORY_OOB);
+	i.args_uu(1, 0xFFFFFFFF).assert2_trap(TrapReason.MEMORY_OOB);
+}
+
+// Code that does not validate traps.
+def test_func_new_invalid(i: ExeTester) {
+	var code = body([u8.!(Opcode.I64_ADD.code)]);	// no operands on the stack
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_trap(TrapReason.FUNC_INVALID);
+}
+
+// Code whose body does not match the requested signature traps.
+def test_func_new_sig_mismatch(i: ExeTester) {
+	var code = body([u8.!(Opcode.I64_CONST.code), 42]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_trap(TrapReason.FUNC_INVALID);
+}
+
+// A failed compilation must not poison later compilations in the same environment.
+def test_func_new_recompile(i: ExeTester) {
+	def BAD = OFFSET + 64;
+	var code = body([I32C, 42]);
+	var bad = body([u8.!(Opcode.I64_ADD.code)]);
+	add_code(i, code);
+	var env = new_env(i);
+	i.addData(BAD, bad);
+	i.sig0([ValueType.I32, ValueType.I32], [ValueType.I32]);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+
+	var b = BinBuilder.new();
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(0);
+	b.put(u8.!(Opcode.LOCAL_GET.code)).put(1);
+	i.codev(emit_call_ref(emit_func_new0(b, 0, sig, env), sig).extract());
+
+	i.args_uu(u32.!(OFFSET), u32.view(code.length)).assert2_i(42);
+	i.args_uu(u32.!(BAD), u32.view(bad.length)).assert2_trap(TrapReason.FUNC_INVALID);
+	i.args_uu(u32.!(OFFSET), u32.view(code.length)).assert2_i(42);
+}
+
+// The memory holding the code does not have to be mapped into the environment: the memory
+// index immediate names a memory of the enclosing module, not one of the environment.
+def test_func_new_env_no_memory(i: ExeTester) {
+	var code = body([I32C, 27]);
+	add_code(i, code);
+	var env = new_env(i);		// maps nothing at all
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);
+	i.noargs().assert2_i(27);
+	if (env.module.memories.length != 0) i.t.fail("expected an environment with no memories");
+}
+
+// The memory index immediate of {func.new} and the memory indices inside the generated code
+// live in different index spaces. Here the code is read from memory 0 of the enclosing
+// module, while the generated function loads from memory 1, which the environment maps to
+// its own memory 0.
+def test_func_new_two_memories(i: ExeTester) {
+	var code = body([I32C, 0, u8.!(Opcode.I32_LOAD.code), /*align=*/2, /*offset=*/8]);
+	add_code(i, code);					// memory 0 holds the code
+	i.extensions |= Extension.MULTI_MEMORY;
+	i.addMemory(1, Max.Set(1));				// memory 1 holds the data
+	i.module.data.put(DataDecl.new(SegmentMode.Active(1, InitExpr.I32(8)), [0x44, 0x33, 0x22, 0x11]));
+	var env = new_env(i);
+	env.refOuterMemory(i.module.memories[1]);
+	i.sig(SigCache.v_i);
+	var sig = i.newSig(SigCache.arr_v, [ValueType.I32]);
+	new_and_call(i, code.length, sig, env);			// reads the code from memory 0
+	i.noargs().assert2_i(0x11223344);
+}
