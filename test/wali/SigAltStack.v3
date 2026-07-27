@@ -1,0 +1,75 @@
+// The guest's alternate signal stack is per-instance state, distinct from the one the
+// engine's runtime installs for itself. A guest that has not set one must see
+// SS_DISABLE and a zeroed stack, and a stack it does set must read back unchanged.
+import component wali {
+	def SYS_write(fd: i32, buf: Pointer, count: i32) -> i64;
+	def SYS_sigaltstack(uss: Pointer, uoss: Pointer) -> i64;
+	def SYS_mmap(addr: Pointer, len: i32, prot: i32, flags: i32, fd: i32, offset: i64) -> i64;
+}
+
+def STDOUT = 1;
+def SS_DISABLE = 2;
+def STACK_SIZE = 8192;
+def PROT_READ = 0x1;
+def PROT_WRITE = 0x2;
+def MAP_PRIVATE = 0x02;
+def MAP_ANONYMOUS = 0x20;
+def WASM_PAGE_SIZE = 65536;
+
+def main() -> i64 {
+	var got = Array<int>.new(3); // stack_t { void* ss_sp; int ss_flags; size_t ss_size; }
+
+	check("query succeeds", wali.SYS_sigaltstack(Pointer.NULL, Pointer.atContents(got)) == 0);
+	check("starts disabled", got[1] == SS_DISABLE);
+	check("starts with no stack", got[0] == 0 && got[2] == 0);
+
+	var mem = Array<byte>.new(STACK_SIZE);
+	var set = Array<int>.new(3);
+	set[0] = int.!(Pointer.atContents(mem) - Pointer.NULL);
+	set[1] = 0;
+	set[2] = STACK_SIZE;
+	check("install", wali.SYS_sigaltstack(Pointer.atContents(set), Pointer.NULL) == 0);
+
+	for (i < 3) got[i] = 0;
+	check("query after install", wali.SYS_sigaltstack(Pointer.NULL, Pointer.atContents(got)) == 0);
+	check("ss_sp round-trips", got[0] == set[0]);
+	check("ss_size round-trips", got[2] == STACK_SIZE);
+	check("no longer disabled", (got[1] & SS_DISABLE) == 0);
+
+	// A stack outside linear memory, or an unknown flag, must be rejected.
+	var bad = Array<int>.new(3);
+	bad[0] = 0x7ffffff0; bad[1] = 0; bad[2] = STACK_SIZE;
+	check("out-of-bounds stack rejected", wali.SYS_sigaltstack(Pointer.atContents(bad), Pointer.NULL) < 0);
+	bad[0] = set[0]; bad[1] = 0x40;
+	check("unknown flag rejected", wali.SYS_sigaltstack(Pointer.atContents(bad), Pointer.NULL) < 0);
+
+	// A stack_t that runs off the end of linear memory must be rejected whole: no field
+	// of it may be written and the installed stack must survive unchanged. Growing the
+	// memory by one page puts a known boundary four bytes into the struct.
+	var grown = wali.SYS_mmap(Pointer.NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	check("mmap", grown >= 0);
+	var edge = Pointer.NULL + (int.!(grown) + WASM_PAGE_SIZE - 4);
+	edge.store<int>(0x5A5A5A5A); // only ss_sp is in bounds; the other two fields are not
+	check("straddling uoss rejected", wali.SYS_sigaltstack(Pointer.NULL, edge) < 0);
+	check("no field of it was written", edge.load<int>() == 0x5A5A5A5A);
+	check("straddling uss rejected", wali.SYS_sigaltstack(edge, Pointer.NULL) < 0);
+	for (i < 3) got[i] = 0;
+	check("query still works", wali.SYS_sigaltstack(Pointer.NULL, Pointer.atContents(got)) == 0);
+	check("stack survived the rejected calls", got[0] == set[0] && got[2] == STACK_SIZE);
+
+	var off = Array<int>.new(3);
+	off[1] = SS_DISABLE;
+	check("disable", wali.SYS_sigaltstack(Pointer.atContents(off), Pointer.NULL) == 0);
+	check("query after disable", wali.SYS_sigaltstack(Pointer.NULL, Pointer.atContents(got)) == 0);
+	check("disabled again", got[1] == SS_DISABLE && got[0] == 0 && got[2] == 0);
+	return 0;
+}
+
+def check(name: string, cond: bool) {
+	print(name);
+	print(if(cond, ": ok\n", ": FAIL\n"));
+}
+
+def print(str: string) {
+	wali.SYS_write(STDOUT, Pointer.atContents(str), str.length);
+}
