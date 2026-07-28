@@ -1,0 +1,12 @@
+(module
+  (type $ft (func (param i32 i32) (result i32)))
+  (memory 1)
+  (data (i32.const 16) "\00\20\01\0b")  ;; (func (param i32 i32) (result i32) (local.get 1))
+  (scope $s)
+  (func (export "main") (param i32 i32) (result i32)
+    (call_ref $ft (local.get 0) (local.get 1)
+      (func.new 0 $ft $s (i32.const 16) (i32.const 4)))
+  )
+)
+(assert_return (invoke "main" (i32.const 11) (i32.const 22)) (i32.const 22))
+(assert_return (invoke "main" (i32.const 33) (i32.const 44)) (i32.const 44))

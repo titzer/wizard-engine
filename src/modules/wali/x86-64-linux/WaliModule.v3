@@ -352,12 +352,41 @@ def unused_ = HostModuleBuilderOf<WaliInstance>.new("wali", WaliInstance.new, Wa
 
 def TODO_ZERO = 0;
 def TODO_EMPTY = ();
-def TODO_UNIMPLEMENTED: long = WaliErrno.ENOSYS.code; // returned for any unimplemented call.
+
+def neg(e: WaliErrno) => 0L - e.code;
+
+def TODO_UNIMPLEMENTED = neg(WaliErrno.ENOSYS); // returned for any unimplemented call.
+
+def PR_SET_NAME = 15;	// prctl() options that take a guest pointer in arg2
+def PR_GET_NAME = 16;
+
+def IOV_MAX = 1024;
+def POLL_MAX = 4096;
+def FD_SETSIZE = 1024;
+def FD_SET_WORDS = FD_SETSIZE / 64;
+def AT_FDCWD = -100;	// "relative to cwd" sentinel accepted by the *at() syscalls
+def HOST_PAGE_SIZE = 4096;
+def WASM_PAGE_SIZE = 65536u;
+def SS_DISABLE = 2;	// sigaltstack flags
+def MINSIGSTKSZ = 2048u;
+def MREMAP_MAYMOVE = 1;
+def MREMAP_FIXED = 2;
+
+def F_DUPFD = 0;	// fcntl() commands
+def F_GETLK = 5;	// ...the ones below take a guest pointer in the third argument
+def F_SETLK = 6;
+def F_SETLKW = 7;
+def F_SETOWN_EX = 15;
+def F_GETOWN_EX = 16;
+def F_DUPFD_CLOEXEC = 1030;
 
 // Implements the "wali" module interface as a host module.
 class WaliInstance {
 	private var memory: Memory;
 	private def fdmap = FileDescriptorMap.new(1000); // per-instance: fd table
+	private var altstack_sp: u32;		// per-instance: guest alternate signal stack
+	private var altstack_size: u32;
+	private var altstack_on: bool;
 	private var cmdline_args: Array<string>; // global: environment
 	private var cmdline_env: Array<string>; // global: environment, TODO
 	private var trace: bool;
@@ -394,6 +423,144 @@ class WaliInstance {
 		if (memory == null) return MaybeTrap(null, TrapReason.MEMORY_OOB);
 		return memory.range_ol_32(u32.view(buf), u32.view(len));
 	}
+	// Translate a guest pointer into a host pointer for an argument the kernel treats
+	// as optional, i.e. a guest NULL becomes a host NULL.
+	def getPtr(buf: int, len: int) -> MaybeTrap<Pointer> {
+		if (buf == 0) return MaybeTrap(Pointer.NULL, TrapReason.NONE);
+		var r = getRegion(buf, len);
+		if (r.reason != TrapReason.NONE) return MaybeTrap(Pointer.NULL, r.reason);
+		return MaybeTrap(Pointer.atContents(r.result), TrapReason.NONE);
+	}
+	// Binds the host {sysfd} returned by a successful syscall to a fresh guest fd and returns
+	// the guest fd. If the guest fd table is full, closes the host fd and reports EMFILE
+	// rather than leaking it.
+	// Translates a directory fd. AT_FDCWD is a sentinel rather than a guest fd and passes
+	// through unchanged.
+	def getDirFd(fd: int) -> int {
+		return if(fd == AT_FDCWD, AT_FDCWD, fdmap.get(fd));
+	}
+	def bindFd(sysfd: long) -> long {
+		var hostfd = int.!(sysfd);
+		var guestfd = fdmap.alloc();
+		if (guestfd < 0 || !fdmap.set(guestfd, hostfd)) {
+			Linux.syscall(LinuxConst.SYS_close, hostfd);
+			return neg(WaliErrno.EMFILE);
+		}
+		return guestfd;
+	}
+	// Rewrites the pair of fds the kernel wrote into guest memory at {ptr} from host fds
+	// into guest fds.
+	def bindFdPair(ptr: int) -> long {
+		for (i: u32 < 2) {
+			var index = i << 2;
+			var hostfd = memory.read_u32(u32.view(ptr), index);
+			if (hostfd.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+			var guestfd = bindFd(long.view(hostfd.result));
+			if (guestfd < 0) return guestfd;
+			if (memory.write_u32(u32.view(ptr), index, u32.!(guestfd)) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		}
+		return 0;
+	}
+
+	// Builds a host iovec array from the guest's, translating each base pointer.
+	def copyIovec(iov: int, iovcnt: int) -> Array<byte> {
+		if (iovcnt < 0 || iovcnt > IOV_MAX) return null;
+		var guest = getRegion(iov, iovcnt * WaliStruct_iovec.size);
+		if (guest.reason != TrapReason.NONE) return null;
+		var host = Array<byte>.new(iovcnt * iovec.size);
+		for (i < iovcnt) {
+			var g = Ref<WaliStruct_iovec>.of(guest.result[WaliStruct_iovec.size * i ...]);
+			var p = getPtr(int.view(g.iov_base), int.view(g.iov_len));
+			if (p.reason != TrapReason.NONE) return null;
+			var h = Ref<iovec>.at(host, iovec.size * i);
+			h.iov_base = u64.view(p.result - Pointer.NULL);
+			h.iov_len = g.iov_len;
+		}
+		return host;
+	}
+
+	// Builds a host pollfd array from the guest's. {struct pollfd} has the same 8-byte
+	// layout on both sides, but holds guest fds. Each entry is packed as
+	// fd | events<<32 | revents<<48. A negative fd tells the kernel to ignore the entry
+	// and passes through unchanged.
+	def copyPollfd(fds: int, nfds: int) -> Array<u64> {
+		var host = Array<u64>.new(nfds);
+		for (i < nfds) {
+			var gfd = memory.read_u32(u32.view(fds), u32.!(i * 8));
+			if (gfd.reason != TrapReason.NONE) return null;
+			var ev = memory.read_u32(u32.view(fds), u32.!(i * 8 + 4));
+			if (ev.reason != TrapReason.NONE) return null;
+			var g = int.view(gfd.result);
+			var h = if(g < 0, g, fdmap.get(g));
+			host[i] = u64.view(u32.view(h)) | (u64.view(ev.result & 0xFFFF) << 32);
+		}
+		return host;
+	}
+	// Copies the revents the kernel produced back into the guest's pollfd array.
+	def writePollRevents(fds: int, nfds: int, host: Array<u64>) -> TrapReason {
+		for (i < nfds) {
+			var r = memory.write_u16(u32.view(fds), u32.!(i * 8 + 6), u16.view(host[i] >> 48));
+			if (r != TrapReason.NONE) return r;
+		}
+		return TrapReason.NONE;
+	}
+
+	// Builds a host fd_set from the guest's. The bitmaps are indexed by fd number, and a
+	// guest fd is not a host fd, so every set bit has to be moved to its host position.
+	// Returns the highest host fd seen plus one (the nfds to pass on), or -1 on error.
+	def copyFdSet(guest: int, nfds: int, host: Array<u64>) -> int {
+		var maxfd = -1;
+		for (g < nfds) {
+			var word = memory.read_u32(u32.view(guest), u32.!((g >> 5) << 2));
+			if (word.reason != TrapReason.NONE) return -1;
+			if (((word.result >> u5.view(g)) & 1) == 0) continue;
+			var h = fdmap.get(g);
+			if (h < 0 || h >= FD_SETSIZE) return -1;
+			host[h >> 6] |= 1uL << u6.view(h);
+			if (h > maxfd) maxfd = h;
+		}
+		return maxfd + 1;
+	}
+	// Copies a host fd_set back into the guest's. select() reports readiness by clearing
+	// every bit that is not ready, so all of [0, nfds) is rewritten, not just the set bits.
+	def writeFdSet(guest: int, nfds: int, host: Array<u64>) -> TrapReason {
+		for (g < nfds) {
+			var h = fdmap.get(g);
+			var ready = h >= 0 && h < FD_SETSIZE && ((host[h >> 6] >> u6.view(h)) & 1) != 0;
+			var index = u32.!((g >> 5) << 2);
+			var word = memory.read_u32(u32.view(guest), index);
+			if (word.reason != TrapReason.NONE) return word.reason;
+			var mask = 1u << u5.view(g);
+			var updated = if(ready, word.result | mask, word.result & ~mask);
+			var r = memory.write_u32(u32.view(guest), index, updated);
+			if (r != TrapReason.NONE) return r;
+		}
+		return TrapReason.NONE;
+	}
+
+	// Builds a host {struct msghdr} from the guest's, along with the host iovec array it
+	// refers to. The caller stores the iovec pointer into {msg_iov} immediately before the
+	// syscall, once nothing more can allocate.
+	def copyMsghdr(msg: int) -> (Array<byte>, Array<byte>) {
+		var guest = getRegion(msg, WaliStruct_msghdr.size);
+		if (guest.reason != TrapReason.NONE) return (null, null);
+		var g = Ref<WaliStruct_msghdr>.of(guest.result);
+		var name = getPtr(int.view(g.msg_name), int.view(g.msg_namelen));
+		if (name.reason != TrapReason.NONE) return (null, null);
+		var ctl = getPtr(int.view(g.msg_control), int.view(g.msg_controllen));
+		if (ctl.reason != TrapReason.NONE) return (null, null);
+		var iov = copyIovec(int.view(g.msg_iov), int.view(g.msg_iovlen));
+		if (iov == null) return (null, null);
+		var host = Array<byte>.new(msghdr.size);
+		var h = Ref<msghdr>.at(host, 0);
+		h.msg_name = u64.view(name.result - Pointer.NULL);
+		h.msg_namelen = g.msg_namelen;
+		h.msg_iovlen = g.msg_iovlen;
+		h.msg_control = u64.view(ctl.result - Pointer.NULL);
+		h.msg_controllen = g.msg_controllen;
+		h.msg_flags = g.msg_flags;
+		return (host, iov);
+	}
 
 	//========================================================================================
 	// Implementations of exported host functions.
@@ -401,25 +568,23 @@ class WaliInstance {
 	def read(fd: int, buf: int, len: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, len);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_read, (sys_fd, Pointer.atContents(region.result), len)).0;
 	}
 	//========================================================================================
 	def write(fd: int, buf: int, len: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, len);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_write, (sys_fd, Pointer.atContents(region.result), len)).0;
 	}
 	//========================================================================================
 	def open(path: int, flags: int, mode: int) -> long {
 		var region = getPath(u32.view(path));
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r = Linux.syscall(LinuxConst.SYS_open, (Pointer.atContents(region.result), flags, mode)).0;
 		if (r < 0) return r;
-		var fd = fdmap.alloc();
-		fdmap.set(fd, int.!(r));
-		return fd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def close(fd: int) -> long {
@@ -432,12 +597,11 @@ class WaliInstance {
 		var sys_fd = fdmap.get(fd);
 		var r = Linux.syscall(LinuxConst.SYS_dup, sys_fd).0;
 		if (r < 0) return r;
-		var fd = fdmap.alloc();
-		fdmap.set(fd, int.!(r));
-		return r;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def dup2(oldfd: int, newfd: int) -> long {
+		if (!fdmap.in_range(newfd)) return neg(WaliErrno.EBADF); // guest-supplied index
 		var sys_oldfd = fdmap.get(oldfd), sys_newfd = fdmap.get(newfd);
 		if (sys_newfd >= 0) {
 			var r = Linux.syscall(LinuxConst.SYS_dup2, (sys_oldfd, sys_newfd)).0;
@@ -451,6 +615,7 @@ class WaliInstance {
 	}
 	//========================================================================================
 	def dup3(oldfd: int, newfd: int, flags: int) -> long {
+		if (!fdmap.in_range(newfd)) return neg(WaliErrno.EBADF); // guest-supplied index
 		var sys_oldfd = fdmap.get(oldfd), sys_newfd = fdmap.get(newfd);
 		if (sys_newfd < 0) {
 			var r = Linux.syscall(LinuxConst.SYS_dup, (sys_oldfd)).0;
@@ -465,9 +630,9 @@ class WaliInstance {
 	//========================================================================================
 	def stat(path: int, buf: int) -> long {
 		var region = getPath(u32.view(path));
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var statbuf = getRegion(buf, WaliStruct_stat.size);
-		if (statbuf.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (statbuf.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_stat, (Pointer.atContents(region.result), Pointer.atContents(statbuf.result))).0;
 	}
 	//========================================================================================
@@ -486,164 +651,278 @@ class WaliInstance {
 	//========================================================================================
 	def access(path: int, mode: int) -> long {
 		var region = getPath(u32.view(path));
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_access, (Pointer.atContents(region.result), mode)).0;
 	}
 	//========================================================================================
-	def exit_group(code: int) => TODO_UNIMPLEMENTED;
+	def exit_group(code: int) -> long {
+		return Linux.syscall(LinuxConst.SYS_exit_group, (code)).0;
+	}
 	//========================================================================================
 	def sched_getaffinity(pid: int, cpusetsize: int, mask_ptr: int) -> long {
 		var m = getRegion(mask_ptr, cpusetsize);
-		if (m.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (m.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_sched_getaffinity, (pid, cpusetsize, Pointer.atContents(m.result))).0;
 	}
 	//========================================================================================
 	def set_tid_address(tidptr: int) -> long {
 		var t = getRegion(tidptr, 4);
-		if (t.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_set_tid_address, (Pointer.atContents(t.result))).0;
 	}
 	//========================================================================================
 	def mmap(addr: int, length: int, prot: int, flags: int, fd: int, offset: long) -> long {
 	    def X86_PAGE_SIZE = 4096u;
 	    def WASM_PAGE_SIZE = 65536u;
-	    def EINVAL = -22;
 
-	    if (length <= 0) return WaliErrno.EINVAL.code;
-	    if ((u64.view(offset) % X86_PAGE_SIZE) != 0u) return WaliErrno.EINVAL.code;
+	    if (length <= 0) return neg(WaliErrno.EINVAL);
+	    if ((u64.view(offset) % X86_PAGE_SIZE) != 0u) return neg(WaliErrno.EINVAL);
 
 	    var need = u64.view(length);
 	    var wasm_pages = (need + (WASM_PAGE_SIZE - 1u)) / WASM_PAGE_SIZE;
-	    var final_addr = Pointer.NULL + long.view(memory.num_bytes);
+	    // The guest can only address linear memory, so satisfy the mapping by growing the
+	    // memory and mapping over the freshly added pages. {guest_addr} is the offset the
+	    // guest will see; it is a wasm page boundary and therefore also host-page aligned.
+	    var guest_addr = memory.num_bytes;
 
-	    if (wasm_pages > 0u && memory.grow(wasm_pages) == -1) return WaliErrno.ENOMEM.code;
+	    if (wasm_pages > 0u && memory.grow(wasm_pages) == -1) return neg(WaliErrno.ENOMEM);
 
+	    // MAP_FIXED takes the *host* address of these pages.
+	    var host_addr = memory.getMemBase64() + guest_addr;
 	    var host_fd = if(fd < 0, fd, fdmap.get(fd));
 	    var want_flags = if(fd == -1, flags | LinuxConst.MAP_ANONYMOUS, flags);
 	    var ret = Linux.syscall(
 		LinuxConst.SYS_mmap,
-		(u64.view(final_addr - Pointer.NULL), length, prot, want_flags | LinuxConst.MAP_FIXED, host_fd, offset)
+		(host_addr, length, prot, want_flags | LinuxConst.MAP_FIXED, host_fd, offset)
 	    ).0;
 	    if (ret < 0) return ret;
-	    return long.view(final_addr - Pointer.NULL);
+	    return long.view(guest_addr);
 	}
 	//========================================================================================
-	def fcntl(fd: int, cmd: int, arg: long) => TODO_UNIMPLEMENTED;
+	// Whether {arg} is a guest pointer or a plain integer depends on {cmd}; only the
+	// record-locking and owner commands take a pointer. F_DUPFD/F_DUPFD_CLOEXEC return a
+	// new descriptor, which has to be bound into the guest fd table like any other.
+	def fcntl(fd: int, cmd: int, arg: long) -> long {
+		var sys_fd = fdmap.get(fd);
+		match (cmd) {
+			F_GETLK, F_SETLK, F_SETLKW, F_SETOWN_EX, F_GETOWN_EX => {
+				var p = getPtr(int.!(arg), /*flock*/ 32);
+				if (p.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+				return Linux.syscall(LinuxConst.SYS_fcntl, (sys_fd, cmd, p.result)).0;
+			}
+			F_DUPFD, F_DUPFD_CLOEXEC => {
+				// {arg} is the lowest guest fd to allocate from; the host picks its own
+				// number, so ask for anything and rebind the result.
+				var r = Linux.syscall(LinuxConst.SYS_fcntl, (sys_fd, cmd, 0)).0;
+				if (r < 0) return r;
+				return bindFd(r);
+			}
+		}
+		return Linux.syscall(LinuxConst.SYS_fcntl, (sys_fd, cmd, arg)).0;
+	}
 	//========================================================================================
 	def sysinfo(info_ptr: int) -> long {
 		var ireg = getRegion(info_ptr, wali_sysinfo.size);
-		if (ireg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (ireg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_sysinfo, (Pointer.atContents(ireg.result))).0;
 	}
 	//========================================================================================
 	def brk(brk: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def prlimit64(pid: int, resource: int, new_limit_ptr: int, old_limit_ptr: int) -> long {
-		var n = getRegion(new_limit_ptr, wali_rlimit64.size);
-		if (new_limit_ptr != 0 && n.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var o = getRegion(old_limit_ptr, wali_rlimit64.size);
-		if (old_limit_ptr != 0 && o.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_prlimit64, (pid, resource, Pointer.atContents(n.result), Pointer.atContents(o.result))).0;
+		var n = getPtr(new_limit_ptr, wali_rlimit64.size);
+		if (n.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var o = getPtr(old_limit_ptr, wali_rlimit64.size);
+		if (o.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_prlimit64, (pid, resource, n.result, o.result)).0;
 	}
 	//========================================================================================
 	def getrlimit(resource: int, rlim_ptr: int) -> long {
 		var rreg = getRegion(rlim_ptr, wali_rlimit.size);
-		if (rreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (rreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getrlimit, (resource, Pointer.atContents(rreg.result))).0;
 	}
 	//========================================================================================
 	def mprotect(addr: int, len: int, prot: int) -> long {
-		var n = getRegion(addr, len);
-		if (addr != 0 && n.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_mprotect, (Pointer.atContents(n.result), n.result.length, prot)).0;
+		var n = getPtr(addr, len);
+		if (n.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_mprotect, (n.result, len, prot)).0;
 	}
 	//========================================================================================
-	def mremap(old_addr: int, old_size: int, new_size: int, flags: int, new_addr: int) => TODO_UNIMPLEMENTED;
+	// Like mmap, the only addresses the guest can name are linear memory offsets, so the
+	// mapping is always moved to freshly grown pages at the end of memory and the guest's
+	// requested {new_addr} is ignored.
+	def mremap(old_addr: int, old_size: int, new_size: int, flags: int, new_addr: int) -> long {
+		if (old_size <= 0 || new_size <= 0) return neg(WaliErrno.EINVAL);
+		if ((old_addr % HOST_PAGE_SIZE) != 0) return neg(WaliErrno.EINVAL);
+		var old = getPtr(old_addr, old_size);
+		if (old.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (old.result == Pointer.NULL) return neg(WaliErrno.EINVAL);
+		var wasm_pages = (u64.view(new_size) + (WASM_PAGE_SIZE - 1u)) / WASM_PAGE_SIZE;
+		var guest_addr = memory.num_bytes;
+		if (memory.grow(wasm_pages) == -1) return neg(WaliErrno.ENOMEM);
+		var host_addr = memory.getMemBase64() + guest_addr;
+		var r = Linux.syscall(LinuxConst.SYS_mremap,
+			(old.result, old_size, new_size, MREMAP_MAYMOVE | MREMAP_FIXED, host_addr)).0;
+		if (r < 0) return r;
+		// Restore ordinary pages over the vacated range to keep linear memory whole.
+		Linux.syscall(LinuxConst.SYS_mmap, (old.result, old_size,
+			LinuxConst.PROT_READ | LinuxConst.PROT_WRITE,
+			LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS | LinuxConst.MAP_FIXED, -1, 0L));
+		return long.view(guest_addr);
+	}
 	//========================================================================================
-	def munmap(addr: int, len: int) => TODO_UNIMPLEMENTED;
+	// Resets the range to plain anonymous pages instead of unmapping it, dropping any file
+	// backing while keeping every address in linear memory readable. Linear memory has no
+	// holes: every offset below its length stays addressable by the guest.
+	def munmap(addr: int, len: int) -> long {
+		if (len <= 0) return neg(WaliErrno.EINVAL);
+		if ((addr % HOST_PAGE_SIZE) != 0) return neg(WaliErrno.EINVAL);
+		var p = getPtr(addr, len);
+		if (p.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (p.result == Pointer.NULL) return neg(WaliErrno.EINVAL);
+		var r = Linux.syscall(LinuxConst.SYS_mmap, (p.result, len,
+			LinuxConst.PROT_READ | LinuxConst.PROT_WRITE,
+			LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS | LinuxConst.MAP_FIXED, -1, 0L)).0;
+		return if(r < 0, r, 0);
+	}
 	//========================================================================================
 	def fstat(fd: int, buf: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var statbuf = getRegion(buf, WaliStruct_stat.size);
-		if (statbuf.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (statbuf.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_fstat, (sys_fd, Pointer.atContents(statbuf.result))).0;
 	}
 	//========================================================================================
 	def fstatat(dirfd: int, path: int, buf: int, flags: int) -> long {
-		var sys_dirfd = fdmap.get(dirfd);
+		var sys_dirfd = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var b = getRegion(buf, WaliStruct_stat.size);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_fstatat, (sys_dirfd, Pointer.atContents(pr.result), Pointer.atContents(b.result), flags)).0;
 	}
 	//========================================================================================
 	def lstat(path: int, buf: int) -> long {
 		var region = getPath(u32.view(path));
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var statbuf = getRegion(buf, WaliStruct_stat.size);
-		if (statbuf.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (statbuf.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_lstat, (Pointer.atContents(region.result), Pointer.atContents(statbuf.result))).0;
 	}
 	//========================================================================================
-	def writev(fd: int, iov: int, iovcnt: int) => TODO_UNIMPLEMENTED;
+	def writev(fd: int, iov: int, iovcnt: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var host = copyIovec(iov, iovcnt);
+		if (host == null) return neg(WaliErrno.EINVAL);
+		return Linux.syscall(LinuxConst.SYS_writev, (sys_fd, Pointer.atContents(host), iovcnt)).0;
+	}
 	//========================================================================================
 	def ioctl(fd: int, request: int, arg: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		// arg may be pointer or integer; pass as-is
-		var argptr = u64.view(arg);
-		return Linux.syscall(LinuxConst.SYS_ioctl, (sys_fd, request, argptr)).0;
+		var argptr = getPtr(arg, 4);
+		if (argptr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_ioctl, (sys_fd, request, argptr.result)).0;
 	}
 	//========================================================================================
 	def futex(uaddr: int, op: int, val: int, timeout_ptr: int, uaddr2: int, val3: int) -> long {
 		var a1 = getRegion(uaddr, 4);
-		if (a1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var t = getRegion(timeout_ptr, 16);
-		if (timeout_ptr != 0 && t.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var a2 = getRegion(uaddr2, 4);
-		if (uaddr2 != 0 && a2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_futex, (Pointer.atContents(a1.result), op, val, Pointer.atContents(t.result), Pointer.atContents(a2.result), val3)).0;
+		if (a1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var t = getPtr(timeout_ptr, 16);
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var a2 = getPtr(uaddr2, 4);
+		if (a2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_futex, (Pointer.atContents(a1.result), op, val, t.result, a2.result, val3)).0;
 	}
 	//========================================================================================
 	def rt_sigprocmask(how: int, set: int, oldset: int, sigsetsize: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
-	def tkill(tid: int, sig: int) => TODO_UNIMPLEMENTED;
+	def tkill(tid: int, sig: int) -> long {
+		return Linux.syscall(LinuxConst.SYS_tkill, (tid, sig)).0;
+	}
 	//========================================================================================
 	def rt_sigaction(sig: int, act: int, oact: int, sigsetsize: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
-	def poll(fds: int, nfds: long, timeout: int) => TODO_UNIMPLEMENTED;
+	def poll(fds: int, nfds: long, timeout: int) -> long {
+		var n = int.!(nfds);
+		if (n < 0 || n > POLL_MAX) return neg(WaliErrno.EINVAL);
+		var host = copyPollfd(fds, n);
+		if (host == null) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_poll, (Pointer.atContents(host), n, timeout)).0;
+		if (r < 0) return r;
+		if (writePollRevents(fds, n, host) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return r;
+	}
 	//========================================================================================
 	def rt_sigreturn(unused: long) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def pread64(fd: int, buf: int, count: int, offset: long) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, count);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_pread64, (sys_fd, Pointer.atContents(region.result), count, offset)).0;
 	}
 	//========================================================================================
 	def pwrite64(fd: int, buf: int, count: int, offset: long) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, count);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_pwrite64, (sys_fd, Pointer.atContents(region.result), count, offset)).0;
 	}
 	//========================================================================================
-	def readv(fd: int, vec: int, vlen: int) => TODO_UNIMPLEMENTED;
+	def readv(fd: int, vec: int, vlen: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var host = copyIovec(vec, vlen);
+		if (host == null) return neg(WaliErrno.EINVAL);
+		return Linux.syscall(LinuxConst.SYS_readv, (sys_fd, Pointer.atContents(host), vlen)).0;
+	}
 	//========================================================================================
-	def pipe(fds_ptr: int) => TODO_UNIMPLEMENTED;
+	def pipe(fds_ptr: int) -> long {
+		var reg = getPtr(fds_ptr, 8);
+		if (reg.reason != TrapReason.NONE || reg.result == Pointer.NULL) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_pipe, (reg.result)).0;
+		if (r < 0) return r;
+		return bindFdPair(fds_ptr);
+	}
 	//========================================================================================
-	def select(nfds: int, readfds: int, writefds: int, exceptfds: int, timeout: int) => TODO_UNIMPLEMENTED;
+	def select(nfds: int, readfds: int, writefds: int, exceptfds: int, timeout: int) -> long {
+		if (nfds < 0 || nfds > FD_SETSIZE) return neg(WaliErrno.EINVAL);
+		var rd = Array<u64>.new(FD_SET_WORDS), wr = Array<u64>.new(FD_SET_WORDS), ex = Array<u64>.new(FD_SET_WORDS);
+		var hnfds = 0;
+		if (readfds != 0) { var m = copyFdSet(readfds, nfds, rd); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		if (writefds != 0) { var m = copyFdSet(writefds, nfds, wr); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		if (exceptfds != 0) { var m = copyFdSet(exceptfds, nfds, ex); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		var t = getPtr(timeout, /*timeval*/ 16);
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		// No allocation may happen between taking these interior pointers and the call.
+		var pr = if(readfds != 0, Pointer.atContents(rd), Pointer.NULL);
+		var pw = if(writefds != 0, Pointer.atContents(wr), Pointer.NULL);
+		var pe = if(exceptfds != 0, Pointer.atContents(ex), Pointer.NULL);
+		var r = Linux.syscall(LinuxConst.SYS_select, (hnfds, pr, pw, pe, t.result)).0;
+		if (r < 0) return r;
+		if (readfds != 0 && writeFdSet(readfds, nfds, rd) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (writefds != 0 && writeFdSet(writefds, nfds, wr) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (exceptfds != 0 && writeFdSet(exceptfds, nfds, ex) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return r;
+	}
 	//========================================================================================
 	def sched_yield() -> long {
 		return Linux.syscall(LinuxConst.SYS_sched_yield, ()).0;
 	}
 	//========================================================================================
-	def msync(addr: int, len: int, flags: int) => TODO_UNIMPLEMENTED;
+	def msync(addr: int, len: int, flags: int) -> long {
+		var p = getPtr(addr, len);
+		if (p.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_msync, (p.result, len, flags)).0;
+	}
 	//========================================================================================
 	def mincore(start: int, len: int, vec: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
-	def madvise(addr: int, len: int, advice: int) => TODO_UNIMPLEMENTED;
+	def madvise(addr: int, len: int, advice: int) -> long {
+		var p = getPtr(addr, len);
+		if (p.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_madvise, (p.result, len, advice)).0;
+	}
 	//========================================================================================
 	def fadvise(fd: int, offset: long, len: long, advice: int) -> long {
 		var sys_fd = fdmap.get(fd);
@@ -659,11 +938,11 @@ class WaliInstance {
 	def pause() => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def nanosleep(req_ptr: int, rem_ptr: int) -> long {
-		var rreg = getRegion(req_ptr, /*timespec*/ 16);
-		if (req_ptr != 0 && rreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var mreg = getRegion(rem_ptr, /*timespec*/ 16);
-		if (rem_ptr != 0 && mreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atContents(rreg.result), Pointer.atContents(mreg.result))).0;
+		var rreg = getPtr(req_ptr, /*timespec*/ 16);
+		if (rreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var mreg = getPtr(rem_ptr, /*timespec*/ 16);
+		if (mreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_nanosleep, (rreg.result, mreg.result)).0;
 	}
 	//========================================================================================
 	def getitimer(which: int, value: int) => TODO_UNIMPLEMENTED;
@@ -673,11 +952,11 @@ class WaliInstance {
 	}
 	//========================================================================================
 	def setitimer(which: int, newptr: int, oldptr: int) -> long {
-		var n = getRegion(newptr, /*itimerval*/ 32);
-		if (newptr != 0 && n.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var o = getRegion(oldptr, /*itimerval*/ 32);
-		if (oldptr != 0 && o.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_setitimer, (which, Pointer.atContents(n.result), Pointer.atContents(o.result))).0;
+		var n = getPtr(newptr, /*itimerval*/ 32);
+		if (n.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var o = getPtr(oldptr, /*itimerval*/ 32);
+		if (o.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_setitimer, (which, n.result, o.result)).0;
 	}
 	//========================================================================================
 	def getpid() -> long {
@@ -689,54 +968,74 @@ class WaliInstance {
 	def socket(domain: int, stype: int, protocol: int) -> long {
 		var r = Linux.syscall(LinuxConst.SYS_socket, (domain, stype, protocol)).0;
 		if (r < 0) return r;
-		var fd = fdmap.alloc();
-		fdmap.set(fd, int.!(r));
-		return fd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def connect(fd: int, addr_ptr: int, addrlen: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var areg = getRegion(addr_ptr, addrlen);
-		if (addr_ptr != 0 && areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_connect, (sys_fd, Pointer.atContents(areg.result), addrlen)).0;
+		var areg = getPtr(addr_ptr, addrlen);
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_connect, (sys_fd, areg.result, addrlen)).0;
 	}
 	//========================================================================================
 	def accept(fd: int, addr_ptr: int, addrlen_ptr: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var areg = getRegion(addr_ptr, /*max addr len*/ 128);
-		if (addr_ptr != 0 && areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var alenreg = getRegion(addrlen_ptr, 4);
-		if (addrlen_ptr != 0 && alenreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var r = Linux.syscall(LinuxConst.SYS_accept, (sys_fd, Pointer.atContents(areg.result), Pointer.atContents(alenreg.result))).0;
+		var areg = getPtr(addr_ptr, /*max addr len*/ 128);
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var alenreg = getPtr(addrlen_ptr, 4);
+		if (alenreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_accept, (sys_fd, areg.result, alenreg.result)).0;
 		if (r < 0) return r;
-		var guestfd = fdmap.alloc();
-		fdmap.set(guestfd, int.!(r));
-		return guestfd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def sendto(fd: int, buf: int, len: int, flags: int, dest: int, addrlen: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, len);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var dreg = getRegion(dest, addrlen);
-		if (dest != 0 && dreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_sendto, (sys_fd, Pointer.atContents(region.result), len, flags, Pointer.atContents(dreg.result), addrlen)).0;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var dreg = getPtr(dest, addrlen);
+		if (dreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_sendto, (sys_fd, Pointer.atContents(region.result), len, flags, dreg.result, addrlen)).0;
 	}
 	//========================================================================================
 	def recvfrom(fd: int, buf: int, len: int, flags: int, src: int, addrlen_ptr: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var region = getRegion(buf, len);
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var sreg = getRegion(src, /*addrlen*/ 128);
-		if (src != 0 && sreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var alenreg = getRegion(addrlen_ptr, 4);
-		if (addrlen_ptr != 0 && alenreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_recvfrom, (sys_fd, Pointer.atContents(region.result), len, flags, Pointer.atContents(sreg.result), Pointer.atContents(alenreg.result))).0;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var sreg = getPtr(src, /*addrlen*/ 128);
+		if (sreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var alenreg = getPtr(addrlen_ptr, 4);
+		if (alenreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_recvfrom, (sys_fd, Pointer.atContents(region.result), len, flags, sreg.result, alenreg.result)).0;
 	}
 	//========================================================================================
-	def sendmsg(fd: int, msg: int, flags: int) => TODO_UNIMPLEMENTED;
+	def sendmsg(fd: int, msg: int, flags: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var t = copyMsghdr(msg);
+		if (t.0 == null) return neg(WaliErrno.EFAULT);
+		var host = t.0;
+		Ref<msghdr>.at(host, 0).msg_iov = u64.view(Pointer.atContents(t.1) - Pointer.NULL);
+		return Linux.syscall(LinuxConst.SYS_sendmsg, (sys_fd, Pointer.atContents(host), flags)).0;
+	}
 	//========================================================================================
-	def recvmsg(fd: int, msg: int, flags: int) => TODO_UNIMPLEMENTED;
+	def recvmsg(fd: int, msg: int, flags: int) -> long {
+		var sys_fd = fdmap.get(fd);
+		var t = copyMsghdr(msg);
+		if (t.0 == null) return neg(WaliErrno.EFAULT);
+		var host = t.0;
+		var h = Ref<msghdr>.at(host, 0);
+		h.msg_iov = u64.view(Pointer.atContents(t.1) - Pointer.NULL);
+		var r = Linux.syscall(LinuxConst.SYS_recvmsg, (sys_fd, Pointer.atContents(host), flags)).0;
+		if (r < 0) return r;
+		// The kernel updates these three in place; the rest is what the guest supplied.
+		var guest = getRegion(msg, WaliStruct_msghdr.size);
+		if (guest.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var g = Ref<WaliStruct_msghdr>.of(guest.result);
+		g.msg_namelen = u32.!(h.msg_namelen);
+		g.msg_controllen = u32.!(h.msg_controllen);
+		g.msg_flags = h.msg_flags;
+		return r;
+	}
 	//========================================================================================
 	def shutdown(fd: int, how: int) -> long {
 		var sys_fd = fdmap.get(fd);
@@ -750,42 +1049,44 @@ class WaliInstance {
 	//========================================================================================
 	def getsockname(fd: int, addr_ptr: int, addrlen_ptr: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var areg = getRegion(addr_ptr, /*space*/ 128);
-		if (addr_ptr != 0 && areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var alenreg = getRegion(addrlen_ptr, 4);
-		if (addrlen_ptr != 0 && alenreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_getsockname, (sys_fd, Pointer.atContents(areg.result), Pointer.atContents(alenreg.result))).0;
+		var areg = getPtr(addr_ptr, /*space*/ 128);
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var alenreg = getPtr(addrlen_ptr, 4);
+		if (alenreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_getsockname, (sys_fd, areg.result, alenreg.result)).0;
 	}
 	//========================================================================================
 	def getpeername(fd: int, addr_ptr: int, addrlen_ptr: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var areg = getRegion(addr_ptr, /*space*/ 128);
-		if (addr_ptr != 0 && areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var alenreg = getRegion(addrlen_ptr, 4);
-		if (addrlen_ptr != 0 && alenreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_getpeername, (sys_fd, Pointer.atContents(areg.result), Pointer.atContents(alenreg.result))).0;
+		var areg = getPtr(addr_ptr, /*space*/ 128);
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var alenreg = getPtr(addrlen_ptr, 4);
+		if (alenreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_getpeername, (sys_fd, areg.result, alenreg.result)).0;
 	}
 	//========================================================================================
 	def socketpair(domain: int, stype: int, protocol: int, sv_ptr: int) -> long {
-		var sreg = getRegion(sv_ptr, 2 * 4);
-		if (sreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_socketpair, (domain, stype, protocol, Pointer.atContents(sreg.result))).0;
+		var sreg = getPtr(sv_ptr, 2 * 4);
+		if (sreg.reason != TrapReason.NONE || sreg.result == Pointer.NULL) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_socketpair, (domain, stype, protocol, sreg.result)).0;
+		if (r < 0) return r;
+		return bindFdPair(sv_ptr);
 	}
 	//========================================================================================
 	def setsockopt(fd: int, level: int, optname: int, optval: int, optlen: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var oreg = getRegion(optval, optlen);
-		if (optval != 0 && oreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_setsockopt, (sys_fd, level, optname, Pointer.atContents(oreg.result), optlen)).0;
+		var oreg = getPtr(optval, optlen);
+		if (oreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_setsockopt, (sys_fd, level, optname, oreg.result, optlen)).0;
 	}
 	//========================================================================================
 	def getsockopt(fd: int, level: int, optname: int, optval_ptr: int, optlen_ptr: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var oreg = getRegion(optval_ptr, /*optlen*/ 64);
-		if (optval_ptr != 0 && oreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var plen = getRegion(optlen_ptr, 4);
-		if (optlen_ptr != 0 && plen.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_getsockopt, (sys_fd, level, optname, Pointer.atContents(oreg.result), Pointer.atContents(plen.result))).0;
+		var oreg = getPtr(optval_ptr, /*optlen*/ 64);
+		if (oreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var plen = getPtr(optlen_ptr, 4);
+		if (plen.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_getsockopt, (sys_fd, level, optname, oreg.result, plen.result)).0;
 	}
 	//========================================================================================
 	def vfork() => TODO_UNIMPLEMENTED;
@@ -793,11 +1094,11 @@ class WaliInstance {
 	def execve(filename: int, argv: int, envp: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def wait4(pid: int, status_ptr: int, options: int, rusage_ptr: int) -> long {
-		var sreg = getRegion(status_ptr, 4);
-		if (status_ptr != 0 && sreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var rreg = getRegion(rusage_ptr, /*rusage*/ 128);
-		if (rusage_ptr != 0 && rreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_wait4, (pid, Pointer.atContents(sreg.result), options, Pointer.atContents(rreg.result))).0;
+		var sreg = getPtr(status_ptr, 4);
+		if (sreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var rreg = getPtr(rusage_ptr, /*rusage*/ 128);
+		if (rreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_wait4, (pid, sreg.result, options, rreg.result)).0;
 	}
 	//========================================================================================
 	def kill(pid: int, sig: int) -> long {
@@ -806,7 +1107,7 @@ class WaliInstance {
 	//========================================================================================
 	def uname(buf: int) -> long {
 		var breg = getRegion(buf, utsname.size);
-		if (breg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (breg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_uname, (Pointer.atContents(breg.result))).0;
 	}
 	//========================================================================================
@@ -850,20 +1151,20 @@ class WaliInstance {
 	//========================================================================================
 	def getdents(fd: int, dirp: int, count: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var dreg = getRegion(dirp, count);
-		if (dirp != 0 && dreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_getdents, (sys_fd, Pointer.atContents(dreg.result), count)).0;
+		var dreg = getPtr(dirp, count);
+		if (dreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_getdents, (sys_fd, dreg.result, count)).0;
 	}
 	//========================================================================================
 	def getcwd(buf: int, size: int) -> long {
 		var breg = getRegion(buf, size);
-		if (breg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (breg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getcwd, (Pointer.atContents(breg.result), size)).0;
 	}
 	//========================================================================================
 	def chdir(path: int) -> long {
 		var region = getPath(u32.view(path));
-		if (region.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (region.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_chdir, (Pointer.atContents(region.result))).0;
 	}
 	//========================================================================================
@@ -874,21 +1175,21 @@ class WaliInstance {
 	//========================================================================================
 	def rename(oldpath: int, newpath: int) -> long {
 		var r1 = getPath(u32.view(oldpath));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(newpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_rename, (Pointer.atContents(r1.result), Pointer.atContents(r2.result))).0;
 	}
 	//========================================================================================
 	def mkdir(path: int, mode: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_mkdir, (Pointer.atContents(r.result), mode)).0;
 	}
 	//========================================================================================
 	def rmdir(path: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_rmdir, (Pointer.atContents(r.result))).0;
 	}
 	//========================================================================================
@@ -896,37 +1197,37 @@ class WaliInstance {
 	//========================================================================================
 	def link(oldpath: int, newpath: int) -> long {
 		var r1 = getPath(u32.view(oldpath));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(newpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_link, (Pointer.atContents(r1.result), Pointer.atContents(r2.result))).0;
 	}
 	//========================================================================================
 	def unlink(path: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_unlink, (Pointer.atContents(r.result))).0;
 	}
 	//========================================================================================
 	def symlink(target: int, linkpath: int) -> long {
 		var r1 = getPath(u32.view(target));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(linkpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_symlink, (Pointer.atContents(r1.result), Pointer.atContents(r2.result))).0;
 	}
 	//========================================================================================
 	def readlink(path: int, buf: int, bufsiz: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var b = getRegion(buf, bufsiz);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_readlink, (Pointer.atContents(r.result), Pointer.atContents(b.result), bufsiz)).0;
 	}
 	//========================================================================================
 	def chmod(path: int, mode: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_chmod, (Pointer.atContents(r.result), mode)).0;
 	}
 	//========================================================================================
@@ -937,7 +1238,7 @@ class WaliInstance {
 	//========================================================================================
 	def chown(path: int, owner: int, group: int) -> long {
 		var r = getPath(u32.view(path));
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_chown, (Pointer.atContents(r.result), owner, group)).0;
 	}
 	//========================================================================================
@@ -952,11 +1253,17 @@ class WaliInstance {
 		return Linux.syscall(LinuxConst.SYS_umask, (mask)).0;
 	}
 	//========================================================================================
-	def gettimeofday(tv: int, tz: int) => TODO_UNIMPLEMENTED;
+	def gettimeofday(tv: int, tz: int) -> long {
+		var v = getPtr(tv, /*timeval*/ 16);
+		if (v.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var z = getPtr(tz, /*timezone*/ 8);
+		if (z.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_gettimeofday, (v.result, z.result)).0;
+	}
 	//========================================================================================
 	def getrusage(who: int, usage_ptr: int) -> long {
 		var ureg = getRegion(usage_ptr, wali_rusage.size);
-		if (ureg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (ureg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getrusage, (who, Pointer.atContents(ureg.result))).0;
 	}
 	//========================================================================================
@@ -974,7 +1281,9 @@ class WaliInstance {
 		return Linux.syscall(LinuxConst.SYS_getgid, ()).0;
 	}
 	//========================================================================================
-	def setuid(uid: int) => TODO_UNIMPLEMENTED;
+	def setuid(uid: int) -> long {
+		return Linux.syscall(LinuxConst.SYS_setuid, (uid)).0;
+	}
 	//========================================================================================
 	def setgid(gid: int) -> long {
 		return Linux.syscall(LinuxConst.SYS_setgid, (gid)).0;
@@ -1012,13 +1321,13 @@ class WaliInstance {
 	//========================================================================================
 	def getgroups(size: int, list_ptr: int) -> long {
 		var lreg = getRegion(list_ptr, if(size > 0, size * 4, 0));
-		if (size > 0 && lreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (size > 0 && lreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getgroups, (size, Pointer.atContents(lreg.result))).0;
 	}
 	//========================================================================================
 	def setgroups(size: int, list_ptr: int) -> long {
 		var lreg = getRegion(list_ptr, size * 4);
-		if (lreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (lreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_setgroups, (size, Pointer.atContents(lreg.result))).0;
 	}
 	//========================================================================================
@@ -1052,7 +1361,7 @@ class WaliInstance {
 	//========================================================================================
 	def rt_sigpending(set_ptr: int, sigsetsize: int) -> long {
 		var sreg = getRegion(set_ptr, sigsetsize);
-		if (sreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (sreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_rt_sigpending, (Pointer.atContents(sreg.result), sigsetsize)).0;
 	}
 	//========================================================================================
@@ -1062,11 +1371,51 @@ class WaliInstance {
 	//========================================================================================
 	def rt_sigsuspend(mask_ptr: int, sigsetsize: int) -> long {
 		var mreg = getRegion(mask_ptr, sigsetsize);
-		if (mreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (mreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_rt_sigsuspend, (Pointer.atContents(mreg.result), sigsetsize)).0;
 	}
 	//========================================================================================
-	def sigaltstack(uss: int, uoss: int) => TODO_UNIMPLEMENTED;
+	// {stack_t} is { void* ss_sp; int ss_flags; size_t ss_size; }: 12 bytes in the guest,
+	// but three 8-byte words on the host. The ss_sp of the returned old stack has to be
+	// translated back into a guest offset, since that is what the guest handed in.
+	// The guest's alternate signal stack is tracked per-instance instead of being handed
+	// to the kernel. The engine's own runtime keeps a sigaltstack for stack-overflow
+	// handling (see RiOs.v3), and there is only one per thread. Signals are never
+	// delivered to guest handlers, so nothing is lost by keeping this in the engine.
+	def sigaltstack(uss: int, uoss: int) -> long {
+		// Both structs are bounds-checked in full up front, so a partially accessible
+		// {uoss} cannot leave a new stack installed with nothing reported back.
+		var newreg = getRegion(uss, WaliStruct_sigaltstack.size);
+		if (uss != 0 && newreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var oldreg = getRegion(uoss, WaliStruct_sigaltstack.size);
+		if (uoss != 0 && oldreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+
+		var old_sp = altstack_sp, old_size = altstack_size;
+		var old_flags = if(altstack_on, 0, SS_DISABLE);
+		if (uss != 0) {
+			var n = Ref<WaliStruct_sigaltstack>.of(newreg.result);
+			if ((n.ss_flags & ~SS_DISABLE) != 0) return neg(WaliErrno.EINVAL);
+			if ((n.ss_flags & SS_DISABLE) != 0) {
+				altstack_on = false;
+				altstack_sp = 0;
+				altstack_size = 0;
+			} else {
+				if (n.ss_size < MINSIGSTKSZ) return neg(WaliErrno.ENOMEM);
+				var stack = getRegion(int.view(n.ss_sp), int.view(n.ss_size));
+				if (stack.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+				altstack_on = true;
+				altstack_sp = n.ss_sp;
+				altstack_size = n.ss_size;
+			}
+		}
+		if (uoss != 0) {
+			var o = Ref<WaliStruct_sigaltstack>.of(oldreg.result);
+			o.ss_sp = old_sp;
+			o.ss_flags = old_flags;
+			o.ss_size = old_size;
+		}
+		return 0;
+	}
 	//========================================================================================
 	def utime(filename: int, times: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
@@ -1080,16 +1429,16 @@ class WaliInstance {
 	//========================================================================================
 	def statfs(path: int, buf: int) -> long {
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var b = getRegion(buf, wali_statfs.size);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_statfs, (Pointer.atContents(pr.result), Pointer.atContents(b.result))).0;
 	}
 	//========================================================================================
 	def fstatfs(fd: int, buf: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var b = getRegion(buf, wali_statfs.size);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_fstatfs, (sys_fd, Pointer.atContents(b.result))).0;
 	}
 	//========================================================================================
@@ -1128,7 +1477,12 @@ class WaliInstance {
 	def pivot_root(new_root: int, put_old: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def prctl(option: int, arg2: long, arg3: long, arg4: long, arg5: long) -> long {
-		return Linux.syscall(LinuxConst.SYS_prctl, (option, arg2, arg3, arg4, arg5)).0;
+		// WALI supports only the two name options, both of which take a 16-byte guest
+		// buffer in arg2; which arguments are pointers depends on {option}.
+		if (option != PR_SET_NAME && option != PR_GET_NAME) return neg(WaliErrno.EINVAL);
+		var p = getPtr(int.!(arg2), 16);
+		if (p.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_prctl, (option, p.result)).0;
 	}
 	//========================================================================================
 	def arch_prctl() => TODO_UNIMPLEMENTED;
@@ -1137,13 +1491,13 @@ class WaliInstance {
 	//========================================================================================
 	def setrlimit(resource: int, rlim_ptr: int) -> long {
 		var r = getRegion(rlim_ptr, wali_rlimit.size);
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_setrlimit, (resource, Pointer.atContents(r.result))).0;
 	}
 	//========================================================================================
 	def chroot(path: int) -> long {
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_chroot, (Pointer.atContents(pr.result))).0;
 	}
 	//========================================================================================
@@ -1254,7 +1608,7 @@ class WaliInstance {
 	def getdents64(fd: int, dirp: int, count: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var d = getRegion(dirp, count);
-		if (d.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (d.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getdents64, (sys_fd, Pointer.atContents(d.result), count)).0;
 	}
 	//========================================================================================
@@ -1276,23 +1630,41 @@ class WaliInstance {
 	//========================================================================================
 	def clock_gettime(which_clock: int, tp: int) -> long {
 		var t = getRegion(tp, timespec.size);
-		if (t.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_clock_gettime, (which_clock, Pointer.atContents(t.result))).0;
 	}
 	//========================================================================================
-	def clock_getres(which_clock: int, tp: int) => TODO_UNIMPLEMENTED;
+	def clock_getres(which_clock: int, tp: int) -> long {
+		var t = getPtr(tp, timespec.size);
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_clock_getres, (which_clock, t.result)).0;
+	}
 	//========================================================================================
 	def clock_nanosleep(clockid: int, flags: int, req_ptr: int, rem_ptr: int) -> long {
 		var r = getRegion(req_ptr, 16);
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var m = getRegion(rem_ptr, 16);
-		if (rem_ptr != 0 && m.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_clock_nanosleep, (clockid, flags, Pointer.atContents(r.result), Pointer.atContents(m.result))).0;
+		if (r.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var m = getPtr(rem_ptr, 16);
+		if (m.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_clock_nanosleep, (clockid, flags, Pointer.atContents(r.result), m.result)).0;
 	}
 	//========================================================================================
-	def epoll_wait(epfd: int, events: int, maxevents: int, timeout: int) => TODO_UNIMPLEMENTED;
+	def epoll_wait(epfd: int, events: int, maxevents: int, timeout: int) -> long {
+		var sys_epfd = fdmap.get(epfd);
+		if (maxevents < 0) return neg(WaliErrno.EINVAL);
+		var e = getPtr(events, maxevents * 12);
+		if (e.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_epoll_wait, (sys_epfd, e.result, maxevents, timeout)).0;
+	}
 	//========================================================================================
-	def epoll_ctl(epfd: int, op: int, fd: int, event: int) => TODO_UNIMPLEMENTED;
+	// {struct epoll_event} is 12 bytes on both sides (x86-64 packs it), so the event can be
+	// passed straight through; its {data} field is opaque to the kernel and stays whatever
+	// the guest put there. Only the two fds need translating.
+	def epoll_ctl(epfd: int, op: int, fd: int, event: int) -> long {
+		var sys_epfd = fdmap.get(epfd), sys_fd = fdmap.get(fd);
+		var e = getPtr(event, /*epoll_event*/ 12);
+		if (e.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_epoll_ctl, (sys_epfd, op, sys_fd, e.result)).0;
+	}
 	//========================================================================================
 	def tgkill(tgid: int, pid: int, sig: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
@@ -1303,7 +1675,7 @@ class WaliInstance {
 	def bind(fd: int, addr_ptr: int, addrlen: int) -> long {
 		var sys_fd = fdmap.get(fd);
 		var areg = getRegion(addr_ptr, addrlen);
-		if (areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_bind, (sys_fd, Pointer.atContents(areg.result), addrlen)).0;
 	}
 	//========================================================================================
@@ -1346,90 +1718,136 @@ class WaliInstance {
 	def migrate_pages(pid: int, maxnode: int, from: int, to: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def openat(dirfd: int, path: int, flags: int, mode: int) -> long {
-		var sys_dirfd = fdmap.get(dirfd);
+		var sys_dirfd = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r = Linux.syscall(LinuxConst.SYS_openat, (sys_dirfd, Pointer.atContents(pr.result), flags, mode)).0;
 		if (r < 0) return r;
-		var guestfd = fdmap.alloc();
-		fdmap.set(guestfd, int.!(r));
-		return guestfd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def mkdirat(dirfd: int, path: int, mode: int) -> long {
-		var sys_dirfd = fdmap.get(dirfd);
+		var sys_dirfd = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_mkdirat, (sys_dirfd, Pointer.atContents(pr.result), mode)).0;
 	}
 	//========================================================================================
 	def mknodat(dfd: int, filename: int, mode: int, dev: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def fchownat(dirfd: int, path: int, owner: int, group: int, flags: int) -> long {
-		var sys_dirfd = fdmap.get(dirfd);
+		var sys_dirfd = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_fchownat, (sys_dirfd, Pointer.atContents(pr.result), owner, group, flags)).0;
 	}
 	//========================================================================================
 	def futimesat(dfd: int, filename: int, utimes: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
-	def newfstatat(dfd: int, filename: int, statbuf: int, flag: int) => TODO_UNIMPLEMENTED;
+	def newfstatat(dfd: int, filename: int, statbuf: int, flag: int) -> long {
+		return fstatat(dfd, filename, statbuf, flag); // WALI aliases fstatat to newfstatat
+	}
 	//========================================================================================
 	def unlinkat(dirfd: int, path: int, flags: int) -> long {
-		var sys_dirfd = fdmap.get(dirfd);
+		var sys_dirfd = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_unlinkat, (sys_dirfd, Pointer.atContents(pr.result), flags)).0;
 	}
 	//========================================================================================
 	def renameat(olddfd: int, oldname: int, newdfd: int, newname: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def linkat(olddirfd: int, oldpath: int, newdirfd: int, newpath: int, flags: int) -> long {
-		var s_old = fdmap.get(olddirfd);
-		var s_new = fdmap.get(newdirfd);
+		var s_old = getDirFd(olddirfd);
+		var s_new = getDirFd(newdirfd);
 		var r1 = getPath(u32.view(oldpath));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(newpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_linkat, (s_old, Pointer.atContents(r1.result), s_new, Pointer.atContents(r2.result), flags)).0;
 	}
 	//========================================================================================
 	def symlinkat(target: int, newdirfd: int, linkpath: int) -> long {
-		var s_new = fdmap.get(newdirfd);
+		var s_new = getDirFd(newdirfd);
 		var r1 = getPath(u32.view(target));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(linkpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_symlinkat, (Pointer.atContents(r1.result), s_new, Pointer.atContents(r2.result))).0;
 	}
 	//========================================================================================
 	def readlinkat(dirfd: int, path: int, buf: int, bufsiz: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var b = getRegion(buf, bufsiz);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_readlinkat, (s, Pointer.atContents(pr.result), Pointer.atContents(b.result), bufsiz)).0;
 	}
 	//========================================================================================
 	def fchmodat(dirfd: int, path: int, mode: int, flags: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_fchmodat, (s, Pointer.atContents(pr.result), mode, flags)).0;
 	}
 	//========================================================================================
 	def faccessat(dirfd: int, path: int, mode: int, flags: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_faccessat, (s, Pointer.atContents(pr.result), mode, flags)).0;
 	}
 	//========================================================================================
-	def pselect6(nfds: int, readfds: int, writefds: int, exceptfds: int, timeout: int, sigmask: int) => TODO_UNIMPLEMENTED;
+	def pselect6(nfds: int, readfds: int, writefds: int, exceptfds: int, timeout: int, sigmask: int) -> long {
+		if (nfds < 0 || nfds > FD_SETSIZE) return neg(WaliErrno.EINVAL);
+		var rd = Array<u64>.new(FD_SET_WORDS), wr = Array<u64>.new(FD_SET_WORDS), ex = Array<u64>.new(FD_SET_WORDS);
+		// The kernel's last argument is a {sigset_t*, size_t} pair: 8 bytes in the guest
+		// against 16 on the host.
+		var sm = Array<u64>.new(2);
+		var hnfds = 0;
+		if (readfds != 0) { var m = copyFdSet(readfds, nfds, rd); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		if (writefds != 0) { var m = copyFdSet(writefds, nfds, wr); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		if (exceptfds != 0) { var m = copyFdSet(exceptfds, nfds, ex); if (m < 0) return neg(WaliErrno.EBADF); if (m > hnfds) hnfds = m; }
+		var t = getPtr(timeout, timespec.size);
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (sigmask != 0) {
+			var set = memory.read_u32(u32.view(sigmask), 0);
+			if (set.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+			var size = memory.read_u32(u32.view(sigmask), 4);
+			if (size.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+			var sp = getPtr(int.view(set.result), int.view(size.result));
+			if (sp.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+			sm[0] = u64.view(sp.result - Pointer.NULL);
+			sm[1] = size.result;
+		}
+		// No allocation may happen between taking these interior pointers and the call.
+		var pr = if(readfds != 0, Pointer.atContents(rd), Pointer.NULL);
+		var pw = if(writefds != 0, Pointer.atContents(wr), Pointer.NULL);
+		var pe = if(exceptfds != 0, Pointer.atContents(ex), Pointer.NULL);
+		var ps = if(sigmask != 0, Pointer.atContents(sm), Pointer.NULL);
+		var r = Linux.syscall(LinuxConst.SYS_pselect6, (hnfds, pr, pw, pe, t.result, ps)).0;
+		if (r < 0) return r;
+		if (readfds != 0 && writeFdSet(readfds, nfds, rd) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (writefds != 0 && writeFdSet(writefds, nfds, wr) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		if (exceptfds != 0 && writeFdSet(exceptfds, nfds, ex) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return r;
+	}
 	//========================================================================================
-	def ppoll(buf: int, a2: long, timeout: int, sigmask: int, len: int) => TODO_UNIMPLEMENTED;
+	def ppoll(buf: int, a2: long, timeout: int, sigmask: int, len: int) -> long {
+		var n = int.!(a2);
+		if (n < 0 || n > POLL_MAX) return neg(WaliErrno.EINVAL);
+		var t = getPtr(timeout, timespec.size);
+		if (t.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var sm = getPtr(sigmask, len);
+		if (sm.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var host = copyPollfd(buf, n);
+		if (host == null) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_ppoll, (Pointer.atContents(host), n, t.result, sm.result, len)).0;
+		if (r < 0) return r;
+		if (writePollRevents(buf, n, host) != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return r;
+	}
 	//========================================================================================
 	def unshare(unshare_flags: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
@@ -1448,15 +1866,23 @@ class WaliInstance {
 	def move_pages(pid: int, nr_pages: int, pages: int, nodes: int, status: int, flags: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def utimensat(dirfd: int, path: int, times_ptr: int, flags: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var treg = getRegion(times_ptr, 32);
-		if (times_ptr != 0 && treg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_utimensat, (s, Pointer.atContents(pr.result), Pointer.atContents(treg.result), flags)).0;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var treg = getPtr(times_ptr, 32);
+		if (treg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_utimensat, (s, Pointer.atContents(pr.result), treg.result, flags)).0;
 	}
 	//========================================================================================
-	def epoll_pwait(epfd: int, events: int, maxevents: int, timeout: int, sigmask: int, sigsetsize: int) => TODO_UNIMPLEMENTED;
+	def epoll_pwait(epfd: int, events: int, maxevents: int, timeout: int, sigmask: int, sigsetsize: int) -> long {
+		var sys_epfd = fdmap.get(epfd);
+		if (maxevents < 0) return neg(WaliErrno.EINVAL);
+		var e = getPtr(events, maxevents * 12);
+		if (e.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var sm = getPtr(sigmask, sigsetsize);
+		if (sm.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		return Linux.syscall(LinuxConst.SYS_epoll_pwait, (sys_epfd, e.result, maxevents, timeout, sm.result, sigsetsize)).0;
+	}
 	//========================================================================================
 	def signalfd(ufd: int, user_mask: int, sizemask: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
@@ -1465,9 +1891,7 @@ class WaliInstance {
 	def eventfd(initval: int) -> long {
 		var r = Linux.syscall(LinuxConst.SYS_eventfd, (initval)).0;
 		if (r < 0) return r;
-		var guestfd = fdmap.alloc();
-		fdmap.set(guestfd, int.!(r));
-		return guestfd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def fallocate(fd: int, mode: int, offset: int, len: int) => TODO_UNIMPLEMENTED;
@@ -1478,33 +1902,35 @@ class WaliInstance {
 	//========================================================================================
 	def accept4(fd: int, addr_ptr: int, addrlen_ptr: int, flags: int) -> long {
 		var sys_fd = fdmap.get(fd);
-		var areg = getRegion(addr_ptr, 128);
-		if (addr_ptr != 0 && areg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var alenreg = getRegion(addrlen_ptr, 4);
-		if (addrlen_ptr != 0 && alenreg.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		var r = Linux.syscall(LinuxConst.SYS_accept4, (sys_fd, Pointer.atContents(areg.result), Pointer.atContents(alenreg.result), flags)).0;
+		var areg = getPtr(addr_ptr, 128);
+		if (areg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var alenreg = getPtr(addrlen_ptr, 4);
+		if (alenreg.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_accept4, (sys_fd, areg.result, alenreg.result, flags)).0;
 		if (r < 0) return r;
-		var guestfd = fdmap.alloc();
-		fdmap.set(guestfd, int.!(r));
-		return guestfd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def signalfd4(ufd: int, user_mask: int, sizemask: int, flags: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
-	def eventfd2(count: int, flags: int) => TODO_UNIMPLEMENTED;
+	def eventfd2(count: int, flags: int) -> long {
+		var r = Linux.syscall(LinuxConst.SYS_eventfd2, (count, flags)).0;
+		if (r < 0) return r;
+		return bindFd(r);
+	}
 	//========================================================================================
 	def epoll_create1(flags: int) -> long {
 		var r = Linux.syscall(LinuxConst.SYS_epoll_create1, (flags)).0;
 		if (r < 0) return r;
-		var guestfd = fdmap.alloc();
-		fdmap.set(guestfd, int.!(r));
-		return guestfd;
+		return bindFd(r);
 	}
 	//========================================================================================
 	def pipe2(fds_ptr: int, flags: int) -> long {
-		var r = getRegion(fds_ptr, 8);
-		if (r.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
-		return Linux.syscall(LinuxConst.SYS_pipe2, (Pointer.atContents(r.result), flags)).0;
+		var reg = getPtr(fds_ptr, 8);
+		if (reg.reason != TrapReason.NONE || reg.result == Pointer.NULL) return neg(WaliErrno.EFAULT);
+		var r = Linux.syscall(LinuxConst.SYS_pipe2, (reg.result, flags)).0;
+		if (r < 0) return r;
+		return bindFdPair(fds_ptr);
 	}
 	//========================================================================================
 	def inotify_init1(flags: int) => TODO_UNIMPLEMENTED;
@@ -1550,12 +1976,12 @@ class WaliInstance {
 	def sched_getattr(pid: int, attr: int, size: int, flags: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def renameat2(olddirfd: int, oldpath: int, newdirfd: int, newpath: int, flags: int) -> long {
-		var s_old = fdmap.get(olddirfd);
-		var s_new = fdmap.get(newdirfd);
+		var s_old = getDirFd(olddirfd);
+		var s_new = getDirFd(newdirfd);
 		var r1 = getPath(u32.view(oldpath));
-		if (r1.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r1.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var r2 = getPath(u32.view(newpath));
-		if (r2.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (r2.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_renameat2, (s_old, Pointer.atContents(r1.result), s_new, Pointer.atContents(r2.result), flags)).0;
 	}
 	//========================================================================================
@@ -1563,7 +1989,7 @@ class WaliInstance {
 	//========================================================================================
 	def getrandom(buf: int, buflen: int, flags: int) -> long {
 		var b = getRegion(buf, buflen);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_getrandom, (Pointer.atContents(b.result), buflen, flags)).0;
 	}
 	//========================================================================================
@@ -1594,11 +2020,11 @@ class WaliInstance {
 	def pkey_free(pkey: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def statx(dirfd: int, path: int, flags: int, mask: int, buf: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		var b = getRegion(buf, wali_statx.size);
-		if (b.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (b.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_statx, (s, Pointer.atContents(pr.result), flags, mask, Pointer.atContents(b.result))).0;
 	}
 	//========================================================================================
@@ -1607,9 +2033,9 @@ class WaliInstance {
 	def rseq(rseq: int, rseq_len: int, flags: int, sig: int) => TODO_UNIMPLEMENTED;
 	//========================================================================================
 	def faccessat2(dirfd: int, path: int, mode: int, flags: int) -> long {
-		var s = fdmap.get(dirfd);
+		var s = getDirFd(dirfd);
 		var pr = getPath(u32.view(path));
-		if (pr.reason != TrapReason.NONE) return WaliErrno.EFAULT.code;
+		if (pr.reason != TrapReason.NONE) return neg(WaliErrno.EFAULT);
 		return Linux.syscall(LinuxConst.SYS_faccessat2, (s, Pointer.atContents(pr.result), mode, flags)).0;
 	}
 	//========================================================================================
@@ -1658,8 +2084,16 @@ class WaliInstance {
 		return HostResult.Throw(Exit.new(code));
 	}
 	//========================================================================================
-	def get_init_envfile(x: int, y: int) -> int {
-		return TODO_ZERO;
+	// Writes the path of the environment file into the guest buffer, NUL-terminated, and
+	// returns its length; 0 means "no environment file", which the guest treats as an
+	// empty environment rather than an error.
+	def get_init_envfile(buf: int, buf_len: int) -> int {
+		var path = WaliOptions.ENV_FILE.val;
+		if (path == null || memory == null) return TODO_ZERO;
+		if (path.length + 1 > buf_len) return TODO_ZERO;
+		if (memory.copyIn(u64.view(u32.view(buf)), path, 0, u64.!(path.length)) != TrapReason.NONE) return TODO_ZERO;
+		if (memory.write_u8(u32.view(buf), u32.!(path.length), 0) != TrapReason.NONE) return TODO_ZERO;
+		return path.length;
 	}
 }
 
@@ -1677,4 +2111,30 @@ layout WaliStruct_stat { // TODO: copied from Virgil x86-64-linux
 	+88	st_mtim:	timespec;
 	+104	st_ctim:	timespec;
 	=144;
+}
+
+// The wasm32 counterparts of {iovec} and {msghdr} from the host's SyscallLayouts. Every
+// pointer and word is 32 bits, so neither struct matches its host layout.
+layout WaliStruct_iovec {
+	+0	iov_base:	u32;
+	+4	iov_len:	u32;
+	=8;
+}
+
+layout WaliStruct_sigaltstack {
+	+0	ss_sp:		u32;
+	+4	ss_flags:	i32;
+	+8	ss_size:	u32;
+	=12;
+}
+
+layout WaliStruct_msghdr {
+	+0	msg_name:	u32;
+	+4	msg_namelen:	u32;
+	+8	msg_iov:	u32;
+	+12	msg_iovlen:	u32;
+	+20	msg_control:	u32;
+	+24	msg_controllen:	u32;
+	+32	msg_flags:	u32;
+	=36;
 }

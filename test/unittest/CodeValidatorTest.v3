@@ -99,6 +99,11 @@ def X_ = void(
 	T("simd.binop1", test_simd_binop1),
 	T("simd.binop2", test_simd_binop2),
 	T("simd.binop3", test_simd_binop3),
+	T("func.new", test_func_new),
+	T("func.new_imms", test_func_new_imms),
+	T("func.new_types", test_func_new_types),
+	T("func.new_mem64", test_func_new_mem64),
+	T("func.new_disabled", test_func_new_disabled),
 	T("memarg_stolen_is64", test_memarg_stolen_is64),
 	T("end_empty_ctl", test_end_empty_ctl),
 	()
@@ -2423,4 +2428,141 @@ def test_memarg_stolen_is64(t: CodeValidatorTester) {
 def test_end_empty_ctl(t: CodeValidatorTester) {
 	t.sig(SigCache.v_v);
 	t.invalid(WasmError.OOB_LABEL, [u8.!(Opcode.END.code)], 2);
+}
+
+// ------ ext:jit-interface -----------------------------------------------------------------
+// {func.new} has the immediates `0:byte x:memoryidx y:typeidx z:environidx`, pops the
+// (start, length) of the code in memory {x}, and pushes a `(ref y)`.
+def I32C = u8.!(Opcode.I32_CONST.code);
+def I64C = u8.!(Opcode.I64_CONST.code);
+def DROP = u8.!(Opcode.DROP.code);
+
+def func_new(mem: byte, sig: byte, env: byte) -> Array<byte> {
+	var code: Array<byte> = [Opcode.FUNC_NEW.prefix, u8.!(Opcode.FUNC_NEW.code), /*flags=*/0, mem, sig, env];
+	return code;
+}
+// Pushes a (start, length) pair with the given constant opcodes and then does {func.new}.
+// In the resulting function body, the {func.new} opcode is at +5, and the memory, signature,
+// and environment immediates are at +8, +9, and +10, respectively.
+def push_func_new(c0: byte, c1: byte, mem: byte, sig: byte, env: byte) -> Array<byte> {
+	var operands: Array<byte> = [c0, 0, c1, 0];
+	return Arrays.concat(operands, func_new(mem, sig, env));
+}
+def then_drop(code: Array<byte>) -> Array<byte> {
+	var drop: Array<byte> = [DROP];
+	return Arrays.concat(code, drop);
+}
+
+def test_func_new(t: CodeValidatorTester) {
+	t.setExtensions(Extension.JIT_INTERFACE);
+	t.addMemory(1, Max.Set(1));
+	var sig = t.newSig([ValueType.F32], [ValueType.F64]);
+	var env = t.newEnviron();
+	var e = byte.!(env.environ_index), s = heapIndexByte(sig);
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig)]);
+
+	t.valid(push_func_new(I32C, I32C, 0, s, e));
+
+	// The result is assignable to the nullable and to the abstract funcref type.
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(true, sig)]);
+	t.valid(push_func_new(I32C, I32C, 0, s, e));
+	t.sig0(SigCache.arr_v, [ValueTypes.FUNCREF]);
+	t.valid(push_func_new(I32C, I32C, 0, s, e));
+
+	// The result can simply be dropped.
+	t.sig0(SigCache.arr_v, SigCache.arr_v);
+	t.valid(then_drop(push_func_new(I32C, I32C, 0, s, e)));
+
+	// More than one environment can be declared and referred to.
+	var env2 = t.newEnviron();
+	t.valid(then_drop(push_func_new(I32C, I32C, 0, s, byte.!(env2.environ_index))));
+}
+
+def test_func_new_imms(t: CodeValidatorTester) {
+	t.setExtensions(Extension.JIT_INTERFACE);
+	var sig = t.newSig([ValueType.F32], [ValueType.F64]);
+	var env = t.newEnviron();
+	var e = byte.!(env.environ_index), s = heapIndexByte(sig);
+	t.sig0(SigCache.arr_v, SigCache.arr_v);
+
+	// No memory is declared yet.
+	t.invalid(WasmError.OOB_INDEX, then_drop(push_func_new(I32C, I32C, 0, s, e)), 8);
+
+	// The flags byte of the instruction is reserved and must be zero. It sits at +7 of the
+	// function body (raw index 6) and is reported ahead of any later immediate error.
+	for (flags in [1, 2, 0x40, 0x80, 0xFF]) {
+		var code = then_drop(push_func_new(I32C, I32C, 0, s, e));
+		code[6] = byte.!(flags);
+		t.invalid(WasmError.EXPECTED_ZERO_BYTE, code, 7);
+	}
+
+	t.addMemory(1, Max.Set(1));
+	// Without ext:multi-memory, the memory immediate is a reserved zero byte.
+	t.invalid(WasmError.EXPECTED_ZERO_BYTE, then_drop(push_func_new(I32C, I32C, 1, s, e)), 8);
+	t.invalid(WasmError.OOB_INDEX, then_drop(push_func_new(I32C, I32C, 0, 99, e)), 9);
+	t.invalid(WasmError.OOB_INDEX, then_drop(push_func_new(I32C, I32C, 0, s, 99)), 10);
+
+	// The type immediate must name a signature, not some other heap type.
+	t.setExtensions(Extension.JIT_INTERFACE | Extension.GC);
+	var str = t.newStruct([StorageType(ValueType.I32, Packedness.UNPACKED, true)]);
+	t.invalid(WasmError.ILLEGAL_TYPE, then_drop(push_func_new(I32C, I32C, 0, heapIndexByte(str), e)), 9);
+}
+
+def test_func_new_types(t: CodeValidatorTester) {
+	t.setExtensions(Extension.JIT_INTERFACE);
+	t.addMemory(1, Max.Set(1));
+	var sig = t.newSig([ValueType.F32], [ValueType.F64]);
+	var env = t.newEnviron();
+	var e = byte.!(env.environ_index), s = heapIndexByte(sig);
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig)]);
+
+	// Both operands must be present and must be i32 for a 32-bit memory.
+	t.TypeError(func_new(0, s, e), 1);
+	t.TypeError(Arrays.concat(func_new(0, s, e), func_new(0, s, e)), 1);
+	t.TypeError(push_func_new(I32C, I64C, 0, s, e), 5);
+	t.TypeError(push_func_new(I64C, I32C, 0, s, e), 5);
+	t.TypeError(push_func_new(I64C, I64C, 0, s, e), 5);
+
+	// The result is a `(ref sig)`, which is not assignable to a different signature.
+	var sig2 = t.newSig([ValueType.I32], [ValueType.I64]);
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig2)]);
+	t.TypeError(push_func_new(I32C, I32C, 0, s, e), 11);
+
+	// Nor is a null funcref assignable to the non-nullable result.
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig)]);
+	t.TypeError([u8.!(Opcode.REF_NULL.code), BpTypeCode.FUNCREF.code], 3);
+}
+
+def test_func_new_mem64(t: CodeValidatorTester) {
+	t.setExtensions(Extension.JIT_INTERFACE | Extension.MEMORY64);
+	t.module.addDecl(MemoryDecl.new(SizeConstraint(true, 1, Max.Set(1)), false, BpConstants.log2_WASM_PAGE_SIZE));
+	var sig = t.newSig([ValueType.F32], [ValueType.F64]);
+	var env = t.newEnviron();
+	var e = byte.!(env.environ_index), s = heapIndexByte(sig);
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig)]);
+
+	// A 64-bit memory takes i64 operands.
+	t.valid(push_func_new(I64C, I64C, 0, s, e));
+	t.TypeError(push_func_new(I32C, I32C, 0, s, e), 5);
+	t.TypeError(push_func_new(I32C, I64C, 0, s, e), 5);
+	t.TypeError(push_func_new(I64C, I32C, 0, s, e), 5);
+}
+
+// Without ext:jit-interface, {func.new} is not a valid opcode. The extension is checked
+// before the immediates are read, so the error is reported at the opcode itself.
+def test_func_new_disabled(t: CodeValidatorTester) {
+	t.setExtensions(Extensions.getDefaults());	// everything but ext:jit-interface
+	t.addMemory(1, Max.Set(1));
+	var sig = t.newSig([ValueType.F32], [ValueType.F64]);
+	var env = t.newEnviron();
+	var e = byte.!(env.environ_index), s = heapIndexByte(sig);
+	t.sig0(SigCache.arr_v, [ValueTypes.RefFunc(false, sig)]);
+
+	t.invalid(WasmError.INVALID_OPCODE, push_func_new(I32C, I32C, 0, s, e), 5);
+	// Even an otherwise malformed instruction reports the missing extension first.
+	t.invalid(WasmError.INVALID_OPCODE, push_func_new(I32C, I32C, 99, 99, 99), 5);
+
+	// Turning the extension on makes the same code valid.
+	t.setExtensions(Extensions.getDefaults() | Extension.JIT_INTERFACE);
+	t.valid(push_func_new(I32C, I32C, 0, s, e));
 }
