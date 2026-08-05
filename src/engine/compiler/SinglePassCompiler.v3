@@ -60,6 +60,16 @@ component SpcConsts {
 	def kindToFlags(kind: ValueKind) -> byte {
 		return byte.view(kind.tag) << 4;
 	}
+
+	// Sentinel {RegAlloc} assignments for the fast interpreter's IVar registers.
+	def IVAR_IP = TMP_SLOT + 1;
+	def IVAR_STP = TMP_SLOT + 2;
+	def IVAR_CURPC = TMP_SLOT + 3;
+	def IVAR_FUNC_DECL = TMP_SLOT + 4;
+	def IVAR_EIP = TMP_SLOT + 5;
+	def IVAR_DISPATCH = TMP_SLOT + 6;
+	def IVAR_SLOT_MIN = IVAR_IP;
+	def IVAR_SLOT_MAX = IVAR_DISPATCH;
 }
 
 // Shorten constants inside this file.
@@ -77,6 +87,14 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 def KIND_CONT = SpcConsts.KIND_CONT;
+def IVAR_IP = SpcConsts.IVAR_IP;
+def IVAR_STP = SpcConsts.IVAR_STP;
+def IVAR_CURPC = SpcConsts.IVAR_CURPC;
+def IVAR_FUNC_DECL = SpcConsts.IVAR_FUNC_DECL;
+def IVAR_EIP = SpcConsts.IVAR_EIP;
+def IVAR_DISPATCH = SpcConsts.IVAR_DISPATCH;
+def IVAR_SLOT_MIN = SpcConsts.IVAR_SLOT_MIN;
+def IVAR_SLOT_MAX = SpcConsts.IVAR_SLOT_MAX;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits, fast: bool) extends BytecodeVisitor {
@@ -92,7 +110,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var num_unrefs = 0;
 
 	// Abstract state of the value stack
-	def state = SpcState.new(regAlloc);
+	def state = SpcState.new(regAlloc, fast);
 	// Other state
 	def trap_labels = Vector<(TrapReason, MasmLabel, Array<SpcFrame>)>.new();
 
@@ -117,7 +135,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var skip_to_end: bool;
 	var whamm_config: WhammInlineConfig;
 	var fast_operand_size: int;
-	var fast_has_outcall = false;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -152,7 +169,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		regAlloc.clear();
 		trap_labels.resize(0);
 		success = true;
-		fast_has_outcall = false;
 		osr_offset = -1;
 		osr_state = null;
 		handler_dest_info.clear();
@@ -398,14 +414,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			fast_operand_size++;
 			n >>= 7;
 		}
-		// Advance IP past the fast-call opcode and spill it
+		// Advance IP past the fast-call opcode.
 		def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
 		masm.emit_addw_r_i(r_ip, fast_operand_size); 	// increment ip
 		masm.emit_compute_pc(-(fast_operand_size + 1)); // compute r_curpc
-		saveFastIVars();
-		// Why do we have to compute and save?
-		// 1. r_ip    = rax (clobbered by HW `div`)
-		// 2. m_curpc = HW trap reads this
+		// spill computed registers to the frame
+		emitSpillIVar(IVAR_IP);
+		emitSpillIVar(IVAR_STP);
+		if (!FeatureDisable.stacktraces) emitSpillIVar(IVAR_CURPC);
+		pinIVars(); // save iVars in regalloc
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
@@ -472,6 +489,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 						masm.emit_mov_r_s(sv.kind(), value_reg, state.sp - 1);
 					}
 				}
+				if (fast) evictIVars();
 				masm.emit_call_OperandProbe_i_v_fire(x, value_reg);
 				emit_reload_regs();
 				if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
@@ -508,6 +526,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// load PC
 		masm.emit_mov_r_i(regs.runtime_arg2, pc);
 		// call runtime
+		if (fast) evictIVars();
 		masm.emit_call_runtime_Probe_instr();
 		// restore {stack.rsp}
 		masm.emit_get_curstack(regs.scratch);
@@ -554,6 +573,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			match(whamm_sig[i]) {
 				FrameAccessor => {
 					if (inline_decision) state.emitSaveAll(resolver, probeSpillMode); // spill entire value stack.
+					if (fast) evictIVars();
 					masm.emit_call_runtime_getFrameAccessorMetaRef();
 					emit_reload_regs();
 					if (inline_decision && !probeSpillMode.free_regs) state.emitRestoreAll(resolver);
@@ -709,6 +729,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			// Adjust VSP to be above whamm args
 			if (whamm_sig.length > 0) masm.emit_addw_r_i(vsp_reg, whamm_sig.length * masm.valuerep.slot_size);
 			// Call to the entrypoint.
+			if (fast) evictIVars();
 			masm.emit_call_r(tmp);
 			emit_reload_regs();
 			if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
@@ -964,11 +985,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		popSpcFrame();
 	}
 	def emitCallToReg(sig: SigDecl, func_reg: Reg, vsp_reg: Reg, tmp: Reg, checkHostCall: bool, tailCall: bool) {
-		if (fast) fast_has_outcall = true;
 		var retpt = masm.newLabel(it.pc), wasmcall_label = masm.newLabel(it.pc);
 		// Handle the current stack state.
 		if (tailCall) emitMoveTailCallArgs(sig); // transfer tail call args
 		else state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS); // spill entire value stack
+		// treat all IVars as clobbered, forcing a reload at the end of this function
+		if (fast) evictIVars();
 
 		// Compute VSP below the args passed into callee function and spill it
 		emit_compute_vsp(vsp_reg, state.sp - u32.!(sig.params.length));
@@ -1056,6 +1078,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				// call runtime
 				emit_load_instance(regs.runtime_arg0);
 				masm.emit_mov_r_i(regs.runtime_arg1, sig_index);
+				if (fast) evictIVars(); // evict IVars for outcall
 				masm.emit_call_runtime_checkFuncSigSubtyping(); // XXX: emit inline code for subtype check
 				// result == null implies sig mismatch
 				masm.emit_br_r(regs.runtime_ret0, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.FUNC_SIG_MISMATCH));
@@ -1541,6 +1564,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
+		if (fast) evictIVars();
 		masm.emit_call_label(stub_resume);
 		/* === CHILD STACK RUNNING === */
 
@@ -1568,10 +1592,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
+		if (fast) evictIVars();
 		masm.emit_call_runtime_SUSPEND();
 
 		var sig_index = module.tags[tag_index].sig_index;
 		state.popArgsAndPushResults(SigDecl.!(module.heaptypes[sig_index]));
+		if (fast) evictIVars();
 		masm.emit_call_label(stub_suspend);
 
 		/* === PARENT STACK RUNNING === */
@@ -1609,6 +1635,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
+		if (fast) evictIVars();
 		masm.emit_call_runtime_SWITCH();
 
 		// unraveling all relevant signatures
@@ -1619,6 +1646,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.pop(); // target_cont
 		state.sp -= u32.view(target_cont_decl.sig.params.length - 1); // params to target_cont
 		state.pushResults(this_cont_decl.sig.params); // params to this_cont
+		if (fast) evictIVars();
 		masm.emit_call_label(stub_switch);
 
 		// /* === SUSPENDED === */
@@ -1676,6 +1704,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
+		if (fast) evictIVars();
 		masm.emit_call_runtime_RESUME_THROW();
 		dropN(u32.!(tag.fields.length));
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
@@ -1707,6 +1736,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
+		if (fast) evictIVars();
 		masm.emit_call_label(stub_resume);
 		/* === CHILD STACK RUNNING === */
 
@@ -1754,6 +1784,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
+		if (fast) evictIVars();
 		masm.emit_call_runtime_RESUME_THROW_REF();
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
@@ -1784,6 +1815,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
+		if (fast) evictIVars();
 		masm.emit_call_label(stub_resume);
 		/* === CHILD STACK RUNNING === */
 
@@ -1898,6 +1930,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, nullable);
 		masm.emit_mov_r_i(regs.runtime_arg3, ht_val);
+		if (fast) evictIVars();
 		masm.emit_call_runtime_cast();
 		masm.emit_get_curstack(regs.runtime_arg0);
 		masm.emit_pop_X86_64Stack_rsp_r_r(regs.runtime_arg0);
@@ -2050,6 +2083,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
 			emit_load_instance(regs.runtime_arg1);
 			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
+			if (fast) evictIVars();
 			masm.emit_call_runtime_op(op);
 		};
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
@@ -2074,6 +2108,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			emit_load_instance(regs.runtime_arg1);
 			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
 			masm.emit_mov_r_i(regs.runtime_arg3, arg2);
+			if (fast) evictIVars();
 			masm.emit_call_runtime_op(op);
 		};
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
@@ -2175,7 +2210,15 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_addw_r_i(regs.sp, frame.frameSize);
 			masm.emit_ret();
 		} else {
-			restoreFastIVars(fast_has_outcall);
+			// restore vfp
+			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
+			// restore interpreter registers (but only if they were ever reassigned in this function)
+			restoreIVar(IVAR_STP);
+			restoreIVar(IVAR_IP);
+			restoreIVar(IVAR_FUNC_DECL);
+			restoreIVar(IVAR_EIP);
+			restoreIVar(IVAR_DISPATCH);
+			restoreIVar(IVAR_CURPC);
 			emitFastDispatch();
 		}
 	}
@@ -2209,10 +2252,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
-	def saveFastIVars();
-	def saveReconstructIVars();
-	def restoreReconstructIVars();
-	def restoreFastIVars(has_outcall: bool);
+	def emitSpillIVar(slot: int);
+	def restoreIVar(slot: int);
+	def evictIVars();
+	def pinIVars();
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		unrefRegs();
@@ -2323,7 +2366,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
 		if (isInlined()) {
-			if (fast) saveReconstructIVars();
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
 			if (space > 0) {
@@ -2331,8 +2373,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					// reload VFP from the deepest inlined frame
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot.plus(space - frame.frameSize - 8));
 					masm.emit_addw_r_i(regs.sp, space);
-
-					restoreReconstructIVars();
 				} else {
 					masm.emit_addw_r_i(regs.sp, space);
 					masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
@@ -2476,6 +2516,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
 			masm.emit_mov_r_r(ValueKind.REF, arg1, index_reg);
 			masm.emit_mov_r_m(ValueKind.REF, arg2, masm.slotAddr(state.sp - 1));
+			if (fast) evictIVars();
 			masm.emit_call_MemoryReadProbe_fire(intrinsified_read_probe);
 			emit_reload_regs();
 			if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
@@ -2564,9 +2605,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return reg;
 	}
 	def allocFixed(kind: ValueKind, reg: Reg, slot: u32) -> Reg {
-		if (!regAlloc.isFree(reg)) spillRegAndFree(reg);
-		regAlloc.assign(reg, int.!(slot));
+		evictAndAssign(reg, int.!(slot));
 		return reg;
+	}
+	// Evicts whatever {reg} currently holds (if anything) and assigns it to {slot}.
+	def evictAndAssign(reg: Reg, slot: int) {
+		if (!regAlloc.isFree(reg)) spillRegAndFree(reg);
+		regAlloc.assign(reg, slot);
 	}
 	def ensureReg(sv: SpcVal, slot: u32) -> Reg {
 		var reg = sv.reg;
@@ -2602,6 +2647,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return regAlloc.alloc(kind, slot);
 	}
 	def addSpillCost(score: int, reg: Reg, slot: int) -> int {
+		if (slot >= IVAR_SLOT_MIN && slot <= IVAR_SLOT_MAX) return 50 + score; // IVar reg
 		if (slot >= state.sp) return 100000000 + score;       // tmp slot?
 		if (!state.state[slot].isStored()) score += 100;      // will generate a spill
 		if (slot < 10 && slot < func.num_locals) score += 10; // penalize first 10 locals
@@ -2728,6 +2774,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
+		// IVars are either spilled in prologue or correct from the interpreter context, and don't need to be spilled again.
+		if (slot >= IVAR_SLOT_MIN && slot <= IVAR_SLOT_MAX) return;
 		var sv = state.state[slot];
 		if (sv.isConst()) return void(state.state[slot] = sv.withoutReg());
 		if (sv.isStored()) return void(state.state[slot] = sv.withoutReg());
@@ -3013,13 +3061,20 @@ class SpcFrame {
 	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc, ret_label) {}
 }
 
-class SpcState(regAlloc: RegAlloc) {
+class SpcState(regAlloc: RegAlloc, fast: bool) {
 	// Abstract state of the value stack (shared across frames)
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
 	var sp: u32;
 	var ctl_stack = ArrayStack<SpcControl>.new();
 	// Frame management (for inlining)
 	var frame_stack = ArrayStack<SpcFrame>.new();
+	// Frees any resident IVar's register; used before a raw merge move.
+	def evictIVars() {
+		for (n < X86_64MasmRegs.PINNED_IVAR_REGS.length) {
+			var reg = X86_64MasmRegs.PINNED_IVAR_REGS[n], slot = IVAR_SLOT_MIN + n;
+			if (regAlloc.hasAssignment(reg, slot)) regAlloc.free(reg);
+		}
+	}
 
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
@@ -3116,7 +3171,7 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
-			regAlloc.clear();
+			if (fast) regAlloc.clearExcept(X86_64MasmRegs.PINNED_IVAR_REGS); else regAlloc.clear(); // preserve still-pinned IVars
 			sp = ctl.val_stack_top;
 			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
 				var sv = state[i];
@@ -3159,6 +3214,8 @@ class SpcState(regAlloc: RegAlloc) {
 				var from = state[f], to = target.merge_state[t];
 				resolver.addMove((t, to), (f, from));
 			}
+			// Evict any IVar still pinned to one the target registers first
+			if (fast) evictIVars();
 		}
 		resolver.emitMoves();
 	}
@@ -3195,10 +3252,18 @@ class SpcState(regAlloc: RegAlloc) {
 		return SpcVal((from.flags & ~(IS_CONST)) | force_store, from.reg, 0);
 	}
 	private def resetTo(max: u32, nstate: Array<SpcVal>) {
-		regAlloc.clear();
+		if (fast) regAlloc.clearExcept(X86_64MasmRegs.PINNED_IVAR_REGS); else regAlloc.clear(); // preserve still-pinned IVars
 		for (i < max) {
 			var sv = nstate[i];
-			if (sv.inReg()) regAlloc.assign(sv.reg, int.!(i));
+			if (sv.inReg()) {
+				// evict any preserved IVar occupying {sv.reg}; don't touch a legitimate ordinary alias
+				if (fast) {
+					for (s = IVAR_SLOT_MIN; s <= IVAR_SLOT_MAX; s++) {
+						if (regAlloc.hasAssignment(sv.reg, s)) { regAlloc.free(sv.reg); break; }
+					}
+				}
+				regAlloc.assign(sv.reg, int.!(i));
+			}
 			state[i] = sv;
 		}
 		sp = max;
