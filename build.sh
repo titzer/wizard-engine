@@ -204,8 +204,7 @@ elif [ "$TARGET" = "jvm" ]; then
     exec v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" == wasm-* ]]; then
     # Compile to a wasm target
-    V3C_PATH=$(which v3c)
-    V3C_WASM_TARGET=${V3C_PATH/bin\/v3c/bin\/dev\/v3c-$TARGET}
+    V3C_WASM_TARGET=$(dirname $V3C)/dev/v3c-$TARGET
     if [ ! -x $V3C_WASM_TARGET ]; then
 	echo Unknown Wasm target \"$TARGET\". Found these:
 	ls -a ${V3C_PATH/bin\/v3c/bin\/dev\/v3c-wasm-*} | cat
