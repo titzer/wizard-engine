@@ -1,0 +1,33 @@
+;; 7 loop-carried locals, no outcall, forcing pressure into the ivar-designated
+;; registers of FAST_INT_ALLOC's pool.
+(module
+  (func $f (export "fast:f") (param $n i32) (result i32)
+    (local $a i32) (local $b i32) (local $c i32) (local $d i32)
+    (local $e i32) (local $g i32) (local $h i32) (local $i i32)
+    (local.set $a (i32.const 1))
+    (local.set $b (i32.const 2))
+    (local.set $c (i32.const 3))
+    (local.set $d (i32.const 4))
+    (local.set $e (i32.const 5))
+    (local.set $g (i32.const 6))
+    (local.set $h (i32.const 7))
+    (local.set $i (i32.const 0))
+    (loop $lp
+      (local.set $a (i32.add (local.get $a) (local.get $b)))
+      (local.set $b (i32.add (local.get $b) (local.get $c)))
+      (local.set $c (i32.add (local.get $c) (local.get $d)))
+      (local.set $d (i32.add (local.get $d) (local.get $e)))
+      (local.set $e (i32.add (local.get $e) (local.get $g)))
+      (local.set $g (i32.add (local.get $g) (local.get $h)))
+      (local.set $h (i32.add (local.get $h) (local.get $a)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $lp (i32.lt_s (local.get $i) (local.get $n)))
+    )
+    (i32.add (local.get $a) (i32.add (local.get $b) (i32.add (local.get $c)
+      (i32.add (local.get $d) (i32.add (local.get $e) (i32.add (local.get $g) (local.get $h)))))))
+  )
+  (func (export "main") (result i32)
+    i32.const 1000
+    call $f
+  )
+)
