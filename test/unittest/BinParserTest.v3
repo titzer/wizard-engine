@@ -18,6 +18,7 @@ def Z = void(
 	T("sect_empty", test_sect_empty),
 	T("sect_empty_s", test_sect_empty_s),
 	T("sect_dup", test_sect_dup),
+	T("sect_repeat", test_sect_repeat),
 	T("sect_underflow", test_sect_underflow),
 	T("sect_size0", test_sect_size0),
 	T("sect_eof", test_sect_eof),
@@ -88,6 +89,14 @@ def Z = void(
 	T("bad_sub1", test_bad_sub1),
 	T("bad_sub2", test_bad_sub2),
 	T("bad_sub3", test_bad_sub3),
+	T("environ0", test_environ0),
+	T("environ_kinds", test_environ_kinds),
+	T("environ_flags", test_environ_flags),
+	T("environ_oob", test_environ_oob),
+	T("environ_trunc", test_environ_trunc),
+	T("environ_bad_kind", test_environ_bad_kind),
+	T("environ_disabled", test_environ_disabled),
+	T("environsN", test_environsN),
 	// TODO: tests for proper decoding of struct and array types
 	()
 );
@@ -274,6 +283,8 @@ def test_hdr_split(t: BinParserTester) {
 	t.valid(template);
 }
 
+// Note: {BpSection.Environment} is gated behind ext:jit-interface, so tests that iterate
+// this list must enable that extension.
 def COUNTED_SECTIONS = [
 	BpSection.Type,
 	BpSection.Import,
@@ -283,6 +294,7 @@ def COUNTED_SECTIONS = [
 	BpSection.Global,
 	BpSection.Export,
 	BpSection.Element,
+	BpSection.Environment,	// ext:jit-interface
 	BpSection.Code,
 	BpSection.Data
 ];
@@ -333,6 +345,7 @@ class SingleEmptySectionTemplate {
 }
 
 def test_sect_empty(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var s = SingleEmptySectionTemplate.new();
 
 	for (sect in COUNTED_SECTIONS) {
@@ -343,6 +356,7 @@ def test_sect_empty(t: BinParserTester) {
 }
 
 def test_sect_empty_s(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var s = SingleEmptySectionTemplate.new();
 
 	t.test_split = true;
@@ -354,6 +368,7 @@ def test_sect_empty_s(t: BinParserTester) {
 }
 
 def test_sect_dup(t: BinParserTester) {
+	t.extensions |= (Extension.set.all - Extension.REPEAT_SECTIONS);
 	t.test_split = true;
 	var b = BinBuilder.new();
 
@@ -366,7 +381,22 @@ def test_sect_dup(t: BinParserTester) {
 	}
 }
 
+def test_sect_repeat(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
+	t.test_split = true;
+	var b = BinBuilder.new();
+
+	for (sect in COUNTED_SECTIONS) {
+		b.reset_header();
+		b.puta([sect.code, 1, 0]);
+		t.validN(b.storage());
+		b.puta([sect.code, 1, 0]);
+		t.validN(b.storage());
+	}
+}
+
 def test_sect_underflow(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var s = SingleEmptySectionTemplate.new();
 
 	for (sect in COUNTED_SECTIONS) {
@@ -377,6 +407,7 @@ def test_sect_underflow(t: BinParserTester) {
 }
 
 def test_sect_size0(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var s = SingleEmptySectionTemplate.new();
 
 	for (sect in COUNTED_SECTIONS) {
@@ -387,6 +418,7 @@ def test_sect_size0(t: BinParserTester) {
 }
 
 def test_sect_eof(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var s = SingleEmptySectionTemplate.new();
 
 	for (sect in COUNTED_SECTIONS) {
@@ -1155,6 +1187,7 @@ def test_data0(t: BinParserTester) {
 }
 
 def test_count_limits(t: BinParserTester) {
+	t.extensions |= Extension.set.all;
 	var limits = DEFAULT_LIMITS;
 	var pairs = [
 		(BpSection.Type, limits.max_num_types),
@@ -1164,7 +1197,8 @@ def test_count_limits(t: BinParserTester) {
 		(BpSection.Global, limits.max_num_globals),
 		(BpSection.Data, limits.max_num_data_segments),
 		(BpSection.Table, limits.max_num_tables),
-		(BpSection.Memory, limits.max_num_memories)
+		(BpSection.Memory, limits.max_num_memories),
+		(BpSection.Environment, limits.max_num_environments)
 	];
 	var b = BinBuilder.new();
 	for (p in pairs) {
@@ -1649,4 +1683,205 @@ def test_bad_sub3(t: BinParserTester) {
 		BpDefTypeCode.SUB.code, 1, 0,
 		BpDefTypeCode.Function.code, 0, 1, BpTypeCode.I32.code
 	]);
+}
+
+// ------ ext:jit-interface -----------------------------------------------------------------
+// An environment declaration consists of a flags byte followed by a vector of references
+// to declarations of the enclosing module. Each reference is mapped into the corresponding
+// index space of the environment's inner module, renumbered from 0.
+def ONE_TAG_SECTION: Array<byte> = [
+	BpSection.Tag.code, 3, 1, /*attribute=*/0, /*sig=*/0
+];
+
+def assert_environs(t: BinParserTester, m: Module, count: int) -> Module {
+	if (m == null) return m;
+	if (m.environments.length != count) {
+		t.t.fail2("expected %d environments, got %d", count, m.environments.length);
+		return m;
+	}
+	for (i < count) {
+		var env = m.environments[i];
+		if (env == null) {
+			t.t.fail1("expected non-null environment #%d", i);
+			continue;
+		}
+		if (env.environ_index != i) t.t.fail2("expected environ_index=%d, got %d", i, env.environ_index);
+		if (env.outer != m) t.t.fail1("expected environment #%d to refer to the enclosing module", i);
+		if (env.module == null) t.t.fail1("expected an inner module for environment #%d", i);
+		// Every mapped declaration becomes an import of the inner module.
+		else if (env.module.imports.length != env.mapping.length) {
+			t.t.fail3("expected environment #%d to have %d inner imports, got %d",
+				i, env.mapping.length, env.module.imports.length);
+		}
+	}
+	return m;
+}
+
+// Asserts the sizes of the index spaces of the inner module of environment {index}.
+def assert_inner(t: BinParserTester, m: Module, index: int,
+	funcs: int, tables: int, memories: int, globals: int, tags: int, heaptypes: int) {
+	if (m == null) return;
+	if (index >= m.environments.length) return t.t.fail1("expected environment #%d", index);
+	var inner = m.environments[index].module;
+	if (inner == null) return t.t.fail1("expected an inner module for environment #%d", index);
+	var got = [inner.functions.length, inner.tables.length, inner.memories.length,
+		inner.globals.length, inner.tags.length, inner.heaptypes.length];
+	var expected = [funcs, tables, memories, globals, tags, heaptypes];
+	var names = ["functions", "tables", "memories", "globals", "tags", "heaptypes"];
+	for (i < expected.length) {
+		if (expected[i] != got[i]) t.t.fail3("expected %d inner %s, got %d", expected[i], names[i], got[i]);
+	}
+}
+
+def test_environ0(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	t.test_split = true;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	assert_environs(t, s.valid([0]), 0);				// no environments
+	assert_environs(t, s.valid([1, 0, 0]), 1);			// one empty environment
+	assert_environs(t, s.valid([2, 0, 0, 0, 0]), 2);		// two empty environments
+	assert_environs(t, s.valid([3, 0, 0, 0, 0, 0, 0]), 3);		// three empty environments
+}
+
+def test_environ_kinds(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	s.b.puta(ONE_FUNC_TYPES_SECTION);
+	s.b.puta(ONE_IMPORTED_FUNC_SECTION);
+	s.b.puta(ONE_TABLE_SECTION);
+	s.b.puta(ONE_PAGE_MEMORY_SECTION);
+	s.b.puta(ONE_TAG_SECTION);
+	s.b.puta(ONE_GLOBAL_SECTION);
+
+	// Each declaration kind can be mapped into an environment by itself.
+	var m = assert_environs(t, s.valid([1, 0, 1, BpImportExportKind.Function.code, 0]), 1);
+	assert_inner(t, m, 0, 1, 0, 0, 0, 0, 0);
+
+	m = assert_environs(t, s.valid([1, 0, 1, BpImportExportKind.Table.code, 0]), 1);
+	assert_inner(t, m, 0, 0, 1, 0, 0, 0, 0);
+
+	m = assert_environs(t, s.valid([1, 0, 1, BpImportExportKind.Memory.code, 0]), 1);
+	assert_inner(t, m, 0, 0, 0, 1, 0, 0, 0);
+
+	m = assert_environs(t, s.valid([1, 0, 1, BpImportExportKind.Global.code, 0]), 1);
+	assert_inner(t, m, 0, 0, 0, 0, 1, 0, 0);
+
+	m = assert_environs(t, s.valid([1, 0, 1, BpImportExportKind.Tag.code, 0]), 1);
+	assert_inner(t, m, 0, 0, 0, 0, 0, 1, 0);
+
+	// All kinds together, in one environment.
+	m = assert_environs(t, s.valid([1, 0, 5,
+		BpImportExportKind.Function.code, 0,
+		BpImportExportKind.Table.code, 0,
+		BpImportExportKind.Memory.code, 0,
+		BpImportExportKind.Global.code, 0,
+		BpImportExportKind.Tag.code, 0]), 1);
+	assert_inner(t, m, 0, 1, 1, 1, 1, 1, 0);
+
+	// Two environments referring to the same outer declaration.
+	m = assert_environs(t, s.valid([2,
+		0, 1, BpImportExportKind.Function.code, 0,
+		0, 1, BpImportExportKind.Function.code, 0]), 2);
+	assert_inner(t, m, 0, 1, 0, 0, 0, 0, 0);
+	assert_inner(t, m, 1, 1, 0, 0, 0, 0, 0);
+}
+
+def test_environ_flags(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	// The flags byte of an environment declaration is reserved and must be zero.
+	for (flags = 1; flags < 5; flags++) {
+		s.invalid(WasmError.EXPECTED_ZERO_BYTE, [1, byte.!(flags), 0]);
+	}
+	s.invalid(WasmError.EXPECTED_ZERO_BYTE, [1, 0xFF, 0]);
+}
+
+def test_environ_oob(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	// Nothing is declared in the enclosing module, so every reference is out of bounds.
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Function.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Table.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Memory.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Global.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Tag.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.HeapType.code, 0]);
+
+	// One declaration of each kind exists, so index 1 is out of bounds.
+	s.b.puta(ONE_FUNC_TYPES_SECTION);
+	s.b.puta(ONE_IMPORTED_FUNC_SECTION);
+	s.b.puta(ONE_TABLE_SECTION);
+	s.b.puta(ONE_PAGE_MEMORY_SECTION);
+	s.b.puta(ONE_TAG_SECTION);
+	s.b.puta(ONE_GLOBAL_SECTION);
+
+	s.valid([1, 0, 1, BpImportExportKind.Function.code, 0]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Function.code, 1]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Table.code, 1]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Global.code, 1]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.Tag.code, 1]);
+	s.invalid(WasmError.OOB_INDEX, [1, 0, 1, BpImportExportKind.HeapType.code, 1]);
+
+	// Without ext:multi-memory the memory reference is a reserved zero byte.
+	s.invalid(WasmError.EXPECTED_ZERO_BYTE, [1, 0, 1, BpImportExportKind.Memory.code, 1]);
+}
+
+def test_environ_trunc(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	s.b.puta(ONE_FUNC_TYPES_SECTION);
+	s.b.puta(ONE_IMPORTED_FUNC_SECTION);
+
+	s.invalid(WasmError.OVERFLOW_SECTION, [1]);				// missing flags byte
+	s.invalid(WasmError.OVERFLOW_SECTION, [1, 0]);				// missing import count
+	s.invalid(WasmError.OVERFLOW_SECTION, [1, 0, 1]);			// missing import kind
+	s.invalid(WasmError.OVERFLOW_SECTION, [1, 0, 1,				// missing function index
+		BpImportExportKind.Function.code]);
+	s.invalid(WasmError.OVERFLOW_SECTION, [2, 0, 0]);			// missing second environment
+}
+
+def test_environsN(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	testCountedSection(t, 3, BpSection.Environment, ONE_FUNC_TYPES_SECTION, [
+		/*flags=*/0, /*imports=*/0
+	]);
+}
+
+def test_environ_bad_kind(t: BinParserTester) {
+	t.extensions |= Extension.JIT_INTERFACE;
+	var s = BinSectionTester.new(t, BpSection.Environment);
+	s.b.puta(ONE_FUNC_TYPES_SECTION);
+	s.b.puta(ONE_IMPORTED_FUNC_SECTION);
+
+	// Only the import/export kind codes name something that can be mapped.
+	for (kind = 6; kind < 12; kind++) {
+		s.invalid(WasmError.INVALID_IMPORT_KIND, [1, 0, 1, byte.!(kind), 0]);
+	}
+	s.invalid(WasmError.INVALID_IMPORT_KIND, [1, 0, 1, 0x7F, 0]);
+	s.invalid(WasmError.INVALID_IMPORT_KIND, [1, 0, 1, 0xFF, 0]);
+
+	// An invalid kind in a later entry is caught too.
+	s.invalid(WasmError.INVALID_IMPORT_KIND, [1, 0, 2,
+		BpImportExportKind.Function.code, 0,
+		/*invalid=*/9, 0]);
+}
+
+// Without ext:jit-interface, the environment section is not a known section at all.
+def test_environ_disabled(t: BinParserTester) {
+	var empty: Array<byte> = [/*count=*/0];
+	var one: Array<byte> = [/*count=*/1, /*flags=*/0, /*imports=*/0];
+	var b = BinBuilder.new();
+	for (body in [empty, one]) {
+		b.reset_header();
+		b.beginShortSection(BpSection.Environment);
+		b.puta(body);
+		b.endSection();
+
+		// Every other extension is on, so only ext:jit-interface can make this decode.
+		t.extensions = Extensions.getDefaults();
+		t.invalidN(WasmError.INVALID_SECTION, b.storage());
+
+		t.extensions |= Extension.JIT_INTERFACE;
+		t.validN(b.storage());
+	}
 }

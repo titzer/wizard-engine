@@ -1,0 +1,481 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Generates the regression tests for ext:jit-interface.
+//
+// Every other directory under test/regress produces its {.bin.wast} files with {build.sh},
+// which runs the reference interpreter over a {.wast} source. That does two jobs: it
+// validates the test itself against the reference, and it encodes the module. Neither the
+// specification nor the reference interpreter implements this proposal yet, so neither job
+// can be done that way today.
+//
+// This generator therefore writes both files directly. The {.wast} is the intended source
+// in the text syntax of the proposal explainer; nothing consumes it yet, but it records
+// what each test means and is the input for later. The {.bin.wast} is what test/regress.sh
+// actually runs. Note the consequence: these tests have no independent oracle. They check
+// that Wizard decodes, instantiates, and runs a real binary end to end -- a path the unit
+// tests cannot reach, since those either decode without running or run modules built
+// in memory -- but they cannot check that the encoding agrees with the specification,
+// because the encoding came from the same reading of it that the decoder did.
+//
+// When the reference interpreter gains support, build.sh should regenerate the {.bin.wast}
+// files from the {.wast} sources; the diff then verifies everything encoded here by hand.
+//
+// The proposal calls an environment a "scope"; Wizard's implementation calls it an
+// environment. The text syntax below follows the proposal.
+
+def OUT = Trace.OUT;
+
+// ------ binary encoding helpers ---------------------------------------------------------
+def I32C = u8.!(Opcode.I32_CONST.code);
+def END = u8.!(Opcode.END.code);
+
+// A complete function body: a local declaration vector, the code, and a terminating {end}.
+def body(code: Array<byte>) -> Array<byte> {
+	var b = BinBuilder.new();
+	b.put_u32leb(0);	// no local declaration groups
+	b.puta(code);
+	b.put(END);
+	return b.extract();
+}
+// `func.new 0:byte mem:memoryidx sig:typeidx env:environidx`
+def func_new(mem: byte, sig: byte, env: byte) -> Array<byte> {
+	var code: Array<byte> = [Opcode.FUNC_NEW.prefix, u8.!(Opcode.FUNC_NEW.code), /*flags=*/0, mem, sig, env];
+	return code;
+}
+def i32_const(val: int) -> Array<byte> {
+	var b = BinBuilder.new();
+	b.put(I32C).put_s32leb(val);
+	return b.extract();
+}
+def cat(a: Array<byte>, b: Array<byte>) -> Array<byte> {
+	return Arrays.concat(a, b);
+}
+def cat3(a: Array<byte>, b: Array<byte>, c: Array<byte>) -> Array<byte> {
+	return Arrays.concat(Arrays.concat(a, b), c);
+}
+
+// Assembles a binary module. Sections must be emitted in the order the format requires.
+// Note that the environment section is ordered between the datacount and code sections,
+// which is not the order of its id (14).
+class ModuleGen {
+	private def b = BinBuilder.new().reset_header();
+
+	def types(sigs: Array<(Array<byte>, Array<byte>)>) -> this {
+		b.beginSection(BpSection.Type);
+		b.put_u32leb(u32.!(sigs.length));
+		for (s in sigs) {
+			b.put(BpDefTypeCode.Function.code);
+			b.put_u32leb(u32.!(s.0.length));
+			b.puta(s.0);
+			b.put_u32leb(u32.!(s.1.length));
+			b.puta(s.1);
+		}
+	}
+	def funcs(sig_indexes: Array<byte>) -> this {
+		b.beginSection(BpSection.Function);
+		b.put_u32leb(u32.!(sig_indexes.length));
+		b.puta(sig_indexes);
+	}
+	def memory(min: u32) -> this {
+		b.beginSection(BpSection.Memory);
+		b.put_u32leb(1);
+		b.put(0);			// no maximum
+		b.put_u32leb(min);
+	}
+	def i32Global(val: int) -> this {
+		b.beginSection(BpSection.Global);
+		b.put_u32leb(1);
+		b.put(BpTypeCode.I32.code);
+		b.put(0);			// immutable
+		b.put(I32C).put_s32leb(val);
+		b.put(END);
+	}
+	def exportFunc(name: string, index: u32) -> this {
+		b.beginSection(BpSection.Export);
+		b.put_u32leb(1);
+		b.put_string(name);
+		b.put(BpImportExportKind.Function.code);
+		b.put_u32leb(index);
+	}
+	// Each environment is a reserved flags byte followed by a vector of references to
+	// declarations of the enclosing module. A memory reference is a reserved zero byte
+	// unless ext:multi-memory is enabled.
+	def environs(envs: Array<Array<(byte, u32)>>) -> this {
+		b.beginSection(BpSection.Environment);
+		b.put_u32leb(u32.!(envs.length));
+		for (env in envs) {
+			b.put(0);		// reserved flags
+			b.put_u32leb(u32.!(env.length));
+			for (imp in env) {
+				b.put(imp.0);
+				if (imp.0 == BpImportExportKind.Memory.code) b.put(0);
+				else b.put_u32leb(imp.1);
+			}
+		}
+	}
+	def code(bodies: Array<Array<byte>>) -> this {
+		b.beginSection(BpSection.Code);
+		b.put_u32leb(u32.!(bodies.length));
+		for (body in bodies) {
+			b.put_u32leb(u32.!(body.length));
+			b.puta(body);
+		}
+	}
+	def data(entries: Array<(int, Array<byte>)>) -> this {
+		b.beginSection(BpSection.Data);
+		b.put_u32leb(u32.!(entries.length));
+		for (e in entries) {
+			b.put(0);		// active, memory 0
+			b.put(I32C).put_s32leb(e.0);
+			b.put(END);
+			b.put_u32leb(u32.!(e.1.length));
+			b.puta(e.1);
+		}
+	}
+	def finish() -> Array<byte> {
+		b.endSection();
+		return b.extract();
+	}
+}
+
+
+// ------ test registry -------------------------------------------------------------------
+// A single test. If {invalid_msg} is non-null, the module is expected to be rejected and
+// is emitted wrapped in an {assert_invalid} rather than standalone.
+class Test(name: string, wast: Array<string>, asserts: Array<string>, bin: Array<byte>, invalid_msg: string) { }
+def NO_LINES: Array<string> = [];
+def tests = Vector<Test>.new();
+def add(name: string, wast: Array<string>, asserts: Array<string>, bin: Array<byte>) {
+	tests.put(Test.new(name, wast, asserts, bin, null));
+}
+def addInvalid(name: string, wast: Array<string>, msg: string, bin: Array<byte>) {
+	tests.put(Test.new(name, wast, NO_LINES, bin, msg));
+}
+
+def buf = StringBuilder.new();
+def write(name: string, contents: string) {
+	OUT.put1("##+gen %s", name).ln();
+	var fd = System.fileOpen(name, false);
+	if (fd < 0) {
+		OUT.puts("##-failed (could not open file)").ln();
+		return;
+	}
+	buf.reset().puts(contents).out(System.fileWriteK(fd, _, _, _));
+	System.fileClose(fd);
+	OUT.puts("##-ok").ln();
+}
+def putLines(b: StringBuilder, lines: Array<string>) {
+	for (l in lines) b.puts(l).ln();
+}
+// The text-format source, which no tool consumes yet; see the header comment.
+def writeWast(t: Test) {
+	var b = buf.reset();
+	putLines(b, t.wast);
+	putLines(b, t.asserts);
+	write(Strings.format1("%s.wast", t.name), b.toString());
+}
+// The binary form, which test/regress.sh runs.
+def writeBinWast(t: Test) {
+	var b = buf.reset();
+	var indent = if(t.invalid_msg != null, "  ", "");
+	if (t.invalid_msg != null) b.puts("(assert_invalid").ln();
+	b.puts(indent).puts("(module binary").ln();
+	for (i = 0; i < t.bin.length; i = i + 16) {
+		b.puts(indent).puts("  \"");
+		for (j = i; j < t.bin.length && j < i + 16; j++) {
+			var byte = t.bin[j];
+			b.putc('\\');
+			b.putc(Chars.hexMap_l[byte >> 4]);
+			b.putc(Chars.hexMap_l[byte & 0xF]);
+		}
+		b.puts("\"").ln();
+	}
+	b.puts(indent).puts(")").ln();
+	if (t.invalid_msg != null) b.put1("  \"%s\"", t.invalid_msg).ln().puts(")").ln();
+	putLines(b, t.asserts);
+	write(Strings.format1("%s.bin.wast", t.name), b.toString());
+}
+
+def main(args: Array<string>) -> int {
+	genAll();
+	for (i < tests.length) {
+		writeWast(tests[i]);
+		writeBinWast(tests[i]);
+	}
+	return 0;
+}
+
+// ------ tests ---------------------------------------------------------------------------
+def V: Array<byte> = [];
+def I: Array<byte> = [BpTypeCode.I32.code];
+def II: Array<byte> = [BpTypeCode.I32.code, BpTypeCode.I32.code];
+
+def CODE_ADDR = 16;		// where each test stores the code to be compiled
+
+// Emits code that compiles the {len} bytes at {CODE_ADDR} into a function of type 1 using
+// environment 0, and calls it. ext:jit-interface implies ext:function-references, so
+// call_ref is available on the (ref $ft) that func.new produces.
+def newAndCall(len: int) -> Array<byte> {
+	return cat3(
+		cat(i32_const(CODE_ADDR), i32_const(len)),
+		func_new(0, 1, 0),
+		[u8.!(Opcode.CALL_REF.code), 1]);
+}
+
+def genAll() {
+	gen_func_new0();
+	gen_func_new_args();
+	gen_func_new_scope_func();
+	gen_func_new_scope_global();
+	gen_func_new_scope_memory();
+	gen_func_new_trap_oob();
+	gen_func_new_trap_invalid();
+	gen_func_new_invalid_env();
+}
+
+// The simplest case: compile a constant function out of memory and call it.
+def gen_func_new0() {
+	var gen = body(i32_const(42));
+	var m = ModuleGen.new()
+		.types([(V, I), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(newAndCall(gen.length))])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new0", [
+		"(module",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 16) \"\\00\\41\\2a\\0b\")  ;; (func (result i32) (i32.const 42))",
+		"  (scope $s)",
+		"  (func (export \"main\") (result i32)",
+		"    (call_ref $ft",
+		"      (func.new 0 $ft $s (i32.const 16) (i32.const 4)))",
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\") (i32.const 42))"
+	], m.finish());
+}
+
+// A generated function that takes parameters, forwarded from the caller.
+def gen_func_new_args() {
+	var gen = body([u8.!(Opcode.LOCAL_GET.code), 1]);
+	var main_code = cat3(
+		cat([u8.!(Opcode.LOCAL_GET.code), 0], [u8.!(Opcode.LOCAL_GET.code), 1]),
+		cat(cat(i32_const(CODE_ADDR), i32_const(gen.length)), func_new(0, 1, 0)),
+		[u8.!(Opcode.CALL_REF.code), 1]);
+	var m = ModuleGen.new()
+		.types([(II, I), (II, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(main_code)])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new_args", [
+		"(module",
+		"  (type $ft (func (param i32 i32) (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 16) \"\\00\\20\\01\\0b\")  ;; (func (param i32 i32) (result i32) (local.get 1))",
+		"  (scope $s)",
+		"  (func (export \"main\") (param i32 i32) (result i32)",
+		"    (call_ref $ft (local.get 0) (local.get 1)",
+		"      (func.new 0 $ft $s (i32.const 16) (i32.const 4)))",
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\" (i32.const 11) (i32.const 22)) (i32.const 22))",
+		"(assert_return (invoke \"main\" (i32.const 33) (i32.const 44)) (i32.const 44))"
+	], m.finish());
+}
+
+// The generated code calls a function the scope maps into its index space. The enclosing
+// module declares two functions, but only the second is in scope, renumbered to index 0.
+def gen_func_new_scope_func() {
+	var gen = body([u8.!(Opcode.CALL.code), 0]);
+	var m = ModuleGen.new()
+		.types([(V, I), (V, I)])
+		.funcs([0, 0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[(BpImportExportKind.Function.code, 1)]])
+		.code([body(newAndCall(gen.length)), body(i32_const(7))])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new_scope_func", [
+		"(module",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 16) \"\\00\\10\\00\\0b\")  ;; (func (result i32) (call 0))",
+		"  (scope $s",
+		"    (func $seven))  ;; only $seven is in scope, renumbered to index 0",
+		"  (func (export \"main\") (result i32)",
+		"    (call_ref $ft",
+		"      (func.new 0 $ft $s (i32.const 16) (i32.const 4)))",
+		"  )",
+		"  (func $seven (result i32) (i32.const 7))",
+		")"
+	], [
+		"(assert_return (invoke \"main\") (i32.const 7))"
+	], m.finish());
+}
+
+// The generated code reads a global the scope maps into its index space.
+def gen_func_new_scope_global() {
+	var gen = body([u8.!(Opcode.GLOBAL_GET.code), 0]);
+	var m = ModuleGen.new()
+		.types([(V, I), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.i32Global(1234)
+		.exportFunc("main", 0)
+		.environs([[(BpImportExportKind.Global.code, 0)]])
+		.code([body(newAndCall(gen.length))])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new_scope_global", [
+		"(module",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (global $g i32 (i32.const 1234))",
+		"  (data (i32.const 16) \"\\00\\23\\00\\0b\")  ;; (func (result i32) (global.get 0))",
+		"  (scope $s",
+		"    (global $g))",
+		"  (func (export \"main\") (result i32)",
+		"    (call_ref $ft",
+		"      (func.new 0 $ft $s (i32.const 16) (i32.const 4)))",
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\") (i32.const 1234))"
+	], m.finish());
+}
+
+// The generated code loads from a memory the scope maps into its index space, and sees the
+// same contents as the enclosing instance.
+def gen_func_new_scope_memory() {
+	var gen = body(cat(i32_const(0), [u8.!(Opcode.I32_LOAD.code), /*align=*/2, /*offset=*/8]));
+	var data: Array<byte> = [0x44, 0x33, 0x22, 0x11];
+	var m = ModuleGen.new()
+		.types([(V, I), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[(BpImportExportKind.Memory.code, 0)]])
+		.code([body(newAndCall(gen.length))])
+		.data([(8, data), (CODE_ADDR, gen)]);
+	add("func_new_scope_memory", [
+		"(module",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 8) \"\\44\\33\\22\\11\")",
+		"  (data (i32.const 16) \"\\00\\41\\00\\28\\02\\08\\0b\")  ;; (func (result i32) (i32.load offset=8 (i32.const 0)))",
+		"  (scope $s",
+		"    (memory 0))",
+		"  (func (export \"main\") (result i32)",
+		"    (call_ref $ft",
+		"      (func.new 0 $ft $s (i32.const 16) (i32.const 7)))",
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\") (i32.const 0x11223344))"
+	], m.finish());
+}
+
+// An out-of-bounds code range traps rather than compiling.
+def gen_func_new_trap_oob() {
+	var gen = body(i32_const(42));
+	var main_code = cat3(
+		cat([u8.!(Opcode.LOCAL_GET.code), 0], [u8.!(Opcode.LOCAL_GET.code), 1]),
+		func_new(0, 1, 0),
+		[u8.!(Opcode.DROP.code)]);
+	var m = ModuleGen.new()
+		.types([(II, V), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(main_code)])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new_trap_oob", [
+		"(module",
+		"  (type $mt (func (param i32 i32)))",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 16) \"\\00\\41\\2a\\0b\")  ;; (func (result i32) (i32.const 42))",
+		"  (scope $s)",
+		"  (func (export \"main\") (param i32 i32)",
+		"    (drop (func.new 0 $ft $s (local.get 0) (local.get 1)))",
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\" (i32.const 16) (i32.const 4)))",
+		"(assert_trap (invoke \"main\" (i32.const 65536) (i32.const 1)) \"out of bounds memory access\")",
+		"(assert_trap (invoke \"main\" (i32.const 65535) (i32.const 2)) \"out of bounds memory access\")",
+		"(assert_trap (invoke \"main\" (i32.const 0) (i32.const 65537)) \"out of bounds memory access\")",
+		"(assert_trap (invoke \"main\" (i32.const -1) (i32.const 1)) \"out of bounds memory access\")"
+	], m.finish());
+}
+
+// Code that does not validate traps: here the body is an i64.add with an empty stack.
+def gen_func_new_trap_invalid() {
+	var gen = body([u8.!(Opcode.I64_ADD.code)]);
+	var main_code = cat3(
+		cat(i32_const(CODE_ADDR), i32_const(gen.length)),
+		func_new(0, 1, 0),
+		[u8.!(Opcode.DROP.code)]);
+	var m = ModuleGen.new()
+		.types([(V, V), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(main_code)])
+		.data([(CODE_ADDR, gen)]);
+	add("func_new_trap_invalid", [
+		"(module",
+		"  (type $mt (func))",
+		"  (type $ft (func (result i32)))",
+		"  (memory 1)",
+		"  (data (i32.const 16) \"\\00\\7c\\0b\")  ;; (func (result i32) (i64.add)) -- does not validate",
+		"  (scope $s)",
+		"  (func (export \"main\")",
+		"    (drop (func.new 0 $ft $s (i32.const 16) (i32.const 3)))",
+		"  )",
+		")"
+	], [
+		"(assert_trap (invoke \"main\") \"function did not validate\")"
+	], m.finish());
+}
+
+// A func.new naming an environment that does not exist does not validate.
+def gen_func_new_invalid_env() {
+	var main_code = cat3(
+		cat(i32_const(CODE_ADDR), i32_const(4)),
+		func_new(0, 1, /*no such environment=*/3),
+		[u8.!(Opcode.DROP.code)]);
+	var m = ModuleGen.new()
+		.types([(V, V), (V, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(main_code)]);
+	addInvalid("func_new_invalid_env", [
+		"(assert_invalid",
+		"  (module",
+		"    (type $mt (func))",
+		"    (type $ft (func (result i32)))",
+		"    (memory 1)",
+		"    (scope $s)",
+		"    (func (export \"main\")",
+		"      ;; environment index 3 is out of bounds",
+		"      (drop (func.new 0 $ft 3 (i32.const 16) (i32.const 4)))",
+		"    )",
+		"  )",
+		"  \"unknown environment\"",
+		")"
+	], "unknown environment", m.finish());
+}

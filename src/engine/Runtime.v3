@@ -111,11 +111,10 @@ component Runtime {
 	def ARRAY_NEW_DATA(stack: ExecStack, instance: Instance, array_index: u31, data_index: u31) -> Throwable {
 		var length = stack.popu();
 		var offset = stack.popu();
-		if (instance.dropped_data[data_index]) return stack.trap(TrapReason.MEMORY_OOB);
 		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
 		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
-		var ddecl = instance.module.data[data_index];
-		var t = bytesToVals(rtt.elem_types[0], ddecl.data, offset, length);
+		var ddata = instance.getData(data_index);
+		var t = bytesToVals(rtt.elem_types[0], ddata, offset, length);
 		if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
 		stack.push(Value.Ref(HeapArray.new(rtt, t.1)));
 		return null;
@@ -123,7 +122,6 @@ component Runtime {
 	def ARRAY_NEW_ELEM(stack: ExecStack, instance: Instance, array_index: u31, elem_index: u31) -> Throwable {
 		var length = stack.popu();
 		var offset = stack.popu();
-		if (instance.dropped_elems[elem_index]) return stack.trap(TrapReason.MEMORY_OOB);
 		if (length > Execute.limits.max_array_length) return stack.trap(TrapReason.OOM);
 		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
 		var evals = instance.getElems(elem_index);
@@ -206,8 +204,7 @@ component Runtime {
 		var obj = stack.popArray();
 		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
 		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
-		if (instance.dropped_data[data_index]) return if(size > 0, stack.trap(TrapReason.DATA_SEGMENT_DROPPED), null);
-		var data = instance.module.data[data_index].data;
+		var data = instance.getData(data_index);
 		if (ArrayUtil.boundsCheck(obj.vals, dst_offset, size) < 0) return stack.trap(TrapReason.ARRAY_OOB);
 		var t = bytesToVals(rtt.elem_types[0], data, src_offset, size);
 		if (!t.0) return stack.trap(TrapReason.MEMORY_OOB);
@@ -221,15 +218,50 @@ component Runtime {
 		var obj = stack.popArray();
 		var rtt = ArrayDecl.!(instance.heaptypes[array_index]);
 		if (obj == null) return stack.trap(TrapReason.NULL_DEREF);
-		if (instance.dropped_elems[elem_index]) return if(size > 0, stack.trap(TrapReason.ELEM_SEGMENT_DROPPED), null);
 		var evals = instance.getElems(elem_index);
 		var r = copyElemsInto(obj.vals, instance, dst_offset, evals, src_offset, size);
 		if (!r) return stack.trap(TrapReason.ARRAY_OOB);
 		return null;
 	}
+	def FUNC_NEW(stack: ExecStack, outer: Instance, mem_index: u31, sig_index: u31, env_index: u31) -> Throwable {
+		// Get new code from outer module's memory.
+		var memory = outer.memories[mem_index], sc = memory.decl.size;
+		var size = stack.popa(sc);
+		var src = stack.popa(sc);
+		var r = memory.range_ol_64(src, size).then(Ranges.dup<byte>); // copy the code to avoid data races if multiple threads
+		if (r.reason != TrapReason.NONE) return stack.trap(r.reason); // trap if out-of-bounds
+		var instance = outer.environments[env_index], module = instance.module;
+		// Create a new function.
+		var func = FuncDecl.new(sig_index);
+		func.setOrigCode(r.result);
+		func.sig = SigDecl.!(outer.heaptypes[sig_index]);
+		func.func_index = module.functions.length + module.new_funcs++;
+		// Get the environment and create or use cached CodeValidator.
+		var env = outer.module.environments[env_index], validator = env.validator;
+		if (validator == null) {
+			env.validator = validator = CodeValidator.new(env.extensions, env.limits, module,
+				ErrorGen.new(module.filename));
+		}
+		var err = validator.err.reset();
+		// Inform the tiering configuration of new code, prior to validation.
+		Execute.tiering.onFuncBody(module, u32.!(func.func_index), func.orig_bytecode, err);
+		// Run validation and handle errors.
+		match (validator.validateFunc(func, 0)) {
+			Ok => ;
+			Error(error_code, error_pos, error_msg) => {
+// TODO				Trace.OUT.put3("error[%s]: %s @ +%d", error_code.name, error_msg, error_pos).ln();
+				return stack.trap(TrapReason.FUNC_INVALID); // trap if validation failed
+			}
+		}
+		// Create a new function instance wrapping the innner instance.
+		var wf = WasmFunction.new(instance, func);
+		Execute.tiering.onNewFunction(wf, err); // inform tiering a new function is validated and finished
+		stack.push(Value.Ref(wf));  // return funcref result
+		return null;
+	}
 	// --- Table operations -----------------------------------------------------------------------------------------
 	def TABLE_INIT(stack: ExecStack, instance: Instance, elem_index: u31, table_index: u31) -> Throwable {
-		var evals = if (!instance.dropped_elems[elem_index], instance.getElems(elem_index));
+		var evals = instance.getElems(elem_index);
 		var table = instance.tables[table_index], sc = table.decl.size;
 		var size = stack.popu();
 		var src_offset = stack.popu();
@@ -269,11 +301,11 @@ component Runtime {
 	}
 	def MEMORY_INIT(stack: ExecStack, instance: Instance, data_index: u31, mem_index: u31) -> Throwable {
 		var memory = instance.memories[mem_index], sc = memory.decl.size;
-		var ddecl = if(!instance.dropped_data[data_index], instance.module.data[data_index]);
+		var ddata = instance.getData(data_index);
 		var size = stack.popu();
 		var src_offset = stack.popu();
 		var dst_offset = stack.popa(sc);
-		var t = memory.copyIn(dst_offset, if(ddecl != null, ddecl.data), src_offset, size);
+		var t = memory.copyIn(dst_offset, ddata, src_offset, size);
 		if (t != TrapReason.NONE) return stack.trap(t);
 		return null;
 	}
@@ -422,11 +454,11 @@ component Runtime {
 	}
 }
 def bytesToVals(storage: StorageType, data: Array<byte>, offset: u32, length: u32) -> (bool, Array<Value>) { // TODO: MaybeTrap
-	var vals = Array<Value>.new(int.!(length));
 	var start = ArrayUtil.boundsCheck(data, offset, length);
 	if (start < 0) return (false, null);
 	var limit = sizeOfStorage(storage) * length + offset;
 	if (limit > data.length) return (false, null);
+	var vals = Array<Value>.new(int.!(length));
 	var d = DataReader.new(data).reset(data, start, int.!(limit));
 	match (storage.pack) {
 		UNPACKED => {
