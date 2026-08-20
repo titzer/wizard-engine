@@ -1,0 +1,183 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Records every binary module that the binary-encoding unit tests decode, together with the
+// result the test expects, and writes them out as .bin.wast files, one per unit test. The
+// point is to externalize the internal tests: the same modules and expectations can then be
+// run through the reference interpreter, or any other engine, to check that Wizard agrees
+// with them. Enabled with --record-binary[=<dir>] on the unittest binary.
+//
+// The specification splits module rejection into two phases, decoding and validation, and
+// the reference interpreter distinguishes them: assert_malformed accepts only a decoding
+// error and assert_invalid only a validation error. Wizard's {WasmError} codes do not carry
+// the phase, so {phaseOf} maps them, best effort. A wrong entry there shows up as a whole
+// class of disagreements for one error code, which is easy to spot and fix in one place;
+// see test/regress/binary/check.sh, which groups its report by error code.
+enum RecordedPhase {
+	VALID,		// the module is accepted
+	MALFORMED,	// rejected while decoding
+	INVALID,	// rejected while validating
+	ENGINE		// rejected by an engine-specific limit; not externalizable
+}
+
+def NONE_SET: Extension.set;
+def NONSTANDARD = Extension.REPEAT_SECTIONS | Extension.LEGACY_EH | Extension.WIZENG;
+
+component BinRecorder {
+	var dir: string;			// output directory, or null when recording is off
+
+	private var name: string;		// unit test currently being recorded
+	private var buf = StringBuilder.new();
+	private var trials: int;		// trials recorded for the current test
+	private var skipped: int;		// engine-specific trials dropped
+	private var prev: Array<byte>;		// previous trial, to suppress duplicates
+
+	def enabled() -> bool {
+		return dir != null;
+	}
+	// Record one trial of {test} over {bytes}. {expected} is the error the test requires,
+	// or {WasmError.NONE} if the module is expected to decode.
+	def record(test: string, bytes: Array<byte>, expected: WasmError, extensions: Extension.set) {
+		if (dir == null) return;
+		if (name == null || !Strings.equal(name, test)) {
+			flush();
+			name = test;
+			trials = 0;
+			skipped = 0;
+			prev = null;
+			header();
+		}
+		// A test that splits a module at every offset re-runs the same bytes many times.
+		if (prev != null && Arrays.equal(prev, bytes)) return;
+		prev = bytes;
+
+		// Extensions the specification does not define; a module needing one of these cannot
+		// be expected to decode anywhere else.
+		var nonstandard = extensions & NONSTANDARD;
+		var phase = if(nonstandard != NONE_SET, RecordedPhase.ENGINE, phaseOf(expected));
+		if (phase == RecordedPhase.ENGINE) {
+			// The reference interpreter has no such limit, so it would decode this module
+			// happily. Note it rather than emitting a test that is guaranteed to disagree.
+			skipped++;
+			if (nonstandard != NONE_SET) {
+				buf.put1(";; skipped: needs the non-standard extension(s) %s",
+					renderExtensions(nonstandard)).ln();
+			} else {
+				buf.put1(";; skipped: %s is an engine-specific limit", expected.name).ln();
+			}
+			return;
+		}
+		trials++;
+		buf.put3(";; unittest %s[%d]: %s", test, trials, phase.name);
+		if (expected != WasmError.NONE) buf.put1(" %s", expected.name);
+		buf.put1(" [%s]", renderExtensions(extensions)).ln();
+
+		var indent = if(phase == RecordedPhase.VALID, "", "  ");
+		match (phase) {
+			// A plain (module binary ...) is instantiated, which the binary tests never do:
+			// they stop after decoding. Use the "definition" form, which decodes and
+			// validates without linking, so that a module with unresolved imports is not
+			// reported as a difference.
+			VALID => ;
+			MALFORMED => buf.puts("(assert_malformed").ln();
+			INVALID => buf.puts("(assert_invalid").ln();
+			ENGINE => ;
+		}
+		putModule(indent, bytes, phase == RecordedPhase.VALID);
+		if (phase != RecordedPhase.VALID) {
+			// The expected message is left empty, which the reference interpreter treats as
+			// matching any message. Wizard's error codes are not the specification's message
+			// texts, so asserting on them would report a difference for every single trial.
+			// What is worth cross-checking is the phase, which the assertion above encodes;
+			// the code is in the comment for triage.
+			buf.puts("  \"\"").ln();
+			buf.puts(")").ln();
+		}
+		buf.ln();
+	}
+	// Write out the file for the test being recorded, if any.
+	def flush() {
+		if (name == null) return;
+		var path = Strings.format2("%s/%s.bin.wast", dir, fileName(name));
+		var fd = System.fileOpen(path, false);
+		if (fd < 0) {
+			Trace.OUT.put1("could not write %s (does the directory exist?)", path).ln();
+		} else {
+			buf.out(System.fileWriteK(fd, _, _, _));
+			System.fileClose(fd);
+			Trace.OUT.put3("recorded %s (%d trials, %d skipped)", path, trials, skipped).ln();
+		}
+		buf.reset();
+		name = null;
+	}
+	private def header() {
+		buf.puts(";; generated by test/regress/binary/record.sh; do not edit").ln();
+		buf.ln();
+	}
+	private def putModule(indent: string, bytes: Array<byte>, definition: bool) {
+		buf.puts(indent).puts(if(definition, "(module definition binary", "(module binary")).ln();
+		for (i = 0; i < bytes.length; i = i + 16) {
+			buf.puts(indent).puts("  \"");
+			for (j = i; j < bytes.length && j < i + 16; j++) {
+				var b = bytes[j];
+				buf.putc('\\');
+				buf.putc(Chars.hexMap_l[b >> 4]);
+				buf.putc(Chars.hexMap_l[b & 0xF]);
+			}
+			buf.puts("\"").ln();
+		}
+		buf.puts(indent).puts(")").ln();
+	}
+	// Turns a unit test name like "bin:sect_dup" into a file name.
+	private def fileName(test: string) -> string {
+		var r = Arrays.dup(test);
+		for (i < r.length) if (r[i] == ':') r[i] = '_';
+		return r;
+	}
+	private def renderExtensions(extensions: Extension.set) -> string {
+		var b = StringBuilder.new();
+		for (e in extensions) {
+			if (b.length > 0) b.sp();
+			b.puts(e.short_name);
+		}
+		if (b.length == 0) b.puts("none");
+		return b.toString();
+	}
+	// Which phase of the specification rejects a module for {code}. Best effort; see the
+	// comment at the top of this file.
+	def phaseOf(code: WasmError) -> RecordedPhase {
+		match (code) {
+			NONE => return RecordedPhase.VALID;
+
+			// Limits that the specification does not impose; the engine chose them.
+			EXCEEDED_LIMIT => return RecordedPhase.ENGINE;
+
+			// Rejected only after the module has been decoded.
+			OOB_INDEX,
+			DUPLICATE_EXPORT,
+			INVALID_INIT_EXPR,
+			ILLEGAL_TYPE,
+			ILLEGAL_SUPERTYPE,
+			INVALID_TAG_SIGNATURE,
+			ILLEGAL_BLOCK_TYPE,
+			ILLEGAL_SELECT_COUNT,
+			ILLEGAL_ASSIGNMENT,
+			ILLEGAL_FUNCREF,
+			ILLEGAL_CAST,
+			TYPE_MISMATCH,
+			MISMATCHED_ELSE,
+			MISMATCHED_CATCH,
+			MISMATCHED_DELEGATE,
+			UNTERMINATED_BODY,
+			OOB_LABEL,
+			ILLEGAL_ALIGNMENT,
+			ILLEGAL_LANE,
+			MISSING_DATA_COUNT,
+			UNINIT_LOCAL,
+			RETHROW_NOT_IN_CATCH => return RecordedPhase.INVALID;
+
+			// Everything else is a decoding error.
+			_ => return RecordedPhase.MALFORMED;
+		}
+	}
+}
