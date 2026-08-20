@@ -48,7 +48,10 @@ MONITORS="src/monitors/*.v3"
 TEST_MONITORS="src/monitors/test/*.v3"
 DEBUG_MONITORS="src/monitors/debug/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
-TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
+# The x86-64 target still represents Wasm structs and arrays as Virgil objects, so it
+# needs the V3 object model, but not the rest of the V3 (interpreter) target.
+V3_OBJECT_MODEL="src/engine/v3/V3ObjectModel.v3"
+TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $V3_OBJECT_MODEL $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
