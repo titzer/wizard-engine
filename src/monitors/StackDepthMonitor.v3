@@ -1,0 +1,128 @@
+// Copyright 2026 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Records the Wasm stack depth whenever a suspend instruction is executed.
+def monitor_ = MonitorRegistry.add(
+	"stackdepth", "Reports Wasm stack depth at suspend instructions.",
+	StackDepthMonitor.new());
+
+class StackDepthMonitor extends Monitor {
+	def stats = StackDepthStats.new();
+	def probe = SuspendDepthProbe.new(stats);
+
+	def onParse(module: Module, err: ErrorGen) {
+		SuspendDepthInstrumenter.new(module, probe).run();
+	}
+
+	def onFinish(i: Instance, r: Result) {
+		if (MonitorOptions.CSV.val) reportStackDepthCSV(out, stats);
+		else reportStackDepthText(out, stats);
+	}
+}
+
+// Inserts the shared depth probe only at suspend instructions.
+class SuspendDepthInstrumenter extends BytecodeInstrumenter {
+	def probe: Probe;
+
+	new(module: Module, probe: Probe) super(module) { }
+
+	def visit_SUSPEND(tag: u31) {
+		insertProbeHere(probe);
+	}
+}
+
+class SuspendDepthProbe(stats: StackDepthStats) extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		// FrameAccessor.depth() is zero-based within the current stack segment.
+		stats.record(dynamicLoc.frame.getFrameAccessor().depth() + 1);
+		return ProbeAction.Continue;
+	}
+}
+
+class StackDepthStats {
+	var counts = Array<u64>.new(1);
+	var total: u64;
+	var sum: u64;
+	var max: int;
+
+	def record(depth: int) {
+		if (depth >= counts.length) counts = Arrays.grow(counts, depth + 1);
+		counts[depth]++;
+		total++;
+		sum += u64.view(depth);
+		if (depth > max) max = depth;
+	}
+
+	def mode() -> int {
+		var result = 0;
+		var highest = 0uL;
+		for (depth < counts.length) {
+			if (counts[depth] > highest) {
+				highest = counts[depth];
+				result = depth;
+			}
+		}
+		return result;
+	}
+
+	// Returns the nearest-rank percentile, where {percent} is in [1, 100].
+	def percentile(percent: u64) -> int {
+		if (total == 0) return 0;
+		// Split the calculation so {total * percent} cannot overflow.
+		var target = (total / 100uL) * percent;
+		target += ((total % 100uL) * percent + 99uL) / 100uL;
+		var cumulative = 0uL;
+		for (depth < counts.length) {
+			cumulative += counts[depth];
+			if (cumulative >= target) return depth;
+		}
+		return max;
+	}
+}
+
+def stackDepthTable = initStackDepthTable();
+def initStackDepthTable() -> TraceTable {
+	var t = TraceTable.new(["Depth", "Suspends", "Percent"]);
+	t.cells[0].set(8, Justification.RIGHT, Color.NONE);
+	t.cells[1].set(12, Justification.RIGHT, Color.COUNT);
+	t.cells[2].set(10, Justification.RIGHT, Color.COUNT);
+	return t;
+}
+
+def fillStackDepthRow(stats: StackDepthStats, depth: int) {
+	var count = stats.counts[depth];
+	stackDepthTable.cells[0].putd(depth);
+	stackDepthTable.cells[1].putd(count);
+	TraceUtil.renderPercent(stackDepthTable.cells[2], long.view(count), long.view(stats.total), 2);
+}
+
+def reportStackDepthText(out: TraceBuilder, stats: StackDepthStats) {
+	out.beginColor(Color.UNDERLINE).puts("stackdepth: Wasm stack depth at suspend").endColors().ln();
+	if (stats.total == 0) {
+		out.puts("  (no suspend instructions were executed)").ln();
+		return;
+	}
+	out.puts("suspends: ").putd(stats.total).puts(", mean: ");
+	TraceUtil.renderFraction(out, long.view(stats.sum), long.view(stats.total), 2);
+	out.puts(", mode: ").putd(stats.mode());
+	out.puts(", p50: ").putd(stats.percentile(50));
+	out.puts(", p90: ").putd(stats.percentile(90));
+	out.puts(", p99: ").putd(stats.percentile(99));
+	out.puts(", max: ").putd(stats.max).ln();
+	stackDepthTable.putTableHeader(out);
+	for (depth = 1; depth < stats.counts.length; depth++) {
+		if (stats.counts[depth] == 0) continue;
+		fillStackDepthRow(stats, depth);
+		stackDepthTable.putTableRow(out);
+	}
+	out.ln();
+}
+
+def reportStackDepthCSV(out: TraceBuilder, stats: StackDepthStats) {
+	stackDepthTable.putCsvHeader(out);
+	for (depth = 1; depth < stats.counts.length; depth++) {
+		if (stats.counts[depth] == 0) continue;
+		fillStackDepthRow(stats, depth);
+		stackDepthTable.putCsvRow(out);
+	}
+}

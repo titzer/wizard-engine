@@ -26,6 +26,7 @@ else
         "globals"
         "memstats"
 	    "profile_bytecode{switch_size=16}"
+	    "stackdepth"
 	    "ssevent")
 fi
 
