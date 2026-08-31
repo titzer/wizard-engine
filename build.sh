@@ -23,8 +23,12 @@ fi
 
 V3C=${V3C:=$(which v3c)}
 if [ ! -x "$V3C" ]; then
-    echo "Virgil compiler (v3c) not found in \$PATH, and \$V3C not set"
-    exit 1
+    if [ "$VIRGIL_LOC" != "" ]; then
+	V3C=$(cd $VIRGIL_LOC && pwd)/bin/v3c
+    else
+        echo "Virgil compiler (v3c) not found in \$PATH, and neither \$V3C or \$VIRGIL_LOC is set"
+        exit 1
+    fi
 fi
 
 if [ "$VIRGIL_LIB" = "" ]; then
