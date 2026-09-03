@@ -1,5 +1,5 @@
-;; struct.new immediately followed by struct.get; regresses the missing
-;; regs.instance reload after a fast-mode runtime call (was MEMORY_OOB).
+;; A fast:-exported function that allocates a struct and immediately reads
+;; a field back from it.
 (module
   (type $s (struct (field i32)))
   (func $f (export "fast:f") (param i32) (result i32)

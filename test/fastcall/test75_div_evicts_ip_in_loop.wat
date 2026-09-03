@@ -1,3 +1,5 @@
+;; A fast:-exported function with a loop that accumulates 50 integer
+;; divisions.
 (module
   (func $f (export "fast:f") (param i32) (result i32)
     (local $i i32) (local $acc i32)

@@ -1,6 +1,5 @@
-;; try_table/catch/throw is unsupported in fast functions (unimplemented
-;; runtime unwind contract, was a crash). Compilation now bails out cleanly;
-;; default (non-eager) execution falls back to interpretation and runs fine.
+;; A fast:-exported function using try_table/catch to handle a thrown tag
+;; from a called function.
 (module
   (type $f1 (func))
   (tag $t (param i32))

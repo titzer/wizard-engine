@@ -327,7 +327,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 
 	def k_frame_size	= X86_64InterpreterFrame.size;
 
-	def vsph = VspHelper.new(r_vsp, valuerep, 3);
+	def vsph = VspHelper.new(r_vsp, valuerep, 4);
 
 	def dispatchTables = Array<(byte, IcCodeRef, IcCodeRef, byte, IcCodeRef)>.new(
 				Opcodes.code_pages.length + Opcodes.num_subpages + 1);
@@ -926,6 +926,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genCompares();
 		genI32Arith();
 		genI64Arith();
+		genWideArith();
 		genExtensions();
 		genF32Arith();
 		genF64Arith();
@@ -2005,6 +2006,40 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def genAtomicCompareAndExchange<T>(cmpxchg: (X86_64Addr, X86_64Gpr) -> T) {
 		genAtomicOp(cmpxchg, null, null, true);
 	}
+	// ext:wide-arithmetic. Operands and results are (low, high) pairs of i64 slots,
+	// with the low half deeper in the stack.
+	def genWideArith() {
+		for (t in [
+			(Opcode.I64_ADD128, asm.q.add_r_m, asm.q.adc_r_m),
+			(Opcode.I64_SUB128, asm.q.sub_r_m, asm.q.sbb_r_m)
+		]) {
+			bindHandler(t.0);
+			asm.movq_r_m(r_tmp0, vsph[-4].value);	// a.low
+			asm.movq_r_m(r_tmp1, vsph[-3].value);	// a.high
+			t.1(r_tmp0, vsph[-2].value);		// low halves, setting carry/borrow
+			t.2(r_tmp1, vsph[-1].value);		// high halves, consuming carry/borrow
+			asm.movq_m_r(vsph[-4].value, r_tmp0);
+			asm.movq_m_r(vsph[-3].value, r_tmp1);
+			adjustVsp(-2);
+			endHandler();
+		}
+		for (t in [
+			(Opcode.I64_MUL_WIDE_S, asm.q.imul_r),
+			(Opcode.I64_MUL_WIDE_U, asm.q.mul_r)
+		]) {
+			bindHandler(t.0);
+			asm.movq_r_m(r_tmp0, vsph[-1].value);	// {r_tmp1} is RDX, so use RCX
+			masm.emit_spill_ivar(X86_64MasmRegs.RAX);
+			masm.emit_spill_ivar(X86_64MasmRegs.RDX);
+			asm.movq_r_m(R.RAX, vsph[-2].value);
+			t.1(r_tmp0);				// RDX:RAX = RAX * RCX
+			asm.movq_m_r(vsph[-2].value, R.RAX);	// low
+			asm.movq_m_r(vsph[-1].value, R.RDX);	// high
+			masm.emit_restore_ivar(X86_64MasmRegs.RAX);
+			masm.emit_restore_ivar(X86_64MasmRegs.RDX);
+			endHandler();
+		}
+	}
 	def genExtensions() {
 		bindHandler(Opcode.I32_WRAP_I64); {
 			genTagUpdate(BpTypeCode.I32.code);
@@ -2279,10 +2314,16 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			asm.movq_r_m(r_tmp0, vsph[-1].value);
 			asm.q.cmp_r_i(r_tmp0, 0);
 			asm.jc_rel_far(X86_64Conds.Z, newTrapLabel(TrapReason.NULL_DEREF));
-			asm.movq_r_m(r_tmp0, r_tmp0.plus(offsets.HeapArray_vals));
+			/* Direct array length access needs to be moved to the object model
+			asm.movq_r_m(r_tmp0, r_tmp0.plus(offsets.WasmArray_vals));
 			asm.movd_r_m(r_tmp0, r_tmp0.plus(offsets.Array_length));
 			asm.movd_m_r(vsph[-1].value, r_tmp0);
 			genTagUpdate(BpTypeCode.I32.code);
+			*/
+			masm.emit_get_curstack(xenv.tmp3);
+			saveCallerIVars();
+			callRuntime(refRuntimeCall(RT.ARRAY_LEN), [r_tmp3, r_instance], false); // runtime pushes result onto stack
+			restoreCallerIVars();
 			endHandler();
 		}
 		bindHandler(Opcode.REF_TEST); {

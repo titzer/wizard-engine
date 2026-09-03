@@ -1,5 +1,5 @@
-;; Fast function under pressure calls another fast function also under
-;; pressure -- two independent regAlloc instances sharing physical registers.
+;; A fast:-exported function with many live locals in a loop, calling
+;; another fast:-exported function that also has many live locals in a loop.
 (module
   (func $g (export "fast:g") (param i32) (result i32)
     (local $i i32) (local $acc i32)

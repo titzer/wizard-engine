@@ -1,0 +1,566 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def NAIVE = NaiveCompressionStrategy.new();
+def PACKED = PackedCompressionStrategy.new();
+
+// A heap object for ref-typed value slots, built as in {CompressionTest.v3}.
+def EMPTY_STRUCT = StructDecl.new(false, ValueTypes.NO_HEAPTYPES, []);
+def newObject = ObjectModel.newStructFromValues(EMPTY_STRUCT, _);
+
+def newIntTester(t: Tester) -> X86_64CompressionTester {
+	return X86_64CompressionTester.new(t, X86_64InterpreterOnlyStrategy.new());
+}
+def newSpcTester(t: Tester) -> X86_64CompressionTester {
+	return X86_64CompressionTester.new(t, X86_64SpcAotStrategy.new(false));
+}
+
+def T = UnitTests.registerT("x86compress:", _, newIntTester, _);
+def TS = UnitTests.registerT("x86compress:spc:", _, newSpcTester, _);
+def X_ = void(
+	T("empty_frames", test_empty_frames),
+	T("single_empty", test_single_empty),
+	T("single_val", test_single_val),
+	T("two_frames", test_two_frames),
+	T("three_frames", test_three_frames),
+	T("varying_vals", test_varying_vals),
+	T("many_frames", test_many_frames),
+	T("many_vals", test_many_vals),
+	T("pc_variety", test_pc_variety),
+	T("multi_func", test_multi_func),
+	T("offset_preserved", test_offset_preserved),
+	T("offset_survives_gc", test_offset_survives_gc),
+	T("val_i32", test_val_i32),
+	T("val_i64", test_val_i64),
+	T("val_f32", test_val_f32),
+	T("val_f64", test_val_f64),
+	T("val_v128", test_val_v128),
+	T("val_ref_null", test_val_ref_null),
+	T("val_ref_obj", test_val_ref_obj),
+	T("val_i31", test_val_i31),
+	T("val_cont", test_val_cont),
+	T("val_mixed", test_val_mixed),
+	T("rewrite_shrinks", test_rewrite_shrinks),
+	T("accessor_cleared", test_accessor_cleared),
+	T("root_params_state", test_root_params_state),
+	T("pipeline_naive", test_pipeline_naive),
+	T("pipeline_packed", test_pipeline_packed),
+	T("pipeline_stack", test_pipeline_stack),
+	T("cont_bottom_set", test_cont_bottom_set),
+	T("stp_at_end", test_stp_at_end),
+	T("write_requires_empty_stack", test_write_requires_empty_stack),
+	TS("single", test_spc_single),
+	TS("chain", test_spc_chain),
+	TS("mixed", test_spc_mixed),
+	TS("inlined_instance_cleared", test_spc_inlined_instance_cleared),
+	TS("vals", test_spc_vals),
+	TS("pc_is_derived", test_spc_pc_is_derived),
+	TS("curpc", test_spc_curpc),
+	()
+);
+
+private class X86_64CompressionTester extends ExeTester {
+	var instance_: Instance;
+	var v_v_func: WasmFunction;
+	var stack_: X86_64Stack;
+	var stack2_: X86_64Stack;
+
+	new(t: Tester, tiering: ExecutionStrategy) super(t, tiering) { }
+
+	// Instantiate the module built so far; an SPC tier also compiles it, giving {spcRetAddr} a real address.
+	def instance() -> Instance {
+		if (instance_ == null) instance_ = makeInstance();
+		return instance_;
+	}
+	def wasmFunc(index: int) -> WasmFunction {
+		return WasmFunction.!(instance().functions[index]);
+	}
+	def emptyFunc() -> WasmFunction {
+		if (v_v_func == null) {
+			sig(SigCache.v_v).codev([]);
+			v_v_func = wasmFunc(0);
+		}
+		return v_v_func;
+	}
+	// Two scratch stacks, reused within a test.
+	def stack() -> X86_64Stack {
+		if (stack_ == null) stack_ = X86_64StackManager.getFreshStack();
+		return stack_;
+	}
+	def stack2() -> X86_64Stack {
+		if (stack2_ == null) stack2_ = X86_64StackManager.getFreshStack();
+		return stack2_;
+	}
+
+	def intRetAddr() -> u64 {
+		var ic = X86_64PreGenStubs.getInterpreterCode();
+		return u64.view(ic.start + ic.header.deoptReentryOffset - Pointer.NULL);
+	}
+	def spcRetAddr(f: WasmFunction) -> u64 {
+		var entry = f.decl.target_code.spc_entry;
+		if (!X86_64SpcModuleCode.?(RiRuntime.findUserCode(entry))) {
+			t.fail("expected an SPC-compiled function; is this tester running under an SPC tier?");
+			return 0;
+		}
+		return u64.view(entry - Pointer.NULL);
+	}
+
+	// Build an interpreter frame with an explicit resume offset.
+	def makeIntFrameAt(f: WasmFunction, pc: int, offset: int, vals: Array<Value>) -> RelocatableFrame {
+		return RelocatableFrame(WasmFrameData(f, pc, intRetAddr(), vals), false, offset);
+	}
+	// Build an interpreter frame with the resume offset pinned to {pc + 1}.
+	def makeIntFrame(f: WasmFunction, pc: int, vals: Array<Value>) -> RelocatableFrame {
+		return makeIntFrameAt(f, pc, pc + 1, vals);
+	}
+	// Build an SPC frame with pc = -1.
+	def makeSpcFrame(f: WasmFunction, vals: Array<Value>) -> RelocatableFrame {
+		return RelocatableFrame(WasmFrameData(f, -1, spcRetAddr(f), vals), true, 0);
+	}
+	// A chain of {n} interpreter frames.
+	def intChain(n: int) -> Array<RelocatableFrame> {
+		var f = emptyFunc();
+		var frames = Array<RelocatableFrame>.new(n);
+		for (i < n) {
+			var vals = Array<Value>.new(i);
+			for (j < i) vals[j] = Value.I32(u32.view(i * 100 + j));
+			frames[i] = makeIntFrame(f, 1, vals);
+		}
+		return frames;
+	}
+	// Real instruction offsets in {f}, so tests do not invent pc values.
+	def validPcs(f: WasmFunction) -> Array<int> {
+		var pcs = Vector<int>.new();
+		var bi = BytecodeIterator.new().reset(f.decl);
+		while (bi.more()) {
+			bi.current();
+			pcs.put(bi.pc);
+			bi.next();
+		}
+		return pcs.extract();
+	}
+
+	def roundtrip(frames: Array<RelocatableFrame>) -> Array<RelocatableFrame> {
+		var s = stack();
+		X86_64Compression.writeFrames(s, frames);
+		return X86_64Compression.readFrames(s);
+	}
+	def assert_roundtrip(frames: Array<RelocatableFrame>) {
+		FrameAsserts.assert_frames_eq(t, frames, roundtrip(frames));
+	}
+	// Roundtrip a single trivial frame holding {vals}.
+	def assert_roundtrip_vals(vals: Array<Value>) {
+		assert_roundtrip([makeIntFrame(emptyFunc(), 1, vals)]);
+	}
+	def assert_frames_eq(expected: Array<RelocatableFrame>, got: Array<RelocatableFrame>) {
+		FrameAsserts.assert_frames_eq(t, expected, got);
+	}
+	// The frame handle of the topmost frame of {s}; {s.rsp} is that frame's return-address slot.
+	def topHandle(s: X86_64Stack) -> X86_64FrameHandle {
+		return X86_64FrameHandles.from(s.rsp + Pointer.SIZE);
+	}
+}
+
+// ===== Frame structure =====
+
+def test_empty_frames(t: X86_64CompressionTester) {
+	var got = t.roundtrip([]);
+	FrameAsserts.assert_length(t.t, 0, got.length, "frames");
+	if (t.stack().state() != StackState.EMPTY) t.t.fail1("expected an empty stack, got %s", t.stack().state().name);
+}
+
+def test_single_empty(t: X86_64CompressionTester) {
+	t.assert_roundtrip([t.makeIntFrame(t.emptyFunc(), 1, [])]);
+}
+
+def test_single_val(t: X86_64CompressionTester) {
+	t.assert_roundtrip([t.makeIntFrame(t.emptyFunc(), 1, [Value.I32(0xCAFEBABEu)])]);
+}
+
+def test_two_frames(t: X86_64CompressionTester) {
+	t.assert_roundtrip(t.intChain(2));
+}
+
+def test_three_frames(t: X86_64CompressionTester) {
+	t.assert_roundtrip(t.intChain(3));
+}
+
+// Frames with 0..9 values, so no two adjacent value regions have the same length.
+def test_varying_vals(t: X86_64CompressionTester) {
+	t.assert_roundtrip(t.intChain(10));
+}
+
+def test_many_frames(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var n = 200; // ~22KB of frames; the stack redzone sits at 256KB
+	var frames = Array<RelocatableFrame>.new(n);
+	for (i < n) frames[i] = t.makeIntFrame(f, 1, [Value.I64(u64.view(i))]);
+	t.assert_roundtrip(frames);
+}
+
+def test_many_vals(t: X86_64CompressionTester) {
+	var n = 1000; // 32KB of value slots
+	var vals = Array<Value>.new(n);
+	for (i < n) vals[i] = Value.I32(u32.view(i * 7));
+	t.assert_roundtrip_vals(vals);
+}
+
+// One frame per real instruction offset in a non-trivial function body.
+def test_pc_variety(t: X86_64CompressionTester) {
+	t.sig(SigCache.ii_i).codev([
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.LOCAL_GET.code), 1,
+		u8.!(Opcode.I32_ADD.code)
+	]);
+	var f = t.wasmFunc(0);
+	var pcs = t.validPcs(f);
+	if (pcs.length < 3) return t.t.fail1("expected several instruction pcs, got %d", pcs.length);
+	var frames = Array<RelocatableFrame>.new(pcs.length);
+	for (i < pcs.length) frames[i] = t.makeIntFrame(f, pcs[i], [Value.I32(u32.view(i))]);
+	t.assert_roundtrip(frames);
+}
+
+// Frames belonging to three different functions of the same instance.
+def test_multi_func(t: X86_64CompressionTester) {
+	t.newFunction(SigCache.v_v, [u8.!(Opcode.NOP.code)]);
+	t.newFunction(SigCache.v_v, [u8.!(Opcode.NOP.code), u8.!(Opcode.NOP.code)]);
+	t.sig(SigCache.v_v).codev([]);
+	var frames = [
+		t.makeIntFrame(t.wasmFunc(0), 1, [Value.I32(10)]),
+		t.makeIntFrame(t.wasmFunc(1), 1, [Value.I32(20), Value.I32(21)]),
+		t.makeIntFrame(t.wasmFunc(2), 1, [])
+	];
+	t.assert_roundtrip(frames);
+}
+
+// ===== Value representation =====
+
+def test_val_i32(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.I32(0), Value.I32(1), Value.I32(0x80000000u), Value.I32(0xFFFFFFFFu)]);
+}
+
+def test_val_i64(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.I64(0), Value.I64(0x8000000000000000uL), Value.I64(0xFFFFFFFFFFFFFFFFuL)]);
+}
+
+def test_val_f32(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.F32(0), Value.F32(0x3F800000u), Value.F32(0x7FC00000u), Value.F32(0xFF800000u)]);
+}
+
+def test_val_f64(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.F64(0), Value.F64(0x3FF0000000000000uL), Value.F64(0x7FF8000000000000uL)]);
+}
+
+def test_val_v128(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([
+		Value.V128(0, 0),
+		Value.V128(0xDEADBEEFCAFE0000uL, 0x0123456789ABCDEFuL),
+		Value.V128(0xFFFFFFFFFFFFFFFFuL, 0xFFFFFFFFFFFFFFFFuL)
+	]);
+}
+
+def test_val_ref_null(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.Ref(null), Value.Ref(null)]);
+}
+
+// Reference identity survives, but the tag byte does not.
+def test_val_ref_obj(t: X86_64CompressionTester) {
+	var a = newObject([]);
+	var b = HostObject.new();
+	var vals: Array<Value> = [Value.Ref(a), Value.Ref(b), Value.Ref(null), Value.Ref(a)];
+	var got = t.roundtrip([t.makeIntFrame(t.emptyFunc(), 1, vals)]);
+	FrameAsserts.assert_length(t.t, 1, got.length, "frames");
+	FrameAsserts.assert_vals_eq(t.t, vals, got[0].data.vals);
+	match (got[0].data.vals[0]) {
+		Ref(obj) => if (obj != a) t.t.fail("ref identity not preserved");
+		_ => t.t.fail("expected a Ref value");
+	}
+}
+
+def test_val_i31(t: X86_64CompressionTester) {
+	t.assert_roundtrip_vals([Value.I31(0), Value.I31(1), Value.I31(u31.!(0x3FFFFFFF)), Value.I31(u31.max)]);
+}
+
+def test_val_cont(t: X86_64CompressionTester) {
+	var target = Target.newWasmStack();
+	var cont = Continuations.makeContinuation(target);
+	var vals: Array<Value> = [Value.Cont(cont)];
+	var got = t.roundtrip([t.makeIntFrame(t.emptyFunc(), 1, vals)]);
+	FrameAsserts.assert_length(t.t, 1, got.length, "frames");
+	FrameAsserts.assert_vals_eq(t.t, vals, got[0].data.vals);
+	match (got[0].data.vals[0]) {
+		Cont(c) => {
+			if (Continuations.getStoredStack(c) != target) t.t.fail("cont stack not preserved");
+			if (Continuations.getStoredVersion(c) != Continuations.getStoredVersion(cont)) {
+				t.t.fail("cont version not preserved");
+			}
+		}
+		_ => t.t.fail("expected a Cont value");
+	}
+}
+
+// Every value kind adjacent in one frame, catching any slot-size or tag-offset mistake.
+def test_val_mixed(t: X86_64CompressionTester) {
+	var obj = newObject([]);
+	t.assert_roundtrip_vals([
+		Value.I32(1), Value.I64(2), Value.F32(3), Value.F64(4),
+		Value.V128(5, 6), Value.Ref(obj), Value.Ref(null), Value.I31(7),
+		Value.I32(0xFFFFFFFFu)
+	]);
+}
+
+// ===== Bytecode resume offset =====
+
+def test_offset_preserved(t: X86_64CompressionTester) {
+	t.sig(SigCache.v_v).codev([
+		u8.!(Opcode.I32_CONST.code), 0x80, 0x80, 0x01,	// 3-byte LEB immediate
+		u8.!(Opcode.DROP.code)
+	]);
+	var f = t.wasmFunc(0);
+	var pc = t.validPcs(f)[0];
+	var offset = pc + 3; // last byte of the immediate, before the next instruction
+	var got = t.roundtrip([t.makeIntFrameAt(f, pc, offset, [])]);
+	FrameAsserts.assert_length(t.t, 1, got.length, "frames");
+	if (got[0].bytecode_offset != offset) {
+		t.t.fail2("expected bytecode_offset=%d, got %d", offset, got[0].bytecode_offset);
+	}
+}
+
+def test_offset_survives_gc(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var seed = t.intChain(3);
+	var src = t.stack2();
+	X86_64Compression.writeFrames(src, seed);
+	var frames = X86_64Compression.readFrames(src);
+
+	Target.forceGC();
+
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, frames);
+	var h = t.topHandle(s);
+	if (!X86_64FrameHandle.Interpreter.?(h)) return t.t.fail("expected an interpreter frame on top");
+	var ih = X86_64FrameHandle.Interpreter.!(h);
+	var code = f.decl.cur_bytecode; // read after the collection
+	if (ih.code() != code) return t.t.fail("expected the frame to hold the current bytecode array");
+	var expected = Pointer.atContents(code) + frames[frames.length - 1].bytecode_offset;
+	if (ih.ip() != expected) {
+		t.t.fail2("expected ip=0x%x, got ip=0x%x",
+			u64.view(expected - Pointer.NULL), u64.view(ih.ip() - Pointer.NULL));
+	}
+	t.assert_frames_eq(frames, X86_64Compression.readFrames(s));
+}
+
+// ===== Stack hygiene =====
+
+// Writing a shorter frame set over a longer one must not leave the tail of the old set reachable.
+def test_rewrite_shrinks(t: X86_64CompressionTester) {
+	var long = t.intChain(6);
+	X86_64Compression.writeFrames(t.stack(), long);
+	t.stack().clear(); // {writeFrames} requires an EMPTY stack
+	var short = t.intChain(2);
+	t.assert_frames_eq(short, t.roundtrip(short));
+}
+
+// {writeFrames} clears the accessor slot, so a stale {X86_64FrameAccessor} cannot defeat {isUnwound}.
+def test_accessor_cleared(t: X86_64CompressionTester) {
+	var frames = t.intChain(2);
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, frames);
+	var stale = X86_64Compression.readFrames(s); // installs accessors
+	if (stale.length != 2) return t.t.fail1("expected 2 frames, got %d", stale.length);
+	if (t.topHandle(s).accessor() == null) return t.t.fail("expected readFrames to install an accessor");
+
+	s.clear();
+	X86_64Compression.writeFrames(s, frames);
+	if (t.topHandle(s).accessor() != null) t.t.fail("expected writeFrames to clear the accessor slot");
+}
+
+def test_root_params_state(t: X86_64CompressionTester) {
+	t.sig(SigCache.ii_i).codev([
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.LOCAL_GET.code), 1,
+		u8.!(Opcode.I32_ADD.code)
+	]);
+	var f = t.wasmFunc(0);
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, [t.makeIntFrame(f, t.validPcs(f)[0], [Value.I32(1), Value.I32(2)])]);
+	if (s.params_arity != 0) t.t.fail1("expected no pending root parameters, got params_arity=%d", s.params_arity);
+	if (s.state() != StackState.RESUMABLE) t.t.fail1("expected a RESUMABLE stack, got %s", s.state().name);
+}
+
+// ===== Full pipeline =====
+
+def assert_pipeline(t: X86_64CompressionTester, roundtrip: Array<RelocatableFrame> -> Array<RelocatableFrame>) {
+	var frames = t.intChain(4);
+	X86_64Compression.writeFrames(t.stack(), frames);
+	var read = Target.readFramesFromStack(t.stack());
+	var back = roundtrip(read);
+	Target.writeFramesToStack(t.stack2(), back);
+	t.assert_frames_eq(frames, X86_64Compression.readFrames(t.stack2()));
+}
+
+def test_pipeline_naive(t: X86_64CompressionTester) {
+	assert_pipeline(t, fun (fs: Array<RelocatableFrame>) => NAIVE.decompress(NAIVE.compress(fs)));
+}
+
+def test_pipeline_packed(t: X86_64CompressionTester) {
+	assert_pipeline(t, fun (fs: Array<RelocatableFrame>) => PACKED.decompress(PACKED.compress(fs)));
+}
+
+// The same loop through the {StackCompression} entrypoints, covering its strategy dispatch.
+def test_pipeline_stack(t: X86_64CompressionTester) {
+	var frames = t.intChain(4);
+	X86_64Compression.writeFrames(t.stack(), frames);
+	var compressed = StackCompression.compressStack(t.stack());
+	StackCompression.decompressStack(t.stack2(), compressed);
+	t.assert_frames_eq(frames, X86_64Compression.readFrames(t.stack2()));
+}
+
+// ===== SPC frames =====
+
+def test_spc_single(t: X86_64CompressionTester) {
+	t.assert_roundtrip([t.makeSpcFrame(t.emptyFunc(), [Value.I32(42)])]);
+}
+
+def test_spc_chain(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var frames = Array<RelocatableFrame>.new(5);
+	for (i < frames.length) {
+		var vals = Array<Value>.new(i);
+		for (j < i) vals[j] = Value.I64(u64.view(i * 10 + j));
+		frames[i] = t.makeSpcFrame(f, vals);
+	}
+	t.assert_roundtrip(frames);
+}
+
+// Interleaved interpreter and SPC frames: same 104-byte footprint, {is_spc} from the return address.
+def test_spc_mixed(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var frames = Array<RelocatableFrame>.new(6);
+	for (i < frames.length) {
+		var vals: Array<Value> = [Value.I32(u32.view(i))];
+		frames[i] = if((i & 1) == 0, t.makeSpcFrame(f, vals), t.makeIntFrame(f, 1, vals));
+	}
+	t.assert_roundtrip(frames);
+}
+
+// {inlined_instance} (+40) aliases the interpreter's {stp} slot, and must be cleared.
+def test_spc_inlined_instance_cleared(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var s = t.stack();
+	var n = 4;
+	X86_64Compression.writeFrames(s, t.intChain(n));
+	var top = t.topHandle(s);
+	if (!X86_64FrameHandle.Interpreter.?(top)) return t.t.fail("setup: expected an interpreter frame");
+	if (X86_64FrameHandle.Interpreter.!(top).stp() == Pointer.NULL) {
+		return t.t.fail("setup: expected the interpreter frame to store a sidetable pointer");
+	}
+
+	var spc = Array<RelocatableFrame>.new(n);
+	for (i < n) spc[i] = t.makeSpcFrame(f, []);
+	s.clear(); // {writeFrames} requires an EMPTY stack; the stale +40 slots stay in the mapping
+	X86_64Compression.writeFrames(s, spc);
+
+	var sfp = s.rsp + Pointer.SIZE;
+	for (i < n) {
+		if (X86_64FrameHandle.Spc(sfp).inlined_instance() != null) {
+			return t.t.fail1("frame[%d]: expected inlined_instance to be cleared", i);
+		}
+		sfp += X86_64InterpreterFrame.size + Pointer.SIZE;
+	}
+	Target.forceGC(); // the stack is a GC root; a stale +40 would be scanned here
+}
+
+def test_spc_vals(t: X86_64CompressionTester) {
+	var obj = newObject([]);
+	t.assert_roundtrip([t.makeSpcFrame(t.emptyFunc(), [
+		Value.I32(1), Value.I64(2), Value.F32(3), Value.F64(4),
+		Value.V128(5, 6), Value.Ref(obj), Value.I31(7)
+	])]);
+}
+
+// An SPC frame's pc is derived from its return address.
+def test_spc_pc_is_derived(t: X86_64CompressionTester) {
+	var f = t.emptyFunc();
+	var frame = RelocatableFrame(WasmFrameData(f, 42, t.spcRetAddr(f), [Value.I32(1)]), true, 0);
+	var got = t.roundtrip([frame]);
+	FrameAsserts.assert_length(t.t, 1, got.length, "frames");
+	if (got[0].data.pc != -1) t.t.fail1("expected the supplied pc to be discarded, got pc=%d", got[0].data.pc);
+}
+
+def test_spc_curpc(t: X86_64CompressionTester) {
+	t.sig(SigCache.v_v).codev([
+		u8.!(Opcode.NOP.code), u8.!(Opcode.NOP.code), u8.!(Opcode.NOP.code)
+	]);
+	var f = t.wasmFunc(0);
+	var stale_pc = t.validPcs(f)[2]; // a real pc, so the frame's resume offset stays in bounds
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, [t.makeIntFrame(f, stale_pc, [Value.I32(1)])]);
+	if (t.topHandle(s).curpc() != stale_pc) return t.t.fail("setup: expected the interpreter frame to store its pc");
+
+	s.clear();
+	X86_64Compression.writeFrames(s, [t.makeSpcFrame(f, [Value.I32(1)])]);
+	var got = t.topHandle(s).curpc();
+	if (got != -1) t.t.fail1("expected the SPC frame to carry curpc=-1, got %d", got);
+}
+
+def test_cont_bottom_set(t: X86_64CompressionTester) {
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, t.intChain(2));
+	if (s.cont_bottom == null) {
+		t.t.fail("expected cont_bottom to be established on a reconstructed stack");
+	}
+}
+
+def test_stp_at_end(t: X86_64CompressionTester) {
+	// One `br` out of a block, so the sidetable holds exactly one 4-int entry.
+	t.sig(SigCache.v_v).codev([
+		u8.!(Opcode.BLOCK.code), BpTypeCode.EmptyBlock.code,
+		u8.!(Opcode.BR.code), 0,
+		u8.!(Opcode.END.code)
+	]);
+	var f = t.wasmFunc(0);
+	var entries = f.decl.sidetable.entries;
+	var map = SidetableMap.new(f.decl);
+	var pcs = t.validPcs(f);
+	var pc = pcs[pcs.length - 1]; // past the branch
+	var stp = map[pc];
+	if (stp != entries.length) {
+		return t.t.fail2("setup: expected stp=%d at the last pc, got %d", entries.length, stp);
+	}
+
+	var s = t.stack();
+	X86_64Compression.writeFrames(s, [t.makeIntFrame(f, pc, [])]);
+	var h = t.topHandle(s);
+	if (!X86_64FrameHandle.Interpreter.?(h)) return t.t.fail("expected an interpreter frame on top");
+	var ih = X86_64FrameHandle.Interpreter.!(h);
+	// Mirrors {X86_64FrameAccessor.stp}, which every consumer of this slot uses.
+	var got = int.!((ih.stp() - Pointer.atContents(entries)) / 4);
+	if (got != stp) t.t.fail2("expected sidetable position %d, got %d", stp, got);
+}
+
+def test_write_requires_empty_stack(t: X86_64CompressionTester) {
+	t.sig(SigCache.ii_i).codev([
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.LOCAL_GET.code), 1,
+		u8.!(Opcode.I32_ADD.code)
+	]);
+	var f = t.wasmFunc(0);
+
+	// A stack awaiting its arguments, exactly as {cont.new} leaves one.
+	var s = X86_64StackManager.getFreshStack();
+	s.reset(f);
+	if (s.params_arity != 2 || s.state() != StackState.SUSPENDED) {
+		return t.t.fail1("setup: expected a SUSPENDED stack awaiting 2 arguments, got %s", s.state().name);
+	}
+
+	// Once its holder is done with it, an explicit {clear()} makes the stack writable again.
+	s.clear();
+	if (s.state() != StackState.EMPTY) {
+		return t.t.fail1("setup: expected clear() to empty the stack, got %s", s.state().name);
+	}
+	X86_64Compression.writeFrames(s, [t.makeIntFrame(f, t.validPcs(f)[0], [Value.I32(1), Value.I32(2)])]);
+	if (s.params_arity != 0 || s.state() != StackState.RESUMABLE) {
+		t.t.fail1("expected a RESUMABLE stack with no pending parameters, got %s", s.state().name);
+	}
+}

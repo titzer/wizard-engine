@@ -1,5 +1,5 @@
-;; No outcall: pool saturates with ivars still pinned, forcing addSpillCost
-;; to pick an ordinary victim over a pinned ivar without an outcall's help.
+;; A fast:-exported function with a loop, no calls, that accumulates a
+;; large arithmetic expression each iteration.
 (module
   (func $f (export "fast:f") (param $n i32) (result i32)
     (local $i i32) (local $acc i32)

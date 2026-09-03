@@ -1,4 +1,5 @@
-;; if/outcall/br shape exercising doElse's ivar-liveness bookkeeping.
+;; A fast:-exported function with 7 locals that calls another function
+;; inside an if-branch, then branches out of a block, summing the locals.
 (module
   (func $leaf (param i32) (result i32)
     local.get 0

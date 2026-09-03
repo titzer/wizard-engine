@@ -1,5 +1,4 @@
-;; 7 loop-carried locals, no outcall, forcing pressure into the ivar-designated
-;; registers of FAST_INT_ALLOC's pool.
+;; A fast:-exported function with 8 loop-carried locals and no calls.
 (module
   (func $f (export "fast:f") (param $n i32) (result i32)
     (local $a i32) (local $b i32) (local $c i32) (local $d i32)

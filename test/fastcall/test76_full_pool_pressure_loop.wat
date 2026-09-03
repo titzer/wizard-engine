@@ -1,5 +1,5 @@
-;; Loop with an outcall and 9 live locals, exercising all 10 registers in
-;; FAST_INT_ALLOC's pool, not just ip(RAX) via div (see test75).
+;; A fast:-exported function with a loop containing a call and 9 live
+;; locals, summed each iteration.
 (module
   (func $leaf (param i32) (result i32)
     local.get 0
