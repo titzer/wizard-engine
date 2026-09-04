@@ -30,6 +30,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	var handler_pc_index_map = Vector<(int, Array<int>)>.new();
 	var handler_dest_map = Vector<int>.new();
 	var handler_dests = Vector<TargetHandlerDest>.new();
+	// (pc, handler table) of every resume site; see {ResumeSites}
+	def resume_sites = Vector<(int, Array<long>)>.new();
 
 	// Used for code validator callbacks that inspect immediates
 	private var imm_codeptr: CodePtr;
@@ -102,6 +104,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			Ranges.quicksort<(int, Array<int>)>(handlers.handler_pc_index_map, fun (a, b) => a.0 < b.0);
 		}
 		if (handler_dests.length > 0) handlers.handler_dests = handler_dests.extract();
+		if (resume_sites.length > 0) handlers.resume_sites = if(err.ok(), finishResumeSites(func));
+		resume_sites.resize(0);
 		if (frame_var_tags.length > 0) func.frame_var_tags = frame_var_tags.extract();
 
 		// Report metrics and return success.
@@ -160,7 +164,24 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		ex_handlers.resize(0);
 		suspend_handlers.resize(0);
 		switch_handlers.resize(0);
+		resume_sites.resize(0);
 		frame_var_tags.resize(0);
+	}
+	// Resolves the handler entries of the recorded resume sites and lays the tables out by pc.
+	private def finishResumeSites(func: FuncDecl) -> Array<Array<long>> {
+		var result = Array<Array<long>>.new(func.orig_bytecode.length);
+		for (i < resume_sites.length) {
+			var site = resume_sites[i], table = site.1;
+			for (j < ResumeSites.count(table)) {
+				var base = ResumeSites.entry(j);
+				var entry = func.sidetable.getCatchEntry(int.!(table[base + ResumeSites.STP_POS]));
+				table[base + ResumeSites.HANDLER_PC] = entry.handler_pc;
+				table[base + ResumeSites.STP_POS] = entry.sidetable_pos;
+				table[base + ResumeSites.VSP_SLOTS] = entry.val_stack_top + func.num_locals;
+			}
+			result[site.0] = table;
+		}
+		return result;
 	}
 	// Add a new handler to the given handler entry list.
 	// {index == -1} to allocate a new one; otherwise write onto the given index.
@@ -1544,14 +1565,19 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def readAndCheckContHandlerTable(cont: ContDecl, handlers: Array<SuspensionHandler>) {
 		var sidetable_pos = ctlxfer.sidetable.length;
 		var handler_indices = Array<int>.new(handlers.length);
+		var table = ResumeSites.alloc(handlers.length);
 		for (i < handlers.length) {
 			// Same sidetable structure is used for both {suspend} and {switch}.
 			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
 			var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
 			var resume_pos = opcode_pos - func_start_pos;
+			var base = ResumeSites.entry(i);
+			table[base + ResumeSites.STP_POS] = sidetable_entry; // resolved by {finishResumeSites}
 			match (handlers[i]) {
 				Suspend(tag_index, depth) => {
 					var tag = module.tags[tag_index];
+					table[base + ResumeSites.TAG_INDEX] = tag.tag_index;
+					table[base + ResumeSites.KIND] = ResumeSites.KIND_SUSPEND;
 					var target = getControl(depth);
 					if (target == null) return;
 					checkContHandle(i, tag, cont, target);
@@ -1560,6 +1586,8 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 				}
 				Switch(tag_index) => {
 					var tag = module.tags[tag_index];
+					table[base + ResumeSites.TAG_INDEX] = tag.tag_index;
+					table[base + ResumeSites.KIND] = ResumeSites.KIND_SWITCH;
 					var expected = cont.sig.results;
 					var tag_type = module.heaptypes[tag.sig_index];
 					if (!SigDecl.?(tag_type)) return err_atpc().ExpectedSignature(tag_type);
@@ -1579,6 +1607,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 			}
 		}
 		handler_pc_index_map.put((opcode_pos, handler_indices));
+		resume_sites.put((opcode_pos, table));
 	}
 	def checkContHandle(i: int, tag: TagDecl, cont: ContDecl, target: ControlEntry) {
 		var p = labelArgs(target);

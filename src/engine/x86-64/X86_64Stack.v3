@@ -24,6 +24,10 @@ class X86_64Stack extends WasmStack {
 	var return_results: Array<ValueType>;
 	var state_: StackState;
 
+	// Handler table (for inline suspend/switch).
+	var handlers: Array<long>;
+	var handler_tier: HandlerTier;
+
 	// Single-linked list for stack manager cache.
 	var next_stack: X86_64Stack;
 
@@ -107,6 +111,7 @@ class X86_64Stack extends WasmStack {
 			var ex = Exception.!(thrown);
 			var result = walk(findExHandler, ex, prev_srp, true);
 			var pos = result.1;
+			clearCrossedHandlers(pos.stack);
 			var new_srp = pos.frame.srp();
 			if (Trace.stack) {
 				if (result.0) Trace.OUT.put1("walk found handler at frame[sfp=0x%x]", pos.frame.sfp - Pointer.NULL).ln();
@@ -120,6 +125,7 @@ class X86_64Stack extends WasmStack {
 		var trace = if (gatherTrace, Vector<(WasmFunction, int)>.new());
 		var result = walk(if(gatherTrace, addFrameToTrace), trace, prev_srp, true);
 		var new_srp = result.1.frame.srp();
+		clearCrossedHandlers(result.1.stack);
 		// Unwind this stack to the return parent stub and overwrite the caller's return IP.
 		this.vsp = mapping.range.start; // clear value stack
 		if (new_srp != prev_srp) unwind(prev_srp, new_srp);
@@ -226,6 +232,7 @@ class X86_64Stack extends WasmStack {
 		var h = X86_64FrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSuspensionHandler(func.instance, tag, h.computePc());
+		shadowCheckHandlerTable(ResumeSites.KIND_SUSPEND, h, func, tag, handler);
 		if (handler.handler_pc < 0) { // not found
 			if (Trace.stack) Trace.OUT.puts("  suspension handler not found, continue to unwind").ln();
 			return handler;
@@ -264,12 +271,40 @@ class X86_64Stack extends WasmStack {
 		var h = X86_64FrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSwitchHandler(func.instance, tag, h.computePc());
+		shadowCheckHandlerTable(ResumeSites.KIND_SWITCH, h, func, tag, handler);
 		if (handler.handler_pc < 0) { // not found
 			if (Trace.stack) Trace.OUT.puts("  switch handler not found, continue to unwind").ln();
 			return handler;
 		}
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
 		return handler;
+	}
+	// TODO[rv]: remove after fully tested
+	private def shadowCheckHandlerTable(kind: int, h: X86_64FrameHandle, func: WasmFunction, tag: Tag, handler: ExHandler) {
+		if (handlers == null) return fatal("no handler table published on a stack inside a resume");
+		var tier = if(X86_64FrameHandle.Spc.?(h), HandlerTier.SPC, HandlerTier.INTERPRETER);
+		if (handler_tier != tier) return fatal(Strings.format2("handler table published by tier %s for a tier %s frame", handler_tier.name, tier.name));
+		var decl = func.decl, sites = decl.handlers.resume_sites;
+		if (sites == null || sites[h.computePc()] != handlers) return fatal("published handler table is not the top frame's resume site");
+		if (h.instance() != func.instance) return fatal("frame instance differs from its function's instance");
+		var tags = h.instance().tags, found = -1;
+		for (i < ResumeSites.count(handlers)) {
+			var base = ResumeSites.entry(i);
+			if (handlers[base + ResumeSites.KIND] != kind) continue;
+			if (tags[int.!(handlers[base + ResumeSites.TAG_INDEX])] != tag) continue;
+			found = base;
+			break;
+		}
+		if ((found < 0) != (handler.handler_pc < 0)) return fatal("handler table and decoder disagree on finding a handler");
+		if (found < 0) return;
+		if (int.!(handlers[found + ResumeSites.HANDLER_PC]) != handler.handler_pc) return fatal("handler table has the wrong handler_pc");
+		if (int.!(handlers[found + ResumeSites.STP_POS]) != handler.sidetable_pos) return fatal("handler table has the wrong sidetable_pos");
+		if (int.!(handlers[found + ResumeSites.VSP_SLOTS]) != handler.val_stack_top + decl.num_locals) return fatal("handler table has the wrong vsp_slots");
+		if (kind == ResumeSites.KIND_SUSPEND && X86_64FrameHandle.Spc.?(h)) {
+			var dest = decl.handlers.get_handler_dest(handler.index);
+			var stub = decl.target_code.spc_entry + X86_64MasmLabel.!(dest.stub_label).label.pos;
+			if (handlers[found + ResumeSites.STUB_ADDR] != (stub - Pointer.NULL)) return fatal("handler table has the wrong stub_addr");
+		}
 	}
 	private def findExHandler(ip: Pointer, code: RiUserCode, pos: StackFramePos, ex: Exception) -> bool {
 		var stack = pos.stack;
@@ -332,6 +367,7 @@ class X86_64Stack extends WasmStack {
 		// Unwind the stack, skipping the top frame (which might have triggered the overflow)
 		var result = walk<void>(null, (), sfp + -RETADDR_SIZE, true);
 		var new_srp = result.1.frame.srp();
+		clearCrossedHandlers(result.1.stack);
 		// Unwind without updating any return addresses.
 		this.vsp = mapping.range.start; // clear value stack
 		if (new_srp != this.rsp) unwind(Pointer.NULL, new_srp);
@@ -350,6 +386,16 @@ class X86_64Stack extends WasmStack {
 		cont_bottom = null;
 		parent_rsp_ptr = Pointer.NULL;
 		func = null;
+		handlers = null;
+		handler_tier = HandlerTier.NONE;
+	}
+	// TODO[rv]: remove after fully tested
+	private def clearCrossedHandlers(stop: X86_64Stack) {
+		for (s = this; s != stop && s.parent != null; s = X86_64Stack.!(s.parent)) {
+			var p = X86_64Stack.!(s.parent);
+			p.handlers = null;
+			p.handler_tier = HandlerTier.NONE;
+		}
 	}
 	def pushRspPointer(p: Pointer) -> Pointer {
 		rsp = rsp + -Pointer.SIZE;
@@ -653,6 +699,8 @@ class X86_64Stack extends WasmStack {
 	}
 }
 
+enum HandlerTier { NONE, INTERPRETER, SPC }
+
 def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
 
 component X86_64Stacks {
@@ -868,6 +916,8 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent), 0);
 	// mov [%stack.parent_rsp_ptr], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.X86_64Stack_parent_rsp_ptr), 0);
+	// clear its published handler table
+	masm.emit_clear_handlers(r_parent);
 
 	// l_return:
 	masm.bindLabel(l_return);
