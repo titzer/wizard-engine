@@ -31,7 +31,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	var handler_dest_map = Vector<int>.new();
 	var handler_dests = Vector<TargetHandlerDest>.new();
 	// (pc, handler table) of every resume site; see {ResumeSites}
-	def resume_sites = Vector<(int, Array<long>)>.new();
+	def resume_sites = Vector<(int, Array<byte>)>.new();
 
 	// Used for code validator callbacks that inspect immediates
 	private var imm_codeptr: CodePtr;
@@ -168,16 +168,16 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 		frame_var_tags.resize(0);
 	}
 	// Resolves the handler entries of the recorded resume sites and lays the tables out by pc.
-	private def finishResumeSites(func: FuncDecl) -> Array<Array<long>> {
-		var result = Array<Array<long>>.new(func.orig_bytecode.length);
+	private def finishResumeSites(func: FuncDecl) -> Array<Array<byte>> {
+		var result = Array<Array<byte>>.new(func.orig_bytecode.length);
 		for (i < resume_sites.length) {
 			var site = resume_sites[i], table = site.1;
-			for (j < ResumeSites.count(table)) {
-				var base = ResumeSites.entry(j);
-				var entry = func.sidetable.getCatchEntry(int.!(table[base + ResumeSites.STP_POS]));
-				table[base + ResumeSites.HANDLER_PC] = entry.handler_pc;
-				table[base + ResumeSites.STP_POS] = entry.sidetable_pos;
-				table[base + ResumeSites.VSP_SLOTS] = entry.val_stack_top + func.num_locals;
+			for (j < ResumeSites.header(table).count) {
+				var e = ResumeSites.entry(table, j);
+				var entry = func.sidetable.getCatchEntry(e.stp_pos);
+				e.handler_pc = entry.handler_pc;
+				e.stp_pos = entry.sidetable_pos;
+				e.vsp_slots = entry.val_stack_top + func.num_locals;
 			}
 			result[site.0] = table;
 		}
@@ -1565,29 +1565,34 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 	def readAndCheckContHandlerTable(cont: ContDecl, handlers: Array<SuspensionHandler>) {
 		var sidetable_pos = ctlxfer.sidetable.length;
 		var handler_indices = Array<int>.new(handlers.length);
-		var table = ResumeSites.alloc(handlers.length);
+		var n_suspend = 0;
+		for (h in handlers) if (SuspensionHandler.Suspend.?(h)) n_suspend++;
+		var table = ResumeSites.alloc(n_suspend, handlers.length - n_suspend);
+		var suspend_rank = 0, switch_rank = 0;
 		for (i < handlers.length) {
 			// Same sidetable structure is used for both {suspend} and {switch}.
 			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4);
 			var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
 			var resume_pos = opcode_pos - func_start_pos;
-			var base = ResumeSites.entry(i);
-			table[base + ResumeSites.STP_POS] = sidetable_entry; // resolved by {finishResumeSites}
 			match (handlers[i]) {
 				Suspend(tag_index, depth) => {
 					var tag = module.tags[tag_index];
-					table[base + ResumeSites.TAG_INDEX] = tag.tag_index;
-					table[base + ResumeSites.KIND] = ResumeSites.KIND_SUSPEND;
+					var pos = suspend_rank++;
+					var e = ResumeSites.entry(table, pos);
+					e.tag_index = tag.tag_index;
+					e.stp_pos = sidetable_entry;
 					var target = getControl(depth);
 					if (target == null) return;
 					checkContHandle(i, tag, cont, target);
 					ctlxfer.refC(target, tag, false, "refH[suspend]");
-					handler_indices[i] = addExHandler(-1, opcode_pos, i, suspend_handlers, info, target, false, tag.tag_index, (resume_pos, resume_pos + 1));
+					handler_indices[pos] = addExHandler(-1, opcode_pos, i, suspend_handlers, info, target, false, tag.tag_index, (resume_pos, resume_pos + 1));
 				}
 				Switch(tag_index) => {
 					var tag = module.tags[tag_index];
-					table[base + ResumeSites.TAG_INDEX] = tag.tag_index;
-					table[base + ResumeSites.KIND] = ResumeSites.KIND_SWITCH;
+					var pos = n_suspend + switch_rank++;
+					var e = ResumeSites.entry(table, pos);
+					e.tag_index = tag.tag_index;
+					e.stp_pos = sidetable_entry;
 					var expected = cont.sig.results;
 					var tag_type = module.heaptypes[tag.sig_index];
 					if (!SigDecl.?(tag_type)) return err_atpc().ExpectedSignature(tag_type);
@@ -1602,7 +1607,7 @@ class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, e
 						}
 					}
 					ctlxfer.refC(null, tag, false, "refH[switch]");
-					handler_indices[i] = addExHandler(-1, opcode_pos, i, switch_handlers, info, null, true, tag.tag_index, (resume_pos, resume_pos + 1));
+					handler_indices[pos] = addExHandler(-1, opcode_pos, i, switch_handlers, info, null, true, tag.tag_index, (resume_pos, resume_pos + 1));
 				}
 			}
 		}
