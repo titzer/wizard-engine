@@ -2513,24 +2513,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_v3_Array_length_r_r(r_nvals, xenv.scratch);
 			masm.emit_cont_mv(xenv.vsp, contStack, r_nvals, xenv.tmp3, xenv.tmp4, xenv.xmm0);
 
-			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
-			var curStack = xenv.tmp4;
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-			genPublishHandlerTable(curStack, xenv.tmp0);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(false);
-			endHandler();
-			// switch to child stack
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(xenv.tmp4, contStack, false);
 		}
 		bindHandler(Opcode.RESUME_THROW); {
 			var tag_id = xenv.tmp0;
@@ -2561,22 +2544,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				masm.emit_ref_from_ref_u64(contStack, cont);
 			}
 
-			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-			genPublishHandlerTable(curStack, xenv.tmp0);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(true);
-			endHandler();
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(curStack, contStack, true);
 		}
 		bindHandler(Opcode.RESUME_THROW_REF); {
 			saveResumeIVars();
@@ -2607,22 +2575,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				masm.emit_ref_from_ref_u64(contStack, cont);
 			}
 
-			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-			genPublishHandlerTable(curStack, xenv.tmp0);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(false);
-			endHandler();
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(curStack, contStack, false);
 		}
 		bindHandler(Opcode.SUSPEND); {
 			var tag_index = r_tmp0;
@@ -4212,14 +4165,28 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		saveCallerIVars();
 		if (FeatureDisable.stacktraces) masm.emit_save_ivar(xenv.curpc);
 	}
-	// Publishes the handler table of the resume at the frame's saved pc.
-	def genPublishHandlerTable(r_stack: Reg, r_tmp: Reg) {
+	// Loads the handler table of the resume at the frame's saved pc into {r_tmp}.
+	def genLoadHandlerTable(r_tmp: Reg) {
 		var t = G(r_tmp);
 		masm.emit_restore_ivar(xenv.curpc); // runtime calls clobber {r_curpc}
 		asm.movq_r_m(t, r_func_decl.plus(offsets.FuncDecl_handlers));
 		asm.movq_r_m(t, t.plus(offsets.FuncHandlerInfo_resume_sites));
 		masm.emit_v3_Array_elem_r_rr(ValueKind.REF, r_tmp, r_tmp, xenv.curpc);
-		masm.emit_publish_handlers(r_stack, r_tmp, HandlerTier.INTERPRETER);
+	}
+	def genResumeChain(curStack: Reg, contStack: Reg, skip_tag: bool) {
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		genLoadHandlerTable(xenv.tmp0);
+		masm.emit_chain_cont_to_parent(curStack, contStack, xenv.tmp0, HandlerTier.INTERPRETER);
+		var stub_resume = X86_64Label.new();
+		asm.call_rel_far(stub_resume);
+		/* === CHILD STACK RETURNS HERE === */
+		genOnResumeFinish(skip_tag);
+		endHandler();
+		asm.bind(stub_resume);
+		masm.emit_switch_to_stack(contStack);
 	}
 	// All traps are generated out-of-line and call into the runtime.
 	def genTraps() {
@@ -4366,7 +4333,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// adjust sidetable
 		asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
 		// calculate length of handler entries in sidetable
-		asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
+		asm.q.imul_r_i(handler_length, Sidetable_CatchEntry.size);
 		asm.q.add_r_r(r_stp, handler_length);
 	}
 }

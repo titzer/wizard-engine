@@ -1451,15 +1451,30 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
 	}
 	// Publishes the handler table of the resume at {it.pc} on {curStack}.
-	def emit_publish_handler_table(curStack: Reg) {
+	def emitResumeChain(curStack: Reg, contStack: Reg, results: Array<ValueType>) {
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
 		masm.emit_mov_r_Array(xenv.scratch, func.handlers.resume_sites[it.pc]);
-		masm.emit_publish_handlers(curStack, xenv.scratch, HandlerTier.SPC);
+		masm.emit_chain_cont_to_parent(curStack, contStack, xenv.scratch, HandlerTier.SPC);
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+		state.pushResults(results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
 	}
 	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
 		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
 
@@ -1486,31 +1501,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(u32.!(cont_decl.sig.params.length));
 		state.emitRestoreAll(resolver);
 
-		// context switch: store to old stack
-		masm.emit_get_curstack(curStack);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-		emit_publish_handler_table(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	def visit_SUSPEND(tag_index: u31) {
 		var stub_suspend = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
@@ -1603,7 +1594,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var pos = it.pc;
 		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		var tag = module.tags[tag_id];
 		if (checkForConstNull(state.peek())) return;
@@ -1644,39 +1634,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_ref_from_ref_u64(contStack, cont);
 		}
 
-		// save %vsp to frame
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-
-		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
-		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-		emit_publish_handler_table(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	def visit_RESUME_THROW_REF(cont_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
 		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
 
@@ -1715,33 +1678,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_ref_from_ref_u64(contStack, cont);
 		}
 
-		// save %vsp to frame
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-
-		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
-		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
-		emit_publish_handler_table(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	private def checkForConstNull(sv: SpcVal) -> bool {
 		if (sv.isConst() && sv.const == 0) {
