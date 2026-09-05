@@ -1503,16 +1503,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_SUSPEND(tag_index: u31) {
 		var sig = SigDecl.!(module.heaptypes[module.tags[tag_index].sig_index]);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		if (FeatureDisable.unboxedConts) emitRuntimeSuspend(sig, tag_index);
-		else emitInlineSuspend(sig, tag_index);
+		emitInlineSuspend(sig, tag_index);
 	}
 	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
 		var target_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
 		var target_top = target_decl.sig.params[target_decl.sig.params.length - 1];
 		var this_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top).heap).cont);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		if (FeatureDisable.unboxedConts) emitRuntimeSwitch(target_decl, this_decl, target_cont_idx, tag_index);
-		else emitInlineSwitch(target_decl, this_decl, tag_index);
+		emitInlineSwitch(target_decl, this_decl, tag_index);
 	}
 	// Spills vsp and reserves the resume slot so the current stack can be left and resumed later.
 	def emitPrepareToLeaveStack(vsp: Reg, cur: Reg) {
@@ -1520,6 +1518,22 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(vsp);
 		masm.emit_get_curstack(cur);
 		masm.emit_reserve_return_slot(cur);
+	}
+	// Boxed continuations only: allocates the continuation object of the current stack into a new temporary.
+	def emitAllocContinuation() -> Reg {
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(regs.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_call_runtime_ALLOC_CONT();
+		masm.emit_get_curstack(regs.scratch);
+		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+		emit_reload_regs();
+		var cont = allocTmp(ValueKind.REF);
+		if (cont != regs.runtime_ret0) masm.emit_mov_r_r(ValueKind.REF, cont, regs.runtime_ret0);
+		return cont;
 	}
 	// Calls the stub that {emitEnter} emits to enter another stack, and lands the resumed frame after the call.
 	def emitLeaveStack(emitEnter: void -> void) {
@@ -1533,6 +1547,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emitEnter();
 		masm.bindLabel(end);
 	}
+	// Makes {dest} the running stack and enters it.
+	def emitEnterStack(dest: Reg) {
+		masm.emit_set_stack_state(dest, StackState.RUNNING);
+		masm.emit_set_curstack(dest);
+		emitLeaveStack(fun => masm.emit_enter_stack(dest));
+	}
 	// Loads the module tag {tag_index} of this instance into {r}.
 	def emit_load_tag(r: Reg, tag_index: u31) {
 		emit_load_instance(r);
@@ -1545,91 +1565,43 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF);
 		var tag = allocTmp(ValueKind.REF), entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
 		var xmm = allocTmp(ValueKind.V128);
+		var cont = if(FeatureDisable.unboxedConts, emitAllocContinuation(), cur);
 		emitPrepareToLeaveStack(vsp, cur);
 		emit_load_tag(tag, tag_index);
 		masm.emit_handler_search(false, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
 		var dst = tag, psfp = cnt;
 		masm.emit_handler_fixup(parent, entry, dst, psfp);
 		if (n > 0) masm.emit_addw_r_i(vsp, 0 - n * slot_size);
-		masm.emit_value_copy_n(dst, vsp, n, xmm);
-		masm.emit_store_continuation(dst, n * slot_size, cur);
-		masm.emit_addw_r_i(dst, (n + 1) * slot_size);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(parent, dst);
+		masm.emit_pass_values(parent, dst, vsp, n, cont, xmm);
 		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(psfp, frame.vsp_slot.offset), dst);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(cur, vsp);
-		masm.emit_set_stack_state(cur, StackState.SUSPENDED);
-		masm.emit_mov_m_i(MasmAddr(cur, offsets.X86_64Stack_params_arity), sig.results.length);
-		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(cur, offsets.X86_64Stack_bottom), prev);
+		masm.emit_suspend_stack(cur, vsp, prev, sig.results.length);
 		masm.emit_mov_m_l(MasmAddr(prev, offsets.X86_64Stack_parent), 0);
-		masm.emit_set_stack_state(parent, StackState.RUNNING);
 		masm.emit_clear_handlers(parent);
-		masm.emit_set_curstack(parent);
 		state.popArgsAndPushResults(sig);
-		emitLeaveStack(fun => masm.emit_enter_stack(parent));
+		emitEnterStack(parent);
 	}
 	// Consumes the target continuation, splices its chain under the switch handler and switches to it.
 	def emitInlineSwitch(target_decl: ContDecl, this_decl: ContDecl, tag_index: u31) {
-		var n = target_decl.sig.params.length - 1, slot_size = masm.valuerep.slot_size, offsets = masm.getOffsets();
+		var n = target_decl.sig.params.length - 1, slot_size = masm.valuerep.slot_size;
 		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), target = allocTmp(ValueKind.REF);
 		var prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF), tag = allocTmp(ValueKind.REF);
 		var entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
 		var xmm = allocTmp(ValueKind.V128);
+		var cont = if(FeatureDisable.unboxedConts, emitAllocContinuation(), cur);
 		emitPrepareToLeaveStack(vsp, cur);
 		masm.emit_validate_and_consume_cont(target, MasmAddr(vsp, masm.valuerep.tag_size - slot_size));
 		emit_load_tag(tag, tag_index);
 		masm.emit_handler_search(true, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
 		var bottom = entry, dst = tag, tmp = cnt;
 		masm.emit_replace_child_chain(parent, prev, target, bottom, tmp);
-		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(cur, offsets.X86_64Stack_bottom), prev);
-		masm.emit_set_stack_state(cur, StackState.SUSPENDED);
-		masm.emit_mov_m_i(MasmAddr(cur, offsets.X86_64Stack_params_arity), this_decl.sig.params.length);
 		masm.emit_addw_r_i(vsp, 0 - (n + 1) * slot_size);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(cur, vsp);
+		masm.emit_suspend_stack(cur, vsp, prev, this_decl.sig.params.length);
 		masm.emit_v3_X86_64Stack_vsp_r_r(dst, target);
-		masm.emit_value_copy_n(dst, vsp, n, xmm);
-		masm.emit_store_continuation(dst, n * slot_size, cur);
-		masm.emit_addw_r_i(dst, (n + 1) * slot_size);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(target, dst);
-		masm.emit_set_stack_state(target, StackState.RUNNING);
-		masm.emit_set_curstack(target);
+		masm.emit_pass_values(target, dst, vsp, n, cont, xmm);
 		state.pop();
 		state.sp -= u32.view(n);
 		state.pushResults(this_decl.sig.params);
-		emitLeaveStack(fun => masm.emit_enter_stack(target));
-	}
-	// Boxed continuations only: the runtime finds the handler and moves the payload.
-	def emitRuntimeSuspend(sig: SigDecl, tag_index: u31) {
-		emitPrepareToLeaveStack(regs.vsp, regs.runtime_arg1); // {regs.vsp} aliases {regs.runtime_arg0}
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(regs.runtime_arg1, regs.vsp);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg0, regs.runtime_arg1);
-		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
-		masm.emit_call_runtime_SUSPEND();
-		state.popArgsAndPushResults(sig);
-		emitLeaveStack(emitRuntimeEnterStack);
-	}
-	// Boxed continuations only: the runtime consumes the target, finds the handler and moves the payload.
-	def emitRuntimeSwitch(target_decl: ContDecl, this_decl: ContDecl, target_cont_idx: u31, tag_index: u31) {
-		emitPrepareToLeaveStack(regs.vsp, regs.runtime_arg1); // {regs.vsp} aliases {regs.runtime_arg0}
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(regs.runtime_arg1, regs.vsp);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg0, regs.runtime_arg1);
-		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
-		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
-		masm.emit_call_runtime_SWITCH();
-		state.pop();
-		state.sp -= u32.view(target_decl.sig.params.length - 1);
-		state.pushResults(this_decl.sig.params);
-		emitLeaveStack(emitRuntimeEnterStack);
-	}
-	// Enters the stack the runtime selected.
-	def emitRuntimeEnterStack() {
-		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
-		masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
-		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-		masm.emit_jump_r(xenv.scratch);
+		emitEnterStack(target);
 	}
 	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
