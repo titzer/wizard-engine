@@ -19,12 +19,11 @@ v3i: bin/wizeng.v3i bin/unittest.v3i
 
 WIZENG_BUILD_SH_ARGS ?=
 
-ENGINE=src/engine/*.v3 src/engine/compression/*.v3 src/engine/v3/*.v3 src/util/*.v3
+OBJECT_MODELS=src/engine/objmodel/*/*.v3
+ENGINE=src/engine/*.v3 src/engine/compression/*.v3 src/engine/v3/*.v3 src/util/*.v3 $(OBJECT_MODELS)
 MONITORS=src/monitors/*.v3 src/monitors/test/*.v3
 JIT=src/engine/compiler/*.v3
-# The x86-64 target pulls in the V3 object model (but not the rest of src/engine/v3).
-V3_OBJECT_MODEL=src/engine/v3/V3ObjectModel.v3
-X86_64=src/engine/x86-64/*.v3 $(V3_OBJECT_MODEL)
+X86_64=src/engine/x86-64/*.v3
 WAVE=src/modules/wave/*.v3
 WASI=src/modules/wasi/*.v3
 WASI_X86_64_LINUX=src/modules/wasi/x86-64-linux/*.v3
