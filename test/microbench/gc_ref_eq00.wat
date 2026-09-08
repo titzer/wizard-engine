@@ -1,0 +1,37 @@
+;; INNER_CALIBRATION = 154
+;; ref.eq and ref.is_null: comparisons of struct references and i31s.
+(module
+  (type $s (struct (field i32)))
+  (func $main (export "main")
+    (local $y i32)
+    (local $o (ref $s))
+    (local.set $o (struct.new $s (i32.const 1)))
+    (local.set $y (i32.const 1 (;$REPEAT;)))
+    (loop $l
+      (drop (call $eq (local.get $o) (local.get $o) (i32.const 1 (;$INNER_ITERATIONS;))))
+      (drop (call $eq (ref.i31 (i32.const 7)) (ref.i31 (i32.const 7)) (i32.const 1 (;$INNER_ITERATIONS;))))
+      (drop (call $eq (local.get $o) (ref.i31 (i32.const 7)) (i32.const 1 (;$INNER_ITERATIONS;))))
+      (drop (call $is_null (local.get $o) (i32.const 1 (;$INNER_ITERATIONS;))))
+      (local.tee $y (i32.sub (local.get $y) (i32.const 1)))
+      (br_if $l)
+    )
+  )
+  (func $eq (param $a eqref) (param $b eqref) (param $n i32) (result i32)
+    (local $acc i32)
+    (loop $l
+      (local.set $acc (i32.add (local.get $acc) (ref.eq (local.get $a) (local.get $b))))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+    (local.get $acc)
+  )
+  (func $is_null (param $a anyref) (param $n i32) (result i32)
+    (local $acc i32)
+    (loop $l
+      (local.set $acc (i32.add (local.get $acc) (ref.is_null (local.get $a))))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+    (local.get $acc)
+  )
+)

@@ -1,0 +1,66 @@
+;; INNER_CALIBRATION = 140
+;; struct.get: reading fields of different kinds from the same struct.
+(module
+  (type $s (struct (field i32) (field i64) (field (ref null $s)) (field anyref) (field i8)))
+  (func $main (export "main")
+    (local $y i32)
+    (local $o (ref $s))
+    (local.set $o (struct.new $s (i32.const 1) (i64.const 2)
+      (struct.new $s (i32.const 1) (i64.const 2) (ref.null $s) (ref.i31 (i32.const 3)) (i32.const -4))
+      (ref.i31 (i32.const 3)) (i32.const -4)))
+    (local.set $y (i32.const 1 (;$REPEAT;)))
+    (loop $l
+      (drop (call $get_i32 (local.get $o) (i32.const 14000 (;$INNER_ITERATIONS;))))
+      (drop (call $get_i64 (local.get $o) (i32.const 14000 (;$INNER_ITERATIONS;))))
+      (call $get_ref (local.get $o) (i32.const 14000 (;$INNER_ITERATIONS;)))
+      (call $get_anyref_i31 (local.get $o) (i32.const 14000 (;$INNER_ITERATIONS;)))
+      (drop (call $get_i8_s (local.get $o) (i32.const 14000 (;$INNER_ITERATIONS;))))
+      (local.tee $y (i32.sub (local.get $y) (i32.const 1)))
+      (br_if $l)
+    )
+  )
+  (func $get_i32 (param $o (ref $s)) (param $n i32) (result i32)
+    (local $acc i32)
+    (loop $l
+      (local.set $acc (i32.add (local.get $acc) (struct.get $s 0 (local.get $o))))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+    (local.get $acc)
+  )
+  (func $get_i64 (param $o (ref $s)) (param $n i32) (result i64)
+    (local $acc i64)
+    (loop $l
+      (local.set $acc (i64.add (local.get $acc) (struct.get $s 1 (local.get $o))))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+    (local.get $acc)
+  )
+  ;; A reference to a struct.
+  (func $get_ref (param $o (ref $s)) (param $n i32)
+    (loop $l
+      (drop (struct.get $s 2 (local.get $o)))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+  )
+  ;; An anyref field that holds an i31.
+  (func $get_anyref_i31 (param $o (ref $s)) (param $n i32)
+    (loop $l
+      (drop (struct.get $s 3 (local.get $o)))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+  )
+  ;; A packed i8 field, sign-extended.
+  (func $get_i8_s (param $o (ref $s)) (param $n i32) (result i32)
+    (local $acc i32)
+    (loop $l
+      (local.set $acc (i32.add (local.get $acc) (struct.get_s $s 4 (local.get $o))))
+      (local.tee $n (i32.sub (local.get $n) (i32.const 1)))
+      (br_if $l)
+    )
+    (local.get $acc)
+  )
+)
