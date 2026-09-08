@@ -1,0 +1,430 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Facade for a Virgil object model where Wasm structs and arrays are
+// split into primitive and reference parts.
+component ObjectModel {
+	// Allocation functions.
+	def newStruct(decl: StructDecl) -> V3SplitWasmStruct {
+		var info = getStructInfo(decl);
+		var bytes = if(info.byte_size > 0, Array<byte>.new(info.byte_size), NO_BYTES);
+		var refs = if(info.ref_count > 0, Array<Object>.new(info.ref_count), NO_REFS);
+		return V3SplitWasmStruct.new(info, bytes, refs);
+	}
+	def newArray(decl: ArrayDecl, length: u32) -> WasmArray {
+		return getArrayInfo(decl).alloc(length);
+	}
+
+	// Bulk access functions.
+	def newStructFromValues(decl: StructDecl, vals: Range<Value>) -> WasmStruct {
+		var obj = newStruct(decl);
+		for (i < vals.length) obj.setField(u31.!(i), vals[i]);
+		return obj;
+	}
+	def newArrayFromValues(decl: ArrayDecl, vals: Range<Value>) -> WasmArray {
+		return getArrayInfo(decl).allocFromValues(vals);
+	}
+	def arrayFill(dst: WasmArray, dst_offset: u64, size: u64, val: Value) -> TrapReason {
+		return V3SplitWasmArray.!(dst).fill(dst_offset, size, val);
+	}
+	def arrayCopy(dst: WasmArray, dst_offset: u64, src: WasmArray, src_offset: u64, size: u64) -> TrapReason {
+		return V3SplitWasmArray.!(dst).copyFrom(dst_offset, V3SplitWasmArray.!(src), src_offset, size);
+	}
+	def copyInto(dst: WasmArray, dst_offset: u64, src: Range<Value>) -> TrapReason {
+		return V3SplitWasmArray.!(dst).copyIn(dst_offset, src);
+	}
+	def copyOutOf(dst: Range<Value>, src: WasmArray, src_offset: u64) -> TrapReason {
+		return V3SplitWasmArray.!(src).copyOut(dst, src_offset);
+	}
+	// Only supported for arrays of 8-bit elements, which are stored directly as bytes.
+	def sendBytes<R>(src: WasmArray, offset: u64, size: u64, f: Range<byte> -> R) -> MaybeTrap<R> {
+		if (!V3SplitWasmArrayOf<u8>.?(src)) return MaybeTrap(R.default, TrapReason.UNIMPLEMENTED);
+		var t = V3SplitWasmArrayOf<u8>.!(src).getRange(offset, size);
+		if (t.reason != OK) return MaybeTrap(R.default, t.reason);
+		return MaybeTrap(f(t.result), OK);
+	}
+}
+def getStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var info = decl.getInfo<V3SplitStructDeclInfo>();
+	if (info == null) info = computeStructInfo(decl);
+	return info;
+}
+def getArrayInfo(decl: ArrayDecl) -> V3SplitArrayDeclInfo {
+	var info = decl.getInfo<V3SplitArrayDeclInfo>();
+	if (info == null) info = computeArrayInfo(decl);
+	return info;
+}
+
+// Storage representations for fields and elements in this object model.
+private type SplitStorageKind {
+	case Bytes(access: MemStorageKind);
+	case Ref;
+	case RefI31;
+	case RefU64;
+}
+def storageKind(st: StorageType) -> SplitStorageKind {
+	match (st.valtype) {
+		I32 => {
+			match (st.pack) {
+				UNPACKED => return SplitStorageKind.Bytes(MemStorageKind.U32);
+				PACKED_I8 => return SplitStorageKind.Bytes(MemStorageKind.U8);
+				PACKED_I16 => return SplitStorageKind.Bytes(MemStorageKind.U16);
+			}
+		}
+		I64 => return SplitStorageKind.Bytes(MemStorageKind.U64);
+		F32 => return SplitStorageKind.Bytes(MemStorageKind.F32);
+		F64 => return SplitStorageKind.Bytes(MemStorageKind.F64);
+		V128 => return SplitStorageKind.Bytes(MemStorageKind.V128);
+		Ref(nullable, heap) => {
+			match (heap) {
+				ANY, EQ, I31, EXTERN => return SplitStorageKind.RefI31; // may hold an i31
+				Cont, NOCONT => return SplitStorageKind.RefU64;
+				_ => return SplitStorageKind.Ref;
+			}
+		}
+		_ => return SplitStorageKind.Ref; // BOTTOM, Host
+	}
+}
+// Rounds {offset} up to a multiple of {size}, which must be a power of 2.
+def alignUp(offset: int, size: int) -> int {
+	var mask = size - 1;
+	return (offset + mask) & ~mask;
+}
+
+// Additional metadata for a Wasm struct declaration, including the total size for the primitive
+// portion and reference portion, as well as the field offsets.
+private class V3SplitStructDeclInfo extends StructDeclInfo {
+	def decl: StructDecl;
+	def field_info: Array<V3SplitFieldInfo>;
+	def byte_size: int;
+	def ref_count: int;
+
+	new(decl: StructDecl, field_info, byte_size, ref_count) { }
+}
+private type V3SplitFieldInfo #unboxed #packed {
+	case Bytes(offset: u24, access: MemStorageKind);
+	case Ref(offset: u24);
+	case RefI31(byte_offset: u24, ref_offset: u24);
+	case RefU64(byte_offset: u24, ref_offset: u24);
+}
+// Computes struct layout, assigning field offsets in the byte portion and/or the reference portion.
+def computeStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var types = decl.field_types;
+	var field_info = Array<V3SplitFieldInfo>.new(types.length);
+	var byte_size = 0, ref_count = 0, start = 0;
+	var sup = getSuperStructInfo(decl);
+	if (sup != null) {
+		start = sup.field_info.length;
+		for (i < start) field_info[i] = sup.field_info[i];
+		byte_size = sup.byte_size;
+		ref_count = sup.ref_count;
+	}
+	for (i = start; i < types.length; i++) {
+		match (storageKind(types[i])) {
+			Bytes(access) => {
+				byte_size = alignUp(byte_size, access.size);
+				field_info[i] = V3SplitFieldInfo.Bytes(u24.!(byte_size), access);
+				byte_size += access.size;
+			}
+			Ref => {
+				field_info[i] = V3SplitFieldInfo.Ref(u24.!(ref_count++));
+			}
+			RefI31 => {
+				byte_size = alignUp(byte_size, 4);
+				field_info[i] = V3SplitFieldInfo.RefI31(u24.!(byte_size), u24.!(ref_count++));
+				byte_size += 4;
+			}
+			RefU64 => {
+				byte_size = alignUp(byte_size, 8);
+				field_info[i] = V3SplitFieldInfo.RefU64(u24.!(byte_size), u24.!(ref_count++));
+				byte_size += 8;
+			}
+		}
+	}
+	var info = V3SplitStructDeclInfo.new(decl, field_info, byte_size, ref_count);
+	if (Debug.paranoid) verifyStructInfo(info, sup);
+	decl.addInfo(info);
+	return info;
+}
+// Returns the layout of the (first) supertype of {decl}, if it is a struct, computing it if necessary.
+def getSuperStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var sup = decl.getFirstSuperType();
+	if (!StructDecl.?(sup)) return null;
+	return getStructInfo(StructDecl.!(sup));
+}
+
+// A wasm struct instance that is split into two arrays: a byte array where all primitives are stored,
+// and an object array where all references are stored.
+class V3SplitWasmStruct extends WasmStruct {
+	private def info: V3SplitStructDeclInfo;
+	private def bytes: Array<byte>;
+	private def refs: Array<Object>;
+
+	private new(info, bytes, refs) { }
+
+	def decl() => info.decl;
+	def getField(index: u31) -> Value {
+		match (info.field_info[index]) {
+			Bytes(offset, access) => {
+				return access.accessor.readValue(bytes[offset ...]);
+			}
+			Ref(offset) => {
+				return Value.Ref(refs[offset]);
+			}
+			RefI31(byte_offset, ref_offset) => {
+				var d = DataReaders.read_range_u32(bytes[byte_offset ...]);
+				return box_i31ref(d, refs[ref_offset]);
+			}
+			RefU64(byte_offset, ref_offset) => {
+				var d = DataReaders.read_range_u64(bytes[byte_offset ...]);
+				return box_ref_u64(refs[ref_offset], d);
+			}
+		}
+	}
+	def setField(index: u31, v: Value) {
+		match (info.field_info[index]) {
+			Bytes(offset, access) => {
+				return void(access.accessor.writeValue(bytes[offset ...], v));
+			}
+			Ref(offset) => {
+				return void(refs[offset] = unbox_ref(v));
+			}
+			RefI31(byte_offset, ref_offset) => {
+				var t = unbox_i31ref(v);
+				DataWriters.write_range_u32(bytes[byte_offset ...], t.0);
+				refs[ref_offset] = t.1;
+			}
+			RefU64(byte_offset, ref_offset) => {
+				var t = unbox_ref_u64(v);
+				DataWriters.write_range_u64(bytes[byte_offset ...], t.1);
+				refs[ref_offset] = t.0;
+			}
+		}
+	}
+}
+
+// Metadata for split arrays.
+private class V3SplitArrayDeclInfo(decl: ArrayDecl) extends ArrayDeclInfo {
+	def alloc(length: u32) -> V3SplitWasmArray;
+	def allocFromValues(vals: Range<Value>) -> V3SplitWasmArray;
+}
+private class V3SplitArrayDeclInfoOf<T> extends V3SplitArrayDeclInfo {
+	def box: T -> Value;
+	def unbox: Value -> T;
+
+	new(decl: ArrayDecl, box, unbox) super(decl) { }
+
+	def alloc(length: u32) -> V3SplitWasmArray {
+		return V3SplitWasmArrayOf<T>.new(this, Array<T>.new(int.!(length)));
+	}
+	def allocFromValues(vals: Range<Value>) -> V3SplitWasmArray {
+		var elems = Array<T>.new(vals.length);
+		for (i < elems.length) elems[i] = unbox(vals[i]);
+		return V3SplitWasmArrayOf<T>.new(this, elems);
+	}
+}
+// Computes the element representation of an array, selecting the Virgil type {T} used for storage
+// and the functions to box and unbox elements.
+def computeArrayInfo(decl: ArrayDecl) -> V3SplitArrayDeclInfo {
+	var info: V3SplitArrayDeclInfo;
+	var kind = elemStorageKind(decl);
+	if (Debug.paranoid) verifyArrayInfo(decl, kind);
+	match (kind) {
+		Bytes(access) => {
+			match (access) {
+				I8, U8 => info = primArrayInfo(decl, MemoryAccessors.U8);
+				I16, U16 => info = primArrayInfo(decl, MemoryAccessors.U16);
+				I32, U32 => info = primArrayInfo(decl, MemoryAccessors.U32);
+				U64 => info = primArrayInfo(decl, MemoryAccessors.U64);
+				F32 => info = V3SplitArrayDeclInfoOf<u32>.new(decl, Values.box_fu32, Values.unbox_fu32); // store raw bits
+				F64 => info = V3SplitArrayDeclInfoOf<u64>.new(decl, Values.box_du64, Values.unbox_du64); // store raw bits
+				V128 => info = primArrayInfo(decl, MemoryAccessors.V128);
+			}
+		}
+		Ref => info = V3SplitArrayDeclInfoOf<Object>.new(decl, Value.Ref, unbox_ref);
+		RefI31 => info = V3SplitArrayDeclInfoOf<(u32, Object)>.new(decl, box_i31ref, unbox_i31ref);
+		RefU64 => info = V3SplitArrayDeclInfoOf<(Object, u64)>.new(decl, box_ref_u64, unbox_ref_u64);
+	}
+	decl.addInfo(info);
+	return info;
+}
+// Returns the storage kind for the elements of {decl}, which is that of its root supertype.
+def elemStorageKind(decl: ArrayDecl) -> SplitStorageKind {
+	var sup = decl.getFirstSuperType();
+	if (ArrayDecl.?(sup)) return elemStorageKind(ArrayDecl.!(sup));
+	return storageKind(decl.elem_types[0]);
+}
+def primArrayInfo<T>(decl: ArrayDecl, access: MemoryAccessorOf<T>) -> V3SplitArrayDeclInfo {
+	return V3SplitArrayDeclInfoOf<T>.new(decl, access.box, access.unbox);
+}
+
+// A wasm array instance whose elements are stored in a Virgil array specialized to the element
+// representation. The bulk operations are virtual so that they can operate on the specialized storage.
+class V3SplitWasmArray extends WasmArray {
+	def fill(offset: u64, size: u64, val: Value) -> TrapReason;
+	def copyFrom(dst_offset: u64, src: V3SplitWasmArray, src_offset: u64, size: u64) -> TrapReason;
+	def copyIn(offset: u64, src: Range<Value>) -> TrapReason;
+	def copyOut(dst: Range<Value>, offset: u64) -> TrapReason;
+	// Checks that the elements in {[offset, offset + size)} are within bounds.
+	def checkRange(offset: u64, size: u64) -> TrapReason {
+		var length = getLength();
+		if (offset > length || size > (length - offset)) return TrapReason.ARRAY_OOB;
+		return OK;
+	}
+}
+class V3SplitWasmArrayOf<T> extends V3SplitWasmArray {
+	private def info: V3SplitArrayDeclInfoOf<T>;
+	private def vals: Array<T>;
+
+	private new(info, vals) {}
+
+	def decl() => info.decl;
+	def getLength() -> u32 { return u32.!(vals.length); }
+	def getElem(index: u32) => info.box(vals[index]);
+	def setElem(index: u32, v: Value) => void(vals[index] = info.unbox(v));
+	def getRange(offset: u64, size: u64) => Traps.getRange(vals, offset, size, TrapReason.ARRAY_OOB);
+
+	def fill(offset: u64, size: u64, val: Value) -> TrapReason {
+		var t = getRange(offset, size), r = t.result;
+		if (t.reason != OK) return t.reason;
+		var v = info.unbox(val);
+		for (i < r.length) r[i] = v;
+		return OK;
+	}
+	def copyFrom(dst_offset: u64, src: V3SplitWasmArray, src_offset: u64, size: u64) -> TrapReason {
+		var t = getRange(dst_offset, size), dr = t.result;
+		if (t.reason != OK) return t.reason;
+		if (V3SplitWasmArrayOf<T>.?(src)) {
+			// Same element representation: copy the storage directly, minding potential overlap.
+			var s = V3SplitWasmArrayOf<T>.!(src);
+			var st = s.getRange(src_offset, size), sr = st.result;
+			if (st.reason != OK) return st.reason;
+			if (s == this && src_offset < dst_offset) {
+				for (i = dr.length - 1; i >= 0; i--) dr[i] = sr[i];
+			} else {
+				for (i < dr.length) dr[i] = sr[i];
+			}
+			return OK;
+		}
+		// Different element representation, e.g. {(ref $struct)} into {anyref}: convert each element.
+		var r = src.checkRange(src_offset, size);
+		if (r != OK) return r;
+		for (i < dr.length) dr[i] = info.unbox(src.getElem(u32.!(src_offset + u64.!(i))));
+		return OK;
+	}
+	def copyIn(offset: u64, src: Range<Value>) -> TrapReason {
+		var t = getRange(offset, u64.!(src.length)), dr = t.result;
+		if (t.reason != OK) return t.reason;
+		for (i < dr.length) dr[i] = info.unbox(src[i]);
+		return OK;
+	}
+	def copyOut(dst: Range<Value>, offset: u64) -> TrapReason {
+		var t = getRange(offset, u64.!(dst.length)), sr = t.result;
+		if (t.reason != OK) return t.reason;
+		for (i < dst.length) dst[i] = info.box(sr[i]);
+		return OK;
+	}
+}
+
+// Boxing and unboxing for references, i31-or-reference pairs, and reference + u64 pairs.
+def unbox_ref(v: Value) -> Object {
+	return Value.Ref.!(v).val;
+}
+def box_i31ref(t: (u32, Object)) -> Value {
+	return if ((t.0 & 1) == 1, Value.I31(u31.view(t.0 >> 1)), Value.Ref(t.1));
+}
+def unbox_i31ref(v: Value) -> (u32, Object) {
+	var d: u32, r: Object;
+	match (v) {
+		I31(val) => d = (u32.!(val) << 1) | 1;
+		Ref(obj) => r = obj;
+		_ => ;
+	}
+	return (d, r);
+}
+def box_ref_u64(t: (Object, u64)) -> Value {
+	return Value.Cont(Continuations.fromStoredObject(t.0, t.1));
+}
+def unbox_ref_u64(v: Value) -> (Object, u64) {
+	var r: Object, d: u64;
+	match (v) {
+		Cont(c) => {
+			r = Continuations.getStoredObject(c);
+			d = Continuations.getStoredVersion(c);
+		}
+		_ => ; // null reference
+	}
+	return (r, d);
+}
+
+def OK = TrapReason.NONE;
+def NO_BYTES: Array<byte> = [];
+def NO_REFS: Array<Object> = [];
+
+// Checks that the layout {info} is consistent: fields inherited from the supertype {sup} have the
+// same offsets as in the supertype, every field's declared type is representable by its assigned
+// layout, every field lies within the struct and is aligned, and no two fields overlap.
+def verifyStructInfo(info: V3SplitStructDeclInfo, sup: V3SplitStructDeclInfo) {
+	var types = info.decl.field_types, field_info = info.field_info;
+	if (sup != null) {
+		if (sup.field_info.length > field_info.length) failLayout(info, -1, "supertype has more fields");
+		if (sup.byte_size > info.byte_size) failLayout(info, -1, "supertype has larger byte portion");
+		if (sup.ref_count > info.ref_count) failLayout(info, -1, "supertype has larger reference portion");
+		for (i < sup.field_info.length) {
+			if (field_info[i] != sup.field_info[i]) failLayout(info, i, "field layout differs from supertype");
+		}
+	}
+	var bytes_used = Array<bool>.new(info.byte_size), refs_used = Array<bool>.new(info.ref_count);
+	for (i < field_info.length) {
+		var kind = storageKind(types[i]);
+		match (field_info[i]) {
+			Bytes(offset, access) => {
+				match (kind) {
+					Bytes(a) => if (a != access) failLayout(info, i, "primitive field has wrong storage kind");
+					_ => failLayout(info, i, "primitive field has non-primitive layout");
+				}
+				claimBytes(info, i, bytes_used, offset, access.size);
+			}
+			Ref(offset) => {
+				if (kind != SplitStorageKind.Ref) failLayout(info, i, "reference field has wrong layout");
+				claimRef(info, i, refs_used, offset);
+			}
+			RefI31(byte_offset, ref_offset) => {
+				if (kind != SplitStorageKind.RefI31 && kind != SplitStorageKind.Ref) failLayout(info, i, "i31-or-reference field has wrong layout");
+				claimBytes(info, i, bytes_used, byte_offset, 4);
+				claimRef(info, i, refs_used, ref_offset);
+			}
+			RefU64(byte_offset, ref_offset) => {
+				if (kind != SplitStorageKind.RefU64) failLayout(info, i, "reference+u64 field has wrong layout");
+				claimBytes(info, i, bytes_used, byte_offset, 8);
+				claimRef(info, i, refs_used, ref_offset);
+			}
+		}
+	}
+}
+def claimBytes(info: V3SplitStructDeclInfo, field: int, used: Array<bool>, offset: int, size: int) {
+	if ((offset & (size - 1)) != 0) failLayout(info, field, "misaligned primitive");
+	if (offset + size > used.length) failLayout(info, field, "primitive out of bounds of byte portion");
+	for (i < size) {
+		if (used[offset + i]) failLayout(info, field, "overlapping primitive");
+		used[offset + i] = true;
+	}
+}
+def claimRef(info: V3SplitStructDeclInfo, field: int, used: Array<bool>, offset: int) {
+	if (offset >= used.length) failLayout(info, field, "reference out of bounds of reference portion");
+	if (used[offset]) failLayout(info, field, "overlapping reference");
+	used[offset] = true;
+}
+def failLayout(info: V3SplitStructDeclInfo, field: int, msg: string) {
+	var buf = StringBuilder.new();
+	info.decl.render(buf);
+	if (field >= 0) buf.put1(" field #%d", field);
+	buf.puts(": ").puts(msg);
+	System.error("SplitObjectModelError", buf.toString());
+}
+// Checks that the declared element type of {decl} is representable by the inherited {kind}.
+def verifyArrayInfo(decl: ArrayDecl, kind: SplitStorageKind) {
+	var declared = storageKind(decl.elem_types[0]);
+	var ok = declared == kind || (declared == SplitStorageKind.Ref && kind == SplitStorageKind.RefI31);
+	if (!ok) System.error("SplitObjectModelError", decl.render(StringBuilder.new()).puts(": element representation differs from supertype").toString());
+}

@@ -9,7 +9,7 @@ done
 HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 export WIZENG_LOC=$(cd $HERE/../../../ && pwd)
-export SPEC_LOC=${SPEC_LOC:=$(cd $WIZENG_LOC/wasm-spec/repos/gc && pwd)}
+export SPEC_LOC=${SPEC_LOC:=$(cd $WIZENG_LOC/wasm-spec/repos/spec && pwd)}
 
 if [ ! -d $SPEC_LOC ]; then
     echo "WebAssembly specification repo not found: $SPEC_LOC"
