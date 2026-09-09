@@ -1,0 +1,199 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A wasm struct instance that is split into two arrays: a byte array where all primitives are stored,
+// and an object array where all references are stored.
+class V3SplitWasmStruct extends WasmStruct {
+	private def info: V3SplitStructDeclInfo;
+	private def bytes: Array<byte>;
+	private def refs: Array<Object>;
+
+	private new(info, bytes, refs) { }
+
+	def decl() => info.decl;
+	def getField(index: u31) -> Value {
+		match (info.field_info[index]) {
+			Bytes(offset, access) => {
+				return access.accessor.readValue(bytes[offset ...]);
+			}
+			Ref(offset) => {
+				return Value.Ref(refs[offset]);
+			}
+			RefI31(byte_offset, ref_offset) => {
+				var d = DataReaders.read_range_u32(bytes[byte_offset ...]);
+				return FieldStorage.box_i31ref(d, refs[ref_offset]);
+			}
+			RefU64(byte_offset, ref_offset) => {
+				var d = DataReaders.read_range_u64(bytes[byte_offset ...]);
+				return FieldStorage.box_ref_u64(refs[ref_offset], d);
+			}
+		}
+	}
+	def setField(index: u31, v: Value) {
+		match (info.field_info[index]) {
+			Bytes(offset, access) => {
+				return void(access.accessor.writeValue(bytes[offset ...], v));
+			}
+			Ref(offset) => {
+				return void(refs[offset] = FieldStorage.unbox_ref(v));
+			}
+			RefI31(byte_offset, ref_offset) => {
+				var t = FieldStorage.unbox_i31ref(v);
+				DataWriters.write_range_u32(bytes[byte_offset ...], t.0);
+				refs[ref_offset] = t.1;
+			}
+			RefU64(byte_offset, ref_offset) => {
+				var t = FieldStorage.unbox_ref_u64(v);
+				DataWriters.write_range_u64(bytes[byte_offset ...], t.1);
+				refs[ref_offset] = t.0;
+			}
+		}
+	}
+}
+
+// Allocation routines.
+component V3SplitWasmStructs {
+	def newStruct(decl: StructDecl) -> V3SplitWasmStruct {
+		var info = getStructInfo(decl);
+		var bytes = if(info.byte_size > 0, Array<byte>.new(info.byte_size), NO_BYTES);
+		var refs = if(info.ref_count > 0, Array<Object>.new(info.ref_count), NO_REFS);
+		return V3SplitWasmStruct.new(info, bytes, refs);
+	}
+	def newStructFromValues(decl: StructDecl, vals: Range<Value>) -> WasmStruct {
+		var obj = newStruct(decl);
+		for (i < vals.length) obj.setField(u31.!(i), vals[i]);
+		return obj;
+	}
+}
+
+// Additional metadata for a Wasm struct declaration, including the total size for the primitive
+// portion and reference portion, as well as the field offsets.
+private class V3SplitStructDeclInfo extends StructDeclInfo {
+	def decl: StructDecl;
+	def field_info: Array<V3SplitFieldInfo>;
+	def byte_size: int;
+	def ref_count: int;
+
+	new(decl: StructDecl, field_info, byte_size, ref_count) { }
+}
+private type V3SplitFieldInfo #unboxed #packed {
+	case Bytes(offset: u24, access: MemStorageKind);
+	case Ref(offset: u24);
+	case RefI31(byte_offset: u24, ref_offset: u24);
+	case RefU64(byte_offset: u24, ref_offset: u24);
+}
+def getStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var info = decl.getInfo<V3SplitStructDeclInfo>();
+	if (info == null) info = computeStructInfo(decl);
+	return info;
+}
+// Computes struct layout, assigning field offsets in the byte portion and/or the reference portion.
+def computeStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var types = decl.field_types;
+	var field_info = Array<V3SplitFieldInfo>.new(types.length);
+	var byte_size = 0, ref_count = 0, start = 0;
+	var sup = getSuperStructInfo(decl);
+	if (sup != null) {
+		start = sup.field_info.length;
+		for (i < start) field_info[i] = sup.field_info[i];
+		byte_size = sup.byte_size;
+		ref_count = sup.ref_count;
+	}
+	for (i = start; i < types.length; i++) {
+		match (FieldStorage.getKind(types[i])) {
+			Bytes(access) => {
+				byte_size = FieldStorage.alignUp(byte_size, access.size);
+				field_info[i] = V3SplitFieldInfo.Bytes(u24.!(byte_size), access);
+				byte_size += access.size;
+			}
+			Ref => {
+				field_info[i] = V3SplitFieldInfo.Ref(u24.!(ref_count++));
+			}
+			RefI31 => {
+				byte_size = FieldStorage.alignUp(byte_size, 4);
+				field_info[i] = V3SplitFieldInfo.RefI31(u24.!(byte_size), u24.!(ref_count++));
+				byte_size += 4;
+			}
+			RefU64 => {
+				byte_size = FieldStorage.alignUp(byte_size, 8);
+				field_info[i] = V3SplitFieldInfo.RefU64(u24.!(byte_size), u24.!(ref_count++));
+				byte_size += 8;
+			}
+		}
+	}
+	var info = V3SplitStructDeclInfo.new(decl, field_info, byte_size, ref_count);
+	if (Debug.paranoid) verifyStructInfo(info, sup);
+	decl.addInfo(info);
+	return info;
+}
+// Returns the layout of the (first) supertype of {decl}, if it is a struct, computing it if necessary.
+def getSuperStructInfo(decl: StructDecl) -> V3SplitStructDeclInfo {
+	var sup = decl.getFirstSuperType();
+	if (!StructDecl.?(sup)) return null;
+	return getStructInfo(StructDecl.!(sup));
+}
+
+// Checks that the layout {info} is consistent: fields inherited from the supertype {sup} have the
+// same offsets as in the supertype, every field's declared type is representable by its assigned
+// layout, every field lies within the struct and is aligned, and no two fields overlap.
+def verifyStructInfo(info: V3SplitStructDeclInfo, sup: V3SplitStructDeclInfo) {
+	var types = info.decl.field_types, field_info = info.field_info;
+	if (sup != null) {
+		if (sup.field_info.length > field_info.length) failLayout(info, -1, "supertype has more fields");
+		if (sup.byte_size > info.byte_size) failLayout(info, -1, "supertype has larger byte portion");
+		if (sup.ref_count > info.ref_count) failLayout(info, -1, "supertype has larger reference portion");
+		for (i < sup.field_info.length) {
+			if (field_info[i] != sup.field_info[i]) failLayout(info, i, "field layout differs from supertype");
+		}
+	}
+	var bytes_used = Array<bool>.new(info.byte_size), refs_used = Array<bool>.new(info.ref_count);
+	for (i < field_info.length) {
+		var kind = FieldStorage.getKind(types[i]);
+		match (field_info[i]) {
+			Bytes(offset, access) => {
+				match (kind) {
+					Bytes(a) => if (a != access) failLayout(info, i, "primitive field has wrong storage kind");
+					_ => failLayout(info, i, "primitive field has non-primitive layout");
+				}
+				claimBytes(info, i, bytes_used, offset, access.size);
+			}
+			Ref(offset) => {
+				if (kind != FieldStorageKind.Ref) failLayout(info, i, "reference field has wrong layout");
+				claimRef(info, i, refs_used, offset);
+			}
+			RefI31(byte_offset, ref_offset) => {
+				if (kind != FieldStorageKind.RefI31 && kind != FieldStorageKind.Ref) failLayout(info, i, "i31-or-reference field has wrong layout");
+				claimBytes(info, i, bytes_used, byte_offset, 4);
+				claimRef(info, i, refs_used, ref_offset);
+			}
+			RefU64(byte_offset, ref_offset) => {
+				if (kind != FieldStorageKind.RefU64) failLayout(info, i, "reference+u64 field has wrong layout");
+				claimBytes(info, i, bytes_used, byte_offset, 8);
+				claimRef(info, i, refs_used, ref_offset);
+			}
+		}
+	}
+}
+def claimBytes(info: V3SplitStructDeclInfo, field: int, used: Array<bool>, offset: int, size: int) {
+	if ((offset & (size - 1)) != 0) failLayout(info, field, "misaligned primitive");
+	if (offset + size > used.length) failLayout(info, field, "primitive out of bounds of byte portion");
+	for (i < size) {
+		if (used[offset + i]) failLayout(info, field, "overlapping primitive");
+		used[offset + i] = true;
+	}
+}
+def claimRef(info: V3SplitStructDeclInfo, field: int, used: Array<bool>, offset: int) {
+	if (offset >= used.length) failLayout(info, field, "reference out of bounds of reference portion");
+	if (used[offset]) failLayout(info, field, "overlapping reference");
+	used[offset] = true;
+}
+def failLayout(info: V3SplitStructDeclInfo, field: int, msg: string) {
+	var buf = StringBuilder.new();
+	info.decl.render(buf);
+	if (field >= 0) buf.put1(" field #%d", field);
+	buf.puts(": ").puts(msg);
+	System.error("SplitObjectModelError", buf.toString());
+}
+
+def NO_BYTES: Array<byte> = [];
+def NO_REFS: Array<Object> = [];
