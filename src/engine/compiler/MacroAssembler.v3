@@ -180,6 +180,9 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_Instance_globals_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Instance_globals));
 	}
+	def emit_v3_Instance_tags_r_r(dst: Reg, ptr: Reg) {
+		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Instance_tags));
+	}
 	def emit_v3_Table_elems_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Table_elems));
 	}
@@ -227,6 +230,21 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	def emit_push_X86_64Stack_rsp_r_r(stk: Reg);
 	def emit_pop_X86_64Stack_rsp_r_r(stk: Reg);
+	// Sets {stk}.rsp to sp - 8, the slot the next call fills with the resume address.
+	def emit_reserve_return_slot(stk: Reg);
+
+	// Finds the suspend or switch clause for {r_tag} above {r_cur}, or branches to {l_trap}.
+	def emit_handler_search(is_switch: bool, r_tag: Reg, r_cur: Reg, r_parent: Reg, r_prev: Reg, r_entry: Reg, r_cnt: Reg, r_ptags: Reg, l_trap: MasmLabel);
+	// Replaces {r_parent}'s child chain {r_prev} with {r_target}'s chain, return route included; {r_bottom} gets its bottom.
+	def emit_replace_child_chain(r_parent: Reg, r_prev: Reg, r_target: Reg, r_bottom: Reg, r_tmp: Reg);
+	// Redirects the top frame of {r_parent} to the handler {r_entry}. {r_dst} gets the handler's vsp.
+	def emit_handler_fixup(r_parent: Reg, r_entry: Reg, r_dst: Reg, r_psfp: Reg);
+	// Copies {n} value-stack slots, tags included, from {r_src} to {r_dst}, fully unrolled.
+	def emit_value_copy_n(r_dst: Reg, r_src: Reg, n: int, r_xmm: Reg);
+	// Writes continuation into the value-stack slot at {r_addr} + {offset}.
+	def emit_store_continuation(r_addr: Reg, offset: int, r_cont: Reg);
+	// Moves rsp onto {r_stack}, pops the landing address the fixup stored there, saves that rsp on {r_stack} and jumps.
+	def emit_enter_stack(r_stack: Reg);
 
 	def scaleOf(kind: ValueKind) -> int {
 		match (kind) {
@@ -279,11 +297,13 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_mov_r_d64(reg: Reg, val: u64);
 	def emit_mov_r_q(reg: Reg, low: u64, high: u64);
 	def emit_mov_r_Object(reg: Reg, obj: Object);
+	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>);
 	def emit_mov_r_Function(reg: Reg, func: Function);
 	def emit_mov_r_Instance(reg: Reg, instance: Instance);
 	def emit_mov_r_Continuation(reg: Reg, cont: Continuation);
 
 	def emit_mov_m_r(kind: ValueKind, addr: MasmAddr, reg: Reg);
+	def emit_mov_m_b(addr: MasmAddr, val: byte);
 	def emit_mov_m_i(addr: MasmAddr, val: int);
 	def emit_mov_m_ri(addr: MasmAddr, val: int);
 	def emit_mov_m_l(addr: MasmAddr, val: long);
@@ -338,6 +358,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_call_runtime_callHost(func_arg: Reg);
 	def emit_call_runtime_SUSPEND();
 	def emit_call_runtime_SWITCH();
+	def emit_call_runtime_ALLOC_CONT();
 	def emit_call_runtime_RESUME_THROW();
 	def emit_call_runtime_RESUME_THROW_REF();
 	def emit_jump_to_trap_at(reason: TrapReason);
@@ -362,6 +383,18 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	// stk.state_ = state;
 	def emit_set_stack_state(stk: Reg, state: StackState);
+	// Publishes the handler table.
+	def emit_publish_handlers(r_stack: Reg, r_table: Reg, tier: HandlerTier) {
+		var offsets = getOffsets();
+		emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, offsets.X86_64Stack_handlers), r_table);
+		emit_mov_m_b(MasmAddr(r_stack, offsets.X86_64Stack_handler_tier), byte.view(tier.tag));
+	}
+	// Clears the published handler table of {r_stack}..
+	def emit_clear_handlers(r_stack: Reg) {
+		var offsets = getOffsets();
+		emit_mov_m_l(MasmAddr(r_stack, offsets.X86_64Stack_handlers), 0);
+		emit_mov_m_b(MasmAddr(r_stack, offsets.X86_64Stack_handler_tier), byte.view(HandlerTier.NONE.tag));
+	}
 	// This should be called after all stack value transfers, but before the
 	// return address is pushed onto parent's {sp}.
 	// Chains {cont} on {parent} by:
@@ -370,42 +403,34 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	// Destructive on {parent}.
 	def emit_cont_mv(from_vsp: Reg, contStack: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg);
 
-	// Validates {cont} and:
-	// - Mark {cont} as used
-	// - Move {cont.stack} to {destContStack}
-	def emit_validate_and_consume_cont(destContStack: Reg, cont: Reg) {
-		// {cont} is a register matching {Continuations.valueKind}'s register class:
-		//   - boxed mode: GPR holding a {Continuation *} directly.
-		//   - unboxed mode: XMM holding (stack, version) in low/high 8 bytes.
+	// Validates the continuation in the value-stack slot {slot}, marks it used and moves its stack to {destContStack}.
+	def emit_validate_and_consume_cont(destContStack: Reg, slot: MasmAddr) {
 		var scratch = regConfig.scratch, offsets = getOffsets();
-		if (FeatureDisable.unboxedConts) { // boxed continuation mode
-			// Check for {cont == null}.
-			emit_br_r(cont, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
-			// Check for {cont.stack == null} (true when {cont} is already used).
-			emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_stack));
+		emit_mov_r_m(ValueKind.REF, destContStack, slot);
+		emit_br_r(destContStack, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+		if (FeatureDisable.unboxedConts) {
+			emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(destContStack, offsets.Continuation_stack));
 			emit_br_r(scratch, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.USED_CONTINUATION));
-			// Consume {cont} by setting {cont.stack} to null.
-			emit_mov_m_l(MasmAddr(cont, offsets.Continuation_stack), 0);
-			// Set {destContStack} to {cont.stack} (its value before being cleared).
+			emit_mov_m_l(MasmAddr(destContStack, offsets.Continuation_stack), 0);
 			emit_mov_r_r(ValueKind.REF, destContStack, scratch);
-		} else { // unboxed continuation mode
-			// Set {destContStack} to {cont.stack}
-			emit_ref_from_ref_u64(destContStack, cont);
-			// Check for {cont == null}.
-			emit_br_r(destContStack, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
-			emit_u64_from_ref_u64(scratch, cont);
-			// Check for {cont.stack == null} (true when {cont} is already used).
+		} else {
+			emit_mov_r_m(ValueKind.REF, scratch, slot.plus(8));
 			emit_validate_cont_version_unboxed(destContStack, scratch);
-			// Consume {cont} by incrementing {destContStack.version}.
 			emit_inc_stack_version(destContStack);
 		}
+	}
+	// Loads the stack of the continuation in the value-stack slot {slot} into {dst}, without checks.
+	def emit_load_cont_stack(dst: Reg, slot: MasmAddr) {
+		emit_mov_r_m(ValueKind.REF, dst, slot);
+		if (FeatureDisable.unboxedConts) emit_v3_Continuation_stack_r_r(dst, dst);
 	}
 	def emit_validate_cont_version_unboxed(stack: Reg, version: Reg);
 	def emit_inc_stack_version(stack: Reg);
 
-	// Called as the last step during resume. Switches {curStack} to the top of {cont}.
-	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg) {
+	// Publishes {r_table} on {parent} and chains {contStack} under it; destructive on {parent}.
+	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg, r_table: Reg, tier: HandlerTier) {
 		var scratch = regConfig.scratch, offsets = getOffsets();
+		emit_publish_handlers(parent, r_table, tier);
 		emit_set_stack_state(parent, StackState.CALL_CHILD); // XXX: not needed for {switch}
 		emit_mov_r_r(ValueKind.REF, scratch, contStack);
 		emit_set_stack_state(scratch, StackState.RUNNING);
@@ -421,6 +446,21 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 		// contStack.cont_bottom = null;
 		emit_mov_m_i(MasmAddr(contStack, offsets.X86_64Stack_bottom), 0);
+	}
+	// Marks {cur} suspended with {prev} as its bottom. Need {arity} values to resume it.
+	def emit_suspend_stack(cur: Reg, vsp: Reg, prev: Reg, arity: int) {
+		var offsets = getOffsets();
+		emit_v3_set_X86_64Stack_vsp_r_r(cur, vsp);
+		emit_set_stack_state(cur, StackState.SUSPENDED);
+		emit_mov_m_i(MasmAddr(cur, offsets.X86_64Stack_params_arity), arity);
+		emit_mov_m_r(ValueKind.REF, MasmAddr(cur, offsets.X86_64Stack_bottom), prev);
+	}
+	// Copies the {n} values at {vsp} and {cont} onto {dest} at {dst}, leaving {dst} past them.
+	def emit_pass_values(dest: Reg, dst: Reg, vsp: Reg, n: int, cont: Reg, xmm: Reg) {
+		emit_value_copy_n(dst, vsp, n, xmm);
+		emit_store_continuation(dst, n * valuerep.slot_size, cont);
+		emit_addw_r_i(dst, (n + 1) * valuerep.slot_size);
+		emit_v3_set_X86_64Stack_vsp_r_r(dest, dst);
 	}
 	def emit_switch_to_stack(r_stack: Reg) {
 		var scratch = regConfig.scratch;
