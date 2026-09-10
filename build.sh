@@ -210,7 +210,7 @@ BUILD_FILE=$(make_build_file)
 
 PREGEN=${PREGEN:=1}
 
-LANG_OPTS="-fun-exprs -simple-bodies"
+LANG_OPTS="-lang:fun-exprs -lang:simple-bodies -lang:descriptors"
 if [ "$REDEFS" != "" ]; then
     V3C_OPTS="$V3C_OPTS -redef-field=$REDEFS"
 fi
