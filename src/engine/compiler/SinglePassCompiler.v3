@@ -84,7 +84,6 @@ def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 def KIND_CONT = SpcConsts.KIND_CONT;
 def IVAR_SLOT = SpcConsts.IVAR_SLOT;
-def BORROWABLE_IVARS = X86_64MasmRegs.BORROWABLE_IVARS;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits, fast: bool) extends BytecodeVisitor {
@@ -334,13 +333,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		for (i = 1; i < config.regSet.length; i++) {
 			var r = Reg(byte.view(i));
-			// A register holding an IVar is allocated without occupying a value-stack slot.
-			if (fast && state.holdsIVar(r)) continue;
 			var buf = StringBuilder.new().puts("{");
 			regAlloc.forEachAssignment(r, appendSlots(buf, _));
 			var slots = buf.puts("}").toString();
 			if (regRefCounts[i] == 0) {
-				assert2(regAlloc.isFree(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
+				assert2(regAlloc.isFree(r) || state.holdsIVar(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
 			} else {
 				assert2(!regAlloc.isFree(r), "%s should be allocated, got slots = %s", config.regSet.getName(r), slots);
 			}
@@ -392,23 +389,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_mov_m_r(ValueKind.REF, frame.mem0_base_slot, regs.mem0_base);
 		}
 	}
-	def emitFastPrologue() {
-		// compute fast operand size to skip over
-		fast_operand_size = Opcodes.minimalUleb32Length(func.func_index);
-		// Advance IP past the fast-call opcode.
-		def r_ip = X86_64MasmRegs.INT_EXEC_ENV.ip;
-		masm.emit_addw_r_i(r_ip, fast_operand_size); 	// increment ip
-		masm.emit_compute_pc(-(fast_operand_size + 1)); // compute r_curpc
-		// save the registers computed above to the frame
-		masm.emit_save_ivar(r_ip);
-		masm.emit_save_ivar(X86_64MasmRegs.INT_EXEC_ENV.stp);
-		if (!FeatureDisable.stacktraces) masm.emit_save_ivar(X86_64MasmRegs.INT_EXEC_ENV.curpc);
-		allocIVars();
-
-		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
-		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
-		masm.emit_subw_r_i(regs.vfp, sig.params.length * masm.valuerep.slot_size);
-	}
+	def emitFastPrologue();
 	def visitLocalDecl(count: u32, vtc: ValueTypeCode) {
 		var vt = vtc.toAbstractValueType(module);
 		var sp = state.sp;
@@ -2173,7 +2154,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			// restore vfp
 			masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
 			// restore interpreter registers (but only if they were ever borrowed in this function)
-			for (reg in BORROWABLE_IVARS) restoreIVar(reg);
+			restoreIVars();
 			emitFastDispatch();
 		}
 	}
@@ -2210,19 +2191,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// In fast mode the interpreter's registers are pre-allocated to {IVAR_SLOT}, so the
 	// allocator hands one out only by evicting it (at cost 50, with nothing to spill), and
 	// the epilogue reloads exactly the ones that were evicted.
-	def allocIVars() {
-		for (reg in BORROWABLE_IVARS) regAlloc.assign(reg, IVAR_SLOT);
-	}
-	def evictIVars() {
-		for (reg in BORROWABLE_IVARS) if (state.holdsIVar(reg)) regAlloc.free(reg);
-	}
-	// Reloads {reg} from the interpreter frame unless it still holds the interpreter's value.
-	def restoreIVar(reg: Reg) {
-		if (state.holdsIVar(reg)) return;
-		evictAndAssign(reg, IVAR_SLOT);
-		emitRestoreIVar(reg);
-	}
-	def emitRestoreIVar(reg: Reg);
+	def allocIVars();
+	def evictIVars();
+	def restoreIVars();
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		unrefRegs();
@@ -2573,13 +2544,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return reg;
 	}
 	def allocFixed(kind: ValueKind, reg: Reg, slot: u32) -> Reg {
-		evictAndAssign(reg, int.!(slot));
-		return reg;
-	}
-	// Evicts whatever {reg} currently holds (if anything) and assigns it to {slot}.
-	def evictAndAssign(reg: Reg, slot: int) {
 		if (!regAlloc.isFree(reg)) spillRegAndFree(reg);
-		regAlloc.assign(reg, slot);
+		regAlloc.assign(reg, int.!(slot));
+		return reg;
 	}
 	def ensureReg(sv: SpcVal, slot: u32) -> Reg {
 		var reg = sv.reg;
