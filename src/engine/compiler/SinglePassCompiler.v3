@@ -61,12 +61,10 @@ component SpcConsts {
 		return byte.view(kind.tag) << 4;
 	}
 
-	// Sentinel {RegAlloc} assignment marking a register that holds its interpreter
-	// variable. Which variable is identified by the register itself.
-	// Invariant: a register holding {IVAR_SLOT} holds nothing else. It gets this
-	// assignment only while free, and anyone who wants such a register for another
-	// purpose must free it first (saving the variable to its home as needed) rather
-	// than assign on top of it.
+	// {RegAlloc} assignment of an interpreter register a fast handler has not borrowed. Such
+	// a register holds nothing else; the register itself says which interpreter variable it
+	// is. Large enough that {forEachAssignmentInRange} skips it and that indexing the value
+	// stack with it fails loudly.
 	def IVAR_SLOT = 2000000000;
 }
 
@@ -2172,15 +2170,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
-	// Marks each borrowable register as holding its interpreter variable ({IVAR_SLOT}).
-	def markIVars();
-	// Writes the interpreter variable in {reg} out to its home in the interpreter frame.
-	def emitSaveIVar(reg: Reg);
-	// Reloads {reg}'s interpreter variable and re-marks it, if not already held.
-	def restoreIVar(reg: Reg);
-	// Frees every borrowable register still holding its interpreter variable, so the epilogue
-	// reloads them all; used after an outcall, which may have clobbered any of them.
+	// In fast mode the interpreter's registers are pre-allocated to {IVAR_SLOT}, so the
+	// allocator hands one out only by evicting it (at cost 50, with nothing to spill), and
+	// the epilogue reloads exactly the ones that were evicted.
+	def allocIVars();
 	def evictIVars();
+	def restoreIVars();
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		Metrics.spc_static_reconst.val++;
@@ -2399,7 +2394,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
 			}
 		}
-		evictIVars();
+		evictIVars(); // an outcall may have clobbered any of them; the epilogue reloads
 	}
 	def emit_load_instance(reg: Reg) {
 		if (whamm_config.is_inlined) { // inline compilation
@@ -2560,7 +2555,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return regAlloc.alloc(kind, slot);
 	}
 	def addSpillCost(score: int, reg: Reg, slot: int) -> int {
-		if (slot == IVAR_SLOT) return 50 + score; // IVar reg
+		if (slot == IVAR_SLOT) return 50 + score; // borrowable IVar; must precede the tmp-slot test
 		if (slot >= state.sp) return 100000000 + score;       // tmp slot?
 		if (!state.state[slot].isStored()) score += 100;      // will generate a spill
 		if (slot < 10 && slot < func.num_locals) score += 10; // penalize first 10 locals
@@ -2687,8 +2682,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
-		// IVars are either spilled in prologue or correct from the interpreter context, and don't need to be spilled again.
-		// TODO: spill a save-required IVar here automatically, so reusing one need not be saved eagerly.
+		// IVars are either saved in the prologue or already correct in the frame.
 		if (slot == IVAR_SLOT) return;
 		var sv = state.state[slot];
 		if (sv.isConst()) return void(state.state[slot] = sv.withoutReg());
@@ -3171,8 +3165,7 @@ class SpcState(regAlloc: RegAlloc) {
 		for (i < max) {
 			var sv = nstate[i];
 			if (sv.inReg()) {
-				// control reaching here has {sv.reg} holding this slot, so an interpreter
-				// variable still marked in it is stale and must be released first
+				// the merge's move clobbers any interpreter variable still in {sv.reg}
 				if (holdsIVar(sv.reg)) regAlloc.free(sv.reg);
 				regAlloc.assign(sv.reg, int.!(i));
 			}
