@@ -60,12 +60,7 @@ component SpcConsts {
 	def kindToFlags(kind: ValueKind) -> byte {
 		return byte.view(kind.tag) << 4;
 	}
-
-	// {RegAlloc} assignment of an interpreter register a fast handler has not borrowed. Such
-	// a register holds nothing else; the register itself says which interpreter variable it
-	// is. Large enough that {forEachAssignmentInRange} skips it and that indexing the value
-	// stack with it fails loudly.
-	def IVAR_SLOT = 2000000000;
+	def IVAR_SLOT = TMP_SLOT + 1;
 }
 
 // Shorten constants inside this file.
@@ -2170,9 +2165,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
-	// In fast mode the interpreter's registers are pre-allocated to {IVAR_SLOT}, so the
-	// allocator hands one out only by evicting it (at cost 50, with nothing to spill), and
-	// the epilogue reloads exactly the ones that were evicted.
+	// Operations for tracking interpreter registers for fast handlers.
 	def allocIVars();
 	def evictIVars();
 	def restoreIVars();
@@ -2971,22 +2964,7 @@ class SpcState(regAlloc: RegAlloc) {
 	var ctl_stack = ArrayStack<SpcControl>.new();
 	// Frame management (for inlining)
 	var frame_stack = ArrayStack<SpcFrame>.new();
-	// Frees every register except those holding an interpreter variable ({IVAR_SLOT}): a
-	// fast handler pre-allocates them, and a reset must not lose that.
-	private def clearExceptIVars() {
-		regAlloc.forEachAllocatedReg(NO_REG, freeUnlessIVar);
-	}
-	private def freeUnlessIVar(reg: Reg) {
-		if (!holdsIVar(reg)) regAlloc.free(reg);
-	}
-	def holdsIVar(reg: Reg) -> bool {
-		found_ivar = false;
-		regAlloc.forEachAssignment(reg, noteIVar);
-		return found_ivar;
-	}
-	private var found_ivar: bool;
-	private def noteIVar(slot: int) { if (slot == IVAR_SLOT) found_ivar = true; }
-
+	def useIVars = false; // TODO replace with `fast` option when implemented in SPC
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
 		sp = 0;
@@ -3082,7 +3060,7 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
-			clearExceptIVars();
+			clear();
 			sp = ctl.val_stack_top;
 			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
 				var sv = state[i];
@@ -3161,12 +3139,12 @@ class SpcState(regAlloc: RegAlloc) {
 		return SpcVal((from.flags & ~(IS_CONST)) | force_store, from.reg, 0);
 	}
 	private def resetTo(max: u32, nstate: Array<SpcVal>) {
-		clearExceptIVars();
+		clear();
 		for (i < max) {
 			var sv = nstate[i];
 			if (sv.inReg()) {
 				// the merge's move clobbers any interpreter variable still in {sv.reg}
-				if (holdsIVar(sv.reg)) regAlloc.free(sv.reg);
+				if (useIVars && holdsIVar(sv.reg)) regAlloc.free(sv.reg);
 				regAlloc.assign(sv.reg, int.!(i));
 			}
 			state[i] = sv;
@@ -3252,6 +3230,19 @@ class SpcState(regAlloc: RegAlloc) {
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 	}
+	def clear() {
+		if (useIVars) regAlloc.forEachAllocatedReg(NO_REG, freeExceptIVar);
+		else regAlloc.clear();
+	}
+	def freeExceptIVar(reg: Reg) {
+		if (!holdsIVar(reg)) regAlloc.free(reg);
+	}
+	def holdsIVar(reg: Reg) -> bool {
+		if (!regAlloc.unassign(reg, IVAR_SLOT)) return false;
+		regAlloc.assign(reg, IVAR_SLOT); // reassign ivar if it was unassigned
+		return true;
+	}
+
 	def trace() {
 		var num_locals = frame_stack.peek().num_locals;
 		trace0("", state, int.!(sp), num_locals);
