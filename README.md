@@ -28,6 +28,7 @@ Newer features are under development and vary in their support in the different 
 | memory64 | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | stack-switching  | &#x2705;| &#x2705; | &#x2705; |  &#x2705; |
 | custom-page-sizes  | &#x2705;| &#x2705; |  |  |
+| wide-arithmetic  | &#x2705;| &#x2705; | &#x2705; | &#x2705; |
 | legacy EH  | &#x2705;| &#x2705; |  &#9745; | &#9745; |
 | threads  | &#x2705;| &#9745; | &#9745; |  |
 
