@@ -1,0 +1,148 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Storage representation of a field in a flat struct layout.
+enum NativeFieldKind {
+	U8, U16, U32, U64, F32, F64, V128,
+	I31REF,		// a reference word that may instead hold a tagged i31 (low bit set)
+	REF,		// a reference word
+	REF_U64		// a reference word followed by a u64
+}
+// The representation and offset (from the start of the object) of a field.
+type NativeFieldInfo(kind: NativeFieldKind, offset: u16) #unboxed { }
+
+// Throwaway helper that lays out struct fields after a base object, in declaration order with natural
+// alignment, tracking the byte size, the reference words, and the field infos.
+class StructLayoutBuilder {
+	def word_size: int;
+	def base_size: int;
+	def fields = Vector<NativeFieldInfo>.new();
+	var size: int;					// end of the last field, in bytes
+	private def refs = Vector<bool>.new();		// one entry per word
+	private var inherited: int;
+
+	// Starts after {base_size} bytes of a base whose reference map {base_refmap} is in the runtime's
+	// encoding: bit {i} set iff word {i} holds a reference, with the highest bit marking the end.
+	new(word_size, base_size, base_refmap: int) {
+		size = base_size;
+		for (i < FieldStorage.alignUp(base_size, word_size) / word_size) {
+			refs.put(i < 32 && ((base_refmap >> u5.view(i)) & 1) != 0);
+		}
+	}
+	// Adds inherited fields, which already lie within the base.
+	def inherit(infos: Array<NativeFieldInfo>) -> this {
+		fields.puta(infos);
+		inherited = fields.length;
+	}
+	// Appends fields of the given {types}.
+	def extend(types: Range<StorageType>) -> this {
+		for (st in types) {
+			var kind = getKind(st), fsize = primSize(kind);
+			if (fsize == 0) fsize = word_size; // a reference
+			size = FieldStorage.alignUp(size, if(fsize < word_size, fsize, word_size));
+			fields.put(NativeFieldInfo(kind, u16.view(size)));
+			match (kind) {
+				REF, I31REF => setRef(size / word_size);
+				REF_U64 => {
+					setRef(size / word_size);
+					fsize += 8;
+				}
+				_ => ;
+			}
+			size += fsize;
+		}
+	}
+	def alignedSize() -> int { return FieldStorage.alignUp(size, word_size); }
+	def words() -> int { return alignedSize() / word_size; }
+	def isRef(word: int) -> bool { return word >= 0 && word < refs.length && refs[word]; }
+	// Encodes the reference map in the runtime's 32-bit format: bit {i} set iff word {i} holds a
+	// reference, with the highest bit marking the end of the object. Returns 0 if over 31 words.
+	def getRefmapI32() -> int {
+		var count = words();
+		if (count > 31) return 0;
+		var map = 1u << u5.view(count);
+		for (i < refs.length) if (refs[i]) map |= 1u << u5.view(i);
+		return int.view(map);
+	}
+	// Checks that the fields are consistent with {types}: kinds match, new fields lie after the base,
+	// fields are aligned and don't overlap, and the reference map matches the reference fields.
+	// Returns {null} if consistent, otherwise a description of the first problem.
+	def check(types: Range<StorageType>) -> string {
+		if (fields.length != types.length) return err(-1, "wrong number of fields");
+		var used = Array<bool>.new(alignedSize());
+		for (i < fields.length) {
+			var f = fields[i], kind = getKind(types[i]), offset = int.view(f.offset);
+			if (f.kind != kind) return err(i, "wrong storage kind");
+			if (i >= inherited && offset < base_size) return err(i, "overlaps base");
+			var msg: string;
+			match (kind) {
+				REF, I31REF => msg = claim(used, i, offset, word_size, true);
+				REF_U64 => {
+					msg = claim(used, i, offset, word_size, true);
+					if (msg == null) msg = claim(used, i, offset + word_size, 8, false);
+				}
+				_ => msg = claim(used, i, offset, primSize(kind), false);
+			}
+			if (msg != null) return msg;
+		}
+		for (w = FieldStorage.alignUp(base_size, word_size) / word_size; w < words(); w++) {
+			if (isRef(w) && !used[w * word_size]) return err(-1, "unused reference word");
+		}
+		return null;
+	}
+	private def setRef(word: int) {
+		while (refs.length <= word) refs.put(false);
+		refs[word] = true;
+	}
+	private def claim(used: Array<bool>, field: int, offset: int, fsize: int, is_ref: bool) -> string {
+		var align = if(fsize < word_size, fsize, word_size);
+		if ((offset & (align - 1)) != 0) return err(field, "misaligned");
+		if (offset + fsize > used.length) return err(field, "out of bounds");
+		for (w = offset / word_size; w <= (offset + fsize - 1) / word_size; w++) {
+			if (isRef(w) != is_ref) return err(field, if(is_ref, "reference not in reference map", "primitive in a reference word"));
+		}
+		for (i < fsize) {
+			if (used[offset + i]) return err(field, "overlaps another field");
+			used[offset + i] = true;
+		}
+		return null;
+	}
+	private def err(field: int, msg: string) -> string {
+		if (field < 0) return msg;
+		return StringBuilder.new().put1("field #%d: ", field).puts(msg).toString();
+	}
+	def getKind(st: StorageType) -> NativeFieldKind {
+		match (st.valtype) {
+			I32 => {
+				match (st.pack) {
+					UNPACKED => return NativeFieldKind.U32;
+					PACKED_I8 => return NativeFieldKind.U8;
+					PACKED_I16 => return NativeFieldKind.U16;
+				}
+			}
+			I64 => return NativeFieldKind.U64;
+			F32 => return NativeFieldKind.F32;
+			F64 => return NativeFieldKind.F64;
+			V128 => return NativeFieldKind.V128;
+			Ref(nullable, heap) => {
+				match (heap) {
+					ANY, EQ, I31, EXTERN => return NativeFieldKind.I31REF; // may hold an i31
+					Cont, NOCONT => return NativeFieldKind.REF_U64;
+					_ => return NativeFieldKind.REF;
+				}
+			}
+			_ => return NativeFieldKind.REF; // BOTTOM, Host
+		}
+	}
+	// The size of a primitive of {kind}, or 0 for references.
+	private def primSize(kind: NativeFieldKind) -> int {
+		match (kind) {
+			U8 => return 1;
+			U16 => return 2;
+			U32, F32 => return 4;
+			U64, F64 => return 8;
+			V128 => return 16;
+			_ => return 0;
+		}
+	}
+}
