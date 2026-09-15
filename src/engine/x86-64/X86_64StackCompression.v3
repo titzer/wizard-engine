@@ -1,0 +1,142 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def valuerep = Target.tagging;
+
+component X86_64Compression {
+
+	def readFrames(stack: X86_64Stack) -> Array<RelocatableFrame> {
+		var collector = StackFrameCollector.new();
+		stack.walk<void>(collector.visitFrame, void, stack.rsp, false);
+
+		var result = Vector<RelocatableFrame>.new();
+		// {collector.frames} is in walk order: index 0 is the topmost frame.
+		for (i = collector.frames.length - 1; i >= 0; i--) {
+			var next_vfp = if(i == 0, stack.vsp, collector.frames[i-1].getFrameAccessorOfStack(stack).handle.vfp());
+			result.put(loadTargetFrame(stack, collector.frames[i], next_vfp));
+		}
+		return result.extract();
+	}
+
+	// Requires {to.state() == EMPTY}.
+	def writeFrames(to: X86_64Stack, frames: Array<RelocatableFrame>) {
+		if (to.state() != StackState.EMPTY) {
+			to.fatal(Strings.format1("writeFrames() requires state == EMPTY, got %s", to.state().name));
+		}
+		if (frames.length == 0) return; // nothing to install; leave {to} empty
+		var root_func = frames[0].data.func;
+		var instance = root_func.instance;
+		to.resetForFrameWrites(instance.functions[root_func.decl.func_index]);
+		to.cont_bottom = to;
+
+		for (f in frames) {
+			// The sidetable lookup allocates, so it must run before {rsp} moves over the new frame (due to GC).
+			var stp = if(f.is_spc, 0, SidetableMap.new(f.data.func.decl)[f.data.pc]);
+
+			// Interpreter and SPC frames share the 104-byte footprint.
+			to.rsp += -X86_64InterpreterFrame.size;
+			var h: X86_64FrameHandle;
+			if (f.is_spc) {
+				var sh = X86_64FrameHandle.Spc(to.rsp);
+				setSpcFrameContext(sh, f.data.func, f.data.pc);
+				h = sh;
+			} else {
+				var ih = X86_64FrameHandle.Interpreter(to.rsp);
+				setFrameContext(ih, f.data.func);
+				setNewProgramLocation(ih, f.data.func.decl, f.data.pc, stp, f.bytecode_offset);
+				h = ih;
+			}
+
+			// Push the value slots and bracket with vfp/vsp.
+			h.set_vfp(to.vsp);
+			for (val in f.data.vals) to.push(val);
+			h.set_vsp(to.vsp);
+
+			// SPC resumes at the call-site continuation, interpreter resumes at its dispatch reentry.
+			to.rsp += -Pointer.SIZE;
+			to.rsp.store<Pointer>(Pointer.NULL + i64.view(f.data.ret_addr));
+		}
+	}
+
+	// {stack} must be the stack that {frame} lives on; the frame accessor reads values through it.
+	def loadTargetFrame(stack: X86_64Stack, frame: TargetFrame, next_vfp: Pointer) -> RelocatableFrame {
+		var accessor = frame.getFrameAccessorOfStack(stack);
+		var func = accessor.func();
+		var pc = accessor.pc();
+		var ret_addr = frame.srp().load<Pointer>();
+		var is_spc = X86_64SpcCode.?(RiRuntime.findUserCode(ret_addr));
+
+		// {bytecode_offset} is interpreter-only; SPC derives its pc from the return address.
+		var h: X86_64FrameHandle;
+		var bytecode_offset = 0;
+		if (is_spc) {
+			h = X86_64FrameHandle.Spc(accessor.sfp());
+		} else {
+			var ih = X86_64FrameHandle.Interpreter(accessor.sfp());
+			h = ih;
+			bytecode_offset = int.!(ih.ip() - Pointer.atContents(ih.code()));
+		}
+
+		var values = Vector<Value>.new();
+		var offset = 0;
+		for (this_vfp = h.vfp(); this_vfp < next_vfp; this_vfp += valuerep.slot_size) {
+			values.put(accessor.getValue(offset));
+			offset++;
+		}
+
+		var data = WasmFrameData(func, pc, u64.view(ret_addr - Pointer.NULL), values.extract());
+		return RelocatableFrame(data, is_spc, bytecode_offset);
+	}
+
+	def setFrameContext(h: X86_64FrameHandle.Interpreter, wf: WasmFunction) {
+		var module = wf.instance.module;
+		h.set_wasm_func(wf);
+		h.set_instance(wf.instance);
+		h.set_sidetable(wf.decl.sidetable.entries);
+		h.set_accessor(null);
+		if (module.memories.length > 0) {
+			var memory = NativeWasmMemory.!(wf.instance.memories[0]);
+			h.set_mem0_base(memory.start);
+		}
+	}
+
+	// SPC layout has no sidetable slot, so it is omitted here.
+	def setSpcFrameContext(h: X86_64FrameHandle.Spc, wf: WasmFunction, pc: int) {
+		var module = wf.instance.module;
+		h.set_wasm_func(wf);
+		h.set_instance(wf.instance);
+		h.writeSpcState(pc);
+		// Cleared to stay consistent with SPC prologue (and avoid GC).
+		h.set_inlined_instance(null);
+		if (module.memories.length > 0) {
+			var memory = NativeWasmMemory.!(wf.instance.memories[0]);
+			h.set_mem0_base(memory.start);
+		}
+	}
+
+	// {bytecode_offset} is the byte offset into {func.cur_bytecode} at which this frame resumes.
+	def setNewProgramLocation(h: X86_64FrameHandle.Interpreter, func: FuncDecl, pc: int, stp: int, bytecode_offset: int) {
+		var code = func.cur_bytecode;
+		if (u32.view(bytecode_offset) > u32.view(code.length)) {
+			System.error("StackCompressionError", "bytecode offset out of bounds");
+		}
+		h.set_func_decl(func);
+		h.set_curpc(pc);
+		h.set_code(code);
+		h.set_ip(Pointer.atContents(code) + bytecode_offset);
+		h.set_eip(Pointer.atContents(code) + code.length);
+		h.set_stp(X86_64Frames.sidetablePtr(func.sidetable.entries, stp));
+	}
+}
+
+// Visitor used by {X86_64Compression.readFrames} to gather module frames.
+class StackFrameCollector {
+	def frames = Vector<TargetFrame>.new();
+
+	def reset() { frames.clear(); }
+	def visitFrame(p: Pointer, c: RiUserCode, pos: StackFramePos, v: void) -> bool {
+		// TODO: handle X86_64SpcInlinedFrame and X86_64SpcTrapsStub.
+		if (X86_64InterpreterCode.?(c) || X86_64SpcModuleCode.?(c)) frames.put(pos.frame);
+		return true;
+	}
+}
