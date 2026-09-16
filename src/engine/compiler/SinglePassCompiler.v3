@@ -116,7 +116,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var last_probe = 0;
 	var skip_to_end: bool;
 	var whamm_config: WhammInlineConfig;
-	var frames_reconstructed = false;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -2165,10 +2164,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def getSpcInlinedFrameIp() -> long;
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
+		unrefRegs();
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
 		def real_frame = frames[0];
 		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+		def outer_module = real_frame.module;
 
 		// load instance
 		var inst_reg = allocTmp(ValueKind.REF);
@@ -2183,12 +2184,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var prev_base_sp = int.view(frames[0].local_base_sp);
 		var wasm_func_reg = allocTmp(ValueKind.REF);
 
-		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+		var inl_inst_reg: Reg, inl_mem0_reg: Reg, whamm_func_reg: Reg;
 		if (whamm_config.is_inlined) { // XXX check individual configs?
 			inl_inst_reg = allocTmp(ValueKind.REF);
 			inl_mem0_reg = allocTmp(ValueKind.REF);
+			whamm_func_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
+			masm.emit_v3_Instance_functions_r_r(whamm_func_reg, inl_inst_reg);
 		}
 
 		// Pre-allocate stack space for all reconstructed frames at once.
@@ -2200,11 +2203,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			def frame_info = frames[i];
 			def cur_base_sp = int.view(frame_info.local_base_sp);
 			def delta = (cur_base_sp - prev_base_sp) * masm.valuerep.slot_size;
+			def func_reg = if(frame_info.module == outer_module, func_reg, whamm_func_reg);
 			emitReconstructStackFrame(frame_info, frames.length - i - 1, delta,
 					wasm_func_reg, func_reg, inst_reg, mem_reg, vfp_reg, inl_inst_reg, inl_mem0_reg);
 			prev_base_sp = cur_base_sp;
 		}
 
+		unrefRegs();
 		return total_space;
 	}
 	def emitReconstructStackFrame(spcFrame: SpcFrame, offset: int, vfp_delta: int,
@@ -2259,19 +2264,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
 		if (isInlined()) {
-			if (frames_reconstructed) {
-				// FIXME this should not happen (but does):
-				// - in the case of deep nesting when one layer is a Whamm probe
-				// - when refactoring to avoid `with` clause, GC test fails (inlining depth 2)
-				if (Trace.compiler) Trace.OUT.puts("  nested frame reconstruction inhibited\n");
-				emit();
-				return;
-			}
-			unrefRegs();
-			frames_reconstructed = true;
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
-			frames_reconstructed = false;
 			if (space > 0) {
 				masm.emit_addw_r_i(regs.sp, space);
 				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
