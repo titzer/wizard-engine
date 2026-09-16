@@ -133,6 +133,10 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_pop_X86_64Stack_rsp_r_r(stk: Reg) {
 		asm.q.add_m_i(G(stk).plus(offsets.X86_64Stack_rsp), Pointer.SIZE);
 	}
+	def emit_reserve_return_slot(stk: Reg) {
+		asm.q.lea(scratch, R.RSP.plus(0 - Pointer.SIZE));
+		asm.movq_m_r(G(stk).plus(offsets.X86_64Stack_rsp), scratch);
+	}
 
 	def emit_loadbsx_r_r_r_i(kind: ValueKind, dst: Reg, base: Reg, index: Reg, offset: u32) {
 		var t = handle_large_offset(index, offset);
@@ -284,6 +288,9 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_mov_r_Object(reg: Reg, obj: Object) {
 		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(obj))));
 	}
+	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>) {
+		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(array))));
+	}
 	def emit_mov_r_Function(reg: Reg, func: Function) {
 		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(func))));
 	}
@@ -312,6 +319,9 @@ class X86_64MacroAssembler extends MacroAssembler {
 			F64 => asm.movsd_m_s(addr, X(reg));
 			V128, REF_U64 => asm.movdqu_m_s(addr, X(reg));
 		}
+	}
+	def emit_mov_m_b(ma: MasmAddr, val: byte) {
+		asm.movb_m_i(A(ma), val);
 	}
 	def emit_mov_m_i(ma: MasmAddr, val: int) {
 		asm.movd_m_i(A(ma), val);
@@ -871,6 +881,9 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_runtime_SWITCH() {
 		emit_call_runtime(X86_64RT.runtime_handle_switch);
 	}
+	def emit_call_runtime_ALLOC_CONT() {
+		emit_call_runtime(X86_64RT.runtime_alloc_cont);
+	}
 	def emit_call_runtime_RESUME_THROW() {
 		emit_call_runtime(X86_64RT.runtime_handle_resume_throw);
 	}
@@ -948,20 +961,120 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.jc_rel_near(C.Z, done);
 		asm.d.shl_r_i(r_count, valuerep.slot_size_log);
 		asm.bind(copy);
-		if (valuerep.value_size == 16) { // 16-byte (SIMD) values
-			asm.movdqu_s_m(r_xmm0, r_src.plusR(r_count, 1, - valuerep.value_size));
-			asm.movdqu_m_s(r_dst.plusR(r_count, 1, - valuerep.value_size), r_xmm0);
-		} else { // 8-byte values
-			asm.movq_r_m(scratch, r_src.plusR(r_count, 1, - Pointer.SIZE));
-			asm.movq_m_r(r_dst.plusR(r_count, 1, - Pointer.SIZE), scratch);
-		}
-		if (valuerep.tagged) {
-			asm.movb_r_m(scratch, r_src.plusR(r_count, 1, - valuerep.slot_size)); // copy tags
-			asm.movb_m_r(r_dst.plusR(r_count, 1, - valuerep.slot_size), scratch);
-		}
+		emit_slot_copy(r_dst.plusR(r_count, 1, - valuerep.slot_size), r_src.plusR(r_count, 1, - valuerep.slot_size), r_xmm0);
 		asm.d.sub_r_i(r_count, valuerep.slot_size);
 		asm.jc_rel_near(C.NZ, copy);
 		asm.bind(done);
+	}
+	def emit_value_copy_n(r_dst: Reg, r_src: Reg, n: int, r_xmm: Reg) {
+		var dst = G(r_dst), src = G(r_src), xmm = X(r_xmm);
+		for (i < n) emit_slot_copy(dst.plus(i * valuerep.slot_size), src.plus(i * valuerep.slot_size), xmm);
+	}
+	// Copies one value-stack slot, tag and payload, from the slot at {src} to the slot at {dst}.
+	def emit_slot_copy(dst: X86_64Addr, src: X86_64Addr, r_xmm0: X86_64Xmmr) {
+		var payload = valuerep.slot_size - valuerep.value_size;
+		if (valuerep.value_size == 16) {
+			asm.movdqu_s_m(r_xmm0, src.plus(payload));
+			asm.movdqu_m_s(dst.plus(payload), r_xmm0);
+		} else {
+			asm.movq_r_m(scratch, src.plus(payload));
+			asm.movq_m_r(dst.plus(payload), scratch);
+		}
+		if (valuerep.tagged) {
+			asm.movb_r_m(scratch, src);
+			asm.movb_m_r(dst, scratch);
+		}
+	}
+	def emit_store_continuation(r_addr: Reg, offset: int, r_cont: Reg) {
+		var addr = G(r_addr), cont = G(r_cont);
+		asm.movb_m_i(addr.plus(offset), Continuations.valueTag);
+		asm.movq_m_r(addr.plus(offset + valuerep.tag_size), cont);
+		if (FeatureDisable.unboxedConts) return;
+		asm.movq_r_m(scratch, cont.plus(offsets.X86_64Stack_version));
+		asm.movq_m_r(addr.plus(offset + valuerep.tag_size + 8), scratch);
+	}
+	def emit_enter_stack(r_stack: Reg) {
+		var stack = G(r_stack);
+		asm.movq_r_m(R.RSP, stack.plus(offsets.X86_64Stack_rsp));
+		asm.popq_r(scratch);
+		asm.movq_m_r(stack.plus(offsets.X86_64Stack_rsp), R.RSP);
+		asm.ijmp_r(scratch);
+	}
+	def emit_handler_search(is_switch: bool, r_tag: Reg, r_cur: Reg, r_parent: Reg, r_prev: Reg, r_entry: Reg, r_cnt: Reg, r_ptags: Reg, l_trap: MasmLabel) {
+		var tag = G(r_tag), parent = G(r_parent), prev = G(r_prev), entry = G(r_entry), cnt = G(r_cnt), ptags = G(r_ptags);
+		var l_link = X86_64Label.new(), l_entry = X86_64Label.new(), l_climb = X86_64Label.new(), l_found = X86_64Label.new();
+		asm.movq_r_r(prev, G(r_cur));
+		asm.bind(l_link);
+		asm.movq_r_m(parent, prev.plus(offsets.X86_64Stack_parent));
+		asm.test_r_r(parent, parent);
+		asm.jc_rel_far(C.Z, X86_64MasmLabel.!(l_trap).label);
+		asm.movq_r_m(ptags, parent.plus(offsets.X86_64Stack_rsp));
+		asm.movq_r_m(ptags, ptags.plus(Pointer.SIZE + X86_64InterpreterFrame.instance.offset));
+		asm.movq_r_m(ptags, ptags.plus(offsets.Instance_tags));
+		asm.movq_r_m(entry, parent.plus(offsets.X86_64Stack_handlers));
+		if (is_switch) {
+			asm.movd_r_m(cnt, entry.plus(offsets.Array_contents + ResumeSiteHeader.count.offset));
+			asm.movd_r_m(scratch, entry.plus(offsets.Array_contents + ResumeSiteHeader.switch_start_index.offset));
+			asm.d.sub_r_r(cnt, scratch);
+			asm.q.imul_r_i(scratch, ResumeHandlerEntry.size);
+			asm.q.lea(entry, X86_64Addr.new(entry, scratch, 1, offsets.Array_contents + ResumeSiteHeader.size));
+		} else {
+			asm.movd_r_m(cnt, entry.plus(offsets.Array_contents + ResumeSiteHeader.switch_start_index.offset));
+			asm.q.add_r_i(entry, offsets.Array_contents + ResumeSiteHeader.size);
+		}
+		asm.d.test_r_r(cnt, cnt);
+		asm.jc_rel_near(C.Z, l_climb);
+		asm.bind(l_entry);
+		asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.tag_index.offset));
+		asm.q.cmp_r_m(tag, X86_64Addr.new(ptags, scratch, 8, offsets.Array_contents));
+		asm.jc_rel_near(C.Z, l_found);
+		asm.q.add_r_i(entry, ResumeHandlerEntry.size);
+		asm.d.dec_r(cnt);
+		asm.jc_rel_near(C.NZ, l_entry);
+		asm.bind(l_climb);
+		asm.movq_r_r(prev, parent);
+		asm.jmp_rel_near(l_link);
+		asm.bind(l_found);
+	}
+	def emit_replace_child_chain(r_parent: Reg, r_prev: Reg, r_target: Reg, r_bottom: Reg, r_tmp: Reg) {
+		var target = G(r_target), parent = G(r_parent), prev = G(r_prev), bottom = G(r_bottom), tmp = G(r_tmp);
+		asm.movq_r_m(bottom, target.plus(offsets.X86_64Stack_bottom));
+		asm.movq_m_r(bottom.plus(offsets.X86_64Stack_parent), parent);
+		asm.movq_r_m(tmp, prev.plus(offsets.X86_64Stack_parent_rsp_ptr));
+		asm.movq_r_m(scratch, tmp.plus(0));
+		asm.movq_m_i(tmp.plus(0), 0);
+		asm.movq_r_m(tmp, bottom.plus(offsets.X86_64Stack_parent_rsp_ptr));
+		asm.movq_m_r(tmp.plus(0), scratch);
+		asm.movq_m_i(prev.plus(offsets.X86_64Stack_parent), 0);
+	}
+	def emit_handler_fixup(r_parent: Reg, r_entry: Reg, r_dst: Reg, r_psfp: Reg) {
+		var parent = G(r_parent), entry = G(r_entry), dst = G(r_dst), psfp = G(r_psfp);
+		var l_int = X86_64Label.new(), l_done = X86_64Label.new();
+		asm.movq_r_m(psfp, parent.plus(offsets.X86_64Stack_rsp));
+		asm.q.add_r_i(psfp, Pointer.SIZE);
+		asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.handler_pc.offset));
+		asm.movd_m_r(psfp.plus(X86_64InterpreterFrame.curpc.offset), scratch);
+		asm.cmpb_m_i(parent.plus(offsets.X86_64Stack_handler_tier), HandlerTier.SPC.tag);
+		asm.jc_rel_near(C.NZ, l_int);
+		asm.movq_m_i(psfp.plus(X86_64InterpreterFrame.accessor.offset), 0);
+		asm.movq_r_m(scratch, entry.plus(ResumeHandlerEntry.stub_addr.offset));
+		asm.movq_m_r(psfp.plus(0 - Pointer.SIZE), scratch);
+		asm.jmp_rel_near(l_done);
+		asm.bind(l_int);
+		asm.movq_r_m(dst, psfp.plus(X86_64InterpreterFrame.code.offset));
+		asm.q.lea(scratch, X86_64Addr.new(dst, scratch, 1, offsets.Array_contents));
+		asm.movq_m_r(psfp.plus(X86_64InterpreterFrame.ip.offset), scratch);
+		asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.stp_pos.offset));
+		asm.movq_r_m(dst, psfp.plus(X86_64InterpreterFrame.sidetable.offset));
+		asm.q.lea(scratch, X86_64Addr.new(dst, scratch, 4, offsets.Array_contents));
+		asm.movq_m_r(psfp.plus(X86_64InterpreterFrame.stp.offset), scratch);
+		var ic = X86_64PreGenStubs.getInterpreterCode();
+		asm.movq_r_l(scratch, (ic.start + ic.header.intSuspendEntryOffset) - Pointer.NULL);
+		asm.movq_m_r(psfp.plus(0 - Pointer.SIZE), scratch);
+		asm.bind(l_done);
+		asm.movd_r_m(dst, entry.plus(ResumeHandlerEntry.vsp_slots.offset));
+		asm.q.shl_r_i(dst, valuerep.slot_size_log);
+		asm.q.add_r_m(dst, psfp.plus(X86_64InterpreterFrame.vfp.offset));
 	}
 
 	def emit_get_curstack(r: Reg) {
@@ -1574,7 +1687,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 
 	def emit_set_stack_state(stk: Reg, state: StackState) {
-		emit_mov_m_i(MasmAddr(stk, offsets.X86_64Stack_state), state.tag);
+		emit_mov_m_b(MasmAddr(stk, offsets.X86_64Stack_state), byte.view(state.tag));
 	}
 
 	// Moves values from the current stack to %cont.top.
