@@ -700,16 +700,9 @@ def G = X86_64MasmRegs.toGpr, X = X86_64MasmRegs.toXmmr;
 def NOP_ENTRY = 1;
 def RETADDR_SIZE = Pointer.SIZE;
 
-def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(NativeStack, NativeStack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0), genV3StackResumeStub);
-def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(), genStackReturnParentStub);
-def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0), genStackEnterFuncStub);
-def STACK_UNWIND_STUB = X86_64PreGenStub.new("stack-unwind", X86_64UnwindStub.new("stack-unwind"), genStackUnwind(_, _, null));
-def STACK_OVERFLOW_STUB = X86_64PreGenStub.new("stack-overflow", X86_64UnwindStub.new("stack-overflow"), genStackUnwind(_, _, Execute.trapObjects[TrapReason.STACK_OVERFLOW.tag]));
-
-// Called by V3 code to resume a stack.
-// Sets up {X86_64Runtime.curStack}, VSP, and switches the machine stack pointer,
-// then pops the resume address off the stack and jumps to it.
-def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
+// Called by V3 code to resume a stack, switching to a native stack from the Virgil stack.
+def V3_STACK_RESUME_FUNC = X86_64PreGenFunc<(NativeStack, NativeStack), Throwable>.new("v3-stack-resume", X86_64SimpleStub.new("v3-stack-resume", 0),
+		fun (ic: X86_64InterpreterCode, w: DataWriter) {
 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	var asm = X86_64Assembler.!(masm.asm);
 	var r_stack = X86_64MasmRegs.PARAM_GPRS[1];	// this stack
@@ -729,68 +722,12 @@ def genV3StackResumeStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 	// jump *%tmp
 	masm.emit_jump_r(xenv.scratch);
-}
-
-// The return parent stub requires special handling for Virgil stackwalking to continue
-// the stackwalk on the parent stack.
-class X86_64ReturnParentStub extends RiUserCode {
-	new() super(Pointer.NULL, Pointer.NULL) { }
-
-	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
-	def describeFrame(ip: Pointer, sfp: Pointer, out: Range<byte> -> void) {
-		if (Debug.stack) NativeStacks.traceIpAndSp(ip, sfp, out);
-		var buf = X86_64Runtime.globalFrameDescriptionBuf;
-		buf.puts("\tin [return-parent-stub]");
-		if (Debug.stack) {
-			var parent_rsp = sfp.load<Pointer>();
-			buf.put1(" parent_rsp=0x%x", parent_rsp - Pointer.NULL);
-		}
-		buf.ln().send(out);
-		buf.reset();
-	}
-	// Called from V3 runtime to get to the next frame.
-	def nextFrame(ip: Pointer, sfp: Pointer) -> (Pointer, Pointer) {
-		var srp = sfp.load<Pointer>(); // parent srp on stack
-		if (srp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
-		ip = srp.load<Pointer>();
-		return (ip + -1, srp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
-	}
-}
-
-// The unwind stub is used to remove frames that have been logically unwound but still remain
-// on the stack because, e.g. host code has not yet returned to Wasm.
-//  [     host frame*    ]                 [     host frame*    ]
-//  [   host call stub   ]  == unwind ==>  [     unwind stub    ]
-//  [     wasm frame*    ]                 [        ...         ]
-//  [ return parent stub ]                 [ return parent stub ]
-class X86_64UnwindStub extends RiUserCode {
-	def name: string;
-	new(name) super(Pointer.NULL, Pointer.NULL) { }
-
-	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
-	def describeFrame(ip: Pointer, sfp: Pointer, out: Range<byte> -> void) {
-		if (Debug.stack) NativeStacks.traceIpAndSp(ip, sfp, out);
-		var buf = X86_64Runtime.globalFrameDescriptionBuf;
-		buf.puts("\tin [").puts(name).puts("-stub]");
-		if (Debug.stack) {
-			var next_rsp = X86_64Runtime.curStack.rsp;
-			buf.put1(" next_rsp=0x%x", next_rsp - Pointer.NULL);
-		}
-		buf.ln().send(out);
-		buf.reset();
-	}
-	// Called from V3 runtime to get to the next frame.
-	def nextFrame(ip: Pointer, sfp: Pointer) -> (Pointer, Pointer) {
-		var srp = X86_64Runtime.curStack.rsp;
-		if (srp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
-		ip = srp.load<Pointer>();
-		return (ip + -1, srp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
-	}
-}
+});
 
 // Returned to by Wasm code when it pops its last frame.
 // Inspects the parent stack and switches to it, which might be the host (V3) stack.
-def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
+def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_64ReturnParentStub.new(),
+		fun (ic: X86_64InterpreterCode, w: DataWriter) {
 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	var asm = X86_64Assembler.!(masm.asm);
 	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
@@ -861,10 +798,11 @@ def genStackReturnParentStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_pop_r(ValueKind.REF, xenv.sp);
 	// ret
 	masm.emit_ret();
-}
+});
 
 // Called when resuming a stack that has a function entry on the top of the stack.
-def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
+def STACK_ENTER_FUNC_STUB = X86_64PreGenStub.new("stack-enter-func", X86_64SimpleStub.new("stack-enter-func", 0),
+		fun (ic: X86_64InterpreterCode, w: DataWriter) {
 	var masm = X86_64MacroAssembler.new(w, X86_64MasmRegs.CONFIG);
 	var asm = X86_64Assembler.!(masm.asm);
 	var xenv = X86_64MasmRegs.INT_EXEC_ENV;
@@ -926,6 +864,66 @@ def genStackEnterFuncStub(ic: X86_64InterpreterCode, w: DataWriter) {
 	masm.emit_br_r(r_func, MasmBrCond.REF_NONNULL, call_wasm); // XXX: near jump
 	// Otherwise return throwable
 	masm.emit_ret();
+});
+
+def STACK_UNWIND_STUB = X86_64PreGenStub.new("stack-unwind", X86_64UnwindStub.new("stack-unwind"), genStackUnwind(_, _, null));
+def STACK_OVERFLOW_STUB = X86_64PreGenStub.new("stack-overflow", X86_64UnwindStub.new("stack-overflow"), genStackUnwind(_, _, Execute.trapObjects[TrapReason.STACK_OVERFLOW.tag]));
+
+// The return parent stub requires special handling for Virgil stackwalking to continue
+// the stackwalk on the parent stack.
+class X86_64ReturnParentStub extends RiUserCode {
+	new() super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sfp: Pointer, out: Range<byte> -> void) {
+		if (Debug.stack) NativeStacks.traceIpAndSp(ip, sfp, out);
+		var buf = X86_64Runtime.globalFrameDescriptionBuf;
+		buf.puts("\tin [return-parent-stub]");
+		if (Debug.stack) {
+			var parent_rsp = sfp.load<Pointer>();
+			buf.put1(" parent_rsp=0x%x", parent_rsp - Pointer.NULL);
+		}
+		buf.ln().send(out);
+		buf.reset();
+	}
+	// Called from V3 runtime to get to the next frame.
+	def nextFrame(ip: Pointer, sfp: Pointer) -> (Pointer, Pointer) {
+		var srp = sfp.load<Pointer>(); // parent srp on stack
+		if (srp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
+		ip = srp.load<Pointer>();
+		return (ip + -1, srp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
+}
+
+// The unwind stub is used to remove frames that have been logically unwound but still remain
+// on the stack because, e.g. host code has not yet returned to Wasm.
+//  [     host frame*    ]                 [     host frame*    ]
+//  [   host call stub   ]  == unwind ==>  [     unwind stub    ]
+//  [     wasm frame*    ]                 [        ...         ]
+//  [ return parent stub ]                 [ return parent stub ]
+class X86_64UnwindStub extends RiUserCode {
+	def name: string;
+	new(name) super(Pointer.NULL, Pointer.NULL) { }
+
+	// Called from V3 runtime upon fatal errors to describe a frame for a stacktrace.
+	def describeFrame(ip: Pointer, sfp: Pointer, out: Range<byte> -> void) {
+		if (Debug.stack) NativeStacks.traceIpAndSp(ip, sfp, out);
+		var buf = X86_64Runtime.globalFrameDescriptionBuf;
+		buf.puts("\tin [").puts(name).puts("-stub]");
+		if (Debug.stack) {
+			var next_rsp = X86_64Runtime.curStack.rsp;
+			buf.put1(" next_rsp=0x%x", next_rsp - Pointer.NULL);
+		}
+		buf.ln().send(out);
+		buf.reset();
+	}
+	// Called from V3 runtime to get to the next frame.
+	def nextFrame(ip: Pointer, sfp: Pointer) -> (Pointer, Pointer) {
+		var srp = X86_64Runtime.curStack.rsp;
+		if (srp == Pointer.NULL) return (Pointer.NULL, Pointer.NULL); // not initialized
+		ip = srp.load<Pointer>();
+		return (ip + -1, srp + RETADDR_SIZE); // XXX: V3 quirk with -1 (use RiOs?)
+	}
 }
 
 // Returned to by host code to unwind frames on the stack, e.g. to exit because of a trap or catch
