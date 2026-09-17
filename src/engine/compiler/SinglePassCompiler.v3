@@ -42,6 +42,7 @@ def TMP_SLOT = 1000000000;
 component SpcConsts {
 	// Abstract values tracked during single-pass compilation.
 	def NO_REG = Reg(0);
+	def IVAR_SLOT = TMP_SLOT + 1;
 	def IS_STORED: byte = 0x01;
 	def IS_CONST: byte = 0x02;
 	def IN_REG: byte = 0x04;
@@ -77,6 +78,7 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 def KIND_CONT = SpcConsts.KIND_CONT;
+def IVAR_SLOT = SpcConsts.IVAR_SLOT;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
@@ -323,7 +325,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			regAlloc.forEachAssignment(r, appendSlots(buf, _));
 			var slots = buf.puts("}").toString();
 			if (regRefCounts[i] == 0) {
-				assert2(regAlloc.isFree(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
+				assert2(regAlloc.isFree(r) || regAlloc.hasAssignment(r, IVAR_SLOT), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
 			} else {
 				assert2(!regAlloc.isFree(r), "%s should be allocated, got slots = %s", config.regSet.getName(r), slots);
 			}
@@ -2150,6 +2152,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
+	// Operations for tracking interpreter registers for fast handlers.
+	def allocIVars();
+	def evictIVars();
+	def restoreIVars();
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
 		unrefRegs();
@@ -2523,6 +2529,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return regAlloc.alloc(kind, slot);
 	}
 	def addSpillCost(score: int, reg: Reg, slot: int) -> int {
+		if (slot == IVAR_SLOT) return 50 + score;             // fast interpreter register?
 		if (slot >= state.sp) return 100000000 + score;       // tmp slot?
 		if (!state.state[slot].isStored()) score += 100;      // will generate a spill
 		if (slot < 10 && slot < func.num_locals) score += 10; // penalize first 10 locals
@@ -2649,6 +2656,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
+		// FIXME spill dirty ivars to their slot
+		if (slot == IVAR_SLOT) return;
 		var sv = state.state[slot];
 		if (sv.isConst()) return void(state.state[slot] = sv.withoutReg());
 		if (sv.isStored()) return void(state.state[slot] = sv.withoutReg());
@@ -2936,7 +2945,7 @@ class SpcState(regAlloc: RegAlloc) {
 	var ctl_stack = ArrayStack<SpcControl>.new();
 	// Frame management (for inlining)
 	var frame_stack = ArrayStack<SpcFrame>.new();
-
+	def useIVars = false; // TODO replace with `fast` option when implemented in SPC
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
 		sp = 0;
@@ -3032,7 +3041,7 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
-			regAlloc.clear();
+			clear();
 			sp = ctl.val_stack_top;
 			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
 				var sv = state[i];
@@ -3111,10 +3120,14 @@ class SpcState(regAlloc: RegAlloc) {
 		return SpcVal((from.flags & ~(IS_CONST)) | force_store, from.reg, 0);
 	}
 	private def resetTo(max: u32, nstate: Array<SpcVal>) {
-		regAlloc.clear();
+		clear();
 		for (i < max) {
 			var sv = nstate[i];
-			if (sv.inReg()) regAlloc.assign(sv.reg, int.!(i));
+			if (sv.inReg()) {
+				// the merge's move clobbers any interpreter variable still in {sv.reg}
+				if (useIVars && regAlloc.hasAssignment(sv.reg, IVAR_SLOT)) regAlloc.free(sv.reg);
+				regAlloc.assign(sv.reg, int.!(i));
+			}
 			state[i] = sv;
 		}
 		sp = max;
@@ -3198,6 +3211,14 @@ class SpcState(regAlloc: RegAlloc) {
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 	}
+	def clear() {
+		if (useIVars) regAlloc.forEachAllocatedReg(NO_REG, freeExceptIVar);
+		else regAlloc.clear();
+	}
+	def freeExceptIVar(reg: Reg) {
+		if (!regAlloc.hasAssignment(reg, IVAR_SLOT)) regAlloc.free(reg);
+	}
+
 	def trace() {
 		var num_locals = frame_stack.peek().num_locals;
 		trace0("", state, int.!(sp), num_locals);
