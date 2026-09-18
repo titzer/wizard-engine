@@ -3,9 +3,15 @@
 
 // Builds a control flow graph for a function.
 class CfgBuilder {
+	// override to build a graph out of subclasses carrying consumer state
+	var newBlock: int -> CfgBlock = CfgBlock.new;
+	var newEdge: (int, CfgBlock, CfgBlock) -> CfgEdge = CfgEdge.new;
+
 	private def bi = BytecodeIterator.new();
 	private def ctl_stack = ControlStack<CfgBlock>.new();
 	private var prev_pc: int = -1; // for recording `last_instr_pc` when ending a block
+	private var entry: CfgBlock;
+	private var exit: CfgBlock;
 
 	new() {
 		ctl_stack.newLabel = newCfgBlock;
@@ -18,34 +24,34 @@ class CfgBuilder {
 	def build(func: FuncDecl) -> (CfgBlock, CfgBlock) {
 		bi.reset(func);
 		bi.dispatchLocalDecls(ctl_stack);  // advance bi.pc past locals
-		def start = ctl_stack.resetAtPc(bi.pc);
-		def exit = ctl_stack.getEntry(0).label;
+		entry = ctl_stack.resetAtPc(bi.pc);
+		exit = ctl_stack.getEntry(0).label;
 		while (bi.more()) {
 			ctl_stack.pc = bi.pc;
 			bi.dispatch(ctl_stack);
 			prev_pc = bi.pc;
 			bi.next();
 		}
-		return (start, exit);
+		return (entry, exit);
 	}
 	// Removes basic blocks without any instructions.
 	def removeEmptyBlocks(entry: CfgBlock, exit: CfgBlock) {
-		var blocks = Vector<CfgBlock>.new();
+		def blocks = Vector<CfgBlock>.new();
 		entry.dfs(blocks.put, null, null);
 		for (i < blocks.length) {
-			var b = blocks[i];
+			def b = blocks[i];
 			if (b == entry || b == exit || b.last_instr_pc >= 0) continue;
 			if (b.incoming == null || b.outgoing == null || b.outgoing.tail != null) continue;
-			var out = b.outgoing.head, to = out.target;
+			def out = b.outgoing.head, to = out.target;
 			for (l = b.incoming; l != null; l = l.tail) {
-				var e = l.head, p = e.source;
+				def e = l.head, p = e.source;
 				// {outgoing} order is the branch's label order, so splice {e} out in place
 				var head = p.outgoing, pre: List<CfgEdge>;
 				while (head.head != e) {
 					pre = List.new(head.head, pre);
 					head = head.tail;
 				}
-				var n = CfgEdge.new(e.pc, p, to);
+				def n = newEdge(e.pc, p, to);
 				// {b} forwards unconditionally, so its edge's backedge status carries over
 				n.isBackedge = out.isBackedge;
 				var rebuilt = List.new(n, head.tail);
@@ -80,28 +86,29 @@ class CfgBuilder {
 		});
 	}
 	// prepends, so {outgoing} is in reverse branch-label order
-	private def link(pc: int, from: CfgBlock, to: CfgBlock) -> CfgEdge {
+	def link(pc: int, from: CfgBlock, to: CfgBlock) -> CfgEdge {
 		if (verbose) Trace.OUT.put2("add id:%d -> id:%d", from.id, to.id).ln();
-		var e = CfgEdge.new(pc, from, to);
+		def e = newEdge(pc, from, to);
 		from.outgoing = List.new(e, from.outgoing);
 		to.incoming = List.new(e, to.incoming);
 		return e;
 	}
-	private def newCfgBlock(cs: ControlStack<CfgBlock>) -> CfgBlock {
-		return if(cs.isUnreachable(), null, CfgBlock.new(cs.pc));
-	}
 	private def splitCfgBlock(cs: ControlStack<CfgBlock>, from: CfgBlock) -> (CfgBlock, CfgBlock) {
 		if (from == null || cs.isUnreachable()) return (null, null);
 		var pos = bi.pc;
-		var a = CfgBlock.new(pos), b = CfgBlock.new(pos);
+		var a = newBlock(pos), b = newBlock(pos);
 		link(pos, from, a);
 		link(pos, from, b);
-
 		return (a, b);
+	}
+	private def newCfgBlock(cs: ControlStack<CfgBlock>) -> CfgBlock {
+		return if(cs.isUnreachable(), null, newBlock(cs.pc));
 	}
 	private def mergeCfgBlock(cs: ControlStack<CfgBlock>, from: CfgBlock, to: CfgBlock) -> CfgBlock {
 		if (from == null || cs.isUnreachable()) return to;
-		var e = link(cs.pc, from, to);
+		// {from} is dead because nothing ever branched to it
+		if (from != entry && from.incoming == null) return to;
+		def e = link(cs.pc, from, to);
 		e.isBackedge = to.bind_pos >= 0 && to.bind_pos < cs.pc;
 		return to;
 	}
@@ -144,19 +151,30 @@ class CfgBlock(decl_pos: int) {
 	var incoming: List<CfgEdge>;
 	var mark: int;
 
+	def hash() -> int {
+		return id;
+	}
+	def equals(that: CfgBlock) -> bool {
+		return this.id == that.id;
+	}
+
 	def dfs<R>(pre: CfgBlock -> R, onEdge: CfgEdge -> R, post: CfgBlock -> R) {
-		var visited = Vector<CfgBlock>.new();
+		def visited = Vector<CfgBlock>.new();
+
 		dfs0(pre, onEdge, post, visited);
+
 		visited.apply(CfgBlock.resetMark);
 	}
 	private def resetMark() { mark = 0; }
 	private def dfs0<R>(pre: CfgBlock -> R, onEdge: CfgEdge -> R, post: CfgBlock -> R, visited: Vector<CfgBlock>) {
 		if (mark != 0) return;
 		mark = 1;
+
 		visited.put(this);
 		if (pre != null) pre(this);
 		Lists.apply(outgoing, fun (e: CfgEdge) {
-			var child = e.target;
+			def child = e.target;
+
 			if (onEdge != null) onEdge(e);
 			if (child != null) child.dfs0(pre, onEdge, post, visited);
 		});
