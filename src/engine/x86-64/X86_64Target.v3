@@ -63,7 +63,9 @@ component Target {
 		f.target_code = TargetCode(addr);
 		Debug.afterCompile(f, u64.view(addr - Pointer.NULL));
 	}
-	def setFastTargetCode(f: FuncDecl, addr: Pointer, end: Pointer) {
+	// {addr} is patched into the dispatch table; {entry}, past the prologue's ip and curpc
+	// computation, is where FAST_CALL_N jumps after computing them itself.
+	def setFastTargetCode(f: FuncDecl, addr: Pointer, entry: Pointer, end: Pointer) {
 		if (Trace.compiler) {
 			Trace.OUT.put2("func[%d].fast_target_code: break *0x%x", f.func_index, addr - Pointer.NULL)
 				.put2(" disass 0x%x, 0x%x", addr - Pointer.NULL, end - Pointer.NULL).ln();
@@ -77,12 +79,12 @@ component Target {
 				Trace.OUT.ln();
 			}
 		}
-		f.fast_target_code = TargetCode(addr);
+		f.fast_target_code = TargetCode(entry);
 		patchFastCallDispatch(f, addr);
 		Debug.afterCompile(f, u64.view(addr - Pointer.NULL));
 	}
 	def patchFastCallDispatch(f: FuncDecl, addr: Pointer) {
-		if (f.fast_call_idx < 0) return;
+		if (f.fast_call_idx < 0 || f.fast_call_idx == Opcodes.FAST_CALL_OPCODES) return;
 		def opcode = Opcodes.indexToFastCall(f.fast_call_idx);
 		def ic = X86_64PreGenStubs.getInterpreterCode();
 		// XXX Patching only fast (non-probed?) dispatch tables
@@ -274,15 +276,18 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 		var w = compiler.w;
 
 		// generate code for all fast functions
-		var bounds = Array<(int, int)>.new(module.functions.length);
+		var bounds = Array<(int, int, int)>.new(module.functions.length);
+		var fastspc_before_us = System.ticksUs();
 		for (i = 0; err.ok() && i < module.functions.length; i++) {
 			var f = module.functions[i];
 			if (f.fast_call_idx < 0) continue;
 			var start = w.atEnd().pos;
 			var compiled = compiler.gen(module, f, err);
-			if (compiled) bounds[i] = (start, w.end());
-			else bounds[i] = (-1, -1);
+			if (compiled) bounds[i] = (start, compiler.fast_entry, w.end());
+			else bounds[i] = (-1, -1, -1);
 		}
+		Metrics.fastspc_time_us.updateDiff(u64.view(fastspc_before_us));
+		Metrics.spc_fast_time_us.updateDiff(u64.view(fastspc_before_us));
 
 		// copy and map code (reserve32 ensures address fits in 32 bits for dispatch table patching)
 		var length = u64.view(w.atEnd().pos) + ballast;
@@ -302,11 +307,12 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 			if (b.0 >= 0) {
 				var addr = mapping.range.start;
 				var f = module.functions[i];
-				Target.setFastTargetCode(f, addr + b.0, addr + b.1);
+				Target.setFastTargetCode(f, addr + b.0, addr + b.1, addr + b.2);
 			} else {
 				var f = module.functions[i];
 				if (Trace.compiler) Trace.OUT.put1("func[%d] initial compile failed", f.func_index).ln();
 				var addr = X86_64Spc.setInterpreterFallback(f);
+				f.fast_target_code = TargetCode(addr);
 				Target.patchFastCallDispatch(f, addr);
 			}
 		}
@@ -340,7 +346,7 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 						break;
 					}
 				}
-				Trace.OUT.put2("  FAST_CALL%d: %s (", func.fast_call_idx, name);
+				Trace.OUT.put2("  %s: %s (", Opcodes.indexToFastCall(func.fast_call_idx).mnemonic, name);
 				func.render(module.names, Trace.OUT);
 				Trace.OUT.puts(")");
 				Trace.OUT.ln();
@@ -397,6 +403,7 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		// Check the JIT filter, if there is one
 		if (!applyJitFilter(wf.instance.module, wf.decl, how)) return SpcResultForStub(wf, X86_64Spc.setInterpreterFallback(wf.decl), null);
 
+		var gen_before_us = System.ticksUs();
 		var module = wf.instance.module;
 		// A module that was never prepared for this target has no code region yet. This
 		// happens for the inner module of an environment, whose functions are created at
@@ -408,7 +415,6 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 		var compiler = newCompiler(module.filename, false, null); // XXX: cache per-thread
 		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
-		// generate code for the function
 		var success = compiler.gen(module, wf.decl, null);
 
 		// Check for remaining code space
@@ -432,6 +438,8 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 			if (Trace.compiler) Trace.OUT.put2("func[%d] %s compile failed", f.func_index, how).ln();
 			entrypoint = X86_64Spc.setInterpreterFallback(f);
 		}
+		if (wf.decl.func_index >= module.functions.length) Metrics.spc_new_time_us.updateDiff(u64.view(gen_before_us));
+		if (wf.decl.fast_call_idx >= 0) Metrics.spc_fast_time_us.updateDiff(u64.view(gen_before_us));
 		return SpcResultForStub(wf, entrypoint, null);
 	}
 }
@@ -477,7 +485,9 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 			var f = module.functions[i];
 			if (f.imported()) continue;
 			var start = w.atEnd().pos;
+			var gen_before_us = System.ticksUs();
 			var compiled = applyJitFilter(module, f, "aot") && compiler.gen(module, f, suberr);
+			if (f.fast_call_idx >= 0) Metrics.spc_fast_time_us.updateDiff(u64.view(gen_before_us));
 			if (compiled) bounds[i] = (start, w.end());
 			else bounds[i] = (-1, -1);
 		}
@@ -569,6 +579,7 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	}
 	def onTierUp(wf: WasmFunction, pc: int) -> TargetOsrInfo {
 		var module = wf.instance.module;
+		var gen_before_us = System.ticksUs();
 		var compiler = newCompiler(module.filename, false, null);
 		if (!applyJitFilter(wf.instance.module, wf.decl, "osr")) {
 			// OSR compile suppressed
@@ -579,6 +590,8 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 		if (label == null) {
 			// OSR compile failed
 			wf.decl.tierup_trigger = int.max; // no point in trying for a while
+			if (wf.decl.func_index >= module.functions.length) Metrics.spc_new_time_us.updateDiff(u64.view(gen_before_us));
+			if (wf.decl.fast_call_idx >= 0) Metrics.spc_fast_time_us.updateDiff(u64.view(gen_before_us));
 			return TargetOsrInfo(Pointer.NULL, null);
 		}
 		var code = module.target_module.spc_code;
@@ -592,6 +605,8 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 			if (Debug.runtime) Trace.OUT.put2("Installing code [0x%x, 0x%x)", entrypoint - Pointer.NULL, entrypoint + codeSize - Pointer.NULL).ln();
 			Target.setTargetCode(wf.decl, entrypoint, entrypoint + codeSize);
 		}
+		if (wf.decl.func_index >= module.functions.length) Metrics.spc_new_time_us.updateDiff(u64.view(gen_before_us));
+		if (wf.decl.fast_call_idx >= 0) Metrics.spc_fast_time_us.updateDiff(u64.view(gen_before_us));
 		// Reset tierup trigger to recompile right away (e.g. other activations stuck in loop).
 		wf.decl.tierup_trigger = SpcTuning.postOsrTierUpThreshold;
 		return TargetOsrInfo(entrypoint, List.new((pc, offset), null));

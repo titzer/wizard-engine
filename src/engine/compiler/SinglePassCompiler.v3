@@ -42,6 +42,7 @@ def TMP_SLOT = 1000000000;
 component SpcConsts {
 	// Abstract values tracked during single-pass compilation.
 	def NO_REG = Reg(0);
+	def IVAR_SLOT = TMP_SLOT + 1;
 	def IS_STORED: byte = 0x01;
 	def IS_CONST: byte = 0x02;
 	def IN_REG: byte = 0x04;
@@ -60,12 +61,6 @@ component SpcConsts {
 	def kindToFlags(kind: ValueKind) -> byte {
 		return byte.view(kind.tag) << 4;
 	}
-
-	// {RegAlloc} assignment of an interpreter register a fast handler has not borrowed. Such
-	// a register holds nothing else; the register itself says which interpreter variable it
-	// is. Large enough that {forEachAssignmentInRange} skips it and that indexing the value
-	// stack with it fails loudly.
-	def IVAR_SLOT = 2000000000;
 }
 
 // Shorten constants inside this file.
@@ -99,7 +94,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var num_unrefs = 0;
 
 	// Abstract state of the value stack
-	def state = SpcState.new(regAlloc);
+	def state = SpcState.new(regAlloc, fast);
 	// Other state
 	def trap_labels = Vector<(TrapReason, MasmLabel, Array<SpcFrame>)>.new();
 
@@ -123,7 +118,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var last_probe = 0;
 	var skip_to_end: bool;
 	var whamm_config: WhammInlineConfig;
-	var fast_operand_size: int;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -337,7 +331,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			regAlloc.forEachAssignment(r, appendSlots(buf, _));
 			var slots = buf.puts("}").toString();
 			if (regRefCounts[i] == 0) {
-				assert2(regAlloc.isFree(r) || state.holdsIVar(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
+				assert2(regAlloc.isFree(r) || regAlloc.hasAssignment(r, IVAR_SLOT), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
 			} else {
 				assert2(!regAlloc.isFree(r), "%s should be allocated, got slots = %s", config.regSet.getName(r), slots);
 			}
@@ -2188,9 +2182,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp(outermost: bool) -> long;
-	// In fast mode the interpreter's registers are pre-allocated to {IVAR_SLOT}, so the
-	// allocator hands one out only by evicting it (at cost 50, with nothing to spill), and
-	// the epilogue reloads exactly the ones that were evicted.
+	// Operations for tracking interpreter registers for fast handlers.
 	def allocIVars();
 	def evictIVars();
 	def restoreIVars();
@@ -2582,7 +2574,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return regAlloc.alloc(kind, slot);
 	}
 	def addSpillCost(score: int, reg: Reg, slot: int) -> int {
-		if (slot == IVAR_SLOT) return 50 + score; // borrowable IVar; must precede the tmp-slot test
+		if (slot == IVAR_SLOT) return 50 + score;             // fast interpreter register?
 		if (slot >= state.sp) return 100000000 + score;       // tmp slot?
 		if (!state.state[slot].isStored()) score += 100;      // will generate a spill
 		if (slot < 10 && slot < func.num_locals) score += 10; // penalize first 10 locals
@@ -2709,7 +2701,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
-		// IVars are either saved in the prologue or already correct in the frame.
+		// FIXME spill dirty ivars to their slot
 		if (slot == IVAR_SLOT) return;
 		var sv = state.state[slot];
 		if (sv.isConst()) return void(state.state[slot] = sv.withoutReg());
@@ -2996,29 +2988,13 @@ class SpcFrame {
 	new(func, module, local_base_sp, ctl_base_sp, num_locals, pc, ret_label) {}
 }
 
-class SpcState(regAlloc: RegAlloc) {
+class SpcState(regAlloc: RegAlloc, useIVars: bool) {
 	// Abstract state of the value stack (shared across frames)
 	var state = Array<SpcVal>.new(INITIAL_VALUE_STACK_SIZE);
 	var sp: u32;
 	var ctl_stack = ArrayStack<SpcControl>.new();
 	// Frame management (for inlining)
 	var frame_stack = ArrayStack<SpcFrame>.new();
-	// Frees every register except those holding an interpreter variable ({IVAR_SLOT}): a
-	// fast handler pre-allocates them, and a reset must not lose that.
-	private def clearExceptIVars() {
-		regAlloc.forEachAllocatedReg(NO_REG, freeUnlessIVar);
-	}
-	private def freeUnlessIVar(reg: Reg) {
-		if (!holdsIVar(reg)) regAlloc.free(reg);
-	}
-	def holdsIVar(reg: Reg) -> bool {
-		found_ivar = false;
-		regAlloc.forEachAssignment(reg, noteIVar);
-		return found_ivar;
-	}
-	private var found_ivar: bool;
-	private def noteIVar(slot: int) { if (slot == IVAR_SLOT) found_ivar = true; }
-
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
 		sp = 0;
@@ -3114,7 +3090,7 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
-			clearExceptIVars();
+			clear();
 			sp = ctl.val_stack_top;
 			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
 				var sv = state[i];
@@ -3193,12 +3169,12 @@ class SpcState(regAlloc: RegAlloc) {
 		return SpcVal((from.flags & ~(IS_CONST)) | force_store, from.reg, 0);
 	}
 	private def resetTo(max: u32, nstate: Array<SpcVal>) {
-		clearExceptIVars();
+		clear();
 		for (i < max) {
 			var sv = nstate[i];
 			if (sv.inReg()) {
 				// the merge's move clobbers any interpreter variable still in {sv.reg}
-				if (holdsIVar(sv.reg)) regAlloc.free(sv.reg);
+				if (useIVars && regAlloc.hasAssignment(sv.reg, IVAR_SLOT)) regAlloc.free(sv.reg);
 				regAlloc.assign(sv.reg, int.!(i));
 			}
 			state[i] = sv;
@@ -3284,6 +3260,14 @@ class SpcState(regAlloc: RegAlloc) {
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 	}
+	def clear() {
+		if (useIVars) regAlloc.forEachAllocatedReg(NO_REG, freeExceptIVar);
+		else regAlloc.clear();
+	}
+	def freeExceptIVar(reg: Reg) {
+		if (!regAlloc.hasAssignment(reg, IVAR_SLOT)) regAlloc.free(reg);
+	}
+
 	def trace() {
 		var num_locals = frame_stack.peek().num_locals;
 		trace0("", state, int.!(sp), num_locals);
