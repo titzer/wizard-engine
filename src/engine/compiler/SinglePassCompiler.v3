@@ -1505,51 +1505,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emitInlineSuspend(sig, tag_index);
 	}
 	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
-		var stub_switch = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
-
+		var target_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
+		var target_top = target_decl.sig.params[target_decl.sig.params.length - 1];
+		var this_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top).heap).cont);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
-		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
-		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
-		masm.emit_call_runtime_SWITCH();
-
-		// unraveling all relevant signatures
-		var target_cont_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
-		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
-		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
-
-		state.pop(); // target_cont
-		state.sp -= u32.view(target_cont_decl.sig.params.length - 1); // params to target_cont
-		state.pushResults(this_cont_decl.sig.params); // params to this_cont
-		masm.emit_call_label(stub_switch);
-
-		// /* === SUSPENDED === */
-
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_switch}
-		masm.emit_br(end);
-		masm.bindLabel(stub_switch); {
-			// load new stack pointers
-			masm.emit_get_curstack(regs.scratch);
-			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
-			// shorthands, so manually popping %rsp is needed
-			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
-			// pop and go to handler stack's stub
-			masm.emit_v3_NativeStack_rsp_r_r(regs.sp, regs.scratch);
-			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
-			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
-			masm.emit_jump_r(xenv.scratch);
-		}
-		masm.bindLabel(end);
+		emitInlineSwitch(target_decl, this_decl, tag_index);
 	}
 	// Spills vsp and reserves the resume slot so the current stack can be left and resumed later.
 	def emitPrepareToLeaveStack(vsp: Reg, cur: Reg) {
@@ -1601,6 +1561,28 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_clear_handlers(parent);
 		state.popArgsAndPushResults(sig);
 		emitEnterStack(parent);
+	}
+	// Consumes the target continuation, splices its chain under the switch handler and switches to it.
+	def emitInlineSwitch(target_decl: ContDecl, this_decl: ContDecl, tag_index: u31) {
+		var n = target_decl.sig.params.length - 1, slot_size = masm.valuerep.slot_size;
+		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), target = allocTmp(ValueKind.REF);
+		var prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF), tag = allocTmp(ValueKind.REF);
+		var entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
+		var xmm = allocTmp(ValueKind.V128);
+		emitPrepareToLeaveStack(vsp, cur);
+		masm.emit_validate_and_consume_cont(target, MasmAddr(vsp, masm.valuerep.tag_size - slot_size));
+		emit_load_tag(tag, tag_index);
+		masm.emit_handler_search(true, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
+		var bottom = entry, dst = tag, tmp = cnt;
+		masm.emit_replace_child_chain(parent, prev, target, bottom, tmp);
+		masm.emit_addw_r_i(vsp, 0 - (n + 1) * slot_size);
+		masm.emit_suspend_stack(cur, vsp, prev, this_decl.sig.params.length);
+		masm.emit_v3_NativeStack_vsp_r_r(dst, target);
+		masm.emit_pass_values(target, dst, vsp, n, cur, xmm);
+		state.pop();
+		state.sp -= u32.view(n);
+		state.pushResults(this_decl.sig.params);
+		emitEnterStack(target);
 	}
 	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
