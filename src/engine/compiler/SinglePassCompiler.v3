@@ -879,7 +879,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 			m = whamm_instance.module;
 			new_local_base_sp = u31.view(state.sp) - u31.view(whamm_sig.length); // XXX
-			func_body_ctl.val_stack_top = new_local_base_sp; // correct val_stack_top for whamm arg count 
+			func_body_ctl.val_stack_top = new_local_base_sp; // correct val_stack_top for whamm arg count
 		}
 
 		// create merge state based on outer function's base sp given inlined function's results
@@ -1087,7 +1087,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			Trace.OUT.put1("    catch tag[%s]", tag_display).ln();
 			Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 		}
-		handler_dest_info[dest_id] = SpcHandlerInfo(false, false, dest_label, masm.newLabel(it.pc), reset_state);
+		handler_dest_info[dest_id] = SpcHandlerInfo(false, dest_label, masm.newLabel(it.pc), reset_state);
 		// Reset reachability.
 		ctl_top.reachable = true;
 	}
@@ -1123,16 +1123,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			if (Trace.compiler) {
 				Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
 			}
-			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.opcode == Opcode.RETURN.code, control.label, masm.newLabel(it.pc), control.merge_state);
+			handler_dest_info[dest_id] = SpcHandlerInfo(control.opcode == Opcode.RETURN.code, control.label, masm.newLabel(it.pc), control.merge_state);
 		}
 	}
-	def buildSwitchHandler(pc: int, inline_index: int) {
-		var handler_id = getHandlerIndex(pc, inline_index);
-		var dest_id = func.handlers.handler_dest_map[handler_id];
-		if (Trace.compiler) {
-			Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+	// Records a handler dest per suspend clause, numbered in the table's suspend-first order.
+	def buildResumeHandlerDests(pos: int, handlers: Range<SuspensionHandler>) {
+		var suspend_rank = 0;
+		for (h in handlers) {
+			match (h) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, suspend_rank++);
+				_ => ;
+			}
 		}
-		handler_dest_info[dest_id] = SpcHandlerInfo(true, false, null, null, null);
 	}
 	def emitSelect(valcount: u32) {
 		var sv = pop();
@@ -1448,31 +1450,40 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var n_binds = u32.!(in_cont.sig.params.length - out_cont.sig.params.length);
 		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
 	}
+	// Publishes the handler table of the resume at {it.pc} on {curStack}.
+	// Parks the current stack, publishes the site's handler table, chains {contStack} under it and switches.
+	def emitResumeChain(curStack: Reg, contStack: Reg, results: Array<ValueType>) {
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_reserve_return_slot(curStack);
+		masm.emit_mov_r_Array(xenv.scratch, func.handlers.resume_sites[it.pc]);
+		masm.emit_chain_cont_to_parent(curStack, contStack, xenv.scratch, HandlerTier.SPC);
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+		state.pushResults(results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
+	}
 	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
-		// record reachable label positions for handler stub
-		for (i < handlers.length) {
-			var handler = handlers[i];
-			match (handler) {
-				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
-				Switch(tag_index) => buildSwitchHandler(pos, i);
-			}
-		}
+		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
 
-		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var top = popReg();
-		var cont = allocTmp(Continuations.valueKind);
-		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(Continuations.valueKind, cont, top.reg);
-		masm.emit_validate_and_consume_cont(contStack, cont);
-
-		// transfer params to child stack
 		// XXX: not necessary to store the entire value stack to memory
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
+		state.pop();
 		var curStack = allocTmp(ValueKind.REF);
 		var nvals = allocTmp(ValueKind.REF);
 		var tmp0 = allocTmp(ValueKind.REF);
@@ -1486,30 +1497,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		dropN(u32.!(cont_decl.sig.params.length));
 		state.emitRestoreAll(resolver);
 
-		// context switch: store to old stack
-		masm.emit_get_curstack(curStack);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_NativeStack_rsp_r_r(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	def visit_SUSPEND(tag_index: u31) {
 		var stub_suspend = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
@@ -1600,29 +1588,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
-		// record reachable label positions for handler stub
-		for (i < handlers.length) {
-			var handler = handlers[i];
-			match (handler) {
-				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
-				Switch(tag_index) => buildSwitchHandler(pos, i);
-			}
-		}
+		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		var tag = module.tags[tag_id];
 		if (checkForConstNull(state.peek())) return;
 
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var curStack = allocTmp(ValueKind.REF);
-
-		var cont = allocTmp(Continuations.valueKind);
 		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		masm.emit_validate_and_consume_cont(contStack, cont);
-
-		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
+		state.pop();
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
@@ -1641,62 +1618,25 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
-		masm.emit_ref_from_ref_u64(contStack, cont);
+		masm.emit_load_cont_stack(contStack, masm.slotAddr(state.sp - 1));
+		state.pop();
 
-		// save %vsp to frame
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-
-		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
-		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_NativeStack_rsp_r_r(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	def visit_RESUME_THROW_REF(cont_id: u31, handlers: Range<SuspensionHandler>) {
 		var pos = it.pc;
-		// record reachable label positions for handler stub
-		for (i < handlers.length) {
-			var handler = handlers[i];
-			match (handler) {
-				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
-				Switch(tag_index) => buildSwitchHandler(pos, i);
-			}
-		}
+		buildResumeHandlerDests(pos, handlers);
 
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
 
-		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var curStack = allocTmp(ValueKind.REF);
-
-		var cont = allocTmp(Continuations.valueKind);
 		var contStack = allocTmp(ValueKind.REF);
-		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		masm.emit_validate_and_consume_cont(contStack, cont);
-
+		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
+		state.pop();
 		popFixedReg(regs.runtime_arg3);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var curStack = allocTmp(ValueKind.REF);
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
@@ -1713,36 +1653,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		/* === only reachable when continuation handles the error === */
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
-		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
-		masm.emit_ref_from_ref_u64(contStack, cont);
+		masm.emit_load_cont_stack(contStack, masm.slotAddr(state.sp - 1));
+		state.pop();
 
-		// save %vsp to frame
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-
-		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
-		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-
-		// reserve space for call addr
-		masm.emit_push_NativeStack_rsp_r_r(curStack);
-		masm.emit_chain_cont_to_parent(curStack, contStack);
-
-		masm.emit_call_label(stub_resume);
-		/* === CHILD STACK RUNNING === */
-
-		// clean up after stack switch
-		state.pushResults(cont_decl.sig.results);
-		emit_reload_regs();
-		state.emitRestoreAll(resolver);
-
-		// skip {stub_resume}
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
+		emitResumeChain(curStack, contStack, cont_decl.sig.results);
 	}
 	private def checkForConstNull(sv: SpcVal) -> bool {
 		if (sv.isConst() && sv.const == 0) {
@@ -2762,7 +2676,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var bi = BytecodeIterator.new().reset(func);
 		while (bi.more()) {
 			match (bi.current()) {
-				RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => 
+				RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF =>
 					return no("uses return instruction");
 				TRY, CATCH, THROW, RETHROW, THROW_REF, DELEGATE, CATCH_ALL, TRY_TABLE =>
 					return no("uses exception handling instruction");
@@ -3512,4 +3426,4 @@ type WhammInlineConfig(swap_membase: bool, swap_instance: bool, is_inlined: bool
 //
 // The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
 // expected state of the environment, then jumps to {dest_label} to continue execution at handler.
-type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
+type SpcHandlerInfo(func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);
