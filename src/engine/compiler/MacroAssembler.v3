@@ -226,6 +226,9 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	def emit_push_NativeStack_rsp_r_r(stk: Reg);
 	def emit_pop_NativeStack_rsp_r_r(stk: Reg);
+	// Sets {stk}.rsp to sp - 8, the slot the next call fills with the resume address.
+	def emit_reserve_return_slot(stk: Reg);
+
 
 	def scaleOf(kind: ValueKind) -> int {
 		match (kind) {
@@ -278,11 +281,13 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_mov_r_d64(reg: Reg, val: u64);
 	def emit_mov_r_q(reg: Reg, low: u64, high: u64);
 	def emit_mov_r_Object(reg: Reg, obj: Object);
+	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>);
 	def emit_mov_r_Function(reg: Reg, func: Function);
 	def emit_mov_r_Instance(reg: Reg, instance: Instance);
 	def emit_mov_r_Continuation(reg: Reg, cont: Continuation);
 
 	def emit_mov_m_r(kind: ValueKind, addr: MasmAddr, reg: Reg);
+	def emit_mov_m_b(addr: MasmAddr, val: byte);
 	def emit_mov_m_i(addr: MasmAddr, val: int);
 	def emit_mov_m_ri(addr: MasmAddr, val: int);
 	def emit_mov_m_l(addr: MasmAddr, val: long);
@@ -361,6 +366,18 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	// stk.state_ = state;
 	def emit_set_stack_state(stk: Reg, state: StackState);
+	// Publishes the handler table.
+	def emit_publish_handlers(r_stack: Reg, r_table: Reg, tier: HandlerTier) {
+		var offsets = getOffsets();
+		emit_mov_m_r(ValueKind.REF, MasmAddr(r_stack, offsets.NativeStack_handlers), r_table);
+		emit_mov_m_b(MasmAddr(r_stack, offsets.NativeStack_handler_tier), byte.view(tier.tag));
+	}
+	// Clears the published handler table of {r_stack}..
+	def emit_clear_handlers(r_stack: Reg) {
+		var offsets = getOffsets();
+		emit_mov_m_l(MasmAddr(r_stack, offsets.NativeStack_handlers), 0);
+		emit_mov_m_b(MasmAddr(r_stack, offsets.NativeStack_handler_tier), byte.view(HandlerTier.NONE.tag));
+	}
 	// This should be called after all stack value transfers, but before the
 	// return address is pushed onto parent's {sp}.
 	// Chains {cont} on {parent} by:
@@ -369,28 +386,26 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	// Destructive on {parent}.
 	def emit_cont_mv(from_vsp: Reg, contStack: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg);
 
-	// Validates {cont} and:
-	// - Mark {cont} as used
-	// - Move {cont.stack} to {destContStack}
-	def emit_validate_and_consume_cont(destContStack: Reg, cont: Reg) {
-		// {cont} is an XMM register holding (stack, version) in its low/high 8 bytes.
+	// Validates the continuation in the value-stack slot {slot}, marks it used and moves its stack to {destContStack}.
+	def emit_validate_and_consume_cont(destContStack: Reg, slot: MasmAddr) {
 		var scratch = regConfig.scratch;
-		// Set {destContStack} to {cont.stack}
-		emit_ref_from_ref_u64(destContStack, cont);
-		// Check for {cont == null}.
+		emit_mov_r_m(ValueKind.REF, destContStack, slot);
 		emit_br_r(destContStack, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
-		emit_u64_from_ref_u64(scratch, cont);
-		// Check for {cont.version != cont.stack.version} (true when {cont} is already used).
+		emit_mov_r_m(ValueKind.REF, scratch, slot.plus(8));
 		emit_validate_cont_version_unboxed(destContStack, scratch);
-		// Consume {cont} by incrementing {destContStack.version}.
 		emit_inc_stack_version(destContStack);
+	}
+	// Loads the stack of the continuation in the value-stack slot {slot} into {dst}, without checks.
+	def emit_load_cont_stack(dst: Reg, slot: MasmAddr) {
+		emit_mov_r_m(ValueKind.REF, dst, slot);
 	}
 	def emit_validate_cont_version_unboxed(stack: Reg, version: Reg);
 	def emit_inc_stack_version(stack: Reg);
 
-	// Called as the last step during resume. Switches {curStack} to the top of {cont}.
-	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg) {
+	// Publishes {r_table} on {parent} and chains {contStack} under it; destructive on {parent}.
+	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg, r_table: Reg, tier: HandlerTier) {
 		var scratch = regConfig.scratch, offsets = getOffsets();
+		emit_publish_handlers(parent, r_table, tier);
 		emit_set_stack_state(parent, StackState.CALL_CHILD); // XXX: not needed for {switch}
 		emit_mov_r_r(ValueKind.REF, scratch, contStack);
 		emit_set_stack_state(scratch, StackState.RUNNING);
