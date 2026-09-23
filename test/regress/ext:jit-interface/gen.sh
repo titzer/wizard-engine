@@ -37,7 +37,6 @@ exec $V3I -fun-exprs -simple-bodies \
     $VIRGIL_LIB_UTIL/*.v3 \
     $WIZENG_LOC/src/engine/*.v3 \
     $WIZENG_LOC/src/engine/compression/*.v3 \
-    $WIZENG_LOC/src/engine/continuation/UnboxedContinuation.v3 \
     $WIZENG_LOC/src/engine/v3/*.v3 \
     $WIZENG_LOC/src/util/*.v3 \
     $WIZENG_LOC/test/unittest/BinBuilder.v3 \

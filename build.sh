@@ -12,7 +12,6 @@ function exit_usage() {
     echo "  --no-spec-test          exclude the spec test mode"
     echo "  --no-wasm-run           exclude the Wasm run mode"
     echo "  --cbd                   include the canonical bytecode description interpreter"
-    echo "  --boxed-continuation    use boxed continuations"
     echo "  --object-model=<model>  select an object model from ${OBJECT_MODEL_DIRS}/"
     exit 1
 }
@@ -88,9 +87,6 @@ MODULES="src/modules/*.v3"
 TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
 TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
 
-CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
-CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64UnboxedContinuation.v3"
-
 CBD=false
 OBJECT_MODEL=boxed
 
@@ -118,11 +114,6 @@ while [[ $# -gt 0 ]]; do
 	--cbd)
 	    CBD=true
 	    ;;
-        --boxed-continuation)
-            append_comma_sep REDEFS "FeatureDisable.unboxedConts=true"
-            CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
-            CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64BoxedContinuation.v3"
-            ;;
         --object-model=*)
             OBJECT_MODEL="${1#*=}"
             ;;
@@ -146,8 +137,7 @@ if [ -z "$OBJECT_MODEL_SRC" ]; then
     exit 1
 fi
 
-ENGINE="$ENGINE $CONTINUATION $OBJECT_MODEL_SRC"
-TARGET_X86_64="$TARGET_X86_64 $CONTINUATION_X86_64"
+ENGINE="$ENGINE $OBJECT_MODEL_SRC"
 
 PROGRAM=$1
 TARGET=$2
