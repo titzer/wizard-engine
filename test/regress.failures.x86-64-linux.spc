@@ -9,6 +9,7 @@ test/regress/ext:threads/atomic_load_i64.bin.wast
 test/regress/ext:threads/atomic_notify0.bin.wast
 test/regress/ext:threads/atomic_or_i32.bin.wast
 test/regress/ext:threads/atomic_or_i64.bin.wast
+test/regress/ext:threads/atomic_or_i64_mem0.bin.wast
 test/regress/ext:threads/atomic_store_i32.bin.wast
 test/regress/ext:threads/atomic_store_i64.bin.wast
 test/regress/ext:threads/atomic_sub_i32.bin.wast
