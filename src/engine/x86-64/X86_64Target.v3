@@ -16,8 +16,8 @@ component Target {
 
 	def newMemory = NativeWasmMemory.new;
 	def forceGC = RiGc.forceGC;
-	def newWasmStack = X86_64StackManager.getFreshStack;
-	def recycleWasmStack = X86_64StackManager.recycleStack;
+	def newWasmStack = NativeStackManager.getFreshStack;
+	def recycleWasmStack = NativeStackManager.recycleStack;
 	def tagging = Tagging.new(!FeatureDisable.valueTags, !FeatureDisable.simd);
 
 	private var offsets: V3Offsets;
@@ -53,13 +53,11 @@ component Target {
 			Trace.OUT.put2("func[%d].target_code: break *0x%x", f.func_index, addr - Pointer.NULL)
 				.put2(" disass 0x%x, 0x%x", addr - Pointer.NULL, end - Pointer.NULL).ln();
 			if (Trace.asm) {
-				var cur_byte = addr;
-				Trace.OUT.puts("JIT code: ");
-				while (cur_byte < end) {
-					Trace.OUT.put1("%x ", cur_byte.load<u8>());
-					cur_byte++;
-				}
-				Trace.OUT.ln();
+				var data = CiRuntime.forgeRange<byte>(addr, int.!(end - addr));
+				Trace.OUT.beginColor(Color.ASM);
+				X86_64CodePrinter.render(Trace.OUT, data);
+				Trace.OUT.endColor(Color.ASM);
+				Trace.OUT.flush();
 			}
 		}
 		f.target_code = TargetCode(addr);
@@ -162,11 +160,14 @@ component Target {
 		return RedZones.addRedZone(mapping, offset, size);
 	}
 
-	// TODO[sc]: empty function stubs for stack compression (real impl lands with the x86-64 backend).
 	// Stack compression: read the frames of a stack into an array of target independent frames representation.
-	def readFramesFromStack(from: WasmStack) -> Array<RelocatableFrame>;
+	def readFramesFromStack(from: WasmStack) -> Array<RelocatableFrame> {
+		return X86_64Compression.readFrames(NativeStack.!(from));
+	}
 	// Stack compression: overwrite the destination stack with the content of the relocatable frames.
-	def writeFramesToStack(dest: WasmStack, frames: Array<RelocatableFrame>);
+	def writeFramesToStack(dest: WasmStack, frames: Array<RelocatableFrame>) {
+		X86_64Compression.writeFrames(NativeStack.!(dest), frames);
+	}
 }
 
 type TargetOsrInfo(spc_entry: Pointer, osr_entries: List<(int, int)>) #unboxed { }
@@ -175,12 +176,12 @@ type TargetModule(spc_code: X86_64SpcModuleCode) #unboxed { }
 // TODO: immutable cache for frame accessor
 type TargetFrame(sfp: Pointer) #unboxed {
 	def srp() -> Pointer { return sfp + -Pointer.SIZE; }
-	def getFrameAccessor() -> X86_64FrameAccessor {
-		return X86_64Stacks.getFrameAccessor(sfp);
+	def getFrameAccessor() -> NativeFrameAccessor {
+		return NativeStacks.getFrameAccessor(sfp);
 	}
 	// TODO[cleanup]: a frame accessor should be able to obtain its corresponding stack
-	def getFrameAccessorOfStack(stack: X86_64Stack) -> X86_64FrameAccessor {
-		return X86_64Stacks.getFrameAccessorOfStack(sfp, stack);
+	def getFrameAccessorOfStack(stack: NativeStack) -> NativeFrameAccessor {
+		return NativeStacks.getFrameAccessorOfStack(sfp, stack);
 	}
 }
 type SpcResultForStub(wf: WasmFunction, entrypoint: Pointer, thrown: Throwable) #unboxed { }
@@ -195,7 +196,7 @@ class TargetHandlerDest(is_dummy: bool) {
 class X86_64ExecutionStrategy extends ExecutionStrategy {
 	// Call a function with arguments and return a result.
 	def call(func: Function, args: Range<Value>) -> Result {
-		return X86_64StackManager.runOnFreshStack(func, args); // XXX: specialize for different strategies?
+		return NativeStackManager.runOnFreshStack(func, args); // XXX: specialize for different strategies?
 	}
 	// Compilation methods called directly by stubs.
 	def lazyCompile(wf: WasmFunction) -> SpcResultForStub;
@@ -212,7 +213,7 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 // One tier: fast-int, modules require no pre-processing.
 class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 	def call(func: Function, args: Range<Value>) -> Result {
-		return X86_64StackManager.runOnFreshStack(func, args);
+		return NativeStackManager.runOnFreshStack(func, args);
 	}
 
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
