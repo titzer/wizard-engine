@@ -42,6 +42,7 @@ def TMP_SLOT = 1000000000;
 component SpcConsts {
 	// Abstract values tracked during single-pass compilation.
 	def NO_REG = Reg(0);
+	def IVAR_SLOT = TMP_SLOT + 1;
 	def IS_STORED: byte = 0x01;
 	def IS_CONST: byte = 0x02;
 	def IN_REG: byte = 0x04;
@@ -54,7 +55,7 @@ component SpcConsts {
 	def KIND_V128: byte = kindToFlags(ValueKind.V128);
 	def KIND_REF: byte = kindToFlags(ValueKind.REF);
 	def KIND_REF_U64: byte = kindToFlags(ValueKind.REF_U64);
-	def KIND_CONT: byte = kindToFlags(Continuations.valueKind); // KIND_REF in boxed mode, KIND_REF_U64 in unboxed mode
+	def KIND_CONT: byte = kindToFlags(Continuations.valueKind);
 	def kinds: Array<ValueKind> = [ValueKind.I32, ValueKind.I64, ValueKind.F32, ValueKind.F64,
 					ValueKind.V128, ValueKind.REF, ValueKind.REF_U64];
 	def kindToFlags(kind: ValueKind) -> byte {
@@ -77,6 +78,7 @@ def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
 def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 def KIND_CONT = SpcConsts.KIND_CONT;
+def IVAR_SLOT = SpcConsts.IVAR_SLOT;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
@@ -116,7 +118,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var last_probe = 0;
 	var skip_to_end: bool;
 	var whamm_config: WhammInlineConfig;
-	var frames_reconstructed = false;
 	// XXX: hack
 	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
@@ -173,6 +174,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Emit prologue, which allocates the frame and initializes various registers.
 		emitPrologue();
+		if (Trace.compiler && Trace.asm) traceAsm();
 
 		// Visit all local declarations.
 		it.dispatchLocalDecls(this);
@@ -184,8 +186,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Emit function entry probe, if any.
 		if (!FeatureDisable.entryProbes && func.entry_probed) {
 			var probe = Instrumentation.getLocalProbe(module, func.func_index, 0);
-			withReconstructedInlinedFrames(fun =>
-				emitProbe0(0, probe));
+			withReconstructedInlinedFrames(fun => emitProbe0(0, probe));
 		}
 
 		masm.current_fid = func.func_index;
@@ -196,12 +197,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.source_loc = it.pc;
 			it.dispatch(this);
 			unrefRegs();
-			if (Trace.compiler && Trace.asm) {
-				OUT.puts("JIT code: ");
-				masm.printCodeBytes(OUT, before_code_bytes, masm.curCodeBytes());
-				before_code_bytes = masm.curCodeBytes();
-				OUT.ln();
-			}
+			if (Trace.compiler && Trace.asm) traceAsm();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
 			if (skip_to_end) doSkipToEndOfBlock();
@@ -329,7 +325,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			regAlloc.forEachAssignment(r, appendSlots(buf, _));
 			var slots = buf.puts("}").toString();
 			if (regRefCounts[i] == 0) {
-				assert2(regAlloc.isFree(r), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
+				assert2(regAlloc.isFree(r) || regAlloc.hasAssignment(r, IVAR_SLOT), "%s should be free, got slots = %s", config.regSet.getName(r), slots);
 			} else {
 				assert2(!regAlloc.isFree(r), "%s should be allocated, got slots = %s", config.regSet.getName(r), slots);
 			}
@@ -402,8 +398,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (last_probe == 0) return;
 		var probe = Instrumentation.getLocalProbe(module, func.func_index, last_probe);
 		last_probe = 0;
-		withReconstructedInlinedFrames(fun =>
-			emitProbe0(it.pc, probe));
+		withReconstructedInlinedFrames(fun => emitProbe0(it.pc, probe));
 		if (Trace.compiler) traceOpcodeAndStack(true);
 	}
 	def emitProbe0(pc: int, probe: Probe) {
@@ -471,8 +466,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// load stack
 		masm.emit_get_curstack(regs.runtime_arg0);
 		// store %sp
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		// reload WasmFunction
 		masm.emit_mov_r_m(ValueKind.REF, regs.runtime_arg1, frame.wasm_func_slot);
 		// load PC
@@ -481,7 +476,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_call_runtime_Probe_instr();
 		// restore {stack.rsp}
 		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 		emit_reload_regs();
 		if (!spillMode.free_regs) state.emitRestoreAll(resolver);
 	}
@@ -616,10 +611,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 								masm.emit_mov_r_Continuation(reg, v);
 								state.push(KIND_CONT | IN_REG, reg, 0);
 							} else {
-								// Load the literal Continuation into a kind-correct scratch
-								// (XMM in unboxed mode, GPR in boxed mode), then store to the
-								// slot. emit_mov_m_r dispatches on kind: 16-byte movdqu in
-								// unboxed, 8-byte movq in boxed.
+								// Load the literal Continuation into an XMM scratch, then store the
+								// 16-byte (stack, version) pair to the slot.
 								var scratch = allocTmp(Continuations.valueKind);
 								masm.emit_mov_r_Continuation(scratch, v);
 								masm.emit_mov_m_r(Continuations.valueKind, slot_addr, scratch);
@@ -742,8 +735,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
 		masm.emit_call_runtime_op(Opcode.THROW);
@@ -757,8 +750,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(regs.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		popFixedReg(regs.runtime_arg1);
 		masm.emit_call_runtime_op(Opcode.THROW_REF);
 		setUnreachable();
@@ -917,12 +910,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.source_loc = it.pc;
 			masm.current_fid = func.func_index;
 			it.dispatch(this);
-			if (Trace.compiler && Trace.asm) {
-				OUT.puts("JIT code: ");
-				masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
-				codegen_offset = masm.curCodeBytes();
-				OUT.ln();
-			}
+			if (Trace.compiler && Trace.asm) traceAsm();
 			unrefRegs();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
@@ -1441,7 +1429,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		} else {
 			// XXX: use masm.br_m if necessary?
 			var tos = state.sp - 1;
-			var kind = sv.kind(); // REF or REF_U64 (cont in unboxed mode)
+			var kind = sv.kind(); // REF or REF_U64 (cont)
 			var reg = allocReg(kind, tos);
 			masm.emit_mov_r_s(kind, reg, tos);
 			emitBrIfR(SpcVal(sv.flags | IN_REG, reg, sv.const),
@@ -1502,11 +1490,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_get_curstack(curStack);
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
 
 		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
 		masm.emit_call_label(stub_resume);
@@ -1532,8 +1520,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(xenv.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
 		masm.emit_call_runtime_SUSPEND();
@@ -1554,10 +1542,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_get_curstack(regs.scratch);
 			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
 			// shorthands, so manually popping %rsp is needed
-			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 			// pop and go to handler stack's stub
-			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
-			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_v3_NativeStack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 			masm.emit_jump_r(xenv.scratch);
 		}
@@ -1572,8 +1560,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_spill_vsp(xenv.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
@@ -1601,10 +1589,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_get_curstack(regs.scratch);
 			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
 			// shorthands, so manually popping %rsp is needed
-			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 			// pop and go to handler stack's stub
-			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
-			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_v3_NativeStack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 			masm.emit_jump_r(xenv.scratch);
 		}
@@ -1635,14 +1623,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_validate_and_consume_cont(contStack, cont);
 
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
 		masm.emit_call_runtime_RESUME_THROW();
 		dropN(u32.!(tag.fields.length));
@@ -1654,13 +1642,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
 		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		// extract {cont.stack} into contStack: in boxed mode {cont} is a {Continuation *}
-		// (load .stack field); in unboxed mode {cont} is XMM with low 8 bytes = stack.
-		if (FeatureDisable.unboxedConts) {
-			masm.emit_v3_Continuation_stack_r_r(contStack, cont);
-		} else {
-			masm.emit_ref_from_ref_u64(contStack, cont);
-		}
+		// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
+		masm.emit_ref_from_ref_u64(contStack, cont);
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1668,11 +1651,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
 		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
 
 		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
 		masm.emit_call_label(stub_resume);
@@ -1714,14 +1697,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		popFixedReg(regs.runtime_arg3);
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		emit_compute_vsp(regs.vsp, state.sp);
 		emit_spill_vsp(xenv.vsp);
 		masm.emit_store_curstack_vsp(regs.vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
-		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
 		masm.emit_call_runtime_RESUME_THROW_REF();
 		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
 		// XXX: make RT function return {Continuation} directly
@@ -1731,13 +1714,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_reload_regs();
 		state.emitRestoreAll(resolver);
 		masm.emit_mov_r_r(Continuations.valueKind, cont, popReg().reg);
-		// extract {cont.stack} into contStack: in boxed mode {cont} is a {Continuation *}
-		// (load .stack field); in unboxed mode {cont} is XMM with low 8 bytes = stack.
-		if (FeatureDisable.unboxedConts) {
-			masm.emit_v3_Continuation_stack_r_r(contStack, cont);
-		} else {
-			masm.emit_ref_from_ref_u64(contStack, cont);
-		}
+		// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
+		masm.emit_ref_from_ref_u64(contStack, cont);
 
 		// save %vsp to frame
 		emit_compute_vsp(regs.vsp, state.sp);
@@ -1745,11 +1723,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
 		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
 
 		// reserve space for call addr
-		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
 		masm.emit_chain_cont_to_parent(curStack, contStack);
 
 		masm.emit_call_label(stub_resume);
@@ -1829,14 +1807,17 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op1n(Opcode.ARRAY_SET, ht_index, 3, ValueTypes.NONE, true);
 	}
 	def visit_ARRAY_LEN() {
+		emit_call_runtime_op1n(Opcode.ARRAY_LEN, 0, 1, SigCache.arr_i, true);
+		/* Direct array-length access needs to be moved into the object model.
 		var sv = popReg();
 		var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
 		masm.emit_breq_r_l(sv.reg, 0, label);
 		var tmp = allocTmp(ValueKind.REF);
 		var dst = allocRegTos(ValueKind.I32);
-		masm.emit_v3_HeapArray_vals_r_r(tmp, sv.reg);
+		masm.emit_v3_WasmArray_vals_r_r(tmp, sv.reg);
 		masm.emit_v3_Array_length_r_r(dst, tmp);
 		state.push(KIND_I32 | IN_REG, dst, 0);
+		*/
 	}
 	def visit_ARRAY_FILL(ht_index: u31) {
 		emit_call_runtime_op1n(Opcode.ARRAY_FILL, ht_index, 4, ValueTypes.NONE, true);
@@ -1861,14 +1842,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_store_curstack_vsp(regs.vsp);
 		// XXX: if a RT function cannot trap, maybe skip setting {rsp}?
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, nullable);
 		masm.emit_mov_r_i(regs.runtime_arg3, ht_val);
 		masm.emit_call_runtime_cast();
 		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		masm.emit_pop_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_reload_regs();
 		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 		return result;
@@ -2014,8 +1995,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		def emit = fun {
 			masm.emit_get_curstack(regs.runtime_arg0);
-			masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+			masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+			masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 			emit_load_instance(regs.runtime_arg1);
 			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
 			masm.emit_call_runtime_op(op);
@@ -2023,7 +2004,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
  		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 		dropN(args);
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
@@ -2037,8 +2018,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		def emit = fun {
 			masm.emit_get_curstack(regs.runtime_arg0);
-			masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
-			masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+			masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
+			masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 			emit_load_instance(regs.runtime_arg1);
 			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
 			masm.emit_mov_r_i(regs.runtime_arg3, arg2);
@@ -2047,7 +2028,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
  		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
 		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
 		dropN(args);
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
@@ -2175,12 +2156,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return label;
 	}
 	def getSpcInlinedFrameIp() -> long;
+	// Operations for tracking interpreter registers for fast handlers.
+	def allocIVars();
+	def evictIVars();
+	def restoreIVars();
 	// Emit code to materialize stack frames for each inlined function.
 	def emitReconstructStackFrames(frames: Array<SpcFrame>) -> int {
+		unrefRegs();
 		Metrics.spc_static_reconst.val++;
 		masm.emit_inc_metric(Metrics.spc_dynamic_reconst);
 		def real_frame = frames[0];
 		masm.emit_mov_m_i(xenv.pc_slot, real_frame.pc);
+		def outer_module = real_frame.module;
 
 		// load instance
 		var inst_reg = allocTmp(ValueKind.REF);
@@ -2195,12 +2182,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var prev_base_sp = int.view(frames[0].local_base_sp);
 		var wasm_func_reg = allocTmp(ValueKind.REF);
 
-		var inl_inst_reg: Reg, inl_mem0_reg: Reg;
+		var inl_inst_reg: Reg, inl_mem0_reg: Reg, whamm_func_reg: Reg;
 		if (whamm_config.is_inlined) { // XXX check individual configs?
 			inl_inst_reg = allocTmp(ValueKind.REF);
 			inl_mem0_reg = allocTmp(ValueKind.REF);
+			whamm_func_reg = allocTmp(ValueKind.REF);
 			masm.emit_mov_r_m(ValueKind.REF, inl_inst_reg, frame.inlined_instance_slot);
 			masm.emit_mov_r_m(ValueKind.REF, inl_mem0_reg, frame.inlined_mem0_base_slot);
+			masm.emit_v3_Instance_functions_r_r(whamm_func_reg, inl_inst_reg);
 		}
 
 		// Pre-allocate stack space for all reconstructed frames at once.
@@ -2212,17 +2201,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			def frame_info = frames[i];
 			def cur_base_sp = int.view(frame_info.local_base_sp);
 			def delta = (cur_base_sp - prev_base_sp) * masm.valuerep.slot_size;
+			def func_reg = if(frame_info.module == outer_module, func_reg, whamm_func_reg);
 			emitReconstructStackFrame(frame_info, frames.length - i - 1, delta,
 					wasm_func_reg, func_reg, inst_reg, mem_reg, vfp_reg, inl_inst_reg, inl_mem0_reg);
 			prev_base_sp = cur_base_sp;
 		}
 
+		unrefRegs();
 		return total_space;
 	}
 	def emitReconstructStackFrame(spcFrame: SpcFrame, offset: int, vfp_delta: int,
 			wasm_func_reg: Reg, func_reg: Reg, inst_reg: Reg, mem_reg: Reg, vfp_reg: Reg, inl_inst_reg: Reg, inl_mem0_reg: Reg) {
 		// Use inlined frame stub IP as return address for all reconstructed frames
-		def return_addr = getSpcInlinedFrameIp();
+		def return_addr = getSpcInlinedFrameIp() + 1;
 
 		def frame_offset = offset * (frame.frameSize + 8);
 		// Write inlined frame stub IP as return address
@@ -2271,19 +2262,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	// Guards compiler code with frame reconstruction (if necessary).
 	def withReconstructedInlinedFrames(emit: void -> void) {
 		if (isInlined()) {
-			if (frames_reconstructed) {
-				// FIXME this should not happen (but does):
-				// - in the case of deep nesting when one layer is a Whamm probe
-				// - when refactoring to avoid `with` clause, GC test fails (inlining depth 2)
-				if (Trace.compiler) Trace.OUT.puts("  nested frame reconstruction inhibited\n");
-				emit();
-				return;
-			}
-			unrefRegs();
-			frames_reconstructed = true;
 			def space = emitReconstructStackFrames(snapshotFrames());
 			emit();
-			frames_reconstructed = false;
 			if (space > 0) {
 				masm.emit_addw_r_i(regs.sp, space);
 				masm.emit_mov_r_m(ValueKind.REF, regs.vfp, frame.vfp_slot);
@@ -2553,6 +2533,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		return regAlloc.alloc(kind, slot);
 	}
 	def addSpillCost(score: int, reg: Reg, slot: int) -> int {
+		if (slot == IVAR_SLOT) return 50 + score;             // fast interpreter register?
 		if (slot >= state.sp) return 100000000 + score;       // tmp slot?
 		if (!state.state[slot].isStored()) score += 100;      // will generate a spill
 		if (slot < 10 && slot < func.num_locals) score += 10; // penalize first 10 locals
@@ -2679,6 +2660,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def emitSpill(slot: int) {
 		if (slot == TMP_SLOT) return;
+		// FIXME spill dirty ivars to their slot
+		if (slot == IVAR_SLOT) return;
 		var sv = state.state[slot];
 		if (sv.isConst()) return void(state.state[slot] = sv.withoutReg());
 		if (sv.isStored()) return void(state.state[slot] = sv.withoutReg());
@@ -2701,12 +2684,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		OUT.flush();
 		instrTracer.instr_width = Opcodes.longestName + 1;
 		instrTracer.putPcAndInstr(OUT, module, func, it.pc, orig);
-		if (Trace.asm) {
-			OUT.puts("JIT code: ");
-			masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
-			codegen_offset = masm.curCodeBytes();
-			OUT.ln();
-		}
+	}
+	def traceAsm() {
+		Trace.OUT.beginColor(Color.ASM);
+		masm.printCodeBytes(OUT, codegen_offset, masm.curCodeBytes());
+		Trace.OUT.endColor(Color.ASM);
+		codegen_offset = masm.curCodeBytes();
 	}
 	// Gets the handler ID of the <inline_index>-th handler declared at pc.
 	private def getHandlerIndex(pc: int, inline_index: int) -> int {
@@ -2772,7 +2755,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	// Determine if a regular function call should be inlined
 	def shouldInline(func: FuncDecl) -> bool {
-		if (Trace.compiler) OUT.put1("deciding on inlining call to func #%d: ", func.func_index);
+		if (Trace.compiler) OUT.put1("    inline func #%d? ", func.func_index);
 
 		if (func.imp != null) return no("imported");
 		if (inlineDepth() >= SpcTuning.maxInlineDepth) return no("max inline depth exceeded");
@@ -2966,7 +2949,7 @@ class SpcState(regAlloc: RegAlloc) {
 	var ctl_stack = ArrayStack<SpcControl>.new();
 	// Frame management (for inlining)
 	var frame_stack = ArrayStack<SpcFrame>.new();
-
+	def useIVars = false; // TODO replace with `fast` option when implemented in SPC
 	// Reset the state for starting a new function.
 	def reset(sig: SigDecl, ret_label: MasmLabel) {
 		sp = 0;
@@ -3062,7 +3045,7 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
-			regAlloc.clear();
+			clear();
 			sp = ctl.val_stack_top;
 			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
 				var sv = state[i];
@@ -3109,7 +3092,7 @@ class SpcState(regAlloc: RegAlloc) {
 		resolver.emitMoves();
 	}
 	def emitSaveAll(resolver: SpcMoveResolver, spillMode: SpillMode) {
-		if (Trace.compiler) OUT.puts("    save all").ln();
+		if (Trace.compiler) OUT.puts("    save all slots").ln();
 		def STORE_MASK = IS_STORED | TAG_STORED;
 		for (slot < sp) {
 			var sv = state[slot], nv = sv;
@@ -3125,7 +3108,7 @@ class SpcState(regAlloc: RegAlloc) {
 		resolver.emitMoves();
 	}
 	def emitRestoreAll(resolver: SpcMoveResolver) {
-		if (Trace.compiler) OUT.puts("    restore all").ln();
+		if (Trace.compiler) OUT.puts("    restore all slots").ln();
 		for (slot < sp) {
 			var sv = state[slot];
 			if (!sv.inReg()) continue;
@@ -3141,10 +3124,14 @@ class SpcState(regAlloc: RegAlloc) {
 		return SpcVal((from.flags & ~(IS_CONST)) | force_store, from.reg, 0);
 	}
 	private def resetTo(max: u32, nstate: Array<SpcVal>) {
-		regAlloc.clear();
+		clear();
 		for (i < max) {
 			var sv = nstate[i];
-			if (sv.inReg()) regAlloc.assign(sv.reg, int.!(i));
+			if (sv.inReg()) {
+				// the merge's move clobbers any interpreter variable still in {sv.reg}
+				if (useIVars && regAlloc.hasAssignment(sv.reg, IVAR_SLOT)) regAlloc.free(sv.reg);
+				regAlloc.assign(sv.reg, int.!(i));
+			}
 			state[i] = sv;
 		}
 		sp = max;
@@ -3228,6 +3215,14 @@ class SpcState(regAlloc: RegAlloc) {
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 	}
+	def clear() {
+		if (useIVars) regAlloc.forEachAllocatedReg(NO_REG, freeExceptIVar);
+		else regAlloc.clear();
+	}
+	def freeExceptIVar(reg: Reg) {
+		if (!regAlloc.hasAssignment(reg, IVAR_SLOT)) regAlloc.free(reg);
+	}
+
 	def trace() {
 		var num_locals = frame_stack.peek().num_locals;
 		trace0("", state, int.!(sp), num_locals);
