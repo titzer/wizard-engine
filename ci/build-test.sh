@@ -44,7 +44,8 @@ export WIZENG_OPTS="$WIZENG_OPTS $WIZENG_RUNTIME_ARGS"
 make -j $TEST_TARGET
 
 # Install Opam for specification tests
-sudo apt install -y opam
+sudo apt-get update
+sudo apt-get install -y opam
 opam init
 
 # Install spec test dependencies
