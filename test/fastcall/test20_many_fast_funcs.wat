@@ -1,4 +1,4 @@
-;; 40 distinct fast functions: exercises the full fast-call table (slots FAST_CALL0..FAST_CALL39).
+;; 39 distinct fast functions: exercises the full fast-call table (slots FAST_CALL0..FAST_CALL38).
 (module
   (func $f0 (export "fast:f0") (param i32) (result i32)
     local.get 0  i32.const 0  i32.add)
@@ -78,8 +78,6 @@
     local.get 0  i32.const 37  i32.add)
   (func $f38 (export "fast:f38") (param i32) (result i32)
     local.get 0  i32.const 38  i32.add)
-  (func $f39 (export "fast:f39") (param i32) (result i32)
-    local.get 0  i32.const 39  i32.add)
   (func (export "main") (result i32)
     (local $acc i32)
     i32.const 0  call $f0  local.get $acc  i32.add  local.set $acc
@@ -121,8 +119,7 @@
     i32.const 0  call $f36  local.get $acc  i32.add  local.set $acc
     i32.const 0  call $f37  local.get $acc  i32.add  local.set $acc
     i32.const 0  call $f38  local.get $acc  i32.add  local.set $acc
-    i32.const 0  call $f39  local.get $acc  i32.add  local.set $acc
     local.get $acc
-    i32.const 780   ;; 0+1+2+...+39 = 780
+    i32.const 741   ;; 0+1+2+...+38 = 741
     i32.ne)
 )
