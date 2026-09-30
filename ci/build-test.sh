@@ -44,8 +44,12 @@ export WIZENG_OPTS="$WIZENG_OPTS $WIZENG_RUNTIME_ARGS"
 make -j $TEST_TARGET
 
 # Install Opam for specification tests
-sudo apt-get update
-sudo apt-get install -y opam
+if [ "$(uname -s)" = "Darwin" ]; then
+    brew install opam
+else
+    sudo apt-get update
+    sudo apt-get install -y opam
+fi
 opam init
 
 # Install spec test dependencies

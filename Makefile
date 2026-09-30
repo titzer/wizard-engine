@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave
+.PHONY: clean x86-linux x86-64-linux x86-64-darwin jvm wasm-wave
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -10,6 +10,8 @@ x86-linux: bin/wizeng.x86-linux bin/unittest.x86-linux
 arm64-linux: bin/wizeng.arm64-linux bin/unittest.arm64-linux
 
 x86-64-linux: bin/wizeng.x86-64-linux bin/unittest.x86-64-linux
+
+x86-64-darwin: bin/wizeng.x86-64-darwin bin/unittest.x86-64-darwin
 
 jvm: bin/wizeng.jvm bin/unittest.jvm
 
@@ -89,6 +91,16 @@ bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(WALI_X86_6
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
 	./build.sh objdump x86-64-linux
+
+# x86-64-darwin targets
+bin/unittest.x86-64-darwin: $(UNITTEST) build.sh
+	./build.sh unittest x86-64-darwin
+
+bin/wizeng.x86-64-darwin: $(WIZENG) $(MONITORS) build.sh
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng x86-64-darwin
+
+bin/objdump.x86-64-darwin: $(OBJDUMP) build.sh
+	./build.sh objdump x86-64-darwin
 
 # interpreter targets
 bin/unittest.v3i: $(UNITTEST) build.sh
