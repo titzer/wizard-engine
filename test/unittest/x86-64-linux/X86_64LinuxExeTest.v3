@@ -21,6 +21,17 @@ component X86_64LinuxExeTest {
 				UnitTests.registerT(strategy.0, test.0, newTester, test.1);
 			}
 		}
+		// a path profile counts exactly, in the interpreter and across a tier-up in the middle of a loop
+		var newInt = ExeTester.new(_, X86_64InterpreterOnlyStrategy.new());
+		var newDyn = ExeTester.new(_, X86_64DynamicStrategy.new());
+		for (test in [
+			("ifs", test_profile_ifs),
+			("br_table", test_profile_br_table),
+			("loop", test_profile_loop)
+			]) {
+			UnitTests.registerT("pathprofile:", test.0, newInt, test.1);
+		}
+		UnitTests.registerT("pathprofile:", "osr", newDyn, test_profile_osr);
 	}
 
 }
@@ -58,6 +69,102 @@ def test_load_oob0(i: ExeTester) {
 	i.code([u8.!(Opcode.LOCAL_GET.code), 0,
 		u8.!(Opcode.I32_LOAD.code), 0, 0]);
 	i.args_i(0).assert2_trap(TrapReason.MEMORY_OOB);
+}
+
+// (sum, max, how many are nonzero) of a profile's path counts
+def tally(counts: Array<int>) -> (int, int, int) {
+	var sum = 0, max = 0, nonzero = 0;
+	for (c in counts) {
+		sum += c;
+		if (c > max) max = c;
+		if (c > 0) nonzero++;
+	}
+	return (sum, max, nonzero);
+}
+
+// Three decisions in a row make eight paths, which eight inputs take once each.
+def test_profile_ifs(i: ExeTester) {
+	var code = Vector<byte>.new();
+	for (bit in [1, 2, 4]) code.puta([
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.I32_CONST.code), byte.!(bit),
+		u8.!(Opcode.I32_AND.code),
+		u8.!(Opcode.IF.code), NONE,
+		u8.!(Opcode.NOP.code),
+		u8.!(Opcode.END.code)]);
+	code.puta([u8.!(Opcode.I32_CONST.code), 7]);
+	i.sig(SigCache.i_i).codev(code.extract());
+	var profile = PathTrace.new(i.module, i.func);
+	i.t.asserti(8, profile.counts.length);
+	for (x < 8) i.args_i(x).assert2_i(7);
+	i.t.assert_eq((8, 1, 8), tally(profile.counts));
+	for (n < 3) i.args_i(5).assert2_i(7);
+	i.t.assert_eq((11, 4, 8), tally(profile.counts));
+}
+
+// One label and the default make two paths.
+def test_profile_br_table(i: ExeTester) {
+	i.sig(SigCache.i_i).codev([
+		u8.!(Opcode.BLOCK.code), NONE,
+		u8.!(Opcode.BLOCK.code), NONE,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.BR_TABLE.code), 1, 0, 1,
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.I32_CONST.code), 11,
+		u8.!(Opcode.RETURN.code),
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.I32_CONST.code), 22]);
+	var profile = PathTrace.new(i.module, i.func);
+	i.t.asserti(2, profile.counts.length);
+	for (x in [0, 5, 5, 9]) i.args_i(x).assert2_i(if(x == 0, 11, 22));
+	i.t.assert_eq((4, 3, 2), tally(profile.counts));
+}
+
+// Each trip around a loop ends one path and starts the next, and none of those pieces is a
+// route through the function. Only a call that never takes the backedge follows a whole path.
+def test_profile_loop(i: ExeTester) {
+	i.sig(SigCache.i_i).codev([
+		u8.!(Opcode.LOOP.code), NONE,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.I32_CONST.code), 1,
+		u8.!(Opcode.I32_AND.code),
+		u8.!(Opcode.IF.code), NONE,
+		u8.!(Opcode.NOP.code),
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.I32_CONST.code), 1,
+		u8.!(Opcode.I32_SUB.code),
+		u8.!(Opcode.LOCAL_TEE.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.I32_CONST.code), 7]);
+	var profile = PathTrace.new(i.module, i.func);
+	i.args_i(6).assert2_i(7);
+	i.t.asserti(6, tally(profile.counts).0);
+	for (n < 10) i.args_i(1).assert2_i(7);
+	i.t.asserti(16, tally(profile.counts).0);
+}
+
+// The loop tiers up part way through the 1000 trips, with the path sum in a frame variable that
+// the interpreter has been updating; every trip is still counted once.
+def test_profile_osr(i: ExeTester) {
+	var f17 = byte.!(i.newFunction(SigCache.v_i, [u8.!(Opcode.I32_CONST.code), 17]).func_index);
+	i.sig(SigCache.i_i).codev([
+		u8.!(Opcode.LOOP.code), NONE,
+		u8.!(Opcode.CALL.code), f17,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.I32_CONST.code), 1,
+		u8.!(Opcode.I32_SUB.code),
+		u8.!(Opcode.LOCAL_TEE.code), 0,
+		u8.!(Opcode.I32_EQZ.code),
+		u8.!(Opcode.BR_IF.code), 1,
+		u8.!(Opcode.BR.code), 0,
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.UNREACHABLE.code)
+	]);
+	var profile = PathTrace.new(i.module, i.func);
+	i.args_i(1000).assert2_i(17);
+	i.t.asserti(1000, tally(profile.counts).0);
 }
 
 def test_call1005(i: ExeTester) {
