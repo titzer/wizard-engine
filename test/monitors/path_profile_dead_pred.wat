@@ -1,13 +1,4 @@
-;; Dead predecessor: a CFG block unreachable from ENTRY that still owns an instruction. It used to
-;; acquire an outgoing edge into a live block (CfgBuilder.mergeCfgBlock's `from.goto`), which
-;; kruskals()'s DFS-from-entry never saw, so it got no TreeEdge and placeCount() hit a null in
-;; SpanningTree.edgeMap. Fixed by giving mergeCfgBlock the same reachability guard gotoExit has.
-;;
-;; Hand-derived expectations:
-;;   $both_arms_return       2 paths; the `i32.const 99` tail is dead. 2 calls x!=0 + 3 calls x=0
-;;                           -> counts are a permutation of {2,3}, sum 5 = 5 calls.
-;;   $both_arms_return_typed 2 paths, called once -> sum 1.
-;;   $br_out_dead_tails      1 path (the two local.set tails after `br $a` are dead) -> counts[0]=1.
+;; Dead blocks that still own instructions: tails after both arms return, and after a `br` out.
 (module
   (func $both_arms_return (export "a") (param $x i32) (result i32)
     (if (local.get $x)

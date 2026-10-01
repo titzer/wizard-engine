@@ -1,15 +1,4 @@
-;; Backedges to DIFFERENT headers, one nested inside the other. `loop_two_backedges` pins two
-;; backedges sharing a header; this pins the other axis -- each backedge targets its own header, so
-;; Section 4 step 1 adds ENTRY->$outer and ENTRY->$inner, and the two branch sources each get their
-;; own ->EXIT.
-;;
-;; The point is that the inner backedge must NOT end a segment that the outer one also ends. Every
-;; backedge execution ends exactly one segment, whichever loop it belongs to, so the two trip counts
-;; add rather than nest in the invariant below.
-;;
-;; $nested runs the inner loop $m times per outer iteration, for $n outer iterations.
-;; main calls $nested(3, 2) once: the inner backedge executes 3*2 == 6 times and the outer 3 times.
-;; INVARIANT: sum(counts) == activations + backedge executions == 1 + (6 + 3) == 10.
+;; Nested loops, each with its own backedge to its own header.
 (module
   (func $nested (export "nested") (param $n i32) (param $m i32) (result i32)
     (local $i i32) (local $j i32) (local $s i32)

@@ -1,11 +1,4 @@
-;; br_table where EVERY executed index falls through to the default label, including the
-;; out-of-range clamp in TableProbe (v >= dispatch.length -> last entry) and an index whose
-;; i32 value is negative (0xffffffff), which must be read as an unsigned u32 and clamped, not
-;; used as a negative array index.
-;;
-;; 3 labels ($L0, $L1, default $L2) -> 3 paths. main only ever passes 2, 3, 100 and -1,
-;; so the two indexed paths are never taken.
-;; expected counts: one path = 4, the other two = 0; sum = 4 = calls to $f
+;; A br_table where every index taken goes to the default, including out-of-range and negative ones.
 (module
   (func $f (export "f") (param $x i32) (result i32)
     (block $L2

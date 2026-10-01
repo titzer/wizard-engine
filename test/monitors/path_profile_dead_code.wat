@@ -1,12 +1,4 @@
-;; Unreachable code following an unconditional `br`, and a function whose entire body is
-;; `unreachable`. Dead straight-line code must not create extra blocks/paths, and a body that
-;; only traps must still get a well-formed single-path CFG (it is never called here, so all
-;; counts stay 0 -- sum(counts) == 0 == activations).
-;;
-;; $after_br  : 1 path (the `local.set 999` after the br is dead). Called 3 times -> counts[0]=3
-;; $trap_body : 1 path, NEVER called -> counts[0] = 0
-;; $trap_tail : `unreachable` as the tail of the else arm; the then arm falls through.
-;;              2 paths; only the non-trapping one is executed, twice.
+;; Dead code after an unconditional `br`, a body that only traps, and an else arm that traps.
 (module
   (func $after_br (export "after_br") (result i32)
     (local $r i32)

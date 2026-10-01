@@ -1,11 +1,4 @@
-;; Frequency accuracy across CONTROL-FLOW SHAPES: one function combining a 4-label br_table, two
-;; `br`s to outer labels at different depths (3 and 1), a mid-body `return`, and a fall-through
-;; default arm. The rest of the suite covers these shapes only at low call counts and never checks
-;; that counts track frequency.
-;;
-;; 4 paths, one per br_table arm. main makes 60 calls: x=0 x17, x=1 x5, x=2 x23, and the default
-;; arm via x=3 x2, x=77 x9, x=255 x4 (out-of-range indices clamp to the default).
-;; Hand-derived: default = 2+9+4 = 15, and the three explicit arms 17, 5, 23. Sum 60 = calls.
+;; Exact path counts in one function mixing a br_table, branches to outer labels and a `return`.
 (module
   (func $g (export "g") (param $x i32) (result i32) (local $r i32)
     (block $out

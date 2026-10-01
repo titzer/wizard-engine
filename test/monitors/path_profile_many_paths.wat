@@ -1,10 +1,4 @@
-;; A function with 32 distinct paths: five sequential if/else diamonds selected by the five low
-;; bits of one argument. This is the strongest available check that path numbering is COMPACT and
-;; UNIQUE -- main calls $five32 once with each of the 32 bit patterns, so a correct profile is
-;; exactly 32 counters, indices 0..31 with no gaps, each holding exactly 1. Any collision shows
-;; as a 2 next to a 0; any gap shows as a stray 0.
-;;
-;; expected counts: counts[0..31] all == 1, sum = 32 = calls to $five32
+;; 32 paths from five if/else in a row, each taken once, so the numbering must be compact and unique.
 (module
   (func $five32 (export "five32") (param $m i32) (result i32)
     (local $r i32)

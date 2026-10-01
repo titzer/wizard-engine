@@ -1,18 +1,4 @@
-;; Loops are PROFILED, not skipped (Ball-Larus Section 4). This file predates that and originally
-;; pinned the opposite -- that a function containing a backedge produced no output at all. It is
-;; kept because its shapes are still the useful ones, and because it pins that a `loop` label
-;; nothing branches to is NOT a cycle.
-;;
-;; func #0 $loop_sum(4)      : one loop, body runs 4 times -> 4 backedges. 1 + 4 == 5 segments.
-;; func #1 $nested_loop(3)   : loop inside a loop -> two independent backedges, two loop headers,
-;;                             so step 1 adds a dummy pair for each.
-;; func #2 $loop_no_backedge : a `loop` label nothing ever branches to. NOT a backedge, so this is
-;;                             an ordinary acyclic function: 1 path, called twice -> counts[0] == 2.
-;;                             This is the case a positional (bind_pos) backedge guess gets wrong;
-;;                             marking from ControlStack's `to.isLoop()` gets it right.
-;; func #3 $acyclic          : plain diamond, 2 paths, each taken once.
-;; func #4 main              : 1 path.
-;; INVARIANT: per function, sum(counts) == activations + backedge executions.
+;; A loop, nested loops, and a `loop` label that no branch targets, which is not a cycle.
 (module
   (func $loop_sum (export "loop_sum") (param $n i32) (result i32)
     (local $i i32) (local $s i32)
