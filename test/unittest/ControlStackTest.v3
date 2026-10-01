@@ -10,6 +10,12 @@ def X_ = void(
 	T("br_if0", test_br_if0),
 	T("br_table_succs", test_br_table_succs),
 	T("loop_backedge", test_loop_backedge),
+	T("block_extent", test_block_extent),
+	T("return_edge", test_return_edge),
+	T("remove_empty", test_remove_empty),
+	T("remove_empty_entry", test_remove_empty_entry),
+	T("subclass_hooks", test_subclass_hooks),
+	T("reverse_topo", test_reverse_topo),
 	T("unreach", test_unreach),
 	T("return", test_return),
 	T("return_call_ref", test_return_call_ref),
@@ -126,7 +132,7 @@ def test_br_table_succs(t: ControlStackTester) {
 		u8.!(Opcode.BR_TABLE.code), 2, 0, 0, 0,
 		u8.!(Opcode.END.code)
 	]);
-	var start = CfgBuilder.new().build(t.func);
+	var start = CfgBuilder.new().build(t.func).0;
 	t.t.asserti(3, Lists.length(start.outgoing));
 }
 
@@ -138,12 +144,73 @@ def test_loop_backedge(t: ControlStackTester) {
 		u8.!(Opcode.BR_IF.code), 0,
 		u8.!(Opcode.END.code)
 	]);
-	var entry = CfgBuilder.new().build(t.func);
+	var entry = CfgBuilder.new().build(t.func).0;
 	var header = entry.outgoing.head;
 	t.t.assertz(false, header.isBackedge);
 	var back = 0;
 	for (l = header.target.outgoing; l != null; l = l.tail) if (l.head.isBackedge) back++;
 	t.t.asserti(1, back);
+}
+
+// the entry block starts after the locals declaration and owns both nops; the final `end` is a
+// merge point, so it belongs to the block it merges into
+def test_block_extent(t: ControlStackTester) {
+	t.addLocal(ValueType.I32);
+	t.code([
+		u8.!(Opcode.NOP.code),
+		u8.!(Opcode.NOP.code)
+	]);
+	var entry = CfgBuilder.new().build(t.func).0;
+	t.t.asserti(3, entry.start);
+	t.t.asserti(4, entry.last_instr_pc);
+	t.t.asserti(5, entry.end);
+}
+
+// a return leaves the function, so its block reaches EXIT only once the edge is added
+def test_return_edge(t: ControlStackTester) {
+	t.code([
+		u8.!(Opcode.RETURN.code)
+	]);
+	var cfg = CfgBuilder.new();
+	var t2 = cfg.build(t.func), entry = t2.0, exit = t2.1;
+	t.t.assertz(true, entry.outgoing == null);
+	cfg.addReturnEdges(t.func, entry, exit);
+	t.t.assert_eq(exit, entry.outgoing.head.target);
+}
+
+// the block between the br_if and the end owns no instruction, so it is removed
+def test_remove_empty(t: ControlStackTester) {
+	t.code([
+		u8.!(Opcode.BLOCK.code), EMPTY,
+		u8.!(Opcode.I32_CONST.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code)
+	]);
+	var cfg = CfgBuilder.new();
+	var t2 = cfg.build(t.func), entry = t2.0, exit = t2.1;
+	var blocks = Vector<CfgBlock>.new();
+	entry.dfs(blocks.put, null, null);
+	t.t.asserti(4, blocks.length);
+	cfg.removeEmptyBlocks(entry, exit);
+	blocks.resize(0);
+	entry.dfs(blocks.put, null, null);
+	t.t.asserti(3, blocks.length);
+}
+
+// a function that starts with `loop` has an empty entry, so it starts at the loop's block instead
+def test_remove_empty_entry(t: ControlStackTester) {
+	t.code([
+		u8.!(Opcode.LOOP.code), EMPTY,
+		u8.!(Opcode.I32_CONST.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code)
+	]);
+	var cfg = CfgBuilder.new();
+	var t2 = cfg.build(t.func), entry = t2.0, exit = t2.1;
+	t.t.asserti(-1, entry.last_instr_pc);
+	var start = cfg.removeEmptyBlocks(entry, exit);
+	t.t.assert(start.last_instr_pc >= 0, "expected the start to own an instruction");
+	for (l = start.incoming; l != null; l = l.tail) t.t.assert(l.head.isBackedge, "expected only the backedge into the start");
 }
 
 def test_unreach(t: ControlStackTester) {
@@ -271,6 +338,53 @@ def test_if_unreach1(t: ControlStackTester) {
 	],
 	(1, 0),
 	1);
+}
+
+class MarkedBlock extends CfgBlock {
+	new(pos: int) super(pos) { }
+}
+class MarkedEdge extends CfgEdge {
+	new(pc: int, source: CfgBlock, target: CfgBlock) super(pc, source, target) { }
+}
+def test_subclass_hooks(t: ControlStackTester) {
+	t.code([
+		u8.!(Opcode.BLOCK.code), EMPTY,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code)
+	]);
+	var b = CfgBuilder.new();
+	b.newBlock = MarkedBlock.new;
+	b.newEdge = MarkedEdge.new;
+	var cfg = b.build(t.func), entry = cfg.0, exit = cfg.1;
+	entry.dfs(fun (blk: CfgBlock) { t.t.assert(MarkedBlock.?(blk), "expected the block override to be used"); }, null, null);
+	t.t.assert(MarkedEdge.?(entry.outgoing.head), "expected the edge override to be used");
+	t.t.assert(MarkedEdge.?(b.link(-1, exit, entry)), "expected `link` to use the edge override");
+	t.t.asserti(entry.hash(), entry.id);
+	t.t.assertz(true, entry.equals(entry));
+	t.t.assertz(false, entry.equals(exit));
+}
+
+// every non-backedge points from later to earlier in the order, regardless of walk order
+def test_reverse_topo(t: ControlStackTester) {
+	t.code([
+		u8.!(Opcode.LOOP.code), EMPTY,
+		u8.!(Opcode.I32_CONST.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code)
+	]);
+	var entry = CfgBuilder.new().build(t.func).0;
+	var order = entry.reverseTopo(false);
+	for (b in order) t.t.asserti(0, b.mark); // a walk leaves every mark cleared
+	t.t.assert_eq(entry, order[order.length - 1]);
+	for (i < order.length) {
+		for (l = order[i].outgoing; l != null; l = l.tail) {
+			if (l.head.isBackedge) continue;
+			var target = l.head.target, seen = false;
+			for (j < i) if (order[j] == target) seen = true;
+			t.t.assert(seen, "expected each successor before its block in the order");
+		}
+	}
 }
 
 def newControlPathCounter() -> ControlStack<int> {

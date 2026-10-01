@@ -1,0 +1,42 @@
+;; Each decision is taken both ways, so both of its paths are counted once.
+(module
+  (func $f_null (param $r funcref) (result i32)
+    (block $b
+      (drop (br_on_null $b (local.get $r)))
+      (return (i32.const 1)))
+    (i32.const 0))
+
+  (func $f_nonnull (param $r funcref) (result i32)
+    (block $b (result (ref func))
+      (br_on_non_null $b (local.get $r))
+      (return (i32.const 0)))
+    (drop)
+    (i32.const 1))
+
+  (func $f_cast (param $r anyref) (result i32)
+    (block $b (result (ref i31))
+      (br_on_cast $b anyref (ref i31) (local.get $r))
+      (drop)
+      (return (i32.const 0)))
+    (drop)
+    (i32.const 1))
+
+  (func $f_castfail (param $r anyref) (result i32)
+    (block $b (result anyref)
+      (br_on_cast_fail $b anyref (ref i31) (local.get $r))
+      (drop)
+      (return (i32.const 1)))
+    (drop)
+    (i32.const 0))
+
+  (func (export "main")
+    (drop (call $f_null (ref.null func)))
+    (drop (call $f_null (ref.func $f_null)))
+    (drop (call $f_nonnull (ref.null func)))
+    (drop (call $f_nonnull (ref.func $f_null)))
+    (drop (call $f_cast (ref.i31 (i32.const 7))))
+    (drop (call $f_cast (ref.null any)))
+    (drop (call $f_castfail (ref.i31 (i32.const 7))))
+    (drop (call $f_castfail (ref.null any))))
+  (elem declare func $f_null)
+)
