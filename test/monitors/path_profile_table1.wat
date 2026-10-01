@@ -1,9 +1,4 @@
-;; br_table with a single entry: the label list is just the default, so the block has ONE
-;; outgoing edge and no runtime decision at all. Pins that a degenerate br_table is treated as
-;; an unconditional branch (single-path function), not as a 0- or 2-way dispatch.
-;;
-;; Paths: 1. main calls $f 3 times with unrelated indices; all take it.
-;; expected counts: {0 => 3}, sum = 3 = calls to $f
+;; A br_table with only a default label, which is an unconditional branch.
 (module
   (func $f (export "f") (param $x i32) (result i32)
     (block $L0

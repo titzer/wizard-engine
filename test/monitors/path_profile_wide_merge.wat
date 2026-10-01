@@ -1,10 +1,4 @@
-;; A single block with FIVE predecessors. wide_only/demo cover a wide br_table whose arms all
-;; `return` (so the fan-in lands on EXIT); here the five arms instead `br` to a common join
-;; block that then continues, so the join is a real interior merge with 5 incoming edges.
-;;
-;; Paths: one per br_table index (0..3 indexed, >=4 default) -> 5 paths.
-;; main: index 0 once, 1 twice, 2 three times, 3 four times, 9 five times (default).
-;; expected counts: a permutation of {1,2,3,4,5}, sum = 15 = calls to $merge5
+;; A br_table whose five arms all branch to one join block, which then continues.
 (module
   (func $merge5 (export "merge5") (param $x i32) (result i32)
     (local $r i32)

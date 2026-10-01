@@ -1,16 +1,4 @@
-;; A br_table arm containing an if/else, and an if arm containing a br_table. Every pre-existing
-;; test keeps the two dispatch kinds in separate functions; this pins that a block probed with a
-;; TableProbe and a block probed with a BoolProbe compose correctly inside one DAG.
-;;
-;; $table_of_ifs: br_table (3 labels) whose index-0 arm holds an if/else on $y.
-;;   P1 x=0,y=0 ; P2 x=0,y!=0 ; P3 x=1 ; P4 x>=2 (default)  -> 4 paths
-;;   main: P1 once, P2 twice, P3 three times, P4 four times.
-;;   expected counts: a permutation of {1,2,3,4}, sum = 10 = calls to $table_of_ifs
-;; $if_of_table: if whose then arm holds a 2-entry br_table on $y; the else arm falls through
-;;   to the shared tail.
-;;   P1 x!=0,y=0 (return 10) ; P2 x!=0,y!=0 (return 20) ; P3 x=0 (else -> tail 30)
-;;   -> 3 paths. main: P1 once, P2 twice, P3 three times.
-;;   expected counts: a permutation of {1,2,3}, sum = 6 = calls to $if_of_table
+;; A br_table arm containing an if/else, and an if arm containing a br_table.
 (module
   (func $table_of_ifs (export "table_of_ifs") (param $x i32) (param $y i32) (result i32)
     (block $L2
