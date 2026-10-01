@@ -1,0 +1,13 @@
+(module
+  (func $empty_block (export "a") (result i32) (block) (i32.const 1))
+  (func $brif_then_end (export "b") (param $x i32) (result i32)
+    (block $L (br_if $L (local.get $x)))
+    (i32.const 2))
+  (func $empty_then (export "c") (param $x i32) (result i32)
+    (if (local.get $x) (then))
+    (i32.const 3))
+  (func $nested_empty (export "d") (result i32) (block (block (block))) (i32.const 4))
+  (func (export "main")
+    (drop (call $empty_block)) (drop (call $brif_then_end (i32.const 0)))
+    (drop (call $empty_then (i32.const 0))) (drop (call $nested_empty)))
+)
