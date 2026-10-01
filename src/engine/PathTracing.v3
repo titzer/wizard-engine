@@ -14,7 +14,7 @@ component PathTracing {
 	}
 }
 
-// One profiled function and the executions of each of its paths.
+// Profiles one function for --trace-paths and holds how many times each of its paths ran.
 class PathTrace(module: Module, func: FuncDecl) {
 	def profile = PathProfile.new(func);
 	var counts: Array<int>; // null if the function is not profiled
@@ -48,12 +48,63 @@ class PathTrace(module: Module, func: FuncDecl) {
 	}
 }
 
-// Runs the action of whichever edge its site's decision is about to take.
-class PathProbe(site: PathSite, counts: Array<int>) extends Probe {
+// Applies the action of the arm its site's branch is about to take, and passes any path it
+// completes to {count}.
+class PathSiteProbe(site: PathSite) extends Probe {
 	def fire(loc: DynamicLoc) -> ProbeAction {
 		def accessor = loc.frame.getFrameAccessor();
-		def path = site.apply(accessor, site.selectArm(accessor));
-		if (path >= 0) counts[path]++;
+		def path = apply(accessor, selectArm(accessor));
+		if (path >= 0) count(accessor, path);
 		return ProbeAction.Continue;
+	}
+	// Records one execution of {path}.
+	def count(accessor: FrameAccessor, path: int);
+
+	// Returns the arm the instruction at the site is about to take, read from its operand.
+	private def selectArm(accessor: FrameAccessor) -> int {
+		def edges = site.edges, imm = site.imm;
+		if (site.kind == PathProbeKind.DIRECT) return 0; // one outgoing edge, so there is no operand
+		def v = accessor.getOperand(0);
+		match (site.kind) {
+			TABLE => {
+				def u = Values.unbox_u(v);
+				return if(u >= u32.!(edges.length), edges.length - 1, int.!(u));
+			}
+			NULL => return if(Values.isNull(v), 1, 0);
+			NONNULL => return if(Values.isNull(v), 0, 1);
+			CAST => return if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 1, 0);
+			CAST_FAIL => return if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 0, 1);
+			_ => return if(Values.unbox_u(v) != 0, 1, 0);
+		}
+	}
+	// Applies the action of {arm} to {r}; returns the path it completes, or -1 if none.
+	private def apply(accessor: FrameAccessor, arm: int) -> int {
+		match (site.edges[arm].action) {
+			Nothing => ;
+			RSet(value) => setR(accessor, value);
+			RAdd(value) => setR(accessor, getR(accessor) + value);
+			CountConst(value) => return value;
+			CountRPlus(value) => return getR(accessor) + value;
+			CountReset(add, set) => {
+				def path = getR(accessor) + add;
+				setR(accessor, set);
+				return path;
+			}
+		}
+		return -1;
+	}
+	private def getR(accessor: FrameAccessor) -> int {
+		return Values.unbox_i(accessor.getFrameVar(site.rvar));
+	}
+	private def setR(accessor: FrameAccessor, v: int) {
+		accessor.getWriter().setFrameVar(site.rvar, Values.box_i(v));
+	}
+}
+// The --trace-paths probe, which counts into {counts}; SPC compiles it inline.
+class PathProbe extends PathSiteProbe {
+	def counts: Array<int>;
+	new(site: PathSite, counts) super(site) { }
+	def count(accessor: FrameAccessor, path: int) {
+		counts[path]++;
 	}
 }

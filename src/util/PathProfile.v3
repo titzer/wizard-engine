@@ -1,20 +1,19 @@
 // Copyright 2026 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// The Ball-Larus path profile of one function, shared by the path-profile monitor and
-// --trace-paths: the number of each acyclic path, and what each edge does to the path register
-// {r} and the counts. Section and figure numbers refer to "Efficient Path Profiling" (Ball and
-// Larus, MICRO 1996).
+// Computes the Ball-Larus path numbering of one function and the action each edge takes on the
+// path register {r} and the counts, for both the path-profile monitor and --trace-paths.
+// Section and figure numbers refer to "Efficient Path Profiling" (Ball and Larus, MICRO 1996).
+def MAX_PATHS = 1 << 16; // more paths than this are not worth a counter each
 class PathProfile(func: FuncDecl) {
-	def MAX_PATHS = 1 << 16; // more paths than this are not worth a counter each
 	var reason: string;      // why the function is not profiled, or null if it is
 	var numPaths: int;       // the paths are numbered 0 .. numPaths - 1
-	var selfLoops: Array<ProfBlock>; // blocks that branch to themselves; block i counts at numPaths + i
+	var selfLoops: Array<PathProfilingBlock>; // blocks that branch to themselves; block i counts at numPaths + i
 	var sites: Array<PathSite>; // one per block with outgoing edges, where its probe goes
-	var entry: ProfBlock;
-	var exit: ProfBlock;
-	def blocks = Vector<ProfBlock>.new(); // a copy of the function's CFG, in DFS preorder
-	private def tree = Vector<ProfEdge>.new(); // the spanning tree's edges
+	var entry: PathProfilingBlock;
+	var exit: PathProfilingBlock;
+	def blocks = Vector<PathProfilingBlock>.new(); // a copy of the function's CFG, in DFS preorder
+	private def tree = Vector<PathProfilingEdge>.new(); // the spanning tree's edges
 
 	new() {
 		// the CFG builder faults on exception handlers, and a frame that is suspended does not
@@ -38,7 +37,7 @@ class PathProfile(func: FuncDecl) {
 		for (i < originals.length) originals[i].mark = 0;
 		// a function whose end no path reaches still needs EXIT as a vertex
 		if (exit == null) {
-			exit = ProfBlock.new(-1, last, last + 1, last);
+			exit = PathProfilingBlock.new(-1, last, last + 1, last);
 			blocks.put(exit);
 		}
 		addReturnEdges();
@@ -53,9 +52,9 @@ class PathProfile(func: FuncDecl) {
 	}
 	// Copies {b} and every block it reaches, recording each copy's index in the original's {mark}
 	// so that a block is copied once. Edges into empty blocks are followed to the block they reach.
-	private def copy(b: CfgBlock, last: int, originals: Vector<CfgBlock>) -> ProfBlock {
+	private def copy(b: CfgBlock, last: int, originals: Vector<CfgBlock>) -> PathProfilingBlock {
 		if (b.mark > 0) return blocks[b.mark - 1];
-		def n = ProfBlock.new(b.id, b.bind_pos, b.end, b.last_instr_pc);
+		def n = PathProfilingBlock.new(b.id, b.bind_pos, b.end, b.last_instr_pc);
 		blocks.put(n);
 		originals.put(b);
 		b.mark = blocks.length;
@@ -92,19 +91,18 @@ class PathProfile(func: FuncDecl) {
 		}
 	}
 	// prepends, so {outgoing} is in reverse branch-label order
-	private def link(pc: int, from: ProfBlock, to: ProfBlock) -> ProfEdge {
-		def e = ProfEdge.new(pc, from, to);
+	private def link(pc: int, from: PathProfilingBlock, to: PathProfilingBlock) -> PathProfilingEdge {
+		def e = PathProfilingEdge.new(pc, from, to);
 		from.outgoing = List.new(e, from.outgoing);
 		to.incoming = List.new(e, to.incoming);
 		return e;
 	}
-	// (Section 3.2) regenerates the route from its path number: at each vertex, the edge whose
-	// range of path sums holds what remains. Blocks print as their start pc; a dummy edge is a
-	// piece of a loop and prints as "..".
+	// Prints the route of path {k} as the start pc of each block, with ".." where a dummy edge
+	// enters or leaves a loop (Section 3.2).
 	def renderPath(k: int, out: TraceBuilder) {
 		var v = entry, dummy = false;
 		while (v != exit) {
-			var pick: ProfEdge;
+			var pick: PathProfilingEdge;
 			for (l = v.outgoing; l != null; l = l.tail) {
 				def e = l.head;
 				if (!e.isBackedge && e.val <= k && k < e.val + e.target.numPaths) pick = e;
@@ -119,8 +117,8 @@ class PathProfile(func: FuncDecl) {
 		if (!dummy) out.put1(" +%d", v.bind_pos);
 	}
 
-	// (Section 4) a dummy ENTRY->v for each backedge target and a dummy w->EXIT for each source,
-	// which stand in for the backedge and make the graph acyclic
+	// Adds a dummy ENTRY->v for each backedge target and a dummy w->EXIT for each backedge
+	// source, which stand in for the backedges and make the graph acyclic (Section 4).
 	private def addDummies() {
 		for (i < blocks.length) {
 			def b = blocks[i];
@@ -142,10 +140,10 @@ class PathProfile(func: FuncDecl) {
 			}
 		}
 	}
-	// (Figure 5) Val(e) for each edge, so that no two paths have the same sum; false if there are
-	// too many paths to count
+	// Assigns each edge its Val(e) so that every path has a different sum (Figure 5); returns
+	// false, with a {reason}, if the function can't be profiled.
 	private def assignVals() -> bool {
-		def order = Vector<ProfBlock>.new();
+		def order = Vector<PathProfilingBlock>.new();
 		postorder(entry, order);
 		for (i < order.length) order[i].mark = 0;
 		for (i < order.length) {
@@ -178,7 +176,7 @@ class PathProfile(func: FuncDecl) {
 	}
 	// Reverse topological order of the graph without its backedges. A walk that followed them
 	// could reach a loop header from inside the loop and finish it before the blocks ahead of it.
-	private def postorder(v: ProfBlock, order: Vector<ProfBlock>) {
+	private def postorder(v: PathProfilingBlock, order: Vector<PathProfilingBlock>) {
 		if (v.mark != 0) return;
 		v.mark = 1;
 		for (l = v.outgoing; l != null; l = l.tail) {
@@ -186,12 +184,12 @@ class PathProfile(func: FuncDecl) {
 		}
 		order.put(v);
 	}
-	// (Section 3.3) a spanning tree by Kruskal's algorithm, seeded with EXIT->ENTRY; returns the
-	// chords left over, which are the edges to instrument
-	private def kruskals() -> Vector<ProfEdge> {
-		def chords = Vector<ProfEdge>.new();
+	// Builds a spanning tree by Kruskal's algorithm, seeded with EXIT->ENTRY, and returns the
+	// chords, the edges left out of it (Section 3.3).
+	private def kruskals() -> Vector<PathProfilingEdge> {
+		def chords = Vector<PathProfilingEdge>.new();
 		if (exit != entry) exit.parent = entry;
-		tree.put(ProfEdge.new(-1, exit, entry));
+		tree.put(PathProfilingEdge.new(-1, exit, entry));
 		for (i < blocks.length) {
 			for (l = blocks[i].outgoing; l != null; l = l.tail) {
 				def e = l.head;
@@ -208,12 +206,14 @@ class PathProfile(func: FuncDecl) {
 		}
 		return chords;
 	}
-	// (Figure 4) Increment(e) for each chord, by a walk of the spanning tree
-	private def computeIncrements(chords: Vector<ProfEdge>) {
+	// Computes Increment(e) for each chord by walking the spanning tree (Figure 4).
+	private def computeIncrements(chords: Vector<PathProfilingEdge>) {
 		walk(0, entry, null, chords);
 		for (i < chords.length) chords[i].increment += chords[i].val;
 	}
-	private def walk(events: int, v: ProfBlock, e: ProfEdge, chords: Vector<ProfEdge>) {
+	// Walks the spanning tree from {v}, reached along {e} with {events}, adding Dir(e, f) * events
+	// to the increment of each chord f at {v}.
+	private def walk(events: int, v: PathProfilingBlock, e: PathProfilingEdge, chords: Vector<PathProfilingEdge>) {
 		for (i < tree.length) {
 			def f = tree[i];
 			if (f != e && v == f.target) walk(dir(e, f) * events + f.val, f.source, f, chords);
@@ -227,45 +227,45 @@ class PathProfile(func: FuncDecl) {
 			if (v == f.source || v == f.target) f.increment += dir(e, f) * events;
 		}
 	}
-	// 1 if {e} and {f}, which share an endpoint, point the same way along the walk, else -1
-	private def dir(e: ProfEdge, f: ProfEdge) -> int {
+	// Returns 1 if {e} and {f}, which share an endpoint, point the same way along the walk, else -1.
+	private def dir(e: PathProfilingEdge, f: PathProfilingEdge) -> int {
 		if (e == null) return 1;
 		return if(e.source == f.target || e.target == f.source, 1, -1);
 	}
-	// (Figure 8) the register initializations, the count increments, and the register increments,
-	// then (Section 4) each backedge, which counts a path and starts the next
-	private def placeActions(chords: Vector<ProfEdge>) {
-		def fromEntry = Vector<ProfBlock>.new(), fromExit = Vector<ProfBlock>.new();
+	// Sets each edge's action: the register initializations, count increments and register
+	// increments (Figure 8), then each backedge's count and restart or self-loop count (Section 4).
+	private def placeActions(chords: Vector<PathProfilingEdge>) {
+		def fromEntry = Vector<PathProfilingBlock>.new(), fromExit = Vector<PathProfilingBlock>.new();
 		fromEntry.put(entry);
-		Vectors.drain(fromEntry, 0, fun (v: ProfBlock) {
+		Vectors.drain(fromEntry, 0, fun (v: PathProfilingBlock) {
 			for (l = v.outgoing; l != null; l = l.tail) {
 				def e = l.head;
 				if (e.isBackedge || e.isDummy) continue;
-				if (e.isChord) e.action = ProfAction.RSet(e.increment);
+				if (e.isChord) e.action = PathProfilingAction.RSet(e.increment);
 				else if (e.target.incoming.tail == null) fromEntry.put(e.target);
-				else e.action = ProfAction.RSet(0);
+				else e.action = PathProfilingAction.RSet(0);
 			}
 		});
 		fromExit.put(exit);
-		Vectors.drain(fromExit, 0, fun (w: ProfBlock) {
+		Vectors.drain(fromExit, 0, fun (w: PathProfilingBlock) {
 			for (l = w.incoming; l != null; l = l.tail) {
 				def e = l.head;
 				if (e.isBackedge || e.isDummy) continue;
 				if (e.isChord) {
-					if (ProfAction.RSet.?(e.action)) e.action = ProfAction.CountConst(e.increment);
-					else e.action = ProfAction.CountRPlus(e.increment);
+					if (PathProfilingAction.RSet.?(e.action)) e.action = PathProfilingAction.CountConst(e.increment);
+					else e.action = PathProfilingAction.CountRPlus(e.increment);
 				} else if (e.source.outgoing.tail == null) {
 					fromExit.put(e.source);
 				} else {
-					e.action = ProfAction.CountRPlus(0);
+					e.action = PathProfilingAction.CountRPlus(0);
 				}
 			}
 		});
 		for (i < chords.length) {
 			def e = chords[i];
-			if (!e.isDummy && ProfAction.Nothing.?(e.action)) e.action = ProfAction.RAdd(e.increment);
+			if (!e.isDummy && PathProfilingAction.Nothing.?(e.action)) e.action = PathProfilingAction.RAdd(e.increment);
 		}
-		def loops = Vector<ProfBlock>.new();
+		def loops = Vector<PathProfilingBlock>.new();
 		for (i < blocks.length) {
 			for (l = blocks[i].outgoing; l != null; l = l.tail) {
 				def e = l.head;
@@ -274,18 +274,18 @@ class PathProfile(func: FuncDecl) {
 					// (Section 4.1) a self-loop repeats a vertex without changing the path, so it
 					// counts its trips in a slot of its own, past the path counts
 					if (loops.length == 0 || loops[loops.length - 1] != blocks[i]) loops.put(blocks[i]);
-					e.action = ProfAction.CountConst(numPaths + loops.length - 1);
+					e.action = PathProfilingAction.CountConst(numPaths + loops.length - 1);
 					continue;
 				}
 				def ex = e.source.exitDummy, en = e.target.entryDummy;
-				e.action = ProfAction.CountReset(if(ex != null, ex.increment), if(en != null, en.increment));
+				e.action = PathProfilingAction.CountReset(if(ex != null, ex.increment), if(en != null, en.increment));
 			}
 		}
 		selfLoops = loops.extract();
 	}
-	// An earlier real edge in {outgoing} to the same target as {l}'s, or null; a dummy stands for
-	// a different path, so it never has one.
-	private def sameTarget(outgoing: List<ProfEdge>, l: List<ProfEdge>) -> ProfEdge {
+	// Returns an earlier real edge in {outgoing} with the same target as {l}'s, or null; a dummy
+	// stands for a different path, so it never has one.
+	private def sameTarget(outgoing: List<PathProfilingEdge>, l: List<PathProfilingEdge>) -> PathProfilingEdge {
 		if (l.head.isDummy) return null;
 		for (k = outgoing; k != l; k = k.tail) {
 			def e = k.head;
@@ -293,8 +293,7 @@ class PathProfile(func: FuncDecl) {
 		}
 		return null;
 	}
-	// A site for each block with a real outgoing edge, at the block's last instruction, with {r}
-	// in a new frame variable so that every activation has its own.
+	// Adds a frame variable for {r} and builds a {PathSite} for each block with a real outgoing edge.
 	private def placeSites() {
 		def rvar = if(func.frame_var_tags != null, func.frame_var_tags.length);
 		def tag = [BpTypeCode.I32.code];
@@ -327,7 +326,7 @@ class PathProfile(func: FuncDecl) {
 				}
 			}
 			// each position in {outgoing} is an arm, and {outgoing} is in reverse label order
-			def edges = Array<ProfEdge>.new(n);
+			def edges = Array<PathProfilingEdge>.new(n);
 			def table = kind == PathProbeKind.TABLE;
 			var pos = 0;
 			for (l = real; l != null; l = l.tail) {
@@ -340,59 +339,21 @@ class PathProfile(func: FuncDecl) {
 	}
 }
 
-// How the probe's decision selects its arm, so the compiler can emit the selection inline.
+// How a site's branch selects its arm, which the probe and the SPC intrinsic both follow.
 enum PathProbeKind { DIRECT, IF, TABLE, NULL, NONNULL, CAST, CAST_FAIL }
 
-// A block's decision at {pc}, its last instruction: {edges} is indexed by the arm it takes, and
-// {r}, the path sum so far, lives in the frame variable {rvar}.
-class PathSite(pc: int, rvar: int, kind: PathProbeKind, imm: BrOnCastImm, edges: Array<ProfEdge>) {
-	// whether any arm changes {r} or the counts
+// Where one block's probe goes: its last instruction {pc}, how that instruction selects an arm,
+// and the edge each arm takes; {r} lives in the frame variable {rvar}.
+class PathSite(pc: int, rvar: int, kind: PathProbeKind, imm: BrOnCastImm, edges: Array<PathProfilingEdge>) {
+	// Returns true if any arm changes {r} or the counts.
 	def acts() -> bool {
-		for (e in edges) if (!ProfAction.Nothing.?(e.action)) return true;
+		for (e in edges) if (!PathProfilingAction.Nothing.?(e.action)) return true;
 		return false;
-	}
-	// The arm the decision is about to take, read from its operand before it executes.
-	def selectArm(accessor: FrameAccessor) -> int {
-		if (kind == PathProbeKind.DIRECT) return 0; // one outgoing edge, so there is no operand
-		def v = accessor.getOperand(0);
-		match (kind) {
-			TABLE => {
-				def u = Values.unbox_u(v);
-				return if(u >= u32.!(edges.length), edges.length - 1, int.!(u));
-			}
-			NULL => return if(Values.isNull(v), 1, 0);
-			NONNULL => return if(Values.isNull(v), 0, 1);
-			CAST => return if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 1, 0);
-			CAST_FAIL => return if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 0, 1);
-			_ => return if(Values.unbox_u(v) != 0, 1, 0);
-		}
-	}
-	// Applies the action of {arm} to {r}; returns the path it completes, or -1 if none.
-	def apply(accessor: FrameAccessor, arm: int) -> int {
-		match (edges[arm].action) {
-			Nothing => ;
-			RSet(value) => setR(accessor, value);
-			RAdd(value) => setR(accessor, getR(accessor) + value);
-			CountConst(value) => return value;
-			CountRPlus(value) => return getR(accessor) + value;
-			CountReset(add, set) => {
-				def path = getR(accessor) + add;
-				setR(accessor, set);
-				return path;
-			}
-		}
-		return -1;
-	}
-	private def getR(accessor: FrameAccessor) -> int {
-		return Values.unbox_i(accessor.getFrameVar(rvar));
-	}
-	private def setR(accessor: FrameAccessor, v: int) {
-		accessor.getWriter().setFrameVar(rvar, Values.box_i(v));
 	}
 }
 
 // What an edge does to the path register {r} and the path counts when it is taken.
-type ProfAction {
+type PathProfilingAction {
 	case Nothing;
 	case RSet(value: int);               // r = value
 	case RAdd(value: int);               // r += value
@@ -402,24 +363,24 @@ type ProfAction {
 }
 
 // A copy of one block of the function's CFG: the original's id and bytecode range [bind_pos ... end).
-class ProfBlock(id: int, bind_pos: int, end: int, last_instr_pc: int) {
-	var outgoing: List<ProfEdge>;
-	var incoming: List<ProfEdge>;
+class PathProfilingBlock(id: int, bind_pos: int, end: int, last_instr_pc: int) {
+	var outgoing: List<PathProfilingEdge>;
+	var incoming: List<PathProfilingEdge>;
 	var mark: int;
-	var numPaths: int;        // NumPaths(v): paths from here to EXIT
-	var entryDummy: ProfEdge; // ENTRY->this, if this is a backedge target
-	var exitDummy: ProfEdge;  // this->EXIT, if this is a backedge source
-	var parent: ProfBlock;    // the spanning tree's disjoint-set forest; null at a root
+	var numPaths: int;                 // NumPaths(v): paths from here to EXIT
+	var entryDummy: PathProfilingEdge; // ENTRY->this, if this is a backedge target
+	var exitDummy: PathProfilingEdge;  // this->EXIT, if this is a backedge source
+	var parent: PathProfilingBlock;    // the spanning tree's disjoint-set forest; null at a root
 
-	def findSet() -> ProfBlock {
+	def findSet() -> PathProfilingBlock {
 		return if(parent == null, this, parent.findSet());
 	}
 }
-class ProfEdge(pc: int, source: ProfBlock, target: ProfBlock) {
+class PathProfilingEdge(pc: int, source: PathProfilingBlock, target: PathProfilingBlock) {
 	var isBackedge: bool; // branches to an enclosing loop label
 	var val: int;       // Val(e)
 	var increment: int; // Increment(e), for a chord
 	var isChord: bool;  // not in the spanning tree
 	var isDummy: bool;  // stands in for a backedge; has no instruction
-	var action: ProfAction;
+	var action: PathProfilingAction;
 }
