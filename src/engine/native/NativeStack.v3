@@ -6,28 +6,19 @@
 // See diagram at the end of the file for mapping layout.
 class NativeStack extends WasmStack {
 	def valuerep = Target.tagging;
-	def size: u32;
 	var mapping: Mapping;
 	var vsp: Pointer;
 	var rsp: Pointer;
 	var func: Function; // TODO: move into "enter-func-stub"
 	var parent_rsp_ptr: Pointer;
-	var params_arity = -1;
 	var return_results: Array<ValueType>;
-	var state_: StackState;
+	var state_: StackState = StackState.EMPTY;
 	var next_stack: NativeStack;
 
-	new(size) {
-		mapping = Target.mmap_reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
-		if (mapping == null) fatal("out of memory allocating value stack");
-		// insert redzone roughly in the middle of the mapping.
-		def PAGE_SIZE = 4096u;
-		var redzone_start = (size >> 1) & ~(PAGE_SIZE - 1u);
-		if (!Target.redzones_add(mapping, redzone_start, PAGE_SIZE)) {
-			fatal("could not protect value stack red zone");
-		}
-		clear();
+	new(mapping) {
 		if (valuerep.tagged) RiGc.registerScanner(this, NativeStack.scan);
+		if (mapping == null) return; // allocated without a mapping, no need to initialize further
+		clear();
 		if (Trace.stack && Debug.stack) Trace.OUT.put2("newStack start=0x%x, end=0x%x", mapping.range.start - Pointer.NULL, mapping.range.end - Pointer.NULL).ln();
 	}
 	// Gets the state of this stack.
@@ -38,9 +29,8 @@ class NativeStack extends WasmStack {
 	def reset0(func: Function, remaining_params: int) -> this {
 		checkState("reset()", StackState.EMPTY);
 		this.func = func;
-		params_arity = remaining_params;
 		return_results = func.sig.results;
-		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
+		state_ = StackState.SUSPENDED;
 		parent_rsp_ptr = pushRspPointer(Pointer.NULL); // placeholder for parent pointer
 		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
 	}
@@ -54,21 +44,17 @@ class NativeStack extends WasmStack {
 		reset0(func, 0);
 	}
 	// Requires {state == SUSPENDED}.
-	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
-	// when enough arguments are pushed.
+	// Pushes {args} incrementally onto the value stack.
 	def bind(args: Range<Value>) -> this {
 		if (args.length == 0) return;
 		checkState("bind()", StackState.SUSPENDED);
-		if (params_arity < args.length) fatal(Strings.format2("bind() expected %d arguments, got %d", params_arity, args.length));
 		for (v in args) push(v);
-		params_arity -= args.length;
-		if (params_arity == 0) state_ = StackState.RESUMABLE;
 	}
-	// Requires {state == RESUMABLE}.
+	// Requires {state == SUSPENDED}.
 	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
 	// or suspends itself.
 	def resume() -> Result {
-		checkState("resume()", StackState.RESUMABLE);
+		checkState("resume()", StackState.SUSPENDED);
 		if (Trace.stack) traceFrames("stack.resume", rsp + RETADDR_SIZE);
 		var bottom = NativeStack.!(this.bottom);
 		state_ = StackState.RUNNING;
@@ -326,7 +312,6 @@ class NativeStack extends WasmStack {
 		state_ = StackState.EMPTY;
 		vsp = mapping.range.start;
 		rsp = mapping.range.end;
-		params_arity = -1;
 		return_results = null;
 		parent =  null;
 		bottom = this;
@@ -609,10 +594,9 @@ class NativeStack extends WasmStack {
 		var bits = vp.load<u64>();
 		return (bits & 1) == 1;
 	}
-	def fatal(msg: string) {
-		System.error("NativeStackError", msg);
-	}
 }
+
+def fatal = System.error("NativeStackError", _);
 
 type StackFramePos(stack: NativeStack, frame: TargetFrame) #unboxed;
 
