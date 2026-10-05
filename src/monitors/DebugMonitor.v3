@@ -13,6 +13,15 @@
 //   disable {}:	disable breakpoint by index
 //   backtrace / bt:	print a backtrace
 //   set {} {} {}	replace local index with a different value, e.g. set 0 i32 123
+//   x/NFU {}:		examine memory, GDB-style, e.g. x/16xb 0x100
+//			N = repeat count, F = format letter, U = unit size letter
+//			formats: o(octal) x(hex) d(decimal) u(unsigned) t(binary)
+//				 f(float) a(address) c(char) s(string) z(zero-padded hex)
+//			sizes:	 b(1 byte) h(2 bytes) w(4 bytes) g(8 bytes)
+//			address: [{memory index}:]{decimal or 0x-prefixed hex}
+//			omitting the address continues after the last one examined
+//			a negative N examines the N units preceding the address
+//   info memory:		show the memories of the module and their sizes
 class DebugMonitor extends Monitor {
 	def configure(args: string) -> string {
 		return null;
@@ -31,7 +40,7 @@ enum DbgCommand2(fullName: string, shortName: string, help: string) {
 	RUN		("run",		"r",	"Run the program, if not already running."),
 	STEP		("step",	"s",	"Single-step the program if running."),
 	NEXT		("next",	"n",	"Run the program until it reaches the next instruction."),
-	INFO		("info",	"i",	"Show information on breakpoints, locals, or globals."),
+	INFO		("info",	"i",	"Show information on breakpoints, locals, globals, or memory."),
 	HELP		("help",	"",	"Print this help."),
 	BREAK		("break",	"b",	"Set at breakpoint the given program location."),
 	DISABLE		("disable",	"d",	"Disable the given breakpoint."),
@@ -39,7 +48,8 @@ enum DbgCommand2(fullName: string, shortName: string, help: string) {
 	BACKTRACE	("backtrace",	"bt",	"Show a backtrace of the call stack."),
 	CONTINUE	("continue",	"c",	"Continue execution after a breakpoint."),
 	LIST		("list",	"l",	"Show local variables."),
-	SET		("set",		"s",	"Set the value of a local variable.")
+	SET		("set",		"s",	"Set the value of a local variable."),
+	EXAMINE		("examine",	"x",	"Examine memory, GDB-style: x/NFU [MEM:]ADDR."),
 	EXIT		("exit",	"",	"Exit the debugger.")
 }
 
@@ -58,6 +68,8 @@ type DbgCommand {
 	case Continue;
 	case List;
 	case Set(local_idx: int, value: Value);
+	case Examine(spec: ExamineSpec);
+	case Error(msg: string);
 	case Exit;
 }
 
@@ -65,8 +77,30 @@ type Info {
 	case Breakpoints;
 	case Locals;
 	case Globals;
+	case Memories;
 	case Invalid(args: string);
 }
+
+// The output formats understood by the GDB-style {x} (examine) command. {NONE}
+// stands for an unspecified format, in which case the previous one is reused.
+enum MemFormat(ch: byte, desc: string) {
+	NONE	(0,	"unspecified"),
+	OCT	('o',	"octal"),
+	HEX	('x',	"hexadecimal"),
+	DEC	('d',	"signed decimal"),
+	UDEC	('u',	"unsigned decimal"),
+	BIN	('t',	"binary"),
+	FLOAT	('f',	"float"),
+	ADDR	('a',	"address"),
+	CHAR	('c',	"character"),
+	STR	('s',	"string"),
+	ZHEX	('z',	"zero-padded hexadecimal"),
+	INSTR	('i',	"instruction")
+}
+
+// A parsed {x/NFU ADDR} command. A {count} or {size} of 0 and a {format} of
+// {MemFormat.NONE} mean that the value was not given and the last one is reused.
+type ExamineSpec(count: int, format: MemFormat, size: int, mem_index: int, addr: u64, hasAddr: bool) { }
 
 type Breakpoint {
 	case FunctionEnter(func_index: int) {
@@ -143,8 +177,118 @@ class DebuggerParser {
 			return parseSet(args);
 		} else if (Strings.equal(name, "exit")) {
 			return DbgCommand.Exit;
+		} else if (isExamineName(name)) {
+			return parseExamine(name, args);
 		}
 		return DbgCommand.Unknown(command);
+	}
+	// Matches "x", "examine", and either of them with a "/NFU" suffix attached.
+	def isExamineName(name: string) -> bool {
+		var end = name.length;
+		for (i < name.length) {
+			if (name[i] == '/') { end = i; break; }
+		}
+		var base = Arrays.range(name, 0, end);
+		return Strings.equal(base, "x") || Strings.equal(base, "examine");
+	}
+	// Parses a GDB-style memory examine command: x/NFU [MEM:]ADDR.
+	def parseExamine(name: string, args: string) -> DbgCommand {
+		var mods: string;
+		for (i < name.length) {
+			if (name[i] == '/') {
+				mods = Arrays.range(name, i + 1, name.length);
+				break;
+			}
+		}
+		var rest = args;
+		if (mods == null && rest != null && rest.length > 0 && rest[0] == '/') {
+			// The format specifier was separated from the command by a space.
+			var j = 1;
+			while (j < rest.length && rest[j] != ' ') j++;
+			mods = Arrays.range(rest, 1, j);
+			rest = Arrays.range(rest, j, rest.length);
+		}
+		var count = 0, size = 0;
+		var format = MemFormat.NONE;
+		if (mods != null) {
+			var i = 0, negate = false;
+			if (i < mods.length && mods[i] == '-') { negate = true; i++; } // examine backwards
+			while (i < mods.length && mods[i] >= '0' && mods[i] <= '9') {
+				count = count * 10 + int.!(mods[i] - '0');
+				i++;
+			}
+			if (negate) count = 0 - count;
+			while (i < mods.length) {
+				var ch = mods[i];
+				var sz = parseSizeLetter(ch);
+				if (sz > 0) {
+					size = sz;
+				} else {
+					var f = parseFormatLetter(ch);
+					if (f == MemFormat.NONE) {
+						return DbgCommand.Error(Strings.format1("undefined output format \"%c\"", ch));
+					}
+					format = f;
+				}
+				i++;
+			}
+		}
+		var mem_index = 0, hasAddr = false;
+		var addr = 0uL;
+		var addrStr = if(rest == null, "", Strings.strip(rest));
+		if (addrStr.length > 0) {
+			hasAddr = true;
+			var pos = 0;
+			for (k < addrStr.length) {
+				if (addrStr[k] == ':') {
+					var r = parseNum(addrStr, 0);
+					if (r.0 != k) return DbgCommand.Error(Strings.format1("invalid memory index in \"%s\"", addrStr));
+					mem_index = int.view(u32.view(r.1));
+					pos = k + 1;
+					break;
+				}
+			}
+			var r = parseNum(addrStr, pos);
+			if (r.0 <= 0 || pos + r.0 != addrStr.length) {
+				return DbgCommand.Error(Strings.format1("invalid address: %s", addrStr));
+			}
+			addr = r.1;
+		}
+		return DbgCommand.Examine(ExamineSpec(count, format, size, mem_index, addr, hasAddr));
+	}
+	// Returns the width in bytes of a GDB unit-size letter, or 0 if not one.
+	def parseSizeLetter(ch: byte) -> int {
+		match (ch) {
+			'b' => return 1;
+			'h' => return 2;
+			'w' => return 4;
+			'g' => return 8;
+			_ => return 0;
+		}
+	}
+	// Returns the format for a GDB format letter, or {MemFormat.NONE} if not one.
+	def parseFormatLetter(ch: byte) -> MemFormat {
+		for (f in MemFormat) {
+			if (f != MemFormat.NONE && f.ch == ch) return f;
+		}
+		return MemFormat.NONE;
+	}
+	// Parses a decimal or "0x"-prefixed hexadecimal number, returning the
+	// number of characters consumed (<= 0 on failure) and the value.
+	def parseNum(s: string, pos: int) -> (int, u64) {
+		if (pos >= s.length) return (-1, 0);
+		if (pos + 2 < s.length && s[pos] == '0' && (s[pos + 1] == 'x' || s[pos + 1] == 'X')) {
+			var r = Longs.parseHex(s, pos + 2);
+			if (r.0 <= 0) return (-1, 0);
+			return (r.0 + 2, r.1);
+		}
+		var accum = 0uL, i = pos;
+		while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+			accum = accum * 10 + u64.!(s[i] - '0');
+			i++;
+		}
+		if (i == pos) return (-1, 0);
+		return (i - pos, accum);
 	}
 	def parseBreakpoint(args: string) -> Breakpoint {
 		if (args == null) return Breakpoint.Invalid("");
@@ -167,6 +311,8 @@ class DebuggerParser {
 			return Info.Locals;
 		} else if (Strings.equal(args, "globals")) {
 			return Info.Globals;
+		} else if (Strings.equal(args, "memory") || Strings.equal(args, "memories") || Strings.equal(args, "mem")) {
+			return Info.Memories;
 		}
 		return Info.Invalid(args);
 	}
@@ -241,6 +387,12 @@ component Debugger {
 	var instance: Instance;
 	var mm: ModuleInstrumenter;
 	var loc: DynamicLoc;
+
+	// Sticky defaults for the GDB-style {x} (examine) command.
+	var lastFormat = MemFormat.HEX;
+	var lastSize = 4;
+	var lastMemIndex = 0;
+	var nextAddr = 0uL;
 
 	def init(i: Instance) {
 		instance = i;
@@ -347,6 +499,9 @@ component Debugger {
 								OUT.put1("global[%d] = ", i).putv(val).ln();
 							}
 						}
+						Memories => {
+							printMemories();
+						}
 						Invalid(args) => {
 							OUT.put1("invalid info args: %s", args).ln();
 						}
@@ -379,6 +534,14 @@ component Debugger {
 						OUT.ln();
 						depth++;
 					}
+				}
+				Examine(spec) => {
+					examine(spec);
+					// Repeating with an empty command continues after the last address.
+					repeatCmd = DbgCommand.Examine(ExamineSpec(spec.count, MemFormat.NONE, 0, 0, 0, false));
+				}
+				Error(msg) => {
+					OUT.puts(msg).ln();
 				}
 				Unknown(cmd) => {
 					OUT.put1("unknown command: '%s'", cmd).ln();
@@ -441,6 +604,237 @@ component Debugger {
 			it.next();
 		}
 	}
+	// Prints a summary of the memories of the module, like GDB's "info mem".
+	def printMemories() {
+		if (instance == null || instance.memories.length == 0) {
+			OUT.puts("no memories in this module").ln();
+			return;
+		}
+		for (i < instance.memories.length) {
+			var mem = instance.memories[i];
+			OUT.put1("memory[%d]: ", i);
+			if (mem == null) {
+				OUT.puts("<not instantiated>").ln();
+				continue;
+			}
+			OUT.put2("%d pages, %d bytes", mem.num_pages, mem.num_bytes);
+			if (mem.decl != null) {
+				match (mem.decl.size.maximum) {
+					None => ;
+					Set(max) => OUT.put1(", max %d pages", max);
+				}
+				if (mem.decl.size.is64) OUT.puts(", 64-bit");
+				if (mem.decl.shared) OUT.puts(", shared");
+			}
+			OUT.puts(", range=[0x");
+			putAddr(mem, 0);
+			OUT.puts(" ... 0x");
+			putAddr(mem, mem.num_bytes);
+			OUT.puts(")").ln();
+		}
+	}
+	// Examines the contents of a memory, GDB-style.
+	def examine(spec: ExamineSpec) {
+		if (instance == null || instance.memories.length == 0) {
+			OUT.puts("no memories in this module").ln();
+			return;
+		}
+		var mem_index = if(spec.hasAddr, spec.mem_index, lastMemIndex);
+		if (mem_index < 0 || mem_index >= instance.memories.length) {
+			OUT.put1("no such memory: %d", mem_index).ln();
+			return;
+		}
+		var mem = instance.memories[mem_index];
+		if (mem == null) {
+			OUT.put1("memory %d is not instantiated", mem_index).ln();
+			return;
+		}
+		var format = spec.format;
+		if (format == MemFormat.NONE) format = lastFormat;
+		if (format == MemFormat.INSTR) {
+			OUT.puts("format 'i' is not supported; Wasm code is not in linear memory (use \"list\")").ln();
+			return;
+		}
+		// Compute the unit size; some formats dictate their own.
+		var size = spec.size;
+		match (format) {
+			CHAR, STR => size = 1;
+			ADDR => size = 8;
+			FLOAT => {
+				if (size == 0) size = if(lastSize == 4, 4, 8);
+				if (size != 4 && size != 8) {
+					OUT.puts("size letter must be 'w' or 'g' for the float format").ln();
+					return;
+				}
+			}
+			_ => if (size == 0) size = lastSize;
+		}
+		var count = if(spec.count != 0, spec.count, 1);
+		var addr = if(spec.hasAddr, spec.addr, nextAddr);
+		if (count < 0) { // a negative count examines the units *preceding* {addr}
+			count = 0 - count;
+			var back = u64.!(count) * u64.!(size);
+			addr = if(back > addr, 0, addr - back);
+		}
+		lastFormat = format;
+		lastMemIndex = mem_index;
+		if (spec.size > 0) lastSize = spec.size;
+
+		var multi = instance.memories.length > 1;
+		var per = perLine(format, size);
+		var col = 0;
+		for (i < count) {
+			if (format == MemFormat.STR) {
+				if (!putString(mem, mem_index, multi, addr)) return;
+				addr = nextAddr;
+				continue;
+			}
+			var r = mem.range_ol_64(addr, u64.!(size));
+			if (!r.ok()) {
+				if (col != 0) OUT.ln();
+				cannotAccess(addr);
+				nextAddr = addr;
+				return;
+			}
+			if (col == 0) {
+				if (multi) OUT.put1("%d:", mem_index);
+				OUT.puts("0x");
+				putAddr(mem, addr);
+				OUT.puts(":");
+			}
+			var v = 0uL;
+			for (k < size) v = v | (u64.!(r.result[k]) << u6.view(k * 8));
+			OUT.tab();
+			putValue(OUT, format, size, v);
+			addr += u64.!(size);
+			if (++col == per) {
+				OUT.ln();
+				col = 0;
+			}
+		}
+		if (col != 0) OUT.ln();
+		nextAddr = addr;
+	}
+	// Prints one NUL-terminated string at {addr}, returning {false} if out of bounds.
+	private def putString(mem: Memory, mem_index: int, multi: bool, addr: u64) -> bool {
+		var len = 0uL;
+		while (true) {
+			var b = mem.range_ol_64(addr + len, 1);
+			if (!b.ok()) {
+				cannotAccess(addr + len);
+				nextAddr = addr;
+				return false;
+			}
+			if (b.result[0] == 0) break;
+			len++;
+		}
+		if (multi) OUT.put1("%d:", mem_index);
+		OUT.puts("0x");
+		putAddr(mem, addr);
+		OUT.puts(":").tab().putc('\"');
+		var r = mem.range_ol_64(addr, len);
+		if (r.ok()) for (i < r.result.length) putEscaped(OUT, r.result[i], '\"');
+		OUT.putc('\"').ln();
+		nextAddr = addr + len + 1;
+		return true;
+	}
+	private def cannotAccess(addr: u64) {
+		OUT.puts("Cannot access memory at address 0x").putxv_64(addr).ln();
+	}
+	// Renders an address with a fixed width matching the memory's index type.
+	private def putAddr(mem: Memory, addr: u64) {
+		if (mem.is64) OUT.putx_64(addr);
+		else OUT.putx_32(u32.view(addr));
+	}
+	// The number of units GDB prints per output line.
+	private def perLine(format: MemFormat, size: int) -> int {
+		match (format) {
+			STR => return 1;
+			CHAR => return 8;
+			_ => ;
+		}
+		match (size) {
+			1 => return 8;
+			2 => return 8;
+			4 => return 4;
+			_ => return 2;
+		}
+	}
+	// Renders the {size}-byte value {v} in the given format.
+	private def putValue(out: StringBuilder, format: MemFormat, size: int, v: u64) {
+		match (format) {
+			DEC => out.putd_i64(signExtend(v, size));
+			UDEC => out.putd_u64(v);
+			OCT => putOctal(out, v);
+			BIN => putBinary(out, v, size);
+			CHAR => {
+				out.putd_i64(signExtend(v, 1));
+				out.puts(" '");
+				putEscaped(out, byte.view(v), '\'');
+				out.putc('\'');
+			}
+			FLOAT => {
+				if (size == 4) {
+					var f = float.view(u32.view(v));
+					DbgFloat.render(out, f, 9);
+				} else {
+					DbgFloat.render(out, double.view(v), 17);
+				}
+			}
+			ADDR => out.puts("0x").putxv_64(v);
+			_ => { // HEX, ZHEX, and anything else
+				out.puts("0x");
+				match (size) {
+					1 => out.putx_8(u32.view(v));
+					2 => out.putx_16(u32.view(v));
+					4 => out.putx_32(u32.view(v));
+					_ => out.putx_64(v);
+				}
+			}
+		}
+	}
+	// Sign-extends the low {size} bytes of {v}.
+	private def signExtend(v: u64, size: int) -> i64 {
+		if (size >= 8) return i64.view(v);
+		var sh = u6.view(64 - size * 8);
+		return i64.view(v << sh) >> sh;
+	}
+	private def putOctal(out: StringBuilder, v: u64) {
+		out.putc('0');
+		if (v == 0) return;
+		var tmp = Array<byte>.new(22);
+		var n = 0, x = v;
+		while (x != 0) {
+			tmp[n++] = DEC_DIGITS[int.view(u32.view(x & 7))];
+			x = x >> 3;
+		}
+		while (n > 0) out.putc(tmp[--n]);
+	}
+	private def putBinary(out: StringBuilder, v: u64, size: int) {
+		for (i = size * 8 - 1; i >= 0; i--) {
+			out.putc(if(((v >> u6.view(i)) & 1) == 1, '1', '0'));
+		}
+	}
+	// Appends {ch}, escaping it the way GDB does inside character and string literals.
+	private def putEscaped(out: StringBuilder, ch: byte, quote: byte) {
+		if (ch == quote) { out.putc('\\').putc(ch); return; }
+		match (ch) {
+			'\\' => out.puts("\\\\");
+			'\n' => out.puts("\\n");
+			'\t' => out.puts("\\t");
+			'\r' => out.puts("\\r");
+			_ => {
+				if (ch >= ' ' && ch < 127) {
+					out.putc(ch);
+				} else { // GDB renders unprintable characters in octal.
+					out.putc('\\');
+					out.putc(DEC_DIGITS[(ch >> 6) & 7]);
+					out.putc(DEC_DIGITS[(ch >> 3) & 7]);
+					out.putc(DEC_DIGITS[ch & 7]);
+				}
+			}
+		}
+	}
 	def printHelp(out: TraceBuilder) {
 		var H = out.putsln, L = out.ln;
 		H("Commands available: ");
@@ -453,5 +847,109 @@ component Debugger {
 			out.puts(c.help);
 			L();
 		}
+	}
+}
+
+def DEC_DIGITS = "0123456789";
+
+// Renders IEEE-754 values in decimal for the debugger's {x/f} command. Digits are
+// generated exactly (every finite binary float has a finite decimal expansion) and
+// then rounded to {prec} significant digits, which round-trips for 9 (f32) and 17 (f64).
+component DbgFloat {
+	// Enough room for the largest expansion: ~309 integer digits and ~1074 fraction digits.
+	private def BUFSIZE = 1500;
+	private def START = 340;
+	private def digits = Array<int>.new(BUFSIZE);
+	private def tmp = Array<int>.new(24);
+
+	def render(out: StringBuilder, val: double, prec: int) -> StringBuilder {
+		var bits = u64.view(val);
+		var negative = (bits >> 63) != 0;
+		var biased = int.view(u32.view((bits >> 52) & 0x7FF));
+		var mant = bits & 0xF_FFFF_FFFF_FFFF;
+		if (biased == 0x7FF) {
+			if (mant != 0) return out.puts("nan");
+			return out.puts(if(negative, "-inf", "inf"));
+		}
+		if (negative) out.putc('-');
+		var m = 0uL, e = 0;
+		if (biased == 0) {
+			if (mant == 0) return out.puts("0");
+			m = mant;			// subnormal: no implicit leading bit
+			e = -1074;
+		} else {
+			m = mant | 0x10_0000_0000_0000;	// normal: add the implicit leading bit
+			e = biased - 1075;
+		}
+		// The value is exactly {m * 2^e}. Start with the decimal digits of {m}.
+		var n = 0, x = m;
+		while (x != 0) {
+			tmp[n++] = int.view(u32.view(x % 10));
+			x = x / 10;
+		}
+		var lo = START, hi = START;
+		for (i = n - 1; i >= 0; i--) digits[hi++] = tmp[i];
+		var point = hi;	// digits[lo ... point) are the integer part
+		while (e > 0) {	// multiply the digit string by 2, exactly
+			var carry = 0;
+			for (i = hi - 1; i >= lo; i--) {
+				var d = digits[i] * 2 + carry;
+				digits[i] = d % 10;
+				carry = d / 10;
+			}
+			if (carry != 0) { lo--; digits[lo] = carry; }
+			e--;
+		}
+		while (e < 0) {	// divide the digit string by 2, exactly
+			var carry = 0;
+			for (i = lo; i < hi; i++) {
+				var d = carry * 10 + digits[i];
+				digits[i] = d / 2;
+				carry = d % 2;
+			}
+			if (carry != 0) digits[hi++] = 5;
+			e++;
+		}
+		var f = lo;
+		while (f < hi && digits[f] == 0) f++;
+		if (f == hi) return out.puts("0");
+		var exp10 = point - f - 1;	// value = digits[f] . digits[f+1] ... * 10^exp10
+		var nd = hi - f;
+		if (nd > prec) {		// round to {prec} significant digits
+			var roundUp = digits[f + prec] >= 5;
+			nd = prec;
+			if (roundUp) {
+				var i = f + nd - 1;
+				while (i >= f) {
+					if (digits[i] == 9) { digits[i] = 0; i--; }
+					else { digits[i]++; break; }
+				}
+				if (i < f) { f--; digits[f] = 1; exp10++; } // carried out of the top digit
+			}
+		}
+		while (nd > 1 && digits[f + nd - 1] == 0) nd--;
+		if (exp10 >= -5 && exp10 < 17) {	// fixed-point notation
+			if (exp10 < 0) {
+				out.puts("0.");
+				for (i = exp10 + 1; i < 0; i++) out.putc('0');
+				for (i < nd) out.putc(DEC_DIGITS[digits[f + i]]);
+			} else {
+				for (i < nd) {
+					if (i == exp10 + 1) out.putc('.');
+					out.putc(DEC_DIGITS[digits[f + i]]);
+				}
+				for (i = nd; i <= exp10; i++) out.putc('0');
+				if (nd <= exp10 + 1) out.puts(".0");
+			}
+		} else {				// scientific notation
+			out.putc(DEC_DIGITS[digits[f]]);
+			out.putc('.');
+			if (nd == 1) out.putc('0');
+			for (i = 1; i < nd; i++) out.putc(DEC_DIGITS[digits[f + i]]);
+			out.putc('e');
+			if (exp10 < 0) { out.putc('-'); out.putd_i32(0 - exp10); }
+			else { out.putc('+'); out.putd_i32(exp10); }
+		}
+		return out;
 	}
 }

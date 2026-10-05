@@ -1,0 +1,115 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A wasm struct instance that uses descriptor extensions to add storage to the end of a V3
+// object, giving the most efficient object layout. Field offsets are from the start of the object.
+class NativeWasmStruct extends WasmStruct descriptor NativeStructDeclInfo {
+	def decl() => this.descriptor.decl;
+	def getField(index: u31) -> Value {
+		var info = this.descriptor.field_info[index], fptr = Pointer.atObject(this) + info.offset;
+		match (info.kind) {
+			U8 => return Value.I32(fptr.load<u8>());
+			U16 => return Value.I32(fptr.load<u16>());
+			U32 => return Value.I32(fptr.load<u32>());
+			U64 => return Value.I64(fptr.load<u64>());
+			F32 => return Value.F32(fptr.load<u32>());
+			F64 => return Value.F64(fptr.load<u64>());
+			V128 => return Value.V128(fptr.load<u64>(), (fptr + 8).load<u64>());
+			I31REF => {
+				var bits = fptr.load<Pointer>() - Pointer.NULL;
+				if ((bits & 1) == 1) return Value.I31(u31.view(bits >> 1)); // tagged i31
+				return Value.Ref(fptr.load<Object>());
+			}
+			REF => return Value.Ref(fptr.load<Object>());
+			REF_U64 => return FieldStorage.box_ref_u64(fptr.load<Object>(), (fptr + RiGc.REF_SIZE).load<u64>());
+		}
+	}
+	def setField(index: u31, v: Value) {
+		var info = this.descriptor.field_info[index], fptr = Pointer.atObject(this) + info.offset;
+		match (info.kind) {
+			U8 => fptr.store<u8>(u8.view(Value.I32.!(v).val));
+			U16 => fptr.store<u16>(u16.view(Value.I32.!(v).val));
+			U32 => fptr.store<u32>(Value.I32.!(v).val);
+			U64 => fptr.store<u64>(Value.I64.!(v).val);
+			F32 => fptr.store<u32>(Value.F32.!(v).bits);
+			F64 => fptr.store<u64>(Value.F64.!(v).bits);
+			V128 => {
+				var t = Value.V128.!(v);
+				fptr.store<u64>(t.low);
+				(fptr + 8).store<u64>(t.high);
+			}
+			I31REF => {
+				match (v) {
+					I31(val) => fptr.store<Pointer>(Pointer.NULL + 1 + (i32.view(val) << 1)); // tagged i31
+					Ref(obj) => fptr.store<Object>(obj);
+					_ => ; // should not happen
+				}
+			}
+			REF => fptr.store<Object>(FieldStorage.unbox_ref(v));
+			REF_U64 => {
+				var t = FieldStorage.unbox_ref_u64(v);
+				fptr.store<Object>(t.0);
+				(fptr + RiGc.REF_SIZE).store<u64>(t.1);
+			}
+		}
+	}
+}
+
+// Allocation routines.
+component NativeWasmStructs {
+	def newStruct(decl: StructDecl) -> NativeWasmStruct {
+		return NativeWasmStruct.new(getStructInfo(decl));
+	}
+	def newStructFromValues(decl: StructDecl, vals: Range<Value>) -> NativeWasmStruct {
+		var obj = newStruct(decl);
+		for (i < vals.length) obj.setField(u31.!(i), vals[i]);
+		return obj;
+	}
+}
+
+// The descriptor for all instances of a Wasm struct declaration. The Virgil runtime stores the
+// (aligned) size and reference map of instances in the descriptor itself.
+private class NativeStructDeclInfo extends StructDeclInfo describes NativeWasmStruct {
+	def decl: StructDecl;
+	def field_info: Array<NativeFieldInfo>;
+	def byte_size: int;	// end of the last field, where subtypes append their fields
+	new(decl, field_info, byte_size) { }
+}
+
+// The descriptor's 32-bit reference map has one bit per word plus a terminator bit, which limits
+// objects to 31 words including the header. Larger structs are not supported yet.
+def MAX_WORDS = 31;
+def NO_FIELDS = Array<NativeFieldInfo>.new(0);
+
+def getStructInfo(decl: StructDecl) -> NativeStructDeclInfo {
+	var info = decl.getInfo<NativeStructDeclInfo>();
+	if (info != null) return info;
+	// Lay out the fields of {decl} after those of its supertype, or after the base object.
+	var sdecl = decl.getFirstSuperType();
+	var inherited = NO_FIELDS, base: NativeStructDeclInfo, base_size: int;
+	if (sdecl != null) {
+		base = getStructInfo(StructDecl.!(sdecl));
+		inherited = base.field_info;
+		base_size = base.byte_size;
+	} else {
+		base = NativeStructDeclInfo.new(null, null, 0); // a fresh descriptor describes the unextended base object
+		base_size = RiGc.getDescriptorSize(Pointer.atObject(base));
+	}
+	var b = StructLayoutBuilder.new(RiGc.REF_SIZE, base_size, RiGc.getDescriptorRefmap(Pointer.atObject(base)));
+	b.inherit(inherited).extend(decl.field_types[inherited.length ...]);
+	if (b.words() > MAX_WORDS) failLayout(decl, StringBuilder.new().put1("too large for native object model (limit is %d words)", MAX_WORDS).toString());
+	if (Debug.paranoid) {
+		var msg = b.check(decl.field_types);
+		if (msg != null) failLayout(decl, msg);
+	}
+	info = NativeStructDeclInfo.new(decl, b.fields.extract(), b.size);
+	CiRuntime.setDescriptorExtension(info, b.getRefmapI32(), b.alignedSize());
+	decl.addInfo(info);
+	return info;
+}
+def failLayout(decl: StructDecl, msg: string) {
+	var buf = StringBuilder.new();
+	if (decl != null) decl.render(buf).puts(": ");
+	buf.puts(msg);
+	System.error("NativeObjectModelError", buf.toString());
+}

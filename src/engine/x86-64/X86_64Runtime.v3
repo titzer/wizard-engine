@@ -4,13 +4,13 @@
 // Shared runtime routines that are called by both the fast interpreter and JITed code.
 component X86_64Runtime {
 	def globalFrameDescriptionBuf = StringBuilder.new().grow(256);  // avoid allocations when describing frames
-	var curStack: X86_64Stack;
+	var curStack: NativeStack;
 
 	// Callback for running host functions. Since host functions can trap, throw exceptions, and
 	// tail-call other functions, this routine must handle all these cases. Trapping/throwing
 	// is handled by returning a non-null {Throwable} and tail-calling a {WasmFunction} is handled
 	// by returning that function to the (Wasm) caller, with the stack already containing its arguments.
-	def runtime_callHost(stack: X86_64Stack, hf: HostFunction) -> (Throwable, WasmFunction) {
+	def runtime_callHost(stack: NativeStack, hf: HostFunction) -> (Throwable, WasmFunction) {
 		var args: Range<Value> = stack.popN(hf.sig.params);
 		while (hf != null) {
 			if (Trace.interpreter) Execute.traceCallHostFunction(hf);
@@ -49,13 +49,13 @@ component X86_64Runtime {
 		}
 		return (null, null);
 	}
-	def runtime_PROBE_loop(stack: X86_64Stack, func: WasmFunction, pc: int) -> Throwable {
+	def runtime_PROBE_loop(stack: NativeStack, func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(stack.rsp + Pointer.SIZE);
 		var ret = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, frame));
 		if (ret != null) return ThrowResult.Unhandled.!(stack.throw(ret)).thrown;
 		return ret;
 	}
-	def runtime_PROBE_instr(stack: X86_64Stack, func: WasmFunction, pc: int) -> Throwable {
+	def runtime_PROBE_instr(stack: NativeStack, func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(stack.rsp + Pointer.SIZE);
 		var ret = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, frame));
 		if (ret != null) return ThrowResult.Unhandled.!(stack.throw(ret)).thrown;
@@ -69,11 +69,11 @@ component X86_64Runtime {
 		var frame = TargetFrame(rsp);
 		return frame.getFrameAccessor().getMetaRef();
 	}
-	def runtime_TRAP(stack: X86_64Stack, func: WasmFunction, pc: int, reason: TrapReason) -> Throwable {
+	def runtime_TRAP(stack: NativeStack, func: WasmFunction, pc: int, reason: TrapReason) -> Throwable {
 		if (Debug.runtime) Trace.OUT.put3("runtime_TRAP(%q, @+%d, %s)", func.render, pc, reason.name).ln();
 		return stack.trap(reason);
 	}
-	def runtime_TIERUP(stack: X86_64Stack, func: WasmFunction, pc: int) {
+	def runtime_TIERUP(stack: NativeStack, func: WasmFunction, pc: int) {
 		if (Debug.runtime) Trace.OUT.put3("tierup(wf=0x%x, func=#%d, pc=%d)",
 					(Pointer.atObject(func) - Pointer.NULL), func.decl.func_index, pc).ln();
 		var osr = Execute.tiering.onTierUp(func, pc);
@@ -83,38 +83,41 @@ component X86_64Runtime {
 				if (Debug.runtime) Trace.OUT.put1("  tierup to 0x%x", entrypoint - Pointer.NULL).ln();
 				var retaddr_ptr = stack.rsp;
 				retaddr_ptr.store<Pointer>(entrypoint); // overwrite return address to return to JIT code
+				var h = NativeFrameHandle.Spc(retaddr_ptr + Pointer.SIZE);
+				var accessor = h.accessor();
+				if (accessor != null) accessor.handle = h;
 				return;
 			}
 		}
 	}
-	def runtime_THROW(stack: X86_64Stack, instance: Instance, tag_index: u31) -> Throwable {
+	def runtime_THROW(stack: NativeStack, instance: Instance, tag_index: u31) -> Throwable {
 		var tag = instance.tags[tag_index];
 		var args = stack.popN(tag.sig.params);
 		var ex = Exception.new(tag, args, null);
 		match (stack.throw(ex)) {
-			Handled(stack) => { curStack = X86_64Stack.!(stack); return null; }
+			Handled(stack) => { curStack = NativeStack.!(stack); return null; }
 			Unhandled(t) => return t;
 		}
 	}
-	def runtime_THROW_REF(stack: X86_64Stack, thrown: Throwable) -> Throwable {
+	def runtime_THROW_REF(stack: NativeStack, thrown: Throwable) -> Throwable {
 		if (thrown == null) return stack.trap(TrapReason.NULL_DEREF);
 		match (stack.throw(thrown)) {
-			Handled(stack) => { curStack = X86_64Stack.!(stack); return null; }
+			Handled(stack) => { curStack = NativeStack.!(stack); return null; }
 			Unhandled(t) => return t;
 		}
 	}
-	def runtime_CONT_NEW(stack: X86_64Stack, instance: Instance, cont_index: u31) -> Throwable {
+	def runtime_CONT_NEW(stack: NativeStack, instance: Instance, cont_index: u31) -> Throwable {
 		return Runtime.CONT_NEW(stack, instance, cont_index);
 	}
 	// If the given continuation handles the thrown error, a modified {Continuation} is pushed
 	// onto the value stack. Otherwise, trap on the current stack.
 	// XXX: eliminate returning {Throwable}?
-	def runtime_handle_resume_throw(stack: X86_64Stack, instance: Instance, contStack: X86_64Stack, tag_index: u31) -> Throwable {
+	def runtime_handle_resume_throw(stack: NativeStack, instance: Instance, contStack: NativeStack, tag_index: u31) -> Throwable {
 		var tag = instance.tags[tag_index];
 		var ex: Throwable = Exception.new(tag, stack.popN(tag.sig.params), null);
 		return runtime_resume_throw_ref(stack, instance, contStack, ex);
 	}
-	def runtime_resume_throw_ref(stack: X86_64Stack, instance: Instance, contStack: X86_64Stack, ex: Throwable) -> Throwable {
+	def runtime_resume_throw_ref(stack: NativeStack, instance: Instance, contStack: NativeStack, ex: Throwable) -> Throwable {
 		if (Trace.stack) Trace.OUT
 			.put2("resume_throw %q @ contStack[addr=0x%x] ", ex.render, Pointer.atObject(contStack) - Pointer.NULL)
 			.put1("on stack[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
@@ -123,7 +126,7 @@ component X86_64Runtime {
 		var result = contStack.throw(ex);
 		match (result) {
 			Handled(handler) => {
-				X86_64Stack.!(handler).state_ = StackState.RESUMABLE;
+				NativeStack.!(handler).state_ = StackState.RESUMABLE;
 				handler.cont_bottom = contStack.cont_bottom;
 				stack.push(Value.Cont(Continuations.makeContinuation(handler)));
 				return null;
@@ -135,7 +138,7 @@ component X86_64Runtime {
 	// the suspension (or throw an error on the top-most stack if no such handler
 	// is found). Then, the tag parameters and the continuation is pushed onto
 	// the handler stack.
-	def runtime_handle_suspend(stack: X86_64Stack, instance: Instance, tag_id: u31) -> Throwable {
+	def runtime_handle_suspend(stack: NativeStack, instance: Instance, tag_id: u31) -> Throwable {
 		var tag = instance.tags[tag_id];
 		var vals = stack.popN(tag.sig.params);
 		var cont = Runtime.unwindStackChain(stack, instance, tag_id, WasmStack.tryHandleSuspension);
@@ -148,7 +151,7 @@ component X86_64Runtime {
 		// set up new stack configuration
 		var old_stack = curStack;
 		var bottom = cont.stack.cont_bottom;
-		curStack = X86_64Stack.!(bottom.parent);
+		curStack = NativeStack.!(bottom.parent);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
 		curStack.push(Value.Cont(cont));
@@ -171,7 +174,7 @@ component X86_64Runtime {
 	// Suspends this stack and sets {curStack} to the stack to switch to (or
 	// throw an error on the top-most stack if no such handler is found). Then,
 	// the tag parameters and the continuation is pushed onto the target stack.
-	def runtime_handle_switch(stack: X86_64Stack, instance: Instance, target_cont_idx: int, tag_id: u31) -> Throwable {
+	def runtime_handle_switch(stack: NativeStack, instance: Instance, target_cont_idx: int, tag_id: u31) -> Throwable {
 		var tag = instance.tags[tag_id];
 
 		// unraveling all relevant signatures
@@ -190,7 +193,7 @@ component X86_64Runtime {
 
 		var this_cont = Runtime.unwindStackChain(stack, instance, tag_id, WasmStack.tryHandleSwitch);
 		if (Continuations.isNull(this_cont)) return stack.trap(TrapReason.INVALID_SUSPEND);
-		var prev = X86_64Stack.!(this_cont.stack.cont_bottom);
+		var prev = NativeStack.!(this_cont.stack.cont_bottom);
 		// set stack params arity
 		stack.params_arity = this_cont_decl.sig.params.length;
 		stack.state_ = StackState.SUSPENDED;
@@ -198,22 +201,22 @@ component X86_64Runtime {
 		stack.bind([]);
 
 		// overwrite {parent_rsp_ptr}
-		var bottom = X86_64Stack.!(target_stack.cont_bottom);
+		var bottom = NativeStack.!(target_stack.cont_bottom);
 		bottom.parent = prev.parent;
 		bottom.parent_rsp_ptr.store<Pointer>(prev.parent_rsp_ptr.load<Pointer>());
 		// set up new stack configuration
-		prev.parent = null;
-		prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
-		curStack = X86_64Stack.!(target_stack);
+		curStack = NativeStack.!(target_stack);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
 		curStack.push(Value.Cont(this_cont));
+		prev.parent = null;
+		prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
 		// RT calls will pop off the top value of {curStack.rsp} on return; push a
 		// value so that the return address is not popped off.
 		curStack.pushRspPointer(Pointer.NULL);
 		return null;
 	}
-	def runtime_doCast(stack: X86_64Stack, instance: Instance, nullable: byte, ht_val: int) -> bool { // XXX: inline into caller
+	def runtime_doCast(stack: NativeStack, instance: Instance, nullable: byte, ht_val: int) -> bool { // XXX: inline into caller
 		var isI31 = stack.topObjectIsI31();
 		if (isI31) {
 			return Runtime.castI31(instance, ht_val);

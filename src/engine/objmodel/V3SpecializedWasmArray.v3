@@ -1,0 +1,156 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// A wasm array instance whose elements are stored in a Virgil array specialized to the element
+// representation.
+class V3SpecializedWasmArrayOf<T> extends WasmArray {
+	private def info: V3SpecializedArrayDeclInfoOf<T>;
+	private def vals: Array<T>;
+
+	private new(info, vals) {}
+
+	def decl() => info.decl;
+	def getLength() -> u32 { return u32.!(vals.length); }
+	def getElem(index: u32) => info.box(vals[index]);
+	def setElem(index: u32, v: Value) => void(vals[index] = info.unbox(v));
+	def getRange(offset: u64, size: u64) => Traps.getRange(vals, offset, size, TrapReason.ARRAY_OOB);
+
+	def fill(offset: u64, size: u64, val: Value) -> TrapReason {
+		var t = getRange(offset, size), r = t.result;
+		if (t.reason != OK) return t.reason;
+		var v = info.unbox(val);
+		for (i < r.length) r[i] = v;
+		return OK;
+	}
+	def copy(dst_offset: u64, src: WasmArray, src_offset: u64, size: u64) -> TrapReason {
+		var t = getRange(dst_offset, size), dr = t.result;
+		if (t.reason != OK) return t.reason;
+		if (V3SpecializedWasmArrayOf<T>.?(src)) {
+			// Same element representation: copy the storage directly, minding potential overlap.
+			var s = V3SpecializedWasmArrayOf<T>.!(src);
+			var st = s.getRange(src_offset, size), sr = st.result;
+			if (st.reason != OK) return st.reason;
+			if (s == this && src_offset < dst_offset) {
+				for (i = dr.length - 1; i >= 0; i--) dr[i] = sr[i];
+			} else {
+				for (i < dr.length) dr[i] = sr[i];
+			}
+			return OK;
+		}
+		// Different element representation, e.g. {(ref $struct)} into {anyref}: convert each element.
+		var r = src.checkRange(src_offset, size);
+		if (r != OK) return r;
+		for (i < dr.length) dr[i] = info.unbox(src.getElem(u32.!(src_offset + u64.!(i))));
+		return OK;
+	}
+	def copyInto(offset: u64, src: Range<Value>) -> TrapReason {
+		var t = getRange(offset, u64.!(src.length)), dr = t.result;
+		if (t.reason != OK) return t.reason;
+		for (i < dr.length) dr[i] = info.unbox(src[i]);
+		return OK;
+	}
+	def copyOutOf(dst: Range<Value>, offset: u64) -> TrapReason {
+		var t = getRange(offset, u64.!(dst.length)), sr = t.result;
+		if (t.reason != OK) return t.reason;
+		for (i < dst.length) dst[i] = info.box(sr[i]);
+		return OK;
+	}
+}
+
+// Byte arrays support sending their bytes directly to certain functions.
+class V3WasmByteArray extends V3SpecializedWasmArrayOf<byte> {
+	private new(info: V3SpecializedArrayDeclInfoOf<byte>, vals: Array<byte>) super(info, vals) {}
+
+	def sendBytes<R>(offset: u64, size: u64, f: Range<byte> -> R) -> MaybeTrap<R> {
+		var t = this.getRange(offset, size);
+		if (t.reason != OK) return MaybeTrap(R.default, t.reason);
+		return MaybeTrap(f(t.result), OK);
+	}
+}
+
+// Allocation routines.
+component V3SpecializedWasmArrays {
+	def newArray(decl: ArrayDecl, length: u32) -> WasmArray {
+		return getArrayInfo(decl).alloc(length);
+	}
+	def newArrayFromValues(decl: ArrayDecl, vals: Range<Value>) -> WasmArray {
+		return getArrayInfo(decl).allocFromValues(vals);
+	}
+}
+
+def getArrayInfo(decl: ArrayDecl) -> V3SpecializedArrayDeclInfo {
+	var info = decl.getInfo<V3SpecializedArrayDeclInfo>();
+	if (info == null) info = computeArrayInfo(decl);
+	return info;
+}
+
+// Metadata for split arrays.
+private class V3SpecializedArrayDeclInfo(decl: ArrayDecl) extends ArrayDeclInfo {
+	def alloc(length: u32) -> WasmArray;
+	def allocFromValues(vals: Range<Value>) -> WasmArray;
+}
+private class V3SpecializedArrayDeclInfoOf<T> extends V3SpecializedArrayDeclInfo {
+	def box: T -> Value;
+	def unbox: Value -> T;
+
+	new(decl: ArrayDecl, box, unbox) super(decl) { }
+
+	def alloc(length: u32) -> WasmArray {
+		if (V3SpecializedArrayDeclInfoOf<byte>.?(this)) { // byte arrays are further specialized
+			return V3WasmByteArray.new(V3SpecializedArrayDeclInfoOf<byte>.!(this), Array<byte>.new(int.!(length)));
+		}
+		return V3SpecializedWasmArrayOf<T>.new(this, Array<T>.new(int.!(length)));
+	}
+	def allocFromValues(vals: Range<Value>) -> WasmArray {
+		if (V3SpecializedArrayDeclInfoOf<byte>.?(this)) { // byte arrays are further specialized
+			var elems = Array<byte>.new(vals.length);
+			for (i < elems.length) elems[i] = Values.unbox_u8(vals[i]);
+			return V3WasmByteArray.new(V3SpecializedArrayDeclInfoOf<byte>.!(this), elems);
+		}
+		var elems = Array<T>.new(vals.length);
+		for (i < elems.length) elems[i] = unbox(vals[i]);
+		return V3SpecializedWasmArrayOf<T>.new(this, elems);
+	}
+}
+// Computes the element representation of an array, selecting the Virgil type {T} used for storage
+// and the functions to box and unbox elements.
+def computeArrayInfo(decl: ArrayDecl) -> V3SpecializedArrayDeclInfo {
+	var info: V3SpecializedArrayDeclInfo;
+	var kind = elemStorageKind(decl);
+	if (Debug.paranoid) verifyArrayInfo(decl, kind);
+	match (kind) {
+		Bytes(access) => {
+			match (access) {
+				I8, U8 => info = primArrayInfo(decl, MemoryAccessors.U8);
+				I16, U16 => info = primArrayInfo(decl, MemoryAccessors.U16);
+				I32, U32 => info = primArrayInfo(decl, MemoryAccessors.U32);
+				U64 => info = primArrayInfo(decl, MemoryAccessors.U64);
+				F32 => info = V3SpecializedArrayDeclInfoOf<u32>.new(decl, Values.box_fu32, Values.unbox_fu32); // store raw bits
+				F64 => info = V3SpecializedArrayDeclInfoOf<u64>.new(decl, Values.box_du64, Values.unbox_du64); // store raw bits
+				V128 => info = primArrayInfo(decl, MemoryAccessors.V128);
+			}
+		}
+		Ref => info = V3SpecializedArrayDeclInfoOf<Object>.new(decl, Value.Ref, FieldStorage.unbox_ref);
+		RefI31 => info = V3SpecializedArrayDeclInfoOf<(u32, Object)>.new(decl, FieldStorage.box_i31ref, FieldStorage.unbox_i31ref);
+		RefU64 => info = V3SpecializedArrayDeclInfoOf<(Object, u64)>.new(decl, FieldStorage.box_ref_u64, FieldStorage.unbox_ref_u64);
+	}
+	decl.addInfo(info);
+	return info;
+}
+// Returns the storage kind for the elements of {decl}, which is that of its root supertype.
+def elemStorageKind(decl: ArrayDecl) -> FieldStorageKind {
+	var sup = decl.getFirstSuperType();
+	if (ArrayDecl.?(sup)) return elemStorageKind(ArrayDecl.!(sup));
+	return FieldStorage.getKind(decl.elem_types[0]);
+}
+def primArrayInfo<T>(decl: ArrayDecl, access: MemoryAccessorOf<T>) -> V3SpecializedArrayDeclInfo {
+	return V3SpecializedArrayDeclInfoOf<T>.new(decl, access.box, access.unbox);
+}
+def OK = TrapReason.NONE;
+
+// Checks that the declared element type of {decl} is representable by the inherited {kind}.
+def verifyArrayInfo(decl: ArrayDecl, kind: FieldStorageKind) {
+	var declared = FieldStorage.getKind(decl.elem_types[0]);
+	var ok = declared == kind || (declared == FieldStorageKind.Ref && kind == FieldStorageKind.RefI31);
+	if (!ok) System.error("SpecializedWasmArrayError", decl.render(StringBuilder.new()).puts(": element representation differs from supertype").toString());
+}

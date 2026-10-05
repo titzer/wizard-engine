@@ -45,7 +45,8 @@ make -j $TEST_TARGET
 
 # Install Opam for specification tests
 if [ "$(which opam)" = "" ]; then
-    sudo apt install -y opam
+    sudo apt-get update
+    sudo apt-get install -y opam
     opam init
 
     # Install spec test dependencies

@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave
+.PHONY: clean x86-linux x86-64-linux x86-64-darwin jvm wasm-wave
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -11,6 +11,8 @@ arm64-linux: bin/wizeng.arm64-linux bin/unittest.arm64-linux
 
 x86-64-linux: bin/wizeng.x86-64-linux bin/unittest.x86-64-linux
 
+x86-64-darwin: bin/wizeng.x86-64-darwin bin/unittest.x86-64-darwin
+
 jvm: bin/wizeng.jvm bin/unittest.jvm
 
 wasm-wave: bin/wizeng.wasm bin/unittest.wasm
@@ -19,10 +21,11 @@ v3i: bin/wizeng.v3i bin/unittest.v3i
 
 WIZENG_BUILD_SH_ARGS ?=
 
-ENGINE=src/engine/*.v3 src/engine/compression/*.v3 src/engine/v3/*.v3 src/util/*.v3
+OBJECT_MODELS=src/engine/objmodel/*/*.v3
+ENGINE=src/engine/*.v3 src/engine/compression/*.v3 src/engine/v3/*.v3 src/util/*.v3 $(OBJECT_MODELS)
 MONITORS=src/monitors/*.v3 src/monitors/test/*.v3
 JIT=src/engine/compiler/*.v3
-X86_64=src/engine/x86-64/*.v3
+X86_64=src/engine/native/*.v3 src/engine/x86-64/*.v3
 WAVE=src/modules/wave/*.v3
 WASI=src/modules/wasi/*.v3
 WASI_X86_64_LINUX=src/modules/wasi/x86-64-linux/*.v3
@@ -88,6 +91,16 @@ bin/wizeng.x86-64-linux: $(WIZENG) $(MONITORS) $(WASI_X86_64_LINUX) $(WALI_X86_6
 
 bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
 	./build.sh objdump x86-64-linux
+
+# x86-64-darwin targets
+bin/unittest.x86-64-darwin: $(UNITTEST) build.sh
+	./build.sh unittest x86-64-darwin
+
+bin/wizeng.x86-64-darwin: $(WIZENG) $(MONITORS) build.sh
+	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng x86-64-darwin
+
+bin/objdump.x86-64-darwin: $(OBJDUMP) build.sh
+	./build.sh objdump x86-64-darwin
 
 # interpreter targets
 bin/unittest.v3i: $(UNITTEST) build.sh
