@@ -5,14 +5,14 @@ def fatal = System.error("NativeStackError", _);
 
 // Manages native memory mappings for native stacks.
 component NativeStackManager {
-	private var all: NativeStackSegment;
-	private var total: int;
+	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
+	var total: int;			// number of segments in {all}
 	var cache: NativeStack;		// used in fast-path allocation in generated code
 
 	def getFreshStack() -> NativeStack {
 		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
 		if (cache == null) {
-			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCompressingStacks();
+			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCollectingAndReclaiming() || tryCompressingStacks();
 			if (!ok) fatal("out of stacks");
 		}
 		
@@ -24,13 +24,15 @@ component NativeStackManager {
 	private def tryAllocatingNewStacks() -> bool {
 		var size = EngineOptions.STACK_SIZE.get();
 		var batch = Ints.min(StackTuning.stackBatchSize, StackTuning.maxStacks - total);
-		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", StackTuning.stackBatchSize).ln();
+		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", batch).ln();
 		
 		for (i < batch) {
 			var t = Mmap.reserveRaw(size, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
 			if (t.0 == Pointer.NULL) break;
 			// insert redzone roughly in the middle of the mapping.
 			var segment = NativeStackSegment.new(t);
+			segment.next = all;
+			all = segment;
 			def PAGE_SIZE = 4096u;
 			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
 			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
@@ -54,6 +56,12 @@ component NativeStackManager {
 			}
 		}
 		return ok;
+	}
+	// Weak references are only cleared by a GC, so force one to find dead stacks.
+	private def tryCollectingAndReclaiming() -> bool {
+		if (all == null) return false;
+		Target.forceGC();
+		return tryReclaimingSegments();
 	}
 	private def tryCompressingStacks() -> bool {
 		return false;
@@ -79,9 +87,9 @@ component NativeStackManager {
 }
 
 // Native stack segments are individually mmap'd with a guard page in the middle
-private class NativeStackSegment extends MemoryRange {
+class NativeStackSegment extends MemoryRange {
 	var next: NativeStackSegment;
-	var stack: WeakRef<NativeStack>;	// owner, if any; cleared by GC
+	def stack = WeakRef<NativeStack>.new();	// owner, if any; cleared by GC
 
 	new(start: Pointer, end: Pointer) super(start, end) { }
 }

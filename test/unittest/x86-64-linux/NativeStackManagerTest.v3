@@ -1,0 +1,360 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Tests for {NativeStackManager}: allocation of native stack segments, recycling, the
+// {StackTuning.maxStacks} limit, and reclamation of segments whose stacks were collected by GC.
+
+def M: NativeStackManager;
+def PAGE_SIZE = 4096u;
+
+def T(name: string, f: NativeStackManagerTester -> void) {
+	UnitTests.registerT("x86stackmgr:", name, NativeStackManagerTester.new, runTest(f, _));
+}
+def X_ = void(
+	T("fresh_empty", test_fresh_empty),
+	T("distinct_segments", test_distinct_segments),
+	T("recycle_reuse", test_recycle_reuse),
+	T("recycle_clears", test_recycle_clears),
+	T("limit_batch", test_limit_batch),
+	T("weak_ref_survives_gc", test_weak_ref_survives_gc),
+	T("reclaim_explicit_gc", test_reclaim_explicit_gc),
+	T("reclaim_implicit_gc", test_reclaim_implicit_gc),
+	T("reclaim_skips_live", test_reclaim_skips_live),
+	T("reclaim_skips_cached", test_reclaim_skips_cached),
+	T("reclaim_suspended", test_reclaim_suspended),
+	T("reclaim_suspended_refs", test_reclaim_suspended_refs),
+	T("reclaim_then_run", test_reclaim_then_run),
+	T("reclaim_many", test_reclaim_many),
+	T("reclaim_churn_live_set", test_reclaim_churn_live_set),
+	T("run_on_fresh_stack_limit", test_run_on_fresh_stack_limit),
+	T("run_on_fresh_stack_gc", test_run_on_fresh_stack_gc),
+	()
+);
+
+private class NativeStackManagerTester extends ExeTester {
+	def saved_max = StackTuning.maxStacks;
+	var limit_total: int = -1;	// expected upper bound on {M.total}, if a limit was set
+	var held: Array<NativeStack>;	// stacks pinned by {limit} so that their segments are not reclaimed
+
+	new(t: Tester) super(t, X86_64InterpreterOnlyStrategy.new()) { }
+
+	// Limits the manager to at most {extra} more segments than currently mapped. First, all
+	// existing segments are pinned (either by their live owners or by {held}), so that only
+	// segments of stacks dropped by the test itself are candidates for reclamation.
+	def limit(extra: int) {
+		StackTuning.maxStacks = M.total;
+		M.cache = null;
+		Target.forceGC();
+		var free = 0;
+		for (seg = M.all; seg != null; seg = seg.next) if (seg.stack.get() == null) free++;
+		held = Array<NativeStack>.new(free);
+		for (i < free) held[i] = fresh();
+		if (M.cache != null) t.fail("expected cache to be empty after pinning");
+		for (seg = M.all; seg != null; seg = seg.next) {
+			if (seg.stack.get() == null) t.fail("expected all segments to be owned after pinning");
+		}
+		StackTuning.maxStacks = M.total + extra;
+		limit_total = StackTuning.maxStacks;
+	}
+	def restore() {
+		StackTuning.maxStacks = saved_max;
+	}
+	def fresh() -> NativeStack {
+		var s = M.getFreshStack();
+		if (s.state() != StackState.EMPTY) t.fail1("expected fresh stack to be EMPTY, got %s", s.state().name);
+		if (s.vsp != s.range.start) t.fail("expected fresh stack vsp == range.start");
+		if (s.rsp != s.range.end) t.fail("expected fresh stack rsp == range.end");
+		if (s.next_stack != null) t.fail("expected fresh stack to be unlinked from the cache");
+		return s;
+	}
+	def allocN(n: int) -> Array<NativeStack> {
+		var r = Array<NativeStack>.new(n);
+		for (i < n) r[i] = fresh();
+		return r;
+	}
+	// Allocates {n} stacks, returning only the start addresses of their segments, so that
+	// the stacks themselves are garbage after return.
+	def allocAndDrop(n: int) -> Array<Pointer> #no-inline {
+		var r = Array<Pointer>.new(n);
+		for (i < n) r[i] = fresh().range.start;
+		return r;
+	}
+	// Like {allocAndDrop}, but leaves each stack SUSPENDED with an entry for {f} and bound {args}.
+	def allocSuspendedAndDrop(n: int, f: Function, args: Array<Value>) -> Array<Pointer> #no-inline {
+		var r = Array<Pointer>.new(n);
+		for (i < n) {
+			var s = fresh();
+			s.reset(f);
+			if (args != null) s.bind(args);
+			if (s.state() != StackState.SUSPENDED) t.fail1("expected SUSPENDED, got %s", s.state().name);
+			r[i] = s.range.start;
+		}
+		return r;
+	}
+	// Checks global invariants of the manager.
+	def checkInvariants(where: string) {
+		var count = 0, size = EngineOptions.STACK_SIZE.get();
+		var starts = Vector<Pointer>.new();
+		for (seg = M.all; seg != null; seg = seg.next) {
+			count++;
+			if (seg.size() != u64.view(size)) t.fail1("%s: segment has wrong size", where);
+			var s = seg.stack.get();
+			if (s != null && s.range != seg) t.fail1("%s: owning stack does not point back at its segment", where);
+			var rz = seg.start + ((size >> 1) & ~(PAGE_SIZE - 1u));
+			if (!RedZones.isInRedZone(rz)) t.fail1("%s: segment is missing its red zone", where);
+			for (i < starts.length) {
+				if (starts[i] == seg.start) t.fail1("%s: duplicate segment", where);
+			}
+			starts.put(seg.start);
+		}
+		if (count != M.total) t.fail3("%s: expected %d segments, got %d", where, M.total, count);
+		if (limit_total >= 0 && M.total > limit_total) t.fail3("%s: expected at most %d segments, got %d", where, limit_total, M.total);
+		// Every stack in the cache owns its segment.
+		for (s = M.cache; s != null; s = s.next_stack) {
+			var seg = NativeStackSegment.!(s.range);
+			if (seg.stack.get() != s) t.fail1("%s: cached stack does not own its segment", where);
+		}
+	}
+	def assertDisjoint(stacks: Array<NativeStack>) {
+		for (i < stacks.length) {
+			for (j = i + 1; j < stacks.length; j++) {
+				if (stacks[i] == stacks[j]) return t.fail2("stacks %d and %d are the same", i, j);
+				if (stacks[i].range.start == stacks[j].range.start) return t.fail2("stacks %d and %d share a segment", i, j);
+			}
+		}
+	}
+	def contains(starts: Array<Pointer>, p: Pointer) -> bool {
+		for (s in starts) if (s == p) return true;
+		return false;
+	}
+	def assertNoneIn(stacks: Array<NativeStack>, starts: Array<Pointer>) {
+		for (s in stacks) if (contains(starts, s.range.start)) t.fail("expected segment not to be reused");
+	}
+	def assertAllIn(stacks: Array<NativeStack>, starts: Array<Pointer>) {
+		for (s in stacks) if (!contains(starts, s.range.start)) t.fail("expected segment to be reclaimed");
+	}
+	// A Wasm function [i32, i32] -> [i32] that subtracts its arguments.
+	def subFunc() -> WasmFunction {
+		sig(SigCache.ii_i).codev([
+			u8.!(Opcode.LOCAL_GET.code), 0,
+			u8.!(Opcode.LOCAL_GET.code), 1,
+			u8.!(Opcode.I32_SUB.code)
+		]);
+		return WasmFunction.!(makeInstance().functions[0]);
+	}
+	def assertResult(expected: Result, got: Result) {
+		if (!expected.equals(got)) t.fail2("expected %q, got %q", expected.render, got.render);
+	}
+}
+
+// Runs a test, then restores the global stack limit.
+def runTest(f: NativeStackManagerTester -> void, t: NativeStackManagerTester) {
+	f(t);
+	t.restore();
+	t.limit_total = -1;
+	t.checkInvariants("after test");
+}
+
+def hf_v_i = HostFunction.new("forty_two", SigCache.v_i, fun args => HostResult.Value1(Values.box_i(42)));
+def EMPTY_STRUCT = StructDecl.new(false, ValueTypes.NO_HEAPTYPES, []);
+
+def test_fresh_empty(t: NativeStackManagerTester) {
+	var s = t.fresh();
+	t.t.assert_eq(u64.view(EngineOptions.STACK_SIZE.get()), s.range.size());
+	var seg = NativeStackSegment.!(s.range);
+	if (seg.stack.get() != s) t.t.fail("expected segment to point back at its stack");
+	t.checkInvariants("fresh");
+}
+
+def test_distinct_segments(t: NativeStackManagerTester) {
+	var stacks = t.allocN(3 * StackTuning.stackBatchSize + 1);
+	t.assertDisjoint(stacks);
+	t.checkInvariants("distinct");
+}
+
+def test_recycle_reuse(t: NativeStackManagerTester) {
+	var s = t.fresh();
+	s.reset(hf_v_i);
+	M.recycleStack(s);
+	var s2 = t.fresh();
+	if (s2 != s) t.t.fail("expected recycled stack to be returned first");
+	t.checkInvariants("recycle");
+}
+
+def test_recycle_clears(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	var s = t.fresh();
+	s.reset(f).bind([Values.box_i(1), Values.box_i(2)]); // leave values on the value stack
+	M.recycleStack(s);
+	var s2 = t.fresh(); // checks the stack is reset to EMPTY
+	t.assertResult(Result.Value([Values.box_i(7)]), s2.reset(f).bind([Values.box_i(10), Values.box_i(3)]).resume());
+}
+
+def test_limit_batch(t: NativeStackManagerTester) {
+	t.limit(3);
+	var before = M.total;
+	var stacks = t.allocN(3);
+	t.t.assert_eq(before + 3, M.total);
+	t.assertDisjoint(stacks);
+	t.checkInvariants("limit");
+}
+
+def test_weak_ref_survives_gc(t: NativeStackManagerTester) {
+	var stacks = t.allocN(5);
+	Target.forceGC();
+	Target.forceGC();
+	for (s in stacks) {
+		var seg = NativeStackSegment.!(s.range);
+		if (seg.stack.get() != s) t.t.fail("expected weak reference to live stack to survive GC");
+	}
+	t.checkInvariants("after GC");
+}
+
+def test_reclaim_explicit_gc(t: NativeStackManagerTester) {
+	t.limit(4);
+	var dropped = t.allocAndDrop(4);
+	var total = M.total;
+	Target.forceGC();
+	var stacks = t.allocN(4);
+	t.t.assert_eq(total, M.total);
+	t.assertAllIn(stacks, dropped);
+	t.assertDisjoint(stacks);
+	t.checkInvariants("reclaim");
+}
+
+def test_reclaim_implicit_gc(t: NativeStackManagerTester) {
+	// No explicit GC; the manager must collect on its own when it hits the limit.
+	t.limit(4);
+	var dropped = t.allocAndDrop(4);
+	var total = M.total;
+	var stacks = t.allocN(4);
+	t.t.assert_eq(total, M.total);
+	t.assertAllIn(stacks, dropped);
+	t.checkInvariants("reclaim");
+}
+
+def test_reclaim_skips_live(t: NativeStackManagerTester) {
+	t.limit(8);
+	var live = t.allocN(4);
+	var live_starts = Arrays.map(live, fun (s: NativeStack) => s.range.start);
+	var dropped = t.allocAndDrop(4);
+	Target.forceGC();
+	var stacks = t.allocN(4);
+	t.assertAllIn(stacks, dropped);
+	t.assertNoneIn(stacks, live_starts);
+	for (s in live) {
+		if (NativeStackSegment.!(s.range).stack.get() != s) t.t.fail("expected live stack to keep its segment");
+	}
+	t.checkInvariants("skips live");
+}
+
+def test_reclaim_skips_cached(t: NativeStackManagerTester) {
+	// Stacks in the cache are reachable and must not have their segments reclaimed.
+	t.limit(3);
+	var a = t.fresh(), b = t.fresh();
+	var dropped = t.allocAndDrop(1);
+	M.recycleStack(a);
+	Target.forceGC();
+	t.checkInvariants("cached");
+	var c = t.fresh();
+	if (c != a) t.t.fail("expected cached stack to be reused");
+	var d = t.fresh();
+	if (d.range.start != dropped[0]) t.t.fail("expected the dropped segment to be reclaimed");
+	t.assertDisjoint([a, b, d]);
+	t.checkInvariants("cached");
+}
+
+def test_reclaim_suspended(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	t.limit(4);
+	var dropped = t.allocSuspendedAndDrop(4, f, [Values.box_i(100), Values.box_i(1)]);
+	var stacks = t.allocN(4);
+	t.assertAllIn(stacks, dropped);
+	t.checkInvariants("suspended");
+}
+
+def test_reclaim_suspended_refs(t: NativeStackManagerTester) {
+	// Dropped stacks have references on their value stacks; reclaimed stacks must not
+	// scan the stale values left behind in the segment.
+	var sig = t.newSig([ValueTypes.ANYREF, ValueTypes.ANYREF], [ValueTypes.ANYREF]);
+	t.sig(sig).codev([u8.!(Opcode.LOCAL_GET.code), 1]);
+	var f = WasmFunction.!(t.makeInstance().functions[0]);
+	t.limit(4);
+	var obj1 = Value.Ref(ObjectModel.newStruct(EMPTY_STRUCT)), obj2 = Value.Ref(ObjectModel.newStruct(EMPTY_STRUCT));
+	var dropped = t.allocSuspendedAndDrop(4, f, [obj1, obj2]);
+	var stacks = t.allocN(4);
+	t.assertAllIn(stacks, dropped);
+	var obj3 = Value.Ref(ObjectModel.newStruct(EMPTY_STRUCT));
+	for (s in stacks) s.reset(f).bind([obj1, obj3]);
+	Target.forceGC();
+	Target.forceGC();
+	for (s in stacks) t.assertResult(Result.Value([obj3]), s.resume());
+	t.checkInvariants("suspended refs");
+}
+
+def test_reclaim_then_run(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	t.limit(2);
+	for (i < 20) {
+		var dropped = t.allocAndDrop(2);
+		var s = t.fresh();
+		if (!t.contains(dropped, s.range.start)) t.t.fail("expected reclaimed segment");
+		t.assertResult(Result.Value([Values.box_i(i - 5)]), s.reset(f).bind([Values.box_i(i), Values.box_i(5)]).resume());
+	}
+	t.checkInvariants("run");
+}
+
+def test_reclaim_many(t: NativeStackManagerTester) {
+	// Allocate many more stacks than the limit, dropping each one.
+	var f = t.subFunc();
+	t.limit(4);
+	for (i < 500) {
+		var s = t.fresh();
+		if ((i % 3) == 0) s.reset(f).bind([Values.box_i(i), Values.box_i(1)]);
+		if ((i % 50) == 0) t.checkInvariants("many");
+	}
+	t.checkInvariants("many");
+}
+
+def test_reclaim_churn_live_set(t: NativeStackManagerTester) {
+	// Keep a rotating window of live stacks while allocating many more.
+	var f = t.subFunc();
+	var N = 6;
+	t.limit(N + 2);
+	var live = Array<NativeStack>.new(N);
+	for (i < 300) {
+		var k = i % N;
+		var s = t.fresh();
+		s.reset(f).bind([Values.box_i(i), Values.box_i(k)]);
+		for (j < N) {
+			if (live[j] == s) t.t.fail("expected a stack distinct from live stacks");
+		}
+		var old = live[k];
+		if (old != null) {
+			t.assertResult(Result.Value([Values.box_i(i - N - k)]), old.resume());
+		}
+		live[k] = s;
+	}
+	t.assertDisjoint(Arrays.filter(live, fun (s: NativeStack) => s != null));
+	t.checkInvariants("churn");
+}
+
+def test_run_on_fresh_stack_limit(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	t.limit(2);
+	for (i < 200) {
+		t.assertResult(Result.Value([Values.box_i(i - 3)]), M.runOnFreshStack(f, [Values.box_i(i), Values.box_i(3)]));
+	}
+	t.checkInvariants("run");
+}
+
+def test_run_on_fresh_stack_gc(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	t.limit(2);
+	for (i < 50) {
+		t.assertResult(Result.Value([Values.box_i(42)]), M.runOnFreshStack(hf_v_i, []));
+		Target.forceGC();
+		t.assertResult(Result.Value([Values.box_i(i)]), M.runOnFreshStack(f, [Values.box_i(i), Values.box_i(0)]));
+	}
+	t.checkInvariants("run gc");
+}
