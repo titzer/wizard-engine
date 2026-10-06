@@ -7,47 +7,56 @@ def fatal = System.error("NativeStackError", _);
 component NativeStackManager {
 	private var all: NativeStackSegment;
 	private var total: int;
-	var cache: NativeStack;
+	var cache: NativeStack;		// used in fast-path allocation in generated code
 
-	def allocStackBatch() {
+	def getFreshStack() -> NativeStack {
+		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
+		if (cache == null) {
+			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCompressingStacks();
+			if (!ok) fatal("out of stacks");
+		}
+		
+		var result = cache;
+		cache = cache.next_stack;
+		result.next_stack = null;
+		return result.clear();
+	}
+	private def tryAllocatingNewStacks() -> bool {
 		var size = EngineOptions.STACK_SIZE.get();
 		var batch = Ints.min(StackTuning.stackBatchSize, StackTuning.maxStacks - total);
 		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", StackTuning.stackBatchSize).ln();
 		
 		for (i < batch) {
 			var t = Mmap.reserveRaw(size, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
-			var segment: NativeStackSegment;
-			if (t.0 == Pointer.NULL) {
-				// mmap failed, try alternate means
-				if (cache != null) return; // succeeded in allocating at least one
-				return tryReusingUnusedSegments() || tryCompressingSuspendedStack();
-			}
+			if (t.0 == Pointer.NULL) break;
 			// insert redzone roughly in the middle of the mapping.
+			var segment = NativeStackSegment.new(t);
 			def PAGE_SIZE = 4096u;
-			var redzone_start = (size >> 1) & ~(PAGE_SIZE - 1u);
-			if (!Target.redzones_add(mapping, redzone_start, PAGE_SIZE)) fatal("could not protect value stack red zone");
-			var curr = NativeStack.new(mapping);
+			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
+			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
+			var curr = NativeStack.new(segment);
+			segment.stack.set(curr);
 			curr.next_stack = cache;
 			cache = curr;
 			total++;
 		}
+		return cache != null; // OK if succeeded in allocating at least one
 	}
-	def tryReusingUnusedSegments() -> bool {
+	private def tryReclaimingSegments() -> bool {
+		var ok = false;
 		for (p = all; p != null; p = p.next) {
+			if (p.stack.get() == null) { // weak reference was cleared by GC, can reclaim
+				var s = NativeStack.new(p);
+				p.stack.set(s);
+				s.next_stack = cache;
+				cache = s;
+				ok = true;
+			}
 		}
+		return ok;
 	}
-	def tryCompressingSuspendedStack() -> bool {
+	private def tryCompressingStacks() -> bool {
 		return false;
-	}
-	def getFreshStack() -> NativeStack {
-		if (cache == null) allocStackBatch();
-
-		var result = cache;
-		cache = cache.next_stack;
-		result.next_stack = null;
-
-		if (Trace.stack) Trace.OUT.put1("Requested fresh x86_stack @ 0x%x", Pointer.atObject(result) - Pointer.NULL).ln();
-		return result.clear();
 	}
 	def recycleStack(stack: NativeStack) {
 		stack.next_stack = cache;
@@ -72,14 +81,7 @@ component NativeStackManager {
 // Native stack segments are individually mmap'd with a guard page in the middle
 private class NativeStackSegment extends MemoryRange {
 	var next: NativeStackSegment;
-	var stack: WeakRef<NativeStack>;	// owner, if any
+	var stack: WeakRef<NativeStack>;	// owner, if any; cleared by GC
 
 	new(start: Pointer, end: Pointer) super(start, end) { }
-
-	def setNativeStack(s: NativeStack) -> this {
-		Pointer.atField(this.weak_stack).store<NativeStack>(s);
-	}
-	def getNativeStack() -> NativeStack {
-		return Pointer.atField(this.weak_stack).load<NativeStack>();
-	}
 }
