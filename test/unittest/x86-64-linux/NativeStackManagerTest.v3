@@ -28,11 +28,14 @@ def X_ = void(
 	T("reclaim_churn_live_set", test_reclaim_churn_live_set),
 	T("run_on_fresh_stack_limit", test_run_on_fresh_stack_limit),
 	T("run_on_fresh_stack_gc", test_run_on_fresh_stack_gc),
+	T("out_of_stacks_host", test_out_of_stacks_host),
+	T("out_of_stacks_cont_new", test_out_of_stacks_cont_new),
 	()
 );
 
 private class NativeStackManagerTester extends ExeTester {
 	def saved_max = StackTuning.maxStacks;
+	def saved_compression = StackTuning.enableCompression;
 	var limit_total: int = -1;	// expected upper bound on {M.total}, if a limit was set
 	var held: Array<NativeStack>;	// stacks pinned by {limit} so that their segments are not reclaimed
 
@@ -58,6 +61,7 @@ private class NativeStackManagerTester extends ExeTester {
 	}
 	def restore() {
 		StackTuning.maxStacks = saved_max;
+		StackTuning.enableCompression = saved_compression;
 	}
 	def fresh() -> NativeStack {
 		var s = M.getFreshStack();
@@ -141,6 +145,24 @@ private class NativeStackManagerTester extends ExeTester {
 			u8.!(Opcode.I32_SUB.code)
 		]);
 		return WasmFunction.!(makeInstance().functions[0]);
+	}
+	def assertTrap(reason: TrapReason, r: Result) {
+		match (r) {
+			Throw(thrown) => if (Trap.?(thrown) && Trap.!(thrown).reason == reason) return;
+			_ => ;
+		}
+		t.fail2("expected trap %s, got %q", reason.name, r.render);
+	}
+	// Instantiates {OOS_MODULE} and returns its "make" export.
+	def makeFunc() -> Function {
+		var err = ErrorGen.new("OOS_MODULE");
+		var bp = BinParser.new(Extension.set.all, Limits.new().set(Extension.set.all), err, "OOS_MODULE");
+		bp.tiering = tiering;
+		var module = bp.push(OOS_MODULE, 0, OOS_MODULE.length).finish();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		var instance = Instantiator.new(Extension.set.all, module, [], err).run();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		return instance.functions[1];
 	}
 	def assertResult(expected: Result, got: Result) {
 		if (!expected.equals(got)) t.fail2("expected %q, got %q", expected.render, got.render);
@@ -358,3 +380,56 @@ def test_run_on_fresh_stack_gc(t: NativeStackManagerTester) {
 	}
 	t.checkInvariants("run gc");
 }
+
+def test_out_of_stacks_host(t: NativeStackManagerTester) {
+	StackTuning.enableCompression = false;
+	t.limit(0);
+	var hf = HostFunction.new("seven", SigCache.v_i, fun args => HostResult.Value1(Values.box_i(7)));
+	t.assertTrap(TrapReason.OUT_OF_STACKS, M.runOnFreshStack(hf, []));
+	t.restore();
+	t.limit_total = -1;
+	t.assertResult(Result.Value([Values.box_i(7)]), M.runOnFreshStack(hf, []));
+}
+
+def test_out_of_stacks_cont_new(t: NativeStackManagerTester) {
+	StackTuning.enableCompression = false;
+	var make = t.makeFunc();
+	t.limit(3);
+	// One stack for the call itself, and one for each of two continuations kept in a table.
+	t.assertResult(Result.Value([Values.box_i(2)]), Execute.call(make, [Values.box_i(2)]));
+	// The two continuations are still alive, so a third cannot get a stack.
+	t.assertTrap(TrapReason.OUT_OF_STACKS, Execute.call(make, [Values.box_i(5)]));
+	t.checkInvariants("after trap");
+	t.restore();
+	t.limit_total = -1;
+	t.assertResult(Result.Value([Values.box_i(5)]), Execute.call(make, [Values.box_i(5)]));
+}
+
+// A module whose "make" export creates continuations, compiled with the reference interpreter:
+// (module
+//   (type $f (func))
+//   (type $c (cont $f))
+//   (func $g)
+//   (elem declare func $g)
+//   ;; Creates {n} continuations and keeps them alive in a table.
+//   (table $t 64 (ref null $c))
+//   (func (export "make") (param $n i32) (result i32)
+//     (local $i i32)
+//     (block $done (loop $l
+//       (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+//       (table.set $t (local.get $i) (cont.new $c (ref.func $g)))
+//       (local.set $i (i32.add (local.get $i) (i32.const 1)))
+//       (br $l)))
+//     (local.get $n)
+//   )
+// )
+def OOS_MODULE: Array<byte> = [
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x8b, 0x80, 0x80, 0x80, 0x00, 0x03, 0x60,
+	0x00, 0x00, 0x5d, 0x00, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x03, 0x83, 0x80, 0x80, 0x80, 0x00, 0x02,
+	0x00, 0x02, 0x04, 0x85, 0x80, 0x80, 0x80, 0x00, 0x01, 0x63, 0x01, 0x00, 0x40, 0x07, 0x88, 0x80,
+	0x80, 0x80, 0x00, 0x01, 0x04, 0x6d, 0x61, 0x6b, 0x65, 0x00, 0x01, 0x09, 0x85, 0x80, 0x80, 0x80,
+	0x00, 0x01, 0x03, 0x00, 0x01, 0x00, 0x0a, 0xb1, 0x80, 0x80, 0x80, 0x00, 0x02, 0x82, 0x80, 0x80,
+	0x80, 0x00, 0x00, 0x0b, 0xa4, 0x80, 0x80, 0x80, 0x00, 0x01, 0x01, 0x7f, 0x02, 0x40, 0x03, 0x40,
+	0x20, 0x01, 0x20, 0x00, 0x4f, 0x0d, 0x01, 0x20, 0x01, 0xd2, 0x00, 0xe0, 0x01, 0x26, 0x00, 0x20,
+	0x01, 0x41, 0x01, 0x6a, 0x21, 0x01, 0x0c, 0x00, 0x0b, 0x0b, 0x20, 0x00, 0x0b,
+];
