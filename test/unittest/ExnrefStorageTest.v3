@@ -1,0 +1,226 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Tests that {exnref} values survive garbage collection wherever Wasm code can store them:
+// locals, operands, parameters, globals, and tables. A host import forces several GCs (which
+// move objects on targets with a moving GC) while an {exnref} is live, after which the
+// exception is rethrown and its payload checked.
+def X_ = TestTiers.addTests([
+	("exnref_local_gc", test_exnref_local_gc),
+	("exnref_operand_gc", test_exnref_operand_gc),
+	("exnref_param_gc", test_exnref_param_gc),
+	("exnref_global_gc", test_exnref_global_gc),
+	("exnref_table_gc", test_exnref_table_gc),
+	("exnref_null_local_gc", test_exnref_null_local_gc),
+	("exnref_loop_gc", test_exnref_loop_gc)
+]);
+
+var gc_count = 0;
+// Forces several GCs, allocating in between so that stale references would be overwritten.
+def host_gc(args: Range<Value>) -> HostResult {
+	for (i < 3) {
+		var garbage = Array<Array<int>>.new(100);
+		for (j < garbage.length) garbage[j] = Array<int>.new(j);
+		Target.forceGC();
+	}
+	gc_count++;
+	return HostResult.Value0;
+}
+
+// Sets up an exception tag "t" with an i32 payload and a host function "gc" that forces GCs.
+// Returns the tag index and the function index of "gc".
+def setup(i: ExeTester) -> (int, int) {
+	i.extensions |= Extension.EXCEPTION_HANDLING;
+	var tag_sig = i.newSig(SigCache.arr_i, SigCache.arr_v);
+	var gc_sig = i.newSig(SigCache.arr_v, SigCache.arr_v);
+	var gc_decl = i.newFunc(gc_sig);
+	i.module.addImport("", "gc", gc_decl);
+	var tag_decl = TagDecl.new(tag_sig.heaptype_index);
+	i.module.addImport("", "t", tag_decl);
+	i.imports = [HostFunction.new("gc", gc_sig, host_gc), Tag.new(tag_sig, tag_decl)];
+	gc_count = 0;
+	return (tag_decl.tag_index, gc_decl.func_index);
+}
+
+// Code that throws {local[0]} with tag {tag} and catches it with {catch_ref}, leaving
+// [i32 exnref] on the operand stack.
+def catchRef(i: ExeTester, tag: int) -> Array<byte> {
+	var bt = i.newSig(SigCache.arr_v, [ValueType.I32, ValueTypes.EXNREF]);
+	return [
+		u8.!(Opcode.BLOCK.code), byte.!(bt.heaptype_index),
+		u8.!(Opcode.TRY_TABLE.code), BpTypeCode.EmptyBlock.code, 1, BpCatchKind.CATCH_REF.code, byte.!(tag), 0,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.THROW.code), byte.!(tag),
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.UNREACHABLE.code),
+		u8.!(Opcode.END.code)
+	];
+}
+// Code that rethrows the exnref on top of the operand stack and catches it with tag {tag},
+// leaving its i32 payload on the operand stack.
+def rethrowPayload(i: ExeTester, tag: int) -> Array<byte> {
+	var bt = i.newSig([ValueTypes.EXNREF], SigCache.arr_i);
+	var tt = i.newSig([ValueTypes.EXNREF], SigCache.arr_v);
+	return [
+		u8.!(Opcode.BLOCK.code), byte.!(bt.heaptype_index),
+		u8.!(Opcode.TRY_TABLE.code), byte.!(tt.heaptype_index), 1, BpCatchKind.CATCH.code, byte.!(tag), 0,
+		u8.!(Opcode.THROW_REF.code),
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.UNREACHABLE.code),
+		u8.!(Opcode.END.code)
+	];
+}
+// Validates {func}, which computes its handler and sidetable information.
+def validate(i: ExeTester, func: FuncDecl) {
+	var err = ErrorGen.new(i.module.filename);
+	var v = CodeValidator.new(i.extensions, Limits.new().set(i.extensions), i.module, err);
+	i.tiering.onFuncValidationStart(i.module, func);
+	var r = v.validateFunc(func, 0);
+	i.tiering.onFuncValidationFinish(i.module, func, err);
+	match (r) {
+		Ok => ;
+		Error(error, pc, msg) => i.t.fail2("invalid code @+%d: %s", pc, msg);
+	}
+}
+def callGc(gc: int) -> Array<byte> {
+	return [u8.!(Opcode.CALL.code), byte.!(gc)];
+}
+def concat(parts: Array<Array<byte>>) -> Array<byte> {
+	var v = Vector<byte>.new();
+	for (p in parts) v.puta(p);
+	return v.extract();
+}
+def checkGcCount(i: ExeTester, expected: int) {
+	if (gc_count != expected) i.t.fail2("expected gc to be called %d times, got %d", expected, gc_count);
+}
+
+def test_exnref_local_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	var x = i.addLocal(ValueTypes.EXNREF);
+	i.codev(concat([
+		catchRef(i, t.0),
+		[u8.!(Opcode.LOCAL_SET.code), byte.!(x), u8.!(Opcode.DROP.code)],
+		callGc(t.1),
+		callGc(t.1),
+		[u8.!(Opcode.LOCAL_GET.code), byte.!(x)],
+		rethrowPayload(i, t.0)
+	]));
+	i.args_i(77).assert2_i(77);
+	i.args_i(-3).assert2_i(-3);
+	checkGcCount(i, 4);
+}
+
+def test_exnref_operand_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	// [i32 exnref] stay on the operand stack across the GCs.
+	i.codev(concat([
+		catchRef(i, t.0),
+		callGc(t.1),
+		callGc(t.1),
+		rethrowPayload(i, t.0),
+		[u8.!(Opcode.I32_ADD.code)]
+	]));
+	i.args_i(21).assert2_i(42);
+	i.args_i(1000).assert2_i(2000);
+	checkGcCount(i, 4);
+}
+
+def test_exnref_param_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	// The callee holds the exnref as a parameter across the GC.
+	var callee_sig = i.newSig([ValueTypes.EXNREF], SigCache.arr_i);
+	var callee = i.newFunction(callee_sig, concat([
+		callGc(t.1),
+		[u8.!(Opcode.LOCAL_GET.code), 0],
+		rethrowPayload(i, t.0)
+	]));
+	validate(i, callee);
+	i.codev(concat([
+		catchRef(i, t.0),
+		[u8.!(Opcode.CALL.code), byte.!(callee.func_index)],
+		[u8.!(Opcode.I32_ADD.code)]
+	]));
+	i.args_i(5).assert2_i(10);
+	i.args_i(-50).assert2_i(-100);
+	checkGcCount(i, 2);
+}
+
+def test_exnref_global_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	var g = i.newGlobal(ValueTypes.EXNREF, InitExpr.RefNull(HeapType.NOEXN));
+	i.codev(concat([
+		catchRef(i, t.0),
+		[u8.!(Opcode.GLOBAL_SET.code), byte.!(g.global_index), u8.!(Opcode.DROP.code)],
+		callGc(t.1),
+		[u8.!(Opcode.GLOBAL_GET.code), byte.!(g.global_index)],
+		rethrowPayload(i, t.0)
+	]));
+	i.args_i(9).assert2_i(9);
+	i.args_i(123456).assert2_i(123456);
+	checkGcCount(i, 2);
+}
+
+def test_exnref_table_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	var table = TableDecl.new(ValueTypes.EXNREF, SizeConstraint(false, 2, Max.Set(2)));
+	i.module.addDecl(table);
+	var x = i.addLocal(ValueTypes.EXNREF);
+	i.codev(concat([
+		catchRef(i, t.0),
+		[u8.!(Opcode.LOCAL_SET.code), byte.!(x), u8.!(Opcode.DROP.code)],
+		[u8.!(Opcode.I32_CONST.code), 1, u8.!(Opcode.LOCAL_GET.code), byte.!(x)],
+		[u8.!(Opcode.TABLE_SET.code), byte.!(table.table_index)],
+		// Clear the local, so that only the table refers to the exception.
+		[u8.!(Opcode.REF_NULL.code), BpHeapTypeCode.EXN.code, u8.!(Opcode.LOCAL_SET.code), byte.!(x)],
+		callGc(t.1),
+		[u8.!(Opcode.I32_CONST.code), 1, u8.!(Opcode.TABLE_GET.code), byte.!(table.table_index)],
+		rethrowPayload(i, t.0)
+	]));
+	i.args_i(31).assert2_i(31);
+	i.args_i(-7).assert2_i(-7);
+	checkGcCount(i, 2);
+}
+
+def test_exnref_null_local_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	var x = i.addLocal(ValueTypes.EXNREF);
+	// A null exnref local stays null across GC.
+	i.codev(concat([
+		callGc(t.1),
+		[u8.!(Opcode.LOCAL_GET.code), byte.!(x), u8.!(Opcode.REF_IS_NULL.code)]
+	]));
+	i.args_i(0).assert2_i(1);
+	checkGcCount(i, 1);
+}
+
+def test_exnref_loop_gc(i: ExeTester) {
+	i.sig(SigCache.i_i);
+	var t = setup(i);
+	var x = i.addLocal(ValueTypes.EXNREF);
+	// Replaces the exnref in a local with a new one {local[0]} times, forcing GCs each time,
+	// then rethrows the last one, whose payload is 1.
+	i.codev(concat([
+		[u8.!(Opcode.LOOP.code), BpTypeCode.EmptyBlock.code],
+		catchRef(i, t.0),
+		[u8.!(Opcode.LOCAL_SET.code), byte.!(x), u8.!(Opcode.DROP.code)],
+		callGc(t.1),
+		[
+			u8.!(Opcode.LOCAL_GET.code), 0,
+			u8.!(Opcode.I32_CONST.code), 1,
+			u8.!(Opcode.I32_SUB.code),
+			u8.!(Opcode.LOCAL_TEE.code), 0,
+			u8.!(Opcode.BR_IF.code), 0,
+			u8.!(Opcode.END.code)
+		],
+		[u8.!(Opcode.LOCAL_GET.code), byte.!(x)],
+		rethrowPayload(i, t.0)
+	]));
+	i.args_i(5).assert2_i(1);
+	checkGcCount(i, 5);
+}
