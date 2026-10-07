@@ -2,6 +2,7 @@
 // See LICENSE for details of Apache 2.0 license.
 
 def fatal = System.error("NativeStackError", _);
+def PAGE_SIZE = 4096u;
 
 // Manages native memory mappings for native stacks.
 component NativeStackManager {
@@ -27,13 +28,15 @@ component NativeStackManager {
 		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", batch).ln();
 		
 		for (i < batch) {
-			var t = Mmap.reserveRaw(size, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
+			// Map a guard page above the segment, so that accesses beyond its end always fault.
+			var t = Mmap.reserveRaw(size + PAGE_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
 			if (t.0 == Pointer.NULL) break;
-			// insert redzone roughly in the middle of the mapping.
-			var segment = NativeStackSegment.new(t);
+			var end = t.0 + size;
+			if (!Mmap.protect(end, PAGE_SIZE, Mmap.PROT_NONE)) fatal("could not protect stack guard page");
+			var segment = NativeStackSegment.new(t.0, end);
 			segment.next = all;
 			all = segment;
-			def PAGE_SIZE = 4096u;
+			// insert redzone roughly in the middle of the mapping.
 			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
 			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
 			var curr = NativeStack.new(segment);
@@ -65,6 +68,16 @@ component NativeStackManager {
 	}
 	private def tryCompressingStacks() -> bool {
 		return false;
+	}
+	// Checks whether a fault at {addr} hit the guard page above a stack segment, which indicates
+	// an engine bug, such as reading a frame that is not there. If so, fails with an error.
+	def checkGuardPageFault(addr: Pointer, ip: Pointer) {
+		for (p = all; p != null; p = p.next) {
+			if (addr >= p.end && addr < p.end + PAGE_SIZE) {
+				fatal(Strings.format2("access to guard page beyond the end of a stack segment @ 0x%x, ip=0x%x",
+					addr - Pointer.NULL, ip - Pointer.NULL));
+			}
+		}
 	}
 	def recycleStack(stack: NativeStack) {
 		stack.next_stack = cache;
