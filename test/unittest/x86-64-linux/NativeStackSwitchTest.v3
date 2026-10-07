@@ -1,0 +1,119 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Tests for switching between native stacks in every execution tier, where the stacks are placed
+// at the end of a mapping with unmapped memory above, so that any access beyond a stack's segment
+// (e.g. reading an interpreter frame that is not there) faults.
+
+def M: NativeStackManager;
+
+def X_ = register();
+def register() {
+	for (l = Target.getTestTiers(); l != null; l = l.tail) {
+		var prefix = Strings.format1("x86switch:%s", l.head.0);
+		UnitTests.registerT(prefix, "fresh_at_mapping_end", SwitchTester.new(_, l.head.1), test_fresh_at_mapping_end);
+		UnitTests.registerT(prefix, "all_at_mapping_end", SwitchTester.new(_, l.head.1), test_all_at_mapping_end);
+	}
+}
+
+// The module below, compiled with the stack-switching reference interpreter.
+// (module
+//   (type $f1 (func (result i32)))
+//   (type $c1 (cont $f1))
+//   (type $f2 (func (param (ref null $c1)) (result i32)))
+//   (type $c2 (cont $f2))
+//   (type $f3 (func (param (ref null $c2)) (result i32)))
+//   (type $c3 (cont $f3))
+//   (tag $e (result i32))
+//
+//   ;; Entered by a switch from {fn_2}; switches back to it.
+//   (func $fn_1 (param (ref null $c2)) (result i32)
+//     (local.get 0)
+//     (switch $c2 $e)
+//     (i32.const 24)
+//   )
+//   (elem declare func $fn_1)
+//
+//   ;; Switches to a fresh continuation of {fn_1}, which switches back.
+//   (func $fn_2 (result i32)
+//     (cont.new $c3 (ref.func $fn_1))
+//     (switch $c3 $e)
+//     (drop)
+//     (i32.const 42)
+//   )
+//   (elem declare func $fn_2)
+//
+//   (func (export "main") (result i32)
+//     (cont.new $c1 (ref.func $fn_2))
+//     (resume $c1 (on $e switch))
+//   )
+// )
+def SWITCH_MODULE: Array<byte> = [
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x97, 0x80, 0x80, 0x80, 0x00, 0x06, 0x60,
+	0x00, 0x01, 0x7f, 0x5d, 0x00, 0x60, 0x01, 0x63, 0x01, 0x01, 0x7f, 0x5d, 0x02, 0x60, 0x01, 0x63,
+	0x03, 0x01, 0x7f, 0x5d, 0x04, 0x03, 0x84, 0x80, 0x80, 0x80, 0x00, 0x03, 0x04, 0x00, 0x00, 0x0d,
+	0x83, 0x80, 0x80, 0x80, 0x00, 0x01, 0x00, 0x00, 0x07, 0x88, 0x80, 0x80, 0x80, 0x00, 0x01, 0x04,
+	0x6d, 0x61, 0x69, 0x6e, 0x00, 0x02, 0x09, 0x89, 0x80, 0x80, 0x80, 0x00, 0x02, 0x03, 0x00, 0x01,
+	0x00, 0x03, 0x00, 0x01, 0x01, 0x0a, 0xb0, 0x80, 0x80, 0x80, 0x00, 0x03, 0x89, 0x80, 0x80, 0x80,
+	0x00, 0x00, 0x20, 0x00, 0xe6, 0x03, 0x00, 0x41, 0x18, 0x0b, 0x8c, 0x80, 0x80, 0x80, 0x00, 0x00,
+	0xd2, 0x00, 0xe0, 0x05, 0xe6, 0x05, 0x00, 0x1a, 0x41, 0x2a, 0x0b, 0x8b, 0x80, 0x80, 0x80, 0x00,
+	0x00, 0xd2, 0x01, 0xe0, 0x01, 0xe3, 0x01, 0x01, 0x01, 0x00, 0x0b,
+
+];
+
+private class SwitchTester(t: Tester, tiering: ExecutionStrategy) {
+	new() { Execute.tiering = tiering; }
+
+	def instantiate() -> Instance {
+		var err = ErrorGen.new("SWITCH_MODULE");
+		var bp = BinParser.new(Extension.set.all, Limits.new().set(Extension.set.all), err, "SWITCH_MODULE");
+		bp.tiering = tiering;
+		var module = bp.push(SWITCH_MODULE, 0, SWITCH_MODULE.length).finish();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		var instance = Instantiator.new(Extension.set.all, module, [], err).run();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		tiering.onTestModule(module);
+		for (f in instance.functions) {
+			if (WasmFunction.?(f)) tiering.onTestRun(WasmFunction.!(f), err);
+		}
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		return instance;
+	}
+	// Maps a stack segment followed by an unmapped page, and returns a stack on it.
+	def stackAtMappingEnd() -> NativeStack {
+		var size = EngineOptions.STACK_SIZE.get();
+		var m = Mmap.reserveRaw(size + PAGE_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
+		if (m.0 == Pointer.NULL) { t.fail("mmap failed"); return null; }
+		var end = m.1 + -i64.view(PAGE_SIZE);
+		MemoryRange.new(end, m.1).unmap(); // leave a hole above the segment
+		var segment = NativeStackSegment.new(m.0, end);
+		var rz = m.0 + ((size >> 1) & ~(PAGE_SIZE - 1u));
+		if (!RedZones.addRedZone(rz, rz + PAGE_SIZE)) t.fail("could not add red zone");
+		var s = NativeStack.new(segment);
+		segment.stack.set(s);
+		return s;
+	}
+	// Runs "main" with the stacks for the host call, {fn_2}, and {fn_1} taken from {stacks}.
+	def run(stacks: Array<NativeStack>) {
+		var instance = instantiate();
+		if (instance == null) return;
+		// The cache is LIFO: the host call gets stacks[0], then {cont.new} gets stacks[1] and stacks[2].
+		for (i = stacks.length - 1; i >= 0; i--) M.recycleStack(stacks[i]);
+		var r = Execute.call(instance.functions[2], []);
+		var expected = Result.Value([Values.box_i(42)]);
+		if (!expected.equals(r)) t.fail2("expected %q, got %q", expected.render, r.render);
+		for (s in stacks) {
+			if ((s.range.end + -2 * Pointer.SIZE).load<Pointer>() == Pointer.NULL) t.fail("expected stack to have been used");
+		}
+	}
+}
+def PAGE_SIZE = 4096u;
+
+def test_fresh_at_mapping_end(t: SwitchTester) {
+	// Only the stack switched to while fresh is at the end of a mapping.
+	t.run([M.getFreshStack(), M.getFreshStack(), t.stackAtMappingEnd()]);
+}
+
+def test_all_at_mapping_end(t: SwitchTester) {
+	t.run([t.stackAtMappingEnd(), t.stackAtMappingEnd(), t.stackAtMappingEnd()]);
+}
