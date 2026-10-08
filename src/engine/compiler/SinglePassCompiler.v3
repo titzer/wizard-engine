@@ -401,48 +401,51 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		withReconstructedInlinedFrames(fun => emitProbe0(it.pc, probe));
 		if (Trace.compiler) traceOpcodeAndStack(true);
 	}
-	// Inline emission of a path profiling probe: selects the arm the decision below is about to
-	// take from its operand and applies that edge's action to {r}'s slot and the counts, with no
+	// Inline emission of a path profiling probe: selects the edge the decision below is about to
+	// take from its operand and applies that edge's instrumentation to {r}'s slot and the counts, with no
 	// runtime call and no register caching of {r}.
 	def emitPathProbe(probe: PathProbe) {
-		// frame variables sit right after the wasm locals, so {r} is at slot num_locals + rvar
-		var site = probe.site, edges = site.edges;
-		var rAddr = masm.slotAddr(u32.!(func.num_locals + site.rvar));
+		// frame variables sit right after the wasm locals, so {r} is at slot num_locals + pathRegVar
+		def edges = probe.edges;
+		var rAddr = masm.slotAddr(u32.!(func.num_locals + probe.pathRegVar));
 		if (edges.length == 1) {
-			return emitPathAction(rAddr, probe, edges[0].action, allocTmp(ValueKind.REF), allocTmp(ValueKind.I32));
+			return emitPathInstrumentation(rAddr, probe, edges[0].instrumentation, allocTmp(ValueKind.REF), allocTmp(ValueKind.I32));
 		}
-		var cond = MasmBrCond.I32_NONZERO, cast: SpcVal;
-		match (site.kind) {
+		var cond = MasmBrCond.I32_NONZERO;
+		var cast: SpcVal;
+		match (probe.kind) {
 			NULL => cond = MasmBrCond.REF_NULL;
 			NONNULL => cond = MasmBrCond.REF_NONNULL;
 			CAST, CAST_FAIL => {
 				// a runtime call, so it comes before the temporaries it would clobber
-				var nullable: byte = if(site.imm.null2(), 2, 0);
-				var result = emit_call_runtime_doCast(nullable, site.imm.ht2), keep = allocTmp(ValueKind.I32);
+				var nullable: byte = if(probe.imm.null2(), 2, 0);
+				def result = emit_call_runtime_doCast(nullable, probe.imm.ht2);
+				def keep = allocTmp(ValueKind.I32);
 				if (keep != result) masm.emit_mov_r_r(ValueKind.I32, keep, result); // claimed, unlike {result}
 				cast = SpcVal(KIND_I32 | IN_REG, keep, 0);
-				cond = if(site.kind == PathProbeKind.CAST, MasmBrCond.I1_ONE, MasmBrCond.I1_ZERO);
+				cond = if(probe.kind == PathProbeKind.CAST, MasmBrCond.I1_ONE, MasmBrCond.I1_ZERO);
 			}
 			_ => ;
 		}
 		// the temporaries are allocated before the operand is read, since allocating one can
-		// spill it, and before the diamond, so no arm changes the abstract state
-		var tmp1 = allocTmp(ValueKind.REF), tmp2 = allocTmp(ValueKind.I32);
+		// spill it, and before the diamond, so no edge's code changes the abstract state
+		def tmp1 = allocTmp(ValueKind.REF);
+		def tmp2 = allocTmp(ValueKind.I32);
 		var sv = if(cast.reg != NO_REG, cast, state.peek());
-		if (site.kind == PathProbeKind.TABLE) {
+		if (probe.kind == PathProbeKind.TABLE) {
 			if (sv.isConst()) {
 				var k = long.!(sv.const);
-				var arm = if(k >= 0 && k < edges.length - 1, int.!(k), edges.length - 1);
-				return emitPathAction(rAddr, probe, edges[arm].action, tmp1, tmp2);
+				var edge = edges[if(k >= 0 && k < edges.length - 1, int.!(k), edges.length - 1)];
+				return emitPathInstrumentation(rAddr, probe, edge.instrumentation, tmp1, tmp2);
 			}
 			var reg = sv.reg;
 			if (reg == NO_REG) masm.emit_mov_r_s(sv.kind(), reg = regs.scratch, state.sp - 1);
 			var done = masm.newLabel(it.pc);
 			for (k < edges.length) {
-				// the last arm is the default, which every index past the others also takes
+				// the last edge is the default, which every index past the others also takes
 				var next = if(k < edges.length - 1, masm.newLabel(it.pc));
 				if (next != null) masm.emit_brne_r_i(reg, k, next);
-				emitPathAction(rAddr, probe, edges[k].action, tmp1, tmp2);
+				emitPathInstrumentation(rAddr, probe, edges[k].instrumentation, tmp1, tmp2);
 				if (next != null) {
 					masm.emit_br(done);
 					masm.bindLabel(next);
@@ -452,36 +455,37 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			return;
 		}
 		if (sv.isConst()) {
-			// {cond} selects the taken arm, so a constant that meets it takes arm 1
-			var arm = if((sv.const == 0) != cond.zero, 1, 0);
-			return emitPathAction(rAddr, probe, edges[arm].action, tmp1, tmp2);
+			// {cond} selects the taken edge, so a constant that meets it takes edges[1]
+			var edge = edges[if((sv.const == 0) != cond.zero, 1, 0)];
+			return emitPathInstrumentation(rAddr, probe, edge.instrumentation, tmp1, tmp2);
 		}
-		var taken = masm.newLabel(it.pc), done = masm.newLabel(it.pc);
+		def taken = masm.newLabel(it.pc);
+		def done = masm.newLabel(it.pc);
 		if (sv.inReg()) emitBrIfR(sv, cond, taken);
 		else masm.emit_br_m(masm.slotAddr(state.sp - 1), cond, taken);
-		emitPathAction(rAddr, probe, edges[0].action, tmp1, tmp2);
+		emitPathInstrumentation(rAddr, probe, edges[0].instrumentation, tmp1, tmp2);
 		masm.emit_br(done);
 		masm.bindLabel(taken);
-		emitPathAction(rAddr, probe, edges[1].action, tmp1, tmp2);
+		emitPathInstrumentation(rAddr, probe, edges[1].instrumentation, tmp1, tmp2);
 		masm.bindLabel(done);
 	}
-	def emitPathAction(rAddr: MasmAddr, probe: PathProbe, action: PathProfilingAction, tmp1: Reg, tmp2: Reg) {
-		match (action) {
-			Nothing => ;
-			RSet(value) => masm.emit_mov_m_i(rAddr, value);
-			RAdd(value) => masm.emit_add_m_i(rAddr, value);
-			CountConst(value) => {
+	def emitPathInstrumentation(rAddr: MasmAddr, probe: PathProbe, instrumentation: PathProfilingInstrumentation, tmp1: Reg, tmp2: Reg) {
+		match (instrumentation) {
+			None => ;
+			InitReg(value) => masm.emit_mov_m_i(rAddr, value);
+			AddReg(value) => masm.emit_add_m_i(rAddr, value);
+			IncCount(index) => {
 				masm.emit_mov_r_Array(tmp1, probe.counts);
-				masm.emit_v3_Array_elem_add_ri(tmp1, value, 1);
+				masm.emit_v3_Array_elem_add_ri(tmp1, index, 1);
 			}
-			CountRPlus(value) => emitCountAtR(rAddr, probe, value, tmp1, tmp2);
-			CountReset(add, set) => {
-				emitCountAtR(rAddr, probe, add, tmp1, tmp2);
-				masm.emit_mov_m_i(rAddr, set);
+			IncCountAtReg(offset) => emitCountAtR(rAddr, probe, offset, tmp1, tmp2);
+			IncCountAndInitReg(offset, init) => {
+				emitCountAtR(rAddr, probe, offset, tmp1, tmp2);
+				masm.emit_mov_m_i(rAddr, init);
 			}
 		}
 	}
-	// counts[r + addend]++, where {r} is signed: increments can make it negative between actions
+	// counts[r + addend]++, where {r} is signed: increments can make it negative between instrumentations
 	def emitCountAtR(rAddr: MasmAddr, probe: PathProbe, addend: int, tmp1: Reg, tmp2: Reg) {
 		masm.emit_movsx_r_m(tmp2, rAddr);
 		masm.emit_mov_r_Array(tmp1, probe.counts);
