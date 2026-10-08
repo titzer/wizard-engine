@@ -30,6 +30,7 @@ test/regress/ext:legacy-eh/try_delegate5.bin.wast
 test/regress/ext:jit-interface/func_new0.bin.wast
 test/regress/ext:jit-interface/func_new_args.bin.wast
 test/regress/ext:jit-interface/func_new_invalid_env.bin.wast
+test/regress/ext:jit-interface/func_new_loop.bin.wast
 test/regress/ext:jit-interface/func_new_scope_func.bin.wast
 test/regress/ext:jit-interface/func_new_scope_global.bin.wast
 test/regress/ext:jit-interface/func_new_scope_memory.bin.wast
