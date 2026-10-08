@@ -1,0 +1,17 @@
+(module
+  (type $ft (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (memory 1)
+  (data (i32.const 16) "\00\20\00\41\1f\6c\20\01\6a\41\1f\6c\20\02\6a\41\1f\6c\20\03\6a\41\1f\6c\20\04\6a\41\1f\6c\20\05\6a\41\1f\6c\20\06\6a\41\1f\6c\20\07\6a\41\1f\6c\20\08\6a\41\1f\6c\20\09\6a\41\1f\6c\20\0a\6a\41\1f\6c\20\0b\6a\41\1f\6c\20\0c\6a\41\1f\6c\20\0d\6a\41\1f\6c\20\0e\6a\41\1f\6c\20\0f\6a\0b")
+  ;; (func (param $p0 i32) ... (param $p15 i32) (result i32)
+  ;;   acc = p0; acc = acc * 31 + p[i] for i in 1..15
+  ;;   ...)
+  (scope $s)
+  (func (export "main") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+    (call_ref $ft (local.get 0) (local.get 1) (local.get 2) (local.get 3) (local.get 4) (local.get 5) (local.get 6) (local.get 7) (local.get 8) (local.get 9) (local.get 10) (local.get 11) (local.get 12) (local.get 13) (local.get 14) (local.get 15)
+      (func.new 0 $ft $s (i32.const 16) (i32.const 94)))
+  )
+)
+(assert_return (invoke "main" (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)) (i32.const 0))
+(assert_return (invoke "main" (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 7)) (i32.const 7))
+(assert_return (invoke "main" (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5) (i32.const 6) (i32.const 7) (i32.const 8) (i32.const 9) (i32.const 10) (i32.const 11) (i32.const 12) (i32.const 13) (i32.const 14) (i32.const 15) (i32.const 16)) (i32.const -1270509304))
+(assert_return (invoke "main" (i32.const 16) (i32.const 15) (i32.const 14) (i32.const 13) (i32.const 12) (i32.const 11) (i32.const 10) (i32.const 9) (i32.const 8) (i32.const 7) (i32.const 6) (i32.const 5) (i32.const 4) (i32.const 3) (i32.const 2) (i32.const 1)) (i32.const 319397880))
