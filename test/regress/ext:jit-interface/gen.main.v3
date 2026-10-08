@@ -48,6 +48,9 @@ def i32_const(val: int) -> Array<byte> {
 	b.put(I32C).put_s32leb(val);
 	return b.extract();
 }
+def op(o: Opcode) -> byte {
+	return u8.!(o.code);
+}
 def cat(a: Array<byte>, b: Array<byte>) -> Array<byte> {
 	return Arrays.concat(a, b);
 }
@@ -232,6 +235,7 @@ def genAll() {
 	gen_func_new_trap_oob();
 	gen_func_new_trap_invalid();
 	gen_func_new_invalid_env();
+	gen_func_new_loop();
 }
 
 // The simplest case: compile a constant function out of memory and call it.
@@ -478,4 +482,57 @@ def gen_func_new_invalid_env() {
 		"  \"unknown environment\"",
 		")"
 	], "unknown environment", m.finish());
+}
+
+// A generated function that runs a long loop, so that a tiering strategy compiles it while
+// it is running (OSR) or after enough calls. Such a function belongs to the environment's
+// instance, not the enclosing one, so compiling it must not assume the enclosing module's
+// code space. Regression test for an OSR crash in --mode=dyn.
+def gen_func_new_loop() {
+	var loop_code: Array<byte> = [
+		op(Opcode.BLOCK), BpTypeCode.EmptyBlock.code,
+		op(Opcode.LOOP), BpTypeCode.EmptyBlock.code,
+		op(Opcode.LOCAL_GET), 0, op(Opcode.I32_EQZ), op(Opcode.BR_IF), 1,
+		op(Opcode.LOCAL_GET), 1, op(Opcode.LOCAL_GET), 0, op(Opcode.I32_ADD), op(Opcode.LOCAL_SET), 1,
+		op(Opcode.LOCAL_GET), 0, I32C, 1, op(Opcode.I32_SUB), op(Opcode.LOCAL_SET), 0,
+		op(Opcode.BR), 0,
+		END, END,
+		op(Opcode.LOCAL_GET), 1, END];
+	var gen = cat([1, 1, BpTypeCode.I32.code], loop_code);	// one local declaration group: 1 x i32
+	var main_code = cat(
+		[u8.!(Opcode.LOCAL_GET.code), 0],
+		newAndCall(gen.length));
+	var m = ModuleGen.new()
+		.types([(I, I), (I, I)])
+		.funcs([0])
+		.memory(1)
+		.exportFunc("main", 0)
+		.environs([[]])
+		.code([body(main_code)])
+		.data([(CODE_ADDR, gen)]);
+	var hex = StringBuilder.new();
+	for (x in gen) hex.putc('\\').putc(Chars.hexMap_l[x >> 4]).putc(Chars.hexMap_l[x & 0xF]);
+	add("func_new_loop", [
+		"(module",
+		"  (type $ft (func (param i32) (result i32)))",
+		"  (memory 1)",
+		Strings.format1("  (data (i32.const 16) \"%s\")", hex.toString()),
+		"  ;; (func (param $n i32) (result i32) (local $sum i32)",
+		"  ;;   (block (loop",
+		"  ;;     (br_if 1 (i32.eqz (local.get $n)))",
+		"  ;;     (local.set $sum (i32.add (local.get $sum) (local.get $n)))",
+		"  ;;     (local.set $n (i32.sub (local.get $n) (i32.const 1)))",
+		"  ;;     (br 0)))",
+		"  ;;   (local.get $sum))",
+		"  (scope $s)",
+		"  (func (export \"main\") (param i32) (result i32)",
+		"    (call_ref $ft (local.get 0)",
+		Strings.format1("      (func.new 0 $ft $s (i32.const 16) (i32.const %d)))", gen.length),
+		"  )",
+		")"
+	], [
+		"(assert_return (invoke \"main\" (i32.const 0)) (i32.const 0))",
+		"(assert_return (invoke \"main\" (i32.const 100)) (i32.const 5050))",
+		"(assert_return (invoke \"main\" (i32.const 100000)) (i32.const 705082704))"
+	], m.finish());
 }

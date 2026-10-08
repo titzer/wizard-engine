@@ -1,0 +1,15 @@
+(module
+  (type $ft (func (param i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64) (result f64)))
+  (memory 1)
+  (data (i32.const 16) "\00\20\00\b7\41\01\b7\a2\20\01\b9\41\02\b7\a2\a0\20\02\bb\41\03\b7\a2\a0\20\03\41\04\b7\a2\a0\20\04\b7\41\05\b7\a2\a0\20\05\b9\41\06\b7\a2\a0\20\06\bb\41\07\b7\a2\a0\20\07\41\08\b7\a2\a0\20\08\b7\41\09\b7\a2\a0\20\09\b9\41\0a\b7\a2\a0\20\0a\bb\41\0b\b7\a2\a0\20\0b\41\0c\b7\a2\a0\20\0c\b7\41\0d\b7\a2\a0\20\0d\b9\41\0e\b7\a2\a0\20\0e\bb\41\0f\b7\a2\a0\20\0f\41\10\b7\a2\a0\0b")
+  ;; (func (param i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64) (result f64)
+  ;;   sum of f64(p[i]) * (i + 1) for i in 0..15
+  ;;   ...)
+  (scope $s)
+  (func (export "main") (param i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64 i32 i64 f32 f64) (result f64)
+    (call_ref $ft (local.get 0) (local.get 1) (local.get 2) (local.get 3) (local.get 4) (local.get 5) (local.get 6) (local.get 7) (local.get 8) (local.get 9) (local.get 10) (local.get 11) (local.get 12) (local.get 13) (local.get 14) (local.get 15)
+      (func.new 0 $ft $s (i32.const 16) (i32.const 125)))
+  )
+)
+(assert_return (invoke "main" (i32.const 1) (i64.const 1) (f32.const 0x1p+0) (f64.const 0x1p+0) (i32.const 1) (i64.const 1) (f32.const 0x1p+0) (f64.const 0x1p+0) (i32.const 1) (i64.const 1) (f32.const 0x1p+0) (f64.const 0x1p+0) (i32.const 1) (i64.const 1) (f32.const 0x1p+0) (f64.const 0x1p+0)) (f64.const 0x1.1p+7))
+(assert_return (invoke "main" (i32.const -1) (i64.const 1000000000000) (f32.const 0x1p-1) (f64.const -0x1p-2) (i32.const 2) (i64.const -3) (f32.const 0x1.8p+0) (f64.const 0x1.2a05f2p+33) (i32.const 0) (i64.const 0) (f32.const 0x0p+0) (f64.const 0x0p+0) (i32.const 0) (i64.const 0) (f32.const 0x0p+0) (f64.const 0x1p-3)) (f64.const 0x1.e449a94004p+40))
