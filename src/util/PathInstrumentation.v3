@@ -1,0 +1,106 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// How a probe's branch selects its outgoing edge, which the probe and the SPC intrinsic both follow.
+enum PathProbeKind { DIRECT, IF, TABLE, NULL, NONNULL, CAST, CAST_FAIL }
+
+component PathInstrumentation {
+	// Appends an i32 frame variable to {func} and returns its index.
+	def newFrameVar(func: FuncDecl) -> int {
+		def index = if(func.frame_var_tags != null, func.frame_var_tags.length);
+		def tag = [BpTypeCode.I32.code];
+		func.frame_var_tags = if(func.frame_var_tags == null, tag, Arrays.concat(func.frame_var_tags, tag));
+		return index;
+	}
+}
+
+// The probe at one block's last instruction: applies the instrumentation of the edge its branch
+// is about to take, and passes any path it completes to {count}; {r} lives in the frame variable
+// {pathRegVar}.
+class PathSiteProbe extends Probe {
+	def pathRegVar: int;  // index into the frame variables to hold the register
+
+	def var kind = PathProbeKind.DIRECT; // how the block's last instruction selects an outgoing edge
+	def var imm: BrOnCastImm;
+	def var edges: Array<PathProfilingEdge>; // the outgoing edges from this block
+
+	// bi must be set to this function
+	new(bi: BytecodeIterator, block: PathProfilingBlock, pathRegVar) {
+		// skip dummy edges which don't get instrumentation
+		// addDummies appends them last, so the real edges are a prefix
+		edges = Ranges.dup(block.outgoing.send(Ranges.skipTrailing(_, PathProfilingEdge.isDummy)));
+
+		if (edges.length > 1) {
+			bi.at(block.last_instr_pc, -1);
+			match (bi.current()) {
+				BR_TABLE => kind = PathProbeKind.TABLE;
+				BR_ON_NULL => kind = PathProbeKind.NULL;
+				BR_ON_NON_NULL => kind = PathProbeKind.NONNULL;
+				BR_ON_CAST => {
+					imm = bi.immptr().read_BrOnCastImm();
+					kind = PathProbeKind.CAST;
+				}
+				BR_ON_CAST_FAIL => {
+					imm = bi.immptr().read_BrOnCastImm();
+					kind = PathProbeKind.CAST_FAIL;
+				}
+				IF, BR_IF => kind = PathProbeKind.IF;
+				_ => ; // no other instruction gives a block two or more edges
+			}
+		}
+		if (kind == PathProbeKind.TABLE) Ranges.reverse(edges); // XXX br_table places its edges backwards
+	}
+	def fire(loc: DynamicLoc) -> ProbeAction {
+		def accessor = loc.frame.getFrameAccessor();
+		def edge = selectEdge(accessor); // edge to be taken
+		def path = traverseEdge(accessor, edge);
+		// path >= 0 means we have reached the stage at the end of the function where we can record the final count
+		if (path >= 0)
+			incCount(accessor, path);
+		return ProbeAction.Continue;
+	}
+	// Records one execution of {path}. Abstract depending on the implementation (monitor or trace)
+	def incCount(accessor: FrameAccessor, path: int);
+
+	// Returns the edge the probed instruction is about to take, read from its operand.
+	private def selectEdge(accessor: FrameAccessor) -> PathProfilingEdge {
+		// a direct probe has only one outgoing edge
+		if (kind == PathProbeKind.DIRECT) return edges[0];
+
+		def v = accessor.getOperand(0);
+		match (kind) {
+			TABLE => {
+				def u = Values.unbox_u(v);
+				return edges[if(u >= u32.!(edges.length), edges.length - 1, int.!(u))];
+			}
+			NULL => return edges[if(Values.isNull(v), 1, 0)];
+			NONNULL => return edges[if(Values.isNull(v), 0, 1)];
+			CAST => return edges[if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 1, 0)];
+			CAST_FAIL => return edges[if(Runtime.cast(accessor.func().instance, imm.null2(), imm.ht2, v), 0, 1)];
+			IF => return edges[if(Values.unbox_u(v) != 0, 1, 0)];
+			_ => return null; // cannot happen, DIRECT returns early above
+		}
+	}
+	// Applies the instrumentation of {edge} to {r}; returns the path it completes, or -1 if none.
+	private def traverseEdge(accessor: FrameAccessor, edge: PathProfilingEdge) -> int {
+		match (edge.instrumentation) {
+			None => ;
+			InitReg(value) => setR(accessor, value);
+			AddReg(value) => setR(accessor, getR(accessor) + value);
+			IncCount(index) => return index;
+			IncCountAtReg(offset) => return getR(accessor) + offset;
+			IncCountAndInitReg(offset, init) => {
+				def path = getR(accessor) + offset;
+				setR(accessor, init);
+				return path;
+			}
+		}
+		return -1; // no count
+	}
+	private def getR(accessor: FrameAccessor) -> int {
+		return Values.unbox_i(accessor.getFrameVar(pathRegVar));
+	}
+	private def setR(accessor: FrameAccessor, v: int) {
+		accessor.getWriter().setFrameVar(pathRegVar, Values.box_i(v));
+	}
+}

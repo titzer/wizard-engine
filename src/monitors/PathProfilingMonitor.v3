@@ -1,0 +1,144 @@
+// Implements a monitor that profiles dynamic execution paths through functions.
+def monitor_ = MonitorRegistry.add(
+	"path-profile", "Profiles dynamic execution paths through functions.",
+	PathProfilingMonitor.new());
+
+class PathProfilingMonitor extends Monitor {
+	// counts for each path
+	def entries = Vector<PathCountsProbe>.new();
+
+	def onParse(m: Module, err: ErrorGen) {
+		def bi = BytecodeIterator.new();
+		for (i < m.functions.length) {
+			def func: FuncDecl = m.functions[i];
+			if (func.imp != null) continue; // skip imported functions
+			def profile = PathProfile.new(func);
+			if (profile.success) {
+				// define entry probe for the function to get index for the per-call site path counts
+				def entry = PathCountsProbe.new(m, func, profile);
+				Instrumentation.insertFuncEntryProbe(m, func.func_index, entry);
+				entries.put(entry);
+
+				// place Ball-Larus instrumentation
+				def pathRegVar = PathInstrumentation.newFrameVar(func);
+				bi.reset(func);
+				profile.entry.dfs(fun (b: PathProfilingBlock) {
+					if (!b.instrumented()) return;
+					def probe = PathMonitorProbe.new(bi, b, pathRegVar, entry);
+					// XXX can be combiend with the probe above? this is only for one probe on `ENTRY -> head` edge
+					if (b.last_instr_pc < 0) Instrumentation.insertFuncEntryProbe(m, func.func_index, probe);
+					else Instrumentation.insertLocalProbe(m, func.func_index, b.last_instr_pc, probe);
+				}, null, null);
+			}
+		}
+	}
+	def onFinish(i: Instance, r: Result) {
+		for (j < entries.length) {
+			def entry = entries[j];
+			def profile = entry.profile;
+			out.put1("func %q", entry.func.render(entry.module.names, _)).ln();
+			printCfg(out, profile);
+			// each call site lists only the paths its calls took
+			for (s < entry.sites.length) {
+				def site = entry.sites[s];
+				def counts = entry.counts[s];
+				// a call site no call counted under
+				var hit = false;
+				for (c in counts) if (c > 0) hit = true;
+				if (!hit) continue;
+				if (site.0 == null) out.puts("  caller engine");
+				else out.put2("  caller %q +%d", site.0.render(entry.module.names, _), site.1);
+				out.ln();
+				for (k < profile.numPaths) {
+					if (counts[k] > 0) out.put2("    counts[%d] = %d", k, counts[k]).ln();
+				}
+			}
+			// each path number with the route it denotes, so counts[k] can be read back to a route
+			for (k < profile.numPaths) {
+				out.put2("  counts[%d] = %d", k, entry.total(k)).ln();
+				out.puts("      path:");
+				profile.renderPath(k, out);
+				out.ln();
+			}
+			// (Section 4.1) a self-loop is counted, not path-profiled
+			for (i < profile.selfLoops.length) {
+				def block = profile.selfLoops[i];
+				out.put3("  selfloop[block %d +%d] = %d", block.id, block.last_instr_pc, entry.total(profile.numPaths + i)).ln();
+			}
+		}
+	}
+}
+
+
+private class PathCountsProbe(module: Module, func: FuncDecl, profile: PathProfile) extends Probe {
+	def numPaths = profile.numPaths + profile.selfLoops.length;
+	def callSiteVar = PathInstrumentation.newFrameVar(func); // holds the activation's call site index
+
+	// (func, pc) of the call sites TO this func, added as their first call enters
+	def sites = Vector<(FuncDecl, int)>.new();  // list of callers
+	def counts = Vector<Array<int>>.new();      // corresponding list of path counts
+
+	new() {
+		// add misc calls: the engine and host functions, which have no wasm frame
+		addSite((null, -1));
+	}
+
+	def fire(loc: DynamicLoc) -> ProbeAction {
+		def accessor = loc.frame.getFrameAccessor();
+		def site = siteOf(accessor.caller());
+		accessor.getWriter().setFrameVar(callSiteVar, Values.box_i(site));
+		return ProbeAction.Continue;
+	}
+	// Returns the index of the call site that {caller} describes, adding it if new.
+	private def siteOf(caller: FrameLoc) -> int {
+		match (caller) {
+			Wasm(func, pc, frame) => {
+				for (i < sites.length) if (sites[i] == (func.decl, pc)) return i; // XXX: linear search
+				return addSite((func.decl, pc));
+			}
+			_ => return 0;
+		}
+	}
+	// Adds {site} and returns its index.
+	private def addSite(site: (FuncDecl, int)) -> int {
+		sites.put(site);
+		counts.put(Array<int>.new(numPaths));
+		return sites.length - 1;
+	}
+	// Returns the count of {path} summed over every call site.
+	def total(path: int) -> int {
+		var sum = 0;
+		for (i < counts.length) sum += counts[i][path];
+		return sum;
+	}
+}
+// The monitor's probe, which counts each completed path under the activation's call site.
+private class PathMonitorProbe extends PathSiteProbe {
+	def counts: PathCountsProbe;
+	new(bi: BytecodeIterator, block: PathProfilingBlock, pathRegVar: int, counts) super(bi, block, pathRegVar) { }
+	def incCount(accessor: FrameAccessor, path: int) {
+		counts.counts[Values.unbox_i(accessor.getFrameVar(counts.callSiteVar))][path]++;
+	}
+}
+
+// Prints each block of the CFG and its outgoing edges, with their Val, increment and kind.
+def printCfg(out: TraceBuilder, p: PathProfile) {
+	p.entry.dfs(printBlock(out, _), null, null);
+}
+def printBlock(out: TraceBuilder, b: PathProfilingBlock) {
+	// the range of bytes this block owns; its outgoing edges are probed at {last_instr_pc}
+	out.put3("  block %d +%d ... %d", b.id, b.bind_pos, b.end).ln();
+	b.outgoing.apply(fun (e: PathProfilingEdge) {
+		// Increment(e) is defined for chords only; a tree edge carries none
+		if (e.isChord) {
+			out.put3("    -> block %d val=%d inc=%d", e.target.id, e.val, e.increment);
+		} else {
+			out.put2("    -> block %d val=%d", e.target.id, e.val);
+		}
+		// Section 4 edge kinds: without these a dummy is indistinguishable from a real val=0 edge
+		if (e.isDummy) out.puts(" DUMMY");
+		// a backedge is left out of the acyclic graph the paths are numbered in (Section 4)
+		if (e.isBackedge) out.puts(" BACKEDGE");
+		out.ln();
+	});
+}

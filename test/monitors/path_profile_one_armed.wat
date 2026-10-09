@@ -1,0 +1,11 @@
+(module
+  (func $f (export "f") (param $x i32) (result i32)
+    (local $r i32)
+    (local.set $r (i32.const 5))
+    (if (local.get $x)
+      (then (local.set $r (i32.const 1))))
+    (local.get $r))
+  (func (export "main")
+    (drop (call $f (i32.const 0)))
+    (drop (call $f (i32.const 1))))
+)

@@ -1,0 +1,33 @@
+;; Dead blocks that still own instructions: tails after both arms return, and after a `br` out.
+(module
+  (func $both_arms_return (export "a") (param $x i32) (result i32)
+    (if (local.get $x)
+      (then (return (i32.const 1)))
+      (else (return (i32.const 2))))
+    (i32.const 99))
+  (func $both_arms_return_typed (export "b") (param $x i32) (result i32)
+    (if (result i32) (local.get $x)
+      (then (return (i32.const 1)))
+      (else (return (i32.const 2)))))
+  (func $br_out_dead_tails (export "c") (result i32)
+    (local $r i32)
+    (block $a
+      (block $b
+        (block $c
+          (local.set $r (i32.const 1))
+          (br $a)
+        )
+        (local.set $r (i32.const 2))
+      )
+      (local.set $r (i32.const 3))
+    )
+    (local.get $r))
+  (func (export "main")
+    (drop (call $both_arms_return (i32.const 1)))
+    (drop (call $both_arms_return (i32.const 1)))
+    (drop (call $both_arms_return (i32.const 0)))
+    (drop (call $both_arms_return (i32.const 0)))
+    (drop (call $both_arms_return (i32.const 0)))
+    (drop (call $both_arms_return_typed (i32.const 1)))
+    (drop (call $br_out_dead_tails)))
+)

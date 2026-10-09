@@ -7,8 +7,10 @@ def OUT = Trace.OUT;
 component BasicTracing {
 	var moduleFilter: DeclFilter;
 	var callsFilter: DeclFilter;
+	var pathsFilter: DeclFilter;
 	var memoryFilter: DeclFilter;
 	var points: List<PointFilter>;
+	private def traced = Vector<PathTrace>.new();
 
 	def reset() {
 		if (Trace.interpreter) Instrumentation.probes.add(TRACE_INTERP_PROBE);
@@ -19,7 +21,7 @@ component BasicTracing {
 	}
 	// Returns {true} if any basic tracing functionality is enabled.
 	def requiresInstrumentation() -> bool {
-		return callsFilter != null || memoryFilter != null || points != null;
+		return callsFilter != null || pathsFilter != null || memoryFilter != null || points != null;
 	}
 	// Instruments a single function.
 	def instrumentFunc(module: Module, func: FuncDecl) {
@@ -33,14 +35,21 @@ component BasicTracing {
 		if (callsFilter != null && callsFilter.matches(module, func)) {
 			Instrumentation.insertFuncEntryProbe(module, func.func_index, CALL_TRACE_PROBE);
 		}
+		if (pathsFilter != null && pathsFilter.matches(module, func)) {
+			if (func.imp == null) traced.put(PathTrace.new(module, func)); // an imported function has no body
+		}
 		if (memoryFilter != null && memoryFilter.matches(module, func)) {
 			TraceMemoryInstrumenter.new(module).runOne(func);
 		}
 	}
 	// Instruments an entire module with basic tracing.
 	def instrumentModule(module: Module) {
-		if (callsFilter == null && memoryFilter == null && points == null) return;
+		if (callsFilter == null && pathsFilter == null && memoryFilter == null && points == null) return;
 		for (i < module.functions.length) instrumentFunc(module, module.functions[i]);
+	}
+	// Prints the --trace-paths counts of each traced function.
+	def reportPaths() {
+		for (i < traced.length) traced[i].report(OUT);
 	}
 }
 
@@ -106,6 +115,56 @@ class CallTraceProbe extends Probe {
 		}
 		OUT.puts(")").ln();
 		return ProbeAction.Continue;
+	}
+}
+
+// Ball-Larus path profiling for the functions matching --trace-paths: each profiled function
+// counts the acyclic paths its executions take, in any tier, and the counts print at exit.
+
+// Profiles one function for --trace-paths and holds how many times each of its paths ran.
+class PathTrace(module: Module, func: FuncDecl) {
+	def profile = PathProfile.new(func);
+	var counts: Array<int>; // null if the function is not profiled
+
+	new() {
+		if (!profile.success) return;
+		counts = Array.new(profile.numPaths + profile.selfLoops.length);
+		// {r} lives in a frame variable, so each activation gets its own, zero-initialized by
+		// the engine at frame entry
+		def pathRegVar = PathInstrumentation.newFrameVar(func);
+		def bi = BytecodeIterator.new().reset(func);
+		profile.entry.dfs(fun (b: PathProfilingBlock) {
+			if (!b.instrumented()) return;
+			def probe = PathProbe.new(bi, b, pathRegVar, counts);
+			// ENTRY's edge leaves before any instruction, so its probe is the function entry probe
+			if (b.last_instr_pc < 0) Instrumentation.insertFuncEntryProbe(module, func.func_index, probe);
+			else Instrumentation.insertLocalProbe(module, func.func_index, b.last_instr_pc, probe);
+		}, null, null);
+	}
+	// Prints the nonzero path counts, each with the route its path number denotes, then the
+	// trips around each self-loop, named by its block's start pc.
+	def report(out: TraceBuilder) {
+		if (counts == null) return;
+		out.put2("path profile of %q: %d paths", func.render(module.names, _), profile.numPaths).ln();
+		for (k < profile.numPaths) {
+			if (counts[k] == 0) continue;
+			out.put2("  counts[%d] = %d\tpath:", k, counts[k]);
+			profile.renderPath(k, out);
+			out.ln();
+		}
+		for (i < profile.selfLoops.length) {
+			def n = counts[profile.numPaths + i];
+			if (n > 0) out.put2("  selfloop +%d = %d", profile.selfLoops[i].bind_pos, n).ln();
+		}
+	}
+}
+
+// The --trace-paths probe, which counts into {counts}; SPC compiles it inline.
+class PathProbe extends PathSiteProbe {
+	def counts: Array<int>;
+	new(bi: BytecodeIterator, block: PathProfilingBlock, pathRegVar: int, counts) super(bi, block, pathRegVar) { }
+	def incCount(accessor: FrameAccessor, path: int) {
+		counts[path]++;
 	}
 }
 
