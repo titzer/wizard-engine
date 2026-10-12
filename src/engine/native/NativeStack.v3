@@ -14,10 +14,12 @@ class NativeStack extends WasmStack {
 	var return_results: Array<ValueType>;
 	var state_: StackState = StackState.EMPTY;
 	var next_stack: NativeStack;
+	var compressed: CompressedStack;	// frames or bound values, if {COMPRESSED}; see {NativeStackCompression}
+	var scanned: bool;			// GC scanner is registered
 
 	new(range) {
-		if (valuerep.tagged) RiGc.registerScanner(this, NativeStack.scan);
-		if (range == null) return; // allocated without a mapping, no need to initialize further
+		if (range == null) return; // allocated without a segment, no need to initialize further
+		registerScanner();
 		clear();
 		if (Trace.stack && Debug.stack) Trace.OUT.put2("newStack start=0x%x, end=0x%x", range.start - Pointer.NULL, range.end - Pointer.NULL).ln();
 	}
@@ -35,7 +37,17 @@ class NativeStack extends WasmStack {
 		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
 	}
 	// Requires {state == EMPTY}.
+	// A stack without a segment becomes {COMPRESSED}, getting a segment when resumed.
 	def reset(func: Function) -> this {
+		if (range == null) {
+			checkState("reset()", StackState.EMPTY);
+			this.func = func;
+			return_results = func.sig.results;
+			parent = null;
+			bottom = this;
+			state_ = StackState.COMPRESSED;
+			return;
+		}
 		reset0(func, func.sig.params.length);
 		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
 	}
@@ -43,10 +55,26 @@ class NativeStack extends WasmStack {
 	def resetForFrameWrites(func: Function) -> this {
 		reset0(func, 0);
 	}
+	// Attaches {segment} to this stack, which has none.
+	def attach(segment: MemoryRange) {
+		range = segment;
+		registerScanner();
+	}
+	private def registerScanner() {
+		if (scanned || !valuerep.tagged) return;
+		RiGc.registerScanner(this, NativeStack.scan);
+		scanned = true;
+	}
+	// Returns {true} if this stack has no frames yet and will enter {func} when resumed.
+	def isAtFuncEntry() -> bool {
+		return range != null && rsp < range.end && rsp.load<Pointer>() == STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY;
+	}
 	// Requires {state == SUSPENDED}.
 	// Pushes {args} incrementally onto the value stack.
 	def bind(args: Range<Value>) -> this {
 		if (args.length == 0) return;
+		if (NativeStackCompression.bindEntry(this, args)) return;
+		NativeStackCompression.decompress(this);
 		checkState("bind()", StackState.SUSPENDED);
 		for (v in args) push(v);
 	}
@@ -54,6 +82,7 @@ class NativeStack extends WasmStack {
 	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
 	// or suspends itself.
 	def resume() -> Result {
+		NativeStackCompression.decompress(this);
 		checkState("resume()", StackState.SUSPENDED);
 		if (Trace.stack) traceFrames("stack.resume", rsp + RETADDR_SIZE);
 		var bottom = NativeStack.!(this.bottom);
@@ -464,6 +493,7 @@ class NativeStack extends WasmStack {
 	}
 	// GC callback to scan (tagged) values on this stack
 	def scan() {
+		if (range == null) return; // compressed, or allocated without a mapping
 		if (Trace.gc) {
 			Trace.OUT.put1("scanStack obj=0x%x", u64.view(Pointer.atObject(this) - Pointer.NULL)).ln();
 		}
@@ -505,6 +535,7 @@ class NativeStack extends WasmStack {
 			BpTypeCode.ARRAYREF.code,
 			BpTypeCode.FUNCREF.code,
 			BpTypeCode.EXNREF.code,
+			BpTypeCode.NULLEXNREF.code,
 			BpTypeCode.NULLFUNCREF.code => return Value.Ref(vp.load<Object>());
 
 			BpTypeCode.I32.code => return Value.I32(vp.load<u32>());
@@ -512,7 +543,8 @@ class NativeStack extends WasmStack {
 			BpTypeCode.F32.code => return Value.F32(vp.load<u32>());
 			BpTypeCode.F64.code => return Value.F64(vp.load<u64>());
 			BpTypeCode.V128.code => return Value.V128(vp.load<u64>(), (vp + 8).load<u64>());
-			BpTypeCode.CONTREF.code => {
+			BpTypeCode.CONTREF.code,
+			BpTypeCode.NULLCONTREF.code => {
 				var stack = vp.load<WasmStack>();
 				var version = (vp + 8).load<u64>();
 				return Value.Cont(Continuation(stack, version));
