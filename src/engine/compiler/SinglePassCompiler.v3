@@ -1450,157 +1450,213 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var n_binds = u32.!(in_cont.sig.params.length - out_cont.sig.params.length);
 		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
 	}
-	// Publishes the handler table of the resume at {it.pc} on {curStack}.
-	// Parks the current stack, publishes the site's handler table, chains {contStack} under it and switches.
-	def emitResumeChain(curStack: Reg, contStack: Reg, results: Array<ValueType>) {
-		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_get_curstack(curStack);
-		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-		masm.emit_reserve_return_slot(curStack);
-		masm.emit_mov_r_Array(xenv.scratch, func.handlers.resume_sites[it.pc]);
-		masm.emit_chain_cont_to_parent(curStack, contStack, xenv.scratch, HandlerTier.SPC);
-		masm.emit_call_label(stub_resume);
-		/* === CHILD RETURNS HERE === */
-		state.pushResults(results);
-		emit_reload_regs();
-		masm.emit_br(end);
-		masm.bindLabel(stub_resume);
-		masm.emit_switch_to_stack(contStack);
-		masm.bindLabel(end);
-	}
 	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
-		var pos = it.pc;
-		buildResumeHandlerDests(pos, handlers);
-
+		buildResumeHandlerDests(it.pc, handlers);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
+		var n = cont_decl.sig.params.length, slot_size = masm.valuerep.slot_size, offsets = masm.getOffsets();
 
-		// XXX: not necessary to store the entire value stack to memory
+		// Spill the value stack and consume the continuation on top of it.
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var contStack = allocTmp(ValueKind.REF);
+		var contStack = allocTmp(ValueKind.REF), curStack = allocTmp(ValueKind.REF);
 		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
 		state.pop();
-		var curStack = allocTmp(ValueKind.REF);
 
-		// Move the arguments onto the continuation's value stack.
-		var n = cont_decl.sig.params.length;
+		// Copy the arguments onto the continuation's value stack and advance its vsp past them.
 		if (n > 0) {
 			var dst = allocTmp(ValueKind.REF), xmm = allocTmp(ValueKind.V128);
 			emit_compute_vsp(vsp, state.sp - u32.view(n));
 			masm.emit_v3_NativeStack_vsp_r_r(dst, contStack);
-			masm.emit_move_values(contStack, dst, vsp, n, xmm);
+			masm.emit_value_copy_n(dst, vsp, n, xmm);
+			masm.emit_addw_r_i(dst, n * slot_size);
+			masm.emit_v3_set_NativeStack_vsp_r_r(contStack, dst);
 			dropN(u32.view(n));
 		}
 
-		emitResumeChain(curStack, contStack, cont_decl.sig.results);
+		// Park the current stack with its vsp and a slot for the child's return address.
+		var bottom = allocTmp(ValueKind.REF), tmp = allocTmp(ValueKind.REF);
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
+
+		// Publish this site's handler table on the current stack for inline suspend and switch.
+		masm.emit_mov_r_Array(tmp, func.handlers.resume_sites[it.pc]);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(curStack, offsets.NativeStack_handlers), tmp);
+		masm.emit_mov_m_b(MasmAddr(curStack, offsets.NativeStack_handler_tier), byte.view(HandlerTier.SPC.tag));
+
+		// Chain the continuation's bottom stack under the current stack and route its return here.
+		masm.emit_set_stack_state(curStack, StackState.CALL_CHILD);
+		masm.emit_set_stack_state(contStack, StackState.RUNNING);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(contStack, offsets.NativeStack_bottom));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, offsets.NativeStack_parent), curStack);
+		masm.emit_v3_NativeStack_rsp_r_r(tmp, curStack);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(bottom, offsets.NativeStack_parent_rsp_ptr));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, 0), tmp);
+		masm.emit_mov_m_l(MasmAddr(contStack, offsets.NativeStack_bottom), 0);
+
+		// Call the stub that enters the continuation; its return lands after the call.
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		masm.emit_call_label(stub_resume);
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		masm.emit_br(end);
+
+		// Stub: make the continuation current, switch to its rsp and jump to its resume address.
+		masm.bindLabel(stub_resume);
+		masm.emit_set_curstack(contStack);
+		masm.emit_v3_NativeStack_rsp_r_r(regs.sp, contStack);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_jump_r(xenv.scratch);
+		masm.bindLabel(end);
 	}
 	def visit_SUSPEND(tag_index: u31) {
 		var sig = SigDecl.!(module.heaptypes[module.tags[tag_index].sig_index]);
+		var n = sig.params.length, slot_size = masm.valuerep.slot_size, offsets = masm.getOffsets();
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		emitInlineSuspend(sig, tag_index);
+		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF);
+		var tag = allocTmp(ValueKind.REF), entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
+		var xmm = allocTmp(ValueKind.V128);
+
+		// Spill vsp and reserve the slot that the stub's call fills with this stack's resume address.
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_get_curstack(cur);
+		masm.emit_v3_set_NativeStack_rsp_r_r(cur, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(cur);
+
+		// Load the tag and find the stack whose published handler table has a suspend clause for it.
+		emit_load_instance(tag);
+		masm.emit_v3_Instance_tags_r_r(tag, tag);
+		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tag, tag, int.!(tag_index));
+		masm.emit_handler_search(false, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+		// Redirect the handler stack's top frame to the handler; {dst} gets the handler's vsp.
+		var dst = tag, psfp = cnt;
+		masm.emit_handler_fixup(parent, entry, dst, psfp);
+
+		// Copy the payload and this continuation onto the handler stack and record its new vsp.
+		if (n > 0) masm.emit_addw_r_i(vsp, 0 - n * slot_size);
+		masm.emit_value_copy_n(dst, vsp, n, xmm);
+		masm.emit_store_continuation(dst, n * slot_size, cur);
+		masm.emit_addw_r_i(dst, (n + 1) * slot_size);
+		masm.emit_v3_set_NativeStack_vsp_r_r(parent, dst);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(psfp, frame.vsp_slot.offset), dst);
+		state.popArgsAndPushResults(sig);
+
+		// Suspend the current stack with {prev} as the continuation's bottom, detached from the handler.
+		masm.emit_v3_set_NativeStack_vsp_r_r(cur, vsp);
+		masm.emit_set_stack_state(cur, StackState.SUSPENDED);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(cur, offsets.NativeStack_bottom), prev);
+		masm.emit_mov_m_l(MasmAddr(prev, offsets.NativeStack_parent), 0);
+
+		// Retire the handler stack's table and make it the running stack.
+		masm.emit_mov_m_l(MasmAddr(parent, offsets.NativeStack_handlers), 0);
+		masm.emit_mov_m_b(MasmAddr(parent, offsets.NativeStack_handler_tier), byte.view(HandlerTier.NONE.tag));
+		masm.emit_set_stack_state(parent, StackState.RUNNING);
+		masm.emit_set_curstack(parent);
+
+		// Call the stub that enters {parent}; a later resume of this stack lands after the call.
+		var stub = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		masm.emit_call_label(stub);
+		emit_reload_regs();
+		masm.emit_br(end);
+
+		// Stub: switch to {parent}'s rsp, pop the landing address, save the new rsp and jump.
+		masm.bindLabel(stub);
+		masm.emit_v3_NativeStack_rsp_r_r(regs.sp, parent);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_v3_set_NativeStack_rsp_r_r(parent, regs.sp);
+		masm.emit_jump_r(xenv.scratch);
+		masm.bindLabel(end);
 	}
 	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
 		var target_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
 		var target_top = target_decl.sig.params[target_decl.sig.params.length - 1];
 		var this_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top).heap).cont);
+		var n = target_decl.sig.params.length - 1, slot_size = masm.valuerep.slot_size, offsets = masm.getOffsets();
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		emitInlineSwitch(target_decl, this_decl, tag_index);
-	}
-	// Spills vsp and reserves the resume slot so the current stack can be left and resumed later.
-	def emitPrepareToLeaveStack(vsp: Reg, cur: Reg) {
-		emit_compute_vsp(vsp, state.sp);
-		emit_spill_vsp(vsp);
-		// TODO[rv]: write vsp to curStack
-		masm.emit_get_curstack(cur);
-		masm.emit_reserve_return_slot(cur);
-	}
-	// Calls the stub that {emitEnter} emits to enter another stack, and lands the resumed frame after the call.
-	// TODO[rv]: inline this
-	def emitLeaveStack(emitEnter: void -> void) {
-		var stub = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
-		masm.emit_call_label(stub);
-		/* === OTHER STACK RUNNING === */
-		emit_reload_regs();
-		masm.emit_br(end);
-		masm.bindLabel(stub);
-		emitEnter();
-		masm.bindLabel(end);
-	}
-	// Makes {dest} the running stack and enters it.
-	def emitEnterStack(dest: Reg) {
-		masm.emit_set_stack_state(dest, StackState.RUNNING);
-		masm.emit_set_curstack(dest);
-		emitLeaveStack(fun => masm.emit_enter_stack(dest));
-	}
-	// Loads the module tag {tag_index} of this instance into {r}.
-	def emit_load_tag(r: Reg, tag_index: u31) {
-		emit_load_instance(r);
-		masm.emit_v3_Instance_tags_r_r(r, r);
-		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, r, r, int.!(tag_index));
-	}
-	// Finds the handler stack, redirects its top frame, moves the payload and switches to it.
-	def emitInlineSuspend(sig: SigDecl, tag_index: u31) {
-		var n = sig.params.length, slot_size = masm.valuerep.slot_size, offsets = masm.getOffsets();
-		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF);
-		var tag = allocTmp(ValueKind.REF), entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
-		var xmm = allocTmp(ValueKind.V128);
-		emitPrepareToLeaveStack(vsp, cur);
-		emit_load_tag(tag, tag_index);
-		masm.emit_handler_search(false, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
-		var dst = tag, psfp = cnt;
-		masm.emit_handler_fixup(parent, entry, dst, psfp);
-		if (n > 0) masm.emit_addw_r_i(vsp, 0 - n * slot_size);
-		masm.emit_pass_values(parent, dst, vsp, n, cur, xmm);
-		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(psfp, frame.vsp_slot.offset), dst);
-		masm.emit_suspend_stack(cur, vsp, prev);
-		masm.emit_mov_m_l(MasmAddr(prev, offsets.NativeStack_parent), 0);
-		masm.emit_clear_handlers(parent);
-		state.popArgsAndPushResults(sig);
-		emitEnterStack(parent);
-	}
-	// Consumes the target continuation, splices its chain under the switch handler and switches to it.
-	def emitInlineSwitch(target_decl: ContDecl, this_decl: ContDecl, tag_index: u31) {
-		var n = target_decl.sig.params.length - 1, slot_size = masm.valuerep.slot_size;
 		var vsp = allocTmp(ValueKind.REF), cur = allocTmp(ValueKind.REF), target = allocTmp(ValueKind.REF);
 		var prev = allocTmp(ValueKind.REF), parent = allocTmp(ValueKind.REF), tag = allocTmp(ValueKind.REF);
 		var entry = allocTmp(ValueKind.REF), cnt = allocTmp(ValueKind.REF), ptags = allocTmp(ValueKind.REF);
 		var xmm = allocTmp(ValueKind.V128);
-		emitPrepareToLeaveStack(vsp, cur);
+
+		// Spill vsp and reserve the slot that the stub's call fills with this stack's resume address.
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_get_curstack(cur);
+		masm.emit_v3_set_NativeStack_rsp_r_r(cur, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(cur);
+
+		// Consume the target continuation on top of the value stack.
 		masm.emit_validate_and_consume_cont(target, MasmAddr(vsp, masm.valuerep.tag_size - slot_size));
-		emit_load_tag(tag, tag_index);
+
+		// Load the tag and find the stack whose published handler table has a switch clause for it.
+		emit_load_instance(tag);
+		masm.emit_v3_Instance_tags_r_r(tag, tag);
+		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tag, tag, int.!(tag_index));
 		masm.emit_handler_search(true, tag, cur, parent, prev, entry, cnt, ptags, masm.newTrapLabel(TrapReason.INVALID_SUSPEND));
+
+		// Splice the target's chain under the handler stack in place of the current chain.
 		var bottom = entry, dst = tag, tmp = cnt;
 		masm.emit_replace_child_chain(parent, prev, target, bottom, tmp);
+
+		// Suspend the current stack below the payload, with {prev} as the continuation's bottom.
 		masm.emit_addw_r_i(vsp, 0 - (n + 1) * slot_size);
-		masm.emit_suspend_stack(cur, vsp, prev);
+		masm.emit_v3_set_NativeStack_vsp_r_r(cur, vsp);
+		masm.emit_set_stack_state(cur, StackState.SUSPENDED);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(cur, offsets.NativeStack_bottom), prev);
+
+		// Copy the payload and this continuation onto the target stack and advance its vsp.
 		masm.emit_v3_NativeStack_vsp_r_r(dst, target);
-		masm.emit_pass_values(target, dst, vsp, n, cur, xmm);
+		masm.emit_value_copy_n(dst, vsp, n, xmm);
+		masm.emit_store_continuation(dst, n * slot_size, cur);
+		masm.emit_addw_r_i(dst, (n + 1) * slot_size);
+		masm.emit_v3_set_NativeStack_vsp_r_r(target, dst);
 		state.pop();
 		state.sp -= u32.view(n);
 		state.pushResults(this_decl.sig.params);
-		emitEnterStack(target);
+
+		// Make the target the running stack.
+		masm.emit_set_stack_state(target, StackState.RUNNING);
+		masm.emit_set_curstack(target);
+
+		// Call the stub that enters {target}; a later resume of this stack lands after the call.
+		var stub = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		masm.emit_call_label(stub);
+		emit_reload_regs();
+		masm.emit_br(end);
+
+		// Stub: switch to {target}'s rsp, pop the landing address, save the new rsp and jump.
+		masm.bindLabel(stub);
+		masm.emit_v3_NativeStack_rsp_r_r(regs.sp, target);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_v3_set_NativeStack_rsp_r_r(target, regs.sp);
+		masm.emit_jump_r(xenv.scratch);
+		masm.bindLabel(end);
 	}
 	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
-		var pos = it.pc;
-		buildResumeHandlerDests(pos, handlers);
-
+		buildResumeHandlerDests(it.pc, handlers);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		var tag = module.tags[tag_id];
 		if (checkForConstNull(state.peek())) return;
+		var offsets = masm.getOffsets();
 
+		// Spill the value stack and consume the continuation on top of it.
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var curStack = allocTmp(ValueKind.REF);
-		var contStack = allocTmp(ValueKind.REF);
+		var curStack = allocTmp(ValueKind.REF), contStack = allocTmp(ValueKind.REF);
 		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
 		state.pop();
+
+		// Call the runtime to throw the tag's exception into the continuation.
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_store_curstack_vsp(vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
 		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
 		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
@@ -1608,24 +1664,59 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
 		masm.emit_call_runtime_RESUME_THROW();
 		dropN(u32.!(tag.fields.length));
-		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
-		// XXX: make RT function return {Continuation} directly
-		state.push(KIND_CONT | TAG_STORED | IS_STORED, NO_REG, 0);
 
-		/* === only reachable when continuation handles the error === */
+		// Only reached if handled; the runtime pushed the handler's continuation (XXX: return it directly).
+		state.push(KIND_CONT | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
-		masm.emit_load_cont_stack(contStack, masm.slotAddr(state.sp - 1));
+		masm.emit_mov_r_m(ValueKind.REF, contStack, masm.slotAddr(state.sp - 1));
 		state.pop();
 
-		emitResumeChain(curStack, contStack, cont_decl.sig.results);
+		// Park the current stack with its vsp and a slot for the child's return address.
+		var bottom = allocTmp(ValueKind.REF), tmp = allocTmp(ValueKind.REF);
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
+
+		// Publish this site's handler table on the current stack for inline suspend and switch.
+		masm.emit_mov_r_Array(tmp, func.handlers.resume_sites[it.pc]);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(curStack, offsets.NativeStack_handlers), tmp);
+		masm.emit_mov_m_b(MasmAddr(curStack, offsets.NativeStack_handler_tier), byte.view(HandlerTier.SPC.tag));
+
+		// Chain the continuation's bottom stack under the current stack and route its return here.
+		masm.emit_set_stack_state(curStack, StackState.CALL_CHILD);
+		masm.emit_set_stack_state(contStack, StackState.RUNNING);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(contStack, offsets.NativeStack_bottom));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, offsets.NativeStack_parent), curStack);
+		masm.emit_v3_NativeStack_rsp_r_r(tmp, curStack);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(bottom, offsets.NativeStack_parent_rsp_ptr));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, 0), tmp);
+		masm.emit_mov_m_l(MasmAddr(contStack, offsets.NativeStack_bottom), 0);
+
+		// Call the stub that enters the continuation; its return lands after the call.
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		masm.emit_call_label(stub_resume);
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		masm.emit_br(end);
+
+		// Stub: make the continuation current, switch to its rsp and jump to its resume address.
+		masm.bindLabel(stub_resume);
+		masm.emit_set_curstack(contStack);
+		masm.emit_v3_NativeStack_rsp_r_r(regs.sp, contStack);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_jump_r(xenv.scratch);
+		masm.bindLabel(end);
 	}
 	def visit_RESUME_THROW_REF(cont_id: u31, handlers: Range<SuspensionHandler>) {
-		var pos = it.pc;
-		buildResumeHandlerDests(pos, handlers);
-
+		buildResumeHandlerDests(it.pc, handlers);
 		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
 		if (checkForConstNull(state.peek())) return;
+		var offsets = masm.getOffsets();
 
+		// Consume the continuation on top, pop the exnref into its argument register and spill the rest.
 		var contStack = allocTmp(ValueKind.REF);
 		masm.emit_validate_and_consume_cont(contStack, masm.slotAddr(state.sp - 1));
 		state.pop();
@@ -1633,25 +1724,62 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
 		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
 		var curStack = allocTmp(ValueKind.REF);
+
+		// Call the runtime to throw the exnref into the continuation.
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(xenv.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_store_curstack_vsp(vsp);
 		masm.emit_get_curstack(regs.runtime_arg0);
 		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
 		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_call_runtime_RESUME_THROW_REF();
-		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
-		// XXX: make RT function return {Continuation} directly
-		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
 
-		/* === only reachable when continuation handles the error === */
+		// Only reached if handled; the runtime pushed the handler's continuation (XXX: return it directly).
+		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
-		masm.emit_load_cont_stack(contStack, masm.slotAddr(state.sp - 1));
+		masm.emit_mov_r_m(ValueKind.REF, contStack, masm.slotAddr(state.sp - 1));
 		state.pop();
 
-		emitResumeChain(curStack, contStack, cont_decl.sig.results);
+		// Park the current stack with its vsp and a slot for the child's return address.
+		var bottom = allocTmp(ValueKind.REF), tmp = allocTmp(ValueKind.REF);
+		emit_compute_vsp(vsp, state.sp);
+		emit_spill_vsp(vsp);
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, vsp);
+		masm.emit_v3_set_NativeStack_rsp_r_r(curStack, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(curStack);
+
+		// Publish this site's handler table on the current stack for inline suspend and switch.
+		masm.emit_mov_r_Array(tmp, func.handlers.resume_sites[it.pc]);
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(curStack, offsets.NativeStack_handlers), tmp);
+		masm.emit_mov_m_b(MasmAddr(curStack, offsets.NativeStack_handler_tier), byte.view(HandlerTier.SPC.tag));
+
+		// Chain the continuation's bottom stack under the current stack and route its return here.
+		masm.emit_set_stack_state(curStack, StackState.CALL_CHILD);
+		masm.emit_set_stack_state(contStack, StackState.RUNNING);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(contStack, offsets.NativeStack_bottom));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, offsets.NativeStack_parent), curStack);
+		masm.emit_v3_NativeStack_rsp_r_r(tmp, curStack);
+		masm.emit_mov_r_m(ValueKind.REF, bottom, MasmAddr(bottom, offsets.NativeStack_parent_rsp_ptr));
+		masm.emit_mov_m_r(ValueKind.REF, MasmAddr(bottom, 0), tmp);
+		masm.emit_mov_m_l(MasmAddr(contStack, offsets.NativeStack_bottom), 0);
+
+		// Call the stub that enters the continuation; its return lands after the call.
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		masm.emit_call_label(stub_resume);
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		masm.emit_br(end);
+
+		// Stub: make the continuation current, switch to its rsp and jump to its resume address.
+		masm.bindLabel(stub_resume);
+		masm.emit_set_curstack(contStack);
+		masm.emit_v3_NativeStack_rsp_r_r(regs.sp, contStack);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_jump_r(xenv.scratch);
+		masm.bindLabel(end);
 	}
 	private def checkForConstNull(sv: SpcVal) -> bool {
 		if (sv.isConst() && sv.const == 0) {
