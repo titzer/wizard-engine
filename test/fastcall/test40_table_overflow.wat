@@ -1,6 +1,6 @@
-;; 41 functions exported with fast: names; the 41st exceeds FAST_CALL_OPCODES (40).
-;; The 41st function must fall back to a regular call rather than crashing.
-;; All 41 calls must produce correct results.
+;; 40 functions exported with fast: names; the 40th exceeds FAST_CALL_OPCODES (39).
+;; The 40th function must fall back to a regular call rather than crashing.
+;; All 40 calls must produce correct results.
 (module
   (func $f0  (export "fast:f0")  (param i32) (result i32) local.get 0 i32.const 1  i32.add)
   (func $f1  (export "fast:f1")  (param i32) (result i32) local.get 0 i32.const 2  i32.add)
@@ -41,9 +41,8 @@
   (func $f36 (export "fast:f36") (param i32) (result i32) local.get 0 i32.const 37 i32.add)
   (func $f37 (export "fast:f37") (param i32) (result i32) local.get 0 i32.const 38 i32.add)
   (func $f38 (export "fast:f38") (param i32) (result i32) local.get 0 i32.const 39 i32.add)
+  ;; 40th: no slot available, must fall back to normal call
   (func $f39 (export "fast:f39") (param i32) (result i32) local.get 0 i32.const 40 i32.add)
-  ;; 41st: no slot available, must fall back to normal call
-  (func $f40 (export "fast:f40") (param i32) (result i32) local.get 0 i32.const 41 i32.add)
   (func (export "main") (result i32)
     (local $acc i32)
     i32.const 0 call $f0  local.get $acc i32.add local.set $acc
@@ -86,8 +85,7 @@
     i32.const 0 call $f37 local.get $acc i32.add local.set $acc
     i32.const 0 call $f38 local.get $acc i32.add local.set $acc
     i32.const 0 call $f39 local.get $acc i32.add local.set $acc
-    i32.const 0 call $f40 local.get $acc i32.add local.set $acc
     local.get $acc
-    i32.const 861  ;; 1+2+3+...+41 = 861
+    i32.const 820  ;; 1+2+3+...+40 = 820
     i32.ne)
 )
