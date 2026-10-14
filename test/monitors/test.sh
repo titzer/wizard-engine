@@ -33,6 +33,7 @@ else
         "profile_bytecode{switch_size=7,abstract_interpreter=true}"
         "alloc"
         "opcodes"
+        "stackdepth"
         "ssevent")
 fi
 
