@@ -1,0 +1,18 @@
+;; Straight-line functions, some making calls, each with exactly one path.
+(module
+  (func $add1 (export "add1") (param $x i32) (result i32)
+    (i32.add (local.get $x) (i32.const 1)))
+  (func $nops (export "nops") (result i32)
+    (nop) (drop (i32.const 3)) (nop)
+    (i32.const 0))
+  (func $calls (export "calls") (param $x i32) (result i32)
+    (i32.add (call $add1 (local.get $x)) (call $nops)))
+  (func (export "main")
+    (drop (call $add1 (i32.const 1)))
+    (drop (call $add1 (i32.const 2)))
+    (drop (call $add1 (i32.const 3)))
+    (drop (call $nops))
+    (drop (call $nops))
+    (drop (call $calls (i32.const 4)))
+    (drop (call $calls (i32.const 5))))
+)

@@ -1,0 +1,13 @@
+(module
+  (func $fact (export "fact") (param $n i32) (result i32)
+    (if (result i32) (i32.le_s (local.get $n) (i32.const 1))
+      (then (i32.const 1))
+      (else (i32.mul (local.get $n) (call $fact (i32.sub (local.get $n) (i32.const 1)))))
+    )
+  )
+  (func (export "main")
+    (drop (call $fact (i32.const 1)))
+    (drop (call $fact (i32.const 2)))
+    (drop (call $fact (i32.const 3)))
+    (drop (call $fact (i32.const 5))))
+)

@@ -1,0 +1,18 @@
+;; Exact path counts in a recursive function, recursing up to 20 deep.
+(module
+  ;; base case + 4 recursive paths (two diamonds on bits 0 and 1 of $n)
+  (func $rec (export "rec") (param $n i32) (result i32) (local $r i32)
+    (if (i32.eqz (local.get $n)) (then (return (i32.const 0))))
+    (if (i32.and (local.get $n) (i32.const 1))
+      (then (local.set $r (i32.add (local.get $r) (i32.const 1))))
+      (else (local.set $r (local.get $r))))
+    (if (i32.and (local.get $n) (i32.const 2))
+      (then (local.set $r (i32.add (local.get $r) (i32.const 2))))
+      (else (local.set $r (local.get $r))))
+    (i32.add (local.get $r) (call $rec (i32.sub (local.get $n) (i32.const 1)))))
+  (func (export "main")
+    (drop (call $rec (i32.const 7)))
+    (drop (call $rec (i32.const 13)))
+    (drop (call $rec (i32.const 20)))
+    (drop (call $rec (i32.const 5)))
+  ))
