@@ -6,15 +6,16 @@ def PAGE_SIZE = 4096u;
 
 // Manages native memory mappings for native stacks.
 component NativeStackManager {
-	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
-	var total: int;			// number of segments in {all}
-	var cache: NativeStack;		// used in fast-path allocation in generated code
+	var all: NativeStackSegment;		// all segments ever mapped; never unmapped
+	var total: int;				// number of segments in {all}
+	var cache: NativeStack;			// used in fast-path allocation in generated code
+	var freeSegments: NativeStackSegment;	// segments released by the GC, not yet wrapped in a stack
 
 	// Gets a stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
 		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
 		if (cache == null) {
-			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCollectingAndReclaiming() || tryCompressingStacks();
+			var ok = tryReclaimingSegments() || tryAllocatingNewStacks() || tryCollectingAndReclaiming() || tryCompressingStacks();
 			if (!ok) return null;
 		}
 
@@ -22,6 +23,31 @@ component NativeStackManager {
 		cache = cache.next_stack;
 		result.next_stack = null;
 		return result.clear();
+	}
+	// Wraps {segment} in a new cached stack that owns it.
+	private def wrap(segment: NativeStackSegment) {
+		var stack = NativeStack.new(segment);
+		attach(stack, segment);
+		stack.next_stack = cache;
+		cache = stack;
+	}
+	// Makes {stack} the empty owner of {segment}, registering its finalizer the first time.
+	def attach(stack: NativeStack, segment: NativeStackSegment) {
+		var owner = stack.owner;
+		if (owner == null) {
+			owner = stack.owner = SegmentOwner.new();
+			RiGc.registerFinalizer(stack, owner.release);
+		}
+		owner.segment = segment;
+		stack.range = segment;
+		stack.clear();
+	}
+	// Takes the segment away from {stack}, which must not be used until another is attached.
+	def detach(stack: NativeStack) -> NativeStackSegment {
+		var segment = stack.range;
+		stack.owner.segment = null;
+		stack.range = null;
+		return segment;
 	}
 	private def tryAllocatingNewStacks() -> bool {
 		var size = EngineOptions.STACK_SIZE.get();
@@ -40,28 +66,24 @@ component NativeStackManager {
 			// insert redzone roughly in the middle of the mapping.
 			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
 			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
-			var curr = NativeStack.new(segment);
-			segment.stack.set(curr);
-			curr.next_stack = cache;
-			cache = curr;
+			wrap(segment);
 			total++;
 		}
 		return cache != null; // OK if succeeded in allocating at least one
 	}
+	// Wraps every segment released by the GC in a fresh stack.
 	private def tryReclaimingSegments() -> bool {
 		var ok = false;
-		for (p = all; p != null; p = p.next) {
-			if (p.stack.get() == null) { // weak reference was cleared by GC, can reclaim
-				var s = NativeStack.new(p);
-				p.stack.set(s);
-				s.next_stack = cache;
-				cache = s;
-				ok = true;
-			}
+		while (freeSegments != null) {
+			var segment = freeSegments;
+			freeSegments = segment.next_free;
+			segment.next_free = null;
+			wrap(segment);
+			ok = true;
 		}
 		return ok;
 	}
-	// Weak references are only cleared by a GC, so force one to find dead stacks.
+	// Dead stacks are only found by a GC, so force one to release their segments.
 	private def tryCollectingAndReclaiming() -> bool {
 		if (all == null) return false;
 		Target.forceGC();
@@ -97,8 +119,27 @@ component NativeStackManager {
 
 // Native stack segments are individually mmap'd with a guard page in the middle
 class NativeStackSegment extends MemoryRange {
-	var next: NativeStackSegment;
-	def stack = WeakRef<NativeStack>.new();	// owner, if any; cleared by GC
+	var next: NativeStackSegment;		// link in {NativeStackManager.all}
+	var next_free: NativeStackSegment;	// link in {NativeStackManager.freeSegments}
 
 	new(start: Pointer, end: Pointer) super(start, end) { }
+
+	// Returns this segment, which no stack owns, to {NativeStackManager.freeSegments}.
+	def release() {
+		next_free = NativeStackManager.freeSegments;
+		NativeStackManager.freeSegments = this;
+	}
+}
+
+// Records which segment a stack owns, so that the stack's finalizer releases the right one.
+class SegmentOwner {
+	var segment: NativeStackSegment;
+
+	// Finalizer run by the GC once the owning stack has been collected.
+	def release() {
+		var s = segment;
+		if (s == null) return; // the segment was detached before the stack died
+		segment = null;
+		s.release();
+	}
 }

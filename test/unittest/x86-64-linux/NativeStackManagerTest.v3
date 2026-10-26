@@ -16,7 +16,12 @@ def X_ = void(
 	T("recycle_reuse", test_recycle_reuse),
 	T("recycle_clears", test_recycle_clears),
 	T("limit_batch", test_limit_batch),
-	T("weak_ref_survives_gc", test_weak_ref_survives_gc),
+	T("live_survives_gc", test_live_survives_gc),
+	T("release_on_gc", test_release_on_gc),
+	T("release_once_per_stack", test_release_once_per_stack),
+	T("owner_tracks_segment", test_owner_tracks_segment),
+	T("owner_moved_segment", test_owner_moved_segment),
+	T("owner_reattach", test_owner_reattach),
 	T("reclaim_explicit_gc", test_reclaim_explicit_gc),
 	T("reclaim_implicit_gc", test_reclaim_implicit_gc),
 	T("reclaim_skips_live", test_reclaim_skips_live),
@@ -48,14 +53,11 @@ private class NativeStackManagerTester extends ExeTester {
 		StackTuning.maxStacks = M.total;
 		M.cache = null;
 		Target.forceGC();
-		var free = 0;
-		for (seg = M.all; seg != null; seg = seg.next) if (seg.stack.get() == null) free++;
+		var free = countFree();
 		held = Array<NativeStack>.new(free);
 		for (i < free) held[i] = fresh();
 		if (M.cache != null) t.fail("expected cache to be empty after pinning");
-		for (seg = M.all; seg != null; seg = seg.next) {
-			if (seg.stack.get() == null) t.fail("expected all segments to be owned after pinning");
-		}
+		if (M.freeSegments != null) t.fail("expected no free segments after pinning");
 		StackTuning.maxStacks = M.total + extra;
 		limit_total = StackTuning.maxStacks;
 	}
@@ -69,7 +71,43 @@ private class NativeStackManagerTester extends ExeTester {
 		if (s.vsp != s.range.start) t.fail("expected fresh stack vsp == range.start");
 		if (s.rsp != s.range.end) t.fail("expected fresh stack rsp == range.end");
 		if (s.next_stack != null) t.fail("expected fresh stack to be unlinked from the cache");
+		checkOwner(s);
 		return s;
+	}
+	def checkOwner(s: NativeStack) {
+		if (s.owner == null) return t.fail("expected stack to have a segment owner");
+		if (s.owner.segment != s.range) t.fail("expected stack owner to record the attached segment");
+	}
+	// Moves a fresh stack's segment to a new stack and drops the fresh stack, returning the new owner.
+	def moveSegmentToNewStack() -> NativeStack #no-inline {
+		var a = fresh();
+		var b = NativeStack.new(null);
+		M.attach(b, M.detach(a));
+		if (a.range != null || a.owner.segment != null) t.fail("expected detached stack to own nothing");
+		return b;
+	}
+	// Checks that a moved segment survives the death of its previous owner, then drops the new owner.
+	def checkMovedSegment() -> NativeStackSegment #no-inline {
+		var b = moveSegmentToNewStack();
+		var seg = b.range;
+		Target.forceGC();
+		Target.forceGC();
+		if (isFree(seg)) t.fail("expected moved segment not to be released by its previous owner");
+		checkOwner(b);
+		return seg;
+	}
+	def countFree() -> int {
+		var count = 0;
+		for (seg = M.freeSegments; seg != null; seg = seg.next_free) count++;
+		return count;
+	}
+	def isMapped(seg: NativeStackSegment) -> bool {
+		for (m = M.all; m != null; m = m.next) if (m == seg) return true;
+		return false;
+	}
+	def isFree(seg: NativeStackSegment) -> bool {
+		for (f = M.freeSegments; f != null; f = f.next_free) if (f == seg) return true;
+		return false;
 	}
 	def allocN(n: int) -> Array<NativeStack> {
 		var r = Array<NativeStack>.new(n);
@@ -95,6 +133,17 @@ private class NativeStackManagerTester extends ExeTester {
 		}
 		return r;
 	}
+	// Detaches and reattaches a fresh stack's segment several times, runs it, then drops the stack.
+	def reattachAndDrop(f: Function) -> NativeStackSegment #no-inline {
+		var s = fresh();
+		var seg = s.range;
+		for (i < 3) M.attach(s, M.detach(s));
+		checkOwner(s);
+		assertResult(Result.Value([Values.box_i(2)]), s.reset(f).bind([Values.box_i(7), Values.box_i(5)]).resume());
+		// Returning recycled the stack into the cache; take it out again so that it can die.
+		if (fresh() != s) t.fail("expected the finished stack to be recycled into the cache");
+		return seg;
+	}
 	// Checks global invariants of the manager.
 	def checkInvariants(where: string) {
 		var count = 0, size = EngineOptions.STACK_SIZE.get();
@@ -102,8 +151,6 @@ private class NativeStackManagerTester extends ExeTester {
 		for (seg = M.all; seg != null; seg = seg.next) {
 			count++;
 			if (seg.size() != u64.view(size)) t.fail1("%s: segment has wrong size", where);
-			var s = seg.stack.get();
-			if (s != null && s.range != seg) t.fail1("%s: owning stack does not point back at its segment", where);
 			var rz = seg.start + ((size >> 1) & ~(PAGE_SIZE - 1u));
 			if (!RedZones.isInRedZone(rz)) t.fail1("%s: segment is missing its red zone", where);
 			for (i < starts.length) {
@@ -113,11 +160,17 @@ private class NativeStackManagerTester extends ExeTester {
 		}
 		if (count != M.total) t.fail3("%s: expected %d segments, got %d", where, M.total, count);
 		if (limit_total >= 0 && M.total > limit_total) t.fail3("%s: expected at most %d segments, got %d", where, limit_total, M.total);
-		// Every stack in the cache owns its segment.
-		for (s = M.cache; s != null; s = s.next_stack) {
-			var seg = NativeStackSegment.!(s.range);
-			if (seg.stack.get() != s) t.fail1("%s: cached stack does not own its segment", where);
+		// Every free segment is a mapped segment, and no cached stack owns a free segment.
+		var free = 0;
+		for (seg = M.freeSegments; seg != null; seg = seg.next_free) {
+			free++;
+			if (!isMapped(seg)) t.fail1("%s: free segment is not a mapped segment", where);
+			for (s = M.cache; s != null; s = s.next_stack) {
+				if (s.range == seg) t.fail1("%s: cached stack owns a free segment", where);
+			}
 		}
+		if (free > M.total) t.fail3("%s: expected at most %d free segments, got %d", where, M.total, free);
+		for (s = M.cache; s != null; s = s.next_stack) checkOwner(s);
 	}
 	def assertDisjoint(stacks: Array<NativeStack>) {
 		for (i < stacks.length) {
@@ -183,8 +236,7 @@ def EMPTY_STRUCT = StructDecl.new(false, ValueTypes.NO_HEAPTYPES, []);
 def test_fresh_empty(t: NativeStackManagerTester) {
 	var s = t.fresh();
 	t.t.assert_eq(u64.view(EngineOptions.STACK_SIZE.get()), s.range.size());
-	var seg = NativeStackSegment.!(s.range);
-	if (seg.stack.get() != s) t.t.fail("expected segment to point back at its stack");
+	if (t.isFree(s.range)) t.t.fail("expected fresh stack's segment not to be free");
 	t.checkInvariants("fresh");
 }
 
@@ -221,15 +273,86 @@ def test_limit_batch(t: NativeStackManagerTester) {
 	t.checkInvariants("limit");
 }
 
-def test_weak_ref_survives_gc(t: NativeStackManagerTester) {
+def test_live_survives_gc(t: NativeStackManagerTester) {
+	t.limit(5);
 	var stacks = t.allocN(5);
 	Target.forceGC();
 	Target.forceGC();
 	for (s in stacks) {
-		var seg = NativeStackSegment.!(s.range);
-		if (seg.stack.get() != s) t.t.fail("expected weak reference to live stack to survive GC");
+		if (t.isFree(s.range)) t.t.fail("expected live stack to keep its segment across GC");
 	}
+	if (M.freeSegments != null) t.t.fail("expected no free segments while all stacks are live");
 	t.checkInvariants("after GC");
+}
+
+def test_release_on_gc(t: NativeStackManagerTester) {
+	// Dropped stacks are released by the GC finalizer without the manager asking for a stack.
+	t.limit(4);
+	var dropped = t.allocAndDrop(4);
+	Target.forceGC();
+	t.t.assert_eq(4, t.countFree());
+	for (seg = M.freeSegments; seg != null; seg = seg.next_free) {
+		if (!t.contains(dropped, seg.start)) t.t.fail("expected only dropped segments to be free");
+	}
+	t.checkInvariants("released");
+	var stacks = t.allocN(4);
+	t.t.assert_eq(0, t.countFree());
+	t.assertAllIn(stacks, dropped);
+	t.assertDisjoint(stacks);
+}
+
+def test_release_once_per_stack(t: NativeStackManagerTester) {
+	// A segment is released exactly once per stack that owned it, even across several GCs.
+	t.limit(2);
+	for (i < 10) {
+		var dropped = t.allocAndDrop(2);
+		Target.forceGC();
+		Target.forceGC();
+		t.t.assert_eq(2, t.countFree());
+		var stacks = t.allocN(2);
+		t.assertAllIn(stacks, dropped);
+		Target.forceGC();
+		t.t.assert_eq(0, t.countFree());
+		// Recycled stacks keep their finalizers and are released again when dropped.
+		for (s in stacks) M.recycleStack(s);
+	}
+	t.checkInvariants("release once");
+}
+
+def test_owner_tracks_segment(t: NativeStackManagerTester) {
+	var s = t.fresh();
+	var seg = s.range;
+	if (M.detach(s) != seg) t.t.fail("expected detach to return the attached segment");
+	if (s.range != null || s.owner.segment != null) t.t.fail("expected detached stack to own nothing");
+	M.attach(s, seg);
+	if (s.range != seg) t.t.fail("expected attach to set the segment");
+	if (s.state() != StackState.EMPTY || s.vsp != seg.start || s.rsp != seg.end) t.t.fail("expected attach to leave the stack empty");
+	t.checkOwner(s);
+	t.checkInvariants("owner");
+}
+
+def test_owner_moved_segment(t: NativeStackManagerTester) {
+	// A segment moved to another stack is released only when the new owner dies.
+	t.limit(1);
+	var seg = t.checkMovedSegment();
+	Target.forceGC();
+	if (!t.isFree(seg)) t.t.fail("expected moved segment to be released by its new owner");
+	t.t.assert_eq(1, t.countFree());
+	var s = t.fresh();
+	if (s.range != seg) t.t.fail("expected the released segment to be reused");
+	t.checkInvariants("moved");
+}
+
+def test_owner_reattach(t: NativeStackManagerTester) {
+	// Detaching and reattaching keeps a single finalizer that still releases the segment.
+	var f = t.subFunc();
+	t.limit(1);
+	var dropped = t.reattachAndDrop(f);
+	Target.forceGC();
+	t.t.assert_eq(1, t.countFree());
+	if (!t.isFree(dropped)) t.t.fail("expected reattached segment to be released");
+	var s = t.fresh();
+	t.assertResult(Result.Value([Values.box_i(3)]), s.reset(f).bind([Values.box_i(8), Values.box_i(5)]).resume());
 }
 
 def test_reclaim_explicit_gc(t: NativeStackManagerTester) {
@@ -265,7 +388,7 @@ def test_reclaim_skips_live(t: NativeStackManagerTester) {
 	t.assertAllIn(stacks, dropped);
 	t.assertNoneIn(stacks, live_starts);
 	for (s in live) {
-		if (NativeStackSegment.!(s.range).stack.get() != s) t.t.fail("expected live stack to keep its segment");
+		if (t.isFree(s.range)) t.t.fail("expected live stack to keep its segment");
 	}
 	t.checkInvariants("skips live");
 }
