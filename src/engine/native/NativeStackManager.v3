@@ -8,26 +8,88 @@ def PAGE_SIZE = 4096u;
 component NativeStackManager {
 	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
 	var total: int;			// number of segments in {all}
-	var cache: NativeStack;		// used in fast-path allocation in generated code
+	var free: NativeStackSegment;	// unowned segments, linked by {next_free}
+	var cache: NativeStack;		// finished stacks that still own a segment; pushed by the return-parent stub
 
-	// Gets a stack with a segment, or {null} if none is available.
+	// Gets an empty stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
 		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
-		if (cache == null) {
-			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCollectingAndReclaiming() || tryCompressingStacks();
-			if (!ok) return null;
-		}
-
+		if (cache != null) return popCache();
+		var segment = acquire();
+		if (segment == null) return null;
+		var stack = NativeStack.new();
+		attach(stack, segment);
+		return stack;
+	}
+	// Gives {stack}, which must have no segment, a segment, keeping its other fields; {false} if none is available.
+	def attachSegment(stack: NativeStack) -> bool {
+		var segment = acquire();
+		if (segment == null) return false;
+		attach(stack, segment);
+		return true;
+	}
+	// Frees the segment of {stack}, whose frames must already be gone.
+	def releaseSegment(stack: NativeStack) {
+		push(detach(stack));
+	}
+	// Caches {stack}, whose frames are dead; clearing waits for reuse, so monitors can still inspect it.
+	def recycleStack(stack: NativeStack) {
+		stack.state_ = StackState.EMPTY; // so that it is never chosen for compression
+		stack.next_stack = cache;
+		cache = stack;
+	}
+	def compressStack(stack: NativeStack) -> bool {
+		if (!NativeStackCompression.canCompress(stack)) return false;
+		NativeStackCompression.compress(stack);
+		return true;
+	}
+	// Gets an unowned segment from {free}, a cached stack, a new mapping or a sweep, or {null}.
+	private def acquire() -> NativeStackSegment {
+		if (free == null && cache != null) return detach(popCache());
+		if (free == null && !refill()) return null;
+		var segment = free;
+		free = segment.next_free;
+		segment.next_free = null;
+		return segment;
+	}
+	// Refills {free} from new mappings or a sweep, forcing a GC if the first sweep finds nothing.
+	private def refill() -> bool {
+		if (mapSegments() > 0) return true;
+		if (sweep() > 0) return true;
+		if (total == 0) return false;
+		Target.forceGC(); // weak references are only cleared by a GC
+		return sweep() > 0;
+	}
+	private def popCache() -> NativeStack {
 		var result = cache;
-		cache = cache.next_stack;
+		cache = result.next_stack;
 		result.next_stack = null;
 		return result.clear();
 	}
-	private def tryAllocatingNewStacks() -> bool {
+	private def push(segment: NativeStackSegment) {
+		segment.next_free = free;
+		free = segment;
+	}
+	// Requires {segment} to be unowned; gives {stack} the segment with empty value and frame areas.
+	private def attach(stack: NativeStack, segment: NativeStackSegment) {
+		stack.range = segment;
+		segment.stack.set(stack);
+		stack.vsp = segment.start;
+		stack.rsp = segment.end;
+		if (Trace.stack && Debug.stack) Trace.OUT.put2("attachSegment start=0x%x, end=0x%x", segment.start - Pointer.NULL, segment.end - Pointer.NULL).ln();
+	}
+	private def detach(stack: NativeStack) -> NativeStackSegment {
+		var segment = stack.range;
+		segment.stack.set(null);
+		stack.range = null;
+		return segment;
+	}
+	// Maps up to a batch of new segments onto {free}, within {StackTuning.maxStacks}.
+	private def mapSegments() -> int {
 		var size = EngineOptions.STACK_SIZE.get();
 		var batch = Ints.min(StackTuning.stackBatchSize, StackTuning.maxStacks - total);
 		if (Trace.stack) Trace.OUT.put1("Batch allocating %d stacks", batch).ln();
-		
+		var count = 0;
 		for (i < batch) {
 			// Map a guard page above the segment, so that accesses beyond its end always fault.
 			var t = Mmap.reserveRaw(size + PAGE_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE, Mmap.MAP_PRIVATE | Mmap.MAP_ANONYMOUS);
@@ -40,35 +102,23 @@ component NativeStackManager {
 			// insert redzone roughly in the middle of the mapping.
 			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
 			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
-			var curr = NativeStack.new(segment);
-			segment.stack.set(curr);
-			curr.next_stack = cache;
-			cache = curr;
+			push(segment);
 			total++;
+			count++;
 		}
-		return cache != null; // OK if succeeded in allocating at least one
+		return count;
 	}
-	private def tryReclaimingSegments() -> bool {
-		var ok = false;
+	// Frees dead segments and, with compression on, compressible stacks' segments; requires {free} empty.
+	private def sweep() -> int {
+		var count = 0;
 		for (p = all; p != null; p = p.next) {
-			if (p.stack.get() == null) { // weak reference was cleared by GC, can reclaim
-				var s = NativeStack.new(p);
-				p.stack.set(s);
-				s.next_stack = cache;
-				cache = s;
-				ok = true;
-			}
+			var s = p.stack.get();
+			if (s == null) push(p);
+			else if (StackTuning.enableCompression && NativeStackCompression.canCompress(s)) NativeStackCompression.compress(s);
+			else continue;
+			count++;
 		}
-		return ok;
-	}
-	// Weak references are only cleared by a GC, so force one to find dead stacks.
-	private def tryCollectingAndReclaiming() -> bool {
-		if (all == null) return false;
-		Target.forceGC();
-		return tryReclaimingSegments();
-	}
-	private def tryCompressingStacks() -> bool {
-		return false;
+		return count;
 	}
 	// Checks whether a fault at {addr} hit the guard page above a stack segment, which indicates
 	// an engine bug, such as reading a frame that is not there. If so, fails with an error.
@@ -79,10 +129,6 @@ component NativeStackManager {
 					addr - Pointer.NULL, ip - Pointer.NULL));
 			}
 		}
-	}
-	def recycleStack(stack: NativeStack) {
-		stack.next_stack = cache;
-		cache = stack;
 	}
 	def runOnFreshStack(f: Function, args: Range<Value>) -> Result {
 		// Always run functions on a separate, fresh stack.
@@ -97,7 +143,8 @@ component NativeStackManager {
 
 // Native stack segments are individually mmap'd with a guard page in the middle
 class NativeStackSegment extends MemoryRange {
-	var next: NativeStackSegment;
+	var next: NativeStackSegment;		// link in {NativeStackManager.all}
+	var next_free: NativeStackSegment;	// link in {NativeStackManager.free}, while unowned
 	def stack = WeakRef<NativeStack>.new();	// owner, if any; cleared by GC
 
 	new(start: Pointer, end: Pointer) super(start, end) { }
