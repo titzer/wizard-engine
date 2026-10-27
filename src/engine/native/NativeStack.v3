@@ -13,6 +13,8 @@ class NativeStack extends WasmStack {
 	var parent_rsp_ptr: Pointer;
 	var return_results: Array<ValueType>;
 	var state_: StackState = StackState.EMPTY;
+	var compressed: CompressedStack;	// frames or bound entry values while {COMPRESSED}
+	var saved_parent_rsp: Pointer;		// contents of the parent rsp slot while {COMPRESSED}
 
 	// Handler table (for inline suspend/switch).
 	var handlers: Array<byte>;
@@ -44,10 +46,16 @@ class NativeStack extends WasmStack {
 	def resetForFrameWrites(func: Function) -> this {
 		reset0(func, 0);
 	}
+	// Returns {true} if this stack has no frames yet and will enter {func} when resumed.
+	def isAtFuncEntry() -> bool {
+		return range != null && rsp < range.end && rsp.load<Pointer>() == STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY;
+	}
 	// Requires {state == SUSPENDED}.
 	// Pushes {args} incrementally onto the value stack.
 	def bind(args: Range<Value>) -> this {
 		if (args.length == 0) return;
+		if (NativeStackCompression.bindEntry(this, args)) return;
+		if (!NativeStackCompression.decompress(this)) fatal("out of stacks while binding a compressed stack");
 		checkState("bind()", StackState.SUSPENDED);
 		for (v in args) push(v);
 	}
@@ -55,6 +63,7 @@ class NativeStack extends WasmStack {
 	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
 	// or suspends itself.
 	def resume() -> Result {
+		if (!NativeStackCompression.decompress(this)) return Result.Throw(Trap.new(TrapReason.OUT_OF_STACKS, null, null));
 		checkState("resume()", StackState.SUSPENDED);
 		if (Trace.stack) traceFrames("stack.resume", rsp + RETADDR_SIZE);
 		var bottom = NativeStack.!(this.bottom);
@@ -550,6 +559,7 @@ class NativeStack extends WasmStack {
 			BpTypeCode.ARRAYREF.code,
 			BpTypeCode.FUNCREF.code,
 			BpTypeCode.EXNREF.code,
+			BpTypeCode.NULLEXNREF.code,
 			BpTypeCode.NULLFUNCREF.code => return Value.Ref(vp.load<Object>());
 
 			BpTypeCode.I32.code => return Value.I32(vp.load<u32>());
@@ -557,7 +567,8 @@ class NativeStack extends WasmStack {
 			BpTypeCode.F32.code => return Value.F32(vp.load<u32>());
 			BpTypeCode.F64.code => return Value.F64(vp.load<u64>());
 			BpTypeCode.V128.code => return Value.V128(vp.load<u64>(), (vp + 8).load<u64>());
-			BpTypeCode.CONTREF.code => {
+			BpTypeCode.CONTREF.code,
+			BpTypeCode.NULLCONTREF.code => {
 				var stack = vp.load<WasmStack>();
 				var version = (vp + 8).load<u64>();
 				return Value.Cont(Continuation(stack, version));
