@@ -49,6 +49,17 @@ def X_ = void(
 	TT("compress_from_host_call", test_compress_from_host_call),
 	TT("decompress_traps_in_wasm", test_decompress_traps_in_wasm),
 	TT("decompress_via_gc_wasm", test_decompress_via_gc_wasm),
+	T("victim_suspended_only", test_victim_suspended_only),
+	T("victim_round_robin", test_victim_round_robin),
+	T("victim_not_recycled", test_victim_not_recycled),
+	T("decompress_compresses_other", test_decompress_compresses_other),
+	T("disabled_no_compress", test_disabled_no_compress),
+	TT("gens_round_robin", test_gens_round_robin),
+	TT("gens_many", test_gens_many),
+	TT("gens_limit_one", test_gens_limit_one),
+	TT("gens_random_order", test_gens_random_order),
+	TT("chains_under_limit", test_chains_under_limit),
+	TT("deep_frames_under_limit", test_deep_frames_under_limit),
 	()
 );
 
@@ -288,6 +299,7 @@ def GEN_MODULE: Array<byte> = [
 
 private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 	def saved_max = StackTuning.maxStacks;
+	def saved_compression = StackTuning.enableCompression;
 	var held: Array<NativeStack>;	// stacks pinned by {limit}
 	var instance: Instance;
 	var limit_total = -1;
@@ -296,7 +308,13 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 
 	def restore() {
 		StackTuning.maxStacks = saved_max;
+		StackTuning.enableCompression = saved_compression;
 		limit_total = -1;
+	}
+	// Enables compression under a limit of {extra} more segments.
+	def compressing(extra: int) {
+		StackTuning.enableCompression = true;
+		limit(extra);
 	}
 	// Pins all existing segments, then allows at most {extra} more.
 	def limit(extra: int) {
@@ -824,4 +842,164 @@ def test_decompress_via_gc_wasm(t: StackCompressionTester) {
 	t.assertCompress(t.stackOf(k));
 	t.dropFresh(); // decompression must force a GC to reclaim this segment
 	t.t.assert_eq(1005, t.callInt("finish", [Value.Cont(k)]));
+}
+
+def test_victim_suspended_only(t: StackCompressionTester) {
+	var f = t.subFunc();
+	t.compressing(4);
+	var empty = M.getFreshStack();
+	var s1 = M.getFreshStack().reset(f).bind([Values.box_i(10), Values.box_i(1)]);
+	var s2 = M.getFreshStack().reset(f).bind([Values.box_i(20), Values.box_i(2)]);
+	var s3 = M.getFreshStack().reset(f).bind([Values.box_i(30), Values.box_i(3)]);
+	// All segments are now owned; the next allocation must compress a SUSPENDED stack.
+	var fresh = M.getFreshStack();
+	t.assertState(StackState.EMPTY, empty);
+	t.assertState(StackState.EMPTY, fresh);
+	var compressed = 0;
+	for (s in [s1, s2, s3]) if (s.state() == StackState.COMPRESSED) compressed++;
+	t.t.assert_eq(1, compressed);
+	t.checkInvariants("victim");
+	t.assertResult(Result.Value([Values.box_i(9)]), s1.resume());
+	t.assertResult(Result.Value([Values.box_i(18)]), s2.resume());
+	t.assertResult(Result.Value([Values.box_i(27)]), s3.resume());
+}
+
+def test_victim_round_robin(t: StackCompressionTester) {
+	var f = t.subFunc();
+	t.compressing(4);
+	var stacks = Array<NativeStack>.new(4);
+	for (i < stacks.length) stacks[i] = M.getFreshStack().reset(f).bind([Values.box_i(i), Values.box_i(0)]);
+	// Each further allocation compresses a different stack.
+	var fresh = Array<NativeStack>.new(4);
+	for (i < fresh.length) {
+		fresh[i] = M.getFreshStack();
+		var compressed = 0;
+		for (s in stacks) if (s.state() == StackState.COMPRESSED) compressed++;
+		t.t.assert_eq(i + 1, compressed);
+	}
+	for (i < stacks.length) t.assertResult(Result.Value([Values.box_i(i)]), stacks[i].resume());
+}
+
+def test_victim_not_recycled(t: StackCompressionTester) {
+	var f = t.subFunc();
+	t.compressing(2);
+	var a = M.getFreshStack().reset(f).bind([Values.box_i(7), Values.box_i(2)]);
+	var b = M.getFreshStack().reset(f);
+	M.recycleStack(b); // a recycled stack is cleared, so never compressed
+	t.assertState(StackState.EMPTY, b);
+	var c = M.getFreshStack();
+	if (c != b) t.t.fail("expected the recycled stack to be reused");
+	t.assertState(StackState.SUSPENDED, a);
+	var d = M.getFreshStack(); // must compress {a}, the only SUSPENDED stack
+	t.assertState(StackState.COMPRESSED, a);
+	t.assertState(StackState.EMPTY, d);
+	if (d == a || d == c) t.t.fail("expected a new stack for the compressed segment");
+	t.assertResult(Result.Value([Values.box_i(5)]), a.resume());
+}
+
+def test_decompress_compresses_other(t: StackCompressionTester) {
+	var f = t.subFunc();
+	t.compressing(2);
+	var a = M.getFreshStack().reset(f).bind([Values.box_i(100), Values.box_i(1)]);
+	var b = M.getFreshStack().reset(f).bind([Values.box_i(200), Values.box_i(2)]);
+	t.assertCompress(a);
+	var hold = M.getFreshStack(); // takes the segment freed by {a}
+	// Decompressing {a} requires a segment, which can only come from compressing {b}.
+	t.assertDecompress(a);
+	t.assertState(StackState.COMPRESSED, b);
+	t.assertState(StackState.EMPTY, hold);
+	t.checkInvariants("ping");
+	t.assertResult(Result.Value([Values.box_i(99)]), a.resume());
+	t.assertResult(Result.Value([Values.box_i(198)]), b.resume());
+}
+
+def test_disabled_no_compress(t: StackCompressionTester) {
+	var f = t.subFunc();
+	StackTuning.enableCompression = false;
+	t.limit(3);
+	var a = M.getFreshStack().reset(f);
+	var b = M.getFreshStack().reset(f);
+	var dropped = allocAndDrop(f);
+	var c = M.getFreshStack(); // must come from the dead stack, never compression
+	if (c.range.start != dropped) t.t.fail("expected the dead stack's segment to be reclaimed");
+	t.assertState(StackState.SUSPENDED, a);
+	t.assertState(StackState.SUSPENDED, b);
+	t.assertState(StackState.EMPTY, c);
+}
+def allocAndDrop(f: Function) -> Pointer #no-inline {
+	return M.getFreshStack().reset(f).range.start;
+}
+
+// Steps {n} generators round-robin to completion under a limit of {extra} segments.
+def roundRobin(t: StackCompressionTester, n: int, extra: int) {
+	t.gen();
+	t.compressing(extra);
+	var before = (C.numCompressed, C.numDecompressed);
+	var gens = Array<Continuation>.new(n);
+	for (i < n) gens[i] = t.make(i * 100);
+	for (j = 1; j < 10; j++) {
+		for (i < n) gens[i] = t.next(gens[i], i * 100 + j);
+	}
+	for (i < n) t.next(gens[i], -1);
+	if (C.numCompressed <= before.0) t.t.fail("expected stacks to be compressed");
+	if (C.numDecompressed <= before.1) t.t.fail("expected stacks to be decompressed");
+	t.checkInvariants("round robin");
+}
+
+def test_gens_round_robin(t: StackCompressionTester) {
+	roundRobin(t, 20, 4);
+}
+
+def test_gens_many(t: StackCompressionTester) {
+	roundRobin(t, 500, 8);
+}
+
+def test_gens_limit_one(t: StackCompressionTester) {
+	// Each call runs on its own stack and the generator needs another; one more suffices for decompression.
+	roundRobin(t, 10, 3);
+}
+
+def test_gens_random_order(t: StackCompressionTester) {
+	t.gen();
+	t.compressing(6);
+	var n = 30;
+	var gens = Array<Continuation>.new(n), steps = Array<int>.new(n);
+	for (i < n) gens[i] = t.make(i * 100);
+	var live = n, seed = 12345;
+	while (live > 0) {
+		seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+		var i = (seed >> 8) % n;
+		if (Continuations.isNull(gens[i])) continue;
+		var j = ++steps[i];
+		gens[i] = t.next(gens[i], if(j < 10, i * 100 + j, -1));
+		if (j >= 10) live--;
+	}
+	t.checkInvariants("random");
+}
+
+def test_chains_under_limit(t: StackCompressionTester) {
+	t.gen();
+	var n = 10;
+	// The waiting parents cannot be compressed, so leave room for them.
+	t.compressing(n + 4);
+	var before = C.numCompressed;
+	var chains = Array<Continuation>.new(n);
+	for (i < n) chains[i] = t.callCont("make_chain", [Values.box_i(i)]);
+	for (i < n) { // some tops may already have been compressed to make room
+		var top = t.stackOf(chains[i]);
+		if (top.state() == StackState.SUSPENDED) t.assertCompress(top);
+		t.assertState(StackState.COMPRESSED, top);
+		t.assertState(StackState.CALL_CHILD, NativeStack.!(top.parent));
+	}
+	for (i = n - 1; i >= 0; i--) t.t.assert_eq(2 * i + 1, t.callInt("finish", [Value.Cont(chains[i])]));
+	if (C.numCompressed < before + n) t.t.fail("expected chains to be compressed");
+}
+
+def test_deep_frames_under_limit(t: StackCompressionTester) {
+	t.gen();
+	t.compressing(4);
+	var n = 40;
+	var ks = Array<Continuation>.new(n);
+	for (i < n) ks[i] = t.callCont("make_deep", [Values.box_i(i)]);
+	for (i < n) t.t.assert_eq(deepSum(i), t.callInt("finish", [Value.Cont(ks[i])]));
 }

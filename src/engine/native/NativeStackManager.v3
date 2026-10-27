@@ -9,15 +9,15 @@ component NativeStackManager {
 	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
 	var total: int;			// number of segments in {all}
 	var cache: NativeStack;		// used in fast-path allocation in generated code
+	private var sweep: NativeStackSegment;	// clock hand for compression victims
+	private var allocsSinceGC: int;		// stacks requested since the last forced GC
+	private var gcInterval: int;		// requests to wait before collecting ahead of compressing
 
 	// Gets a stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
 		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
-		if (cache == null) {
-			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCollectingAndReclaiming() || tryCompressingStacks();
-			if (!ok) return null;
-		}
-
+		allocsSinceGC++;
+		if (cache == null && !refill()) return null;
 		var result = cache;
 		cache = cache.next_stack;
 		result.next_stack = null;
@@ -48,6 +48,21 @@ component NativeStackManager {
 		var s = getFreshStack();
 		return if(s == null, null, detach(s)); // {s} becomes garbage
 	}
+	// Refills the cache with new segments, segments of dead stacks, or segments of compressed stacks.
+	private def refill() -> bool {
+		if (tryAllocatingNewStacks()) return true;
+		if (tryReclaimingSegments() > 0) return true;
+		var collected = false;
+		if (StackTuning.enableCompression) {
+			// Collect before compressing if collecting has been productive lately.
+			if (allocsSinceGC >= gcInterval) {
+				collected = true;
+				if (tryCollectingAndReclaiming()) return true;
+			}
+			if (tryCompressingStacks()) return true;
+		}
+		return !collected && tryCollectingAndReclaiming();
+	}
 	// Wraps {segment} in a new cached stack that owns it.
 	private def addToCache(segment: NativeStackSegment) {
 		var stack = NativeStack.new();
@@ -77,23 +92,42 @@ component NativeStackManager {
 		}
 		return cache != null; // OK if succeeded in allocating at least one
 	}
-	private def tryReclaimingSegments() -> bool {
-		var ok = false;
+	// Returns the number of segments reclaimed from stacks that the GC found dead.
+	private def tryReclaimingSegments() -> int {
+		var count = 0;
 		for (p = all; p != null; p = p.next) {
 			if (p.stack.get() == null) { // weak reference was cleared by GC, can reclaim
 				addToCache(p);
-				ok = true;
+				count++;
 			}
 		}
-		return ok;
+		return count;
 	}
 	// Weak references are only cleared by a GC, so force one to find dead stacks.
 	private def tryCollectingAndReclaiming() -> bool {
 		if (all == null) return false;
 		Target.forceGC();
-		return tryReclaimingSegments();
+		allocsSinceGC = 0;
+		var count = tryReclaimingSegments();
+		// Back off exponentially while collecting is unproductive.
+		gcInterval = if(count * 4 >= total, total, Ints.min(gcInterval * 2 + 1, 1 << 24));
+		return count > 0;
 	}
+	// Compresses one suspended stack, sweeping round-robin over all segments.
 	private def tryCompressingStacks() -> bool {
+		for (i < total) {
+			if (sweep == null) sweep = all;
+			var segment = sweep;
+			sweep = segment.next;
+			var s = segment.stack.get();
+			if (s == null) { // its stack died since the last reclamation
+				addToCache(segment);
+				return true;
+			}
+			if (!NativeStackCompression.canCompress(s)) continue;
+			addToCache(NativeStackCompression.compress(s));
+			return true;
+		}
 		return false;
 	}
 	// Checks whether a fault at {addr} hit the guard page above a stack segment, which indicates
@@ -106,7 +140,9 @@ component NativeStackManager {
 			}
 		}
 	}
+	// Returns {stack} to the cache, clearing it so that it is never chosen for compression.
 	def recycleStack(stack: NativeStack) {
+		stack.clear();
 		stack.next_stack = cache;
 		cache = stack;
 	}
