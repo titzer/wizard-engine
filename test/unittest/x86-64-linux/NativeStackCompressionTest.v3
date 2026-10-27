@@ -1,7 +1,7 @@
 // Copyright 2026 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Tests for compressing suspended native stacks and resuming them from host code in every tier.
+// Tests for compressing suspended native stacks and resuming them from host and Wasm code in every tier.
 
 def M: NativeStackManager;
 def C: NativeStackCompression;
@@ -35,6 +35,20 @@ def X_ = void(
 	TT("chain_top_roundtrip", test_chain_top_roundtrip),
 	TT("trap_after_decompress", test_trap_after_decompress),
 	TT("throw_after_decompress", test_throw_after_decompress),
+	TT("mid_explicit", test_mid_explicit),
+	TT("mid_wasm_twice", test_mid_wasm_twice),
+	TT("mid_wasm_bind", test_mid_wasm_bind),
+	TT("mid_gc_wasm", test_mid_gc_wasm),
+	TT("chain_top", test_chain_top),
+	TT("deep_frames_wasm", test_deep_frames_wasm),
+	TT("used_after_compress", test_used_after_compress),
+	TT("trap_after_decompress_wasm", test_trap_after_decompress_wasm),
+	TT("throw_after_decompress_wasm", test_throw_after_decompress_wasm),
+	TT("resume_null", test_resume_null),
+	TT("entry_cont_arg", test_entry_cont_arg),
+	TT("compress_from_host_call", test_compress_from_host_call),
+	TT("decompress_traps_in_wasm", test_decompress_traps_in_wasm),
+	TT("decompress_via_gc_wasm", test_decompress_via_gc_wasm),
 	()
 );
 
@@ -386,6 +400,48 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 	def stackOf(k: Continuation) -> NativeStack {
 		return NativeStack.!(k.stack);
 	}
+	def exported(name: string) -> Function {
+		gen();
+		for (i < instance.module.exports.length) {
+			if (Strings.equal(name, instance.module.exports[i].0)) return Function.!(instance.exports[i]);
+		}
+		t.fail1("export %s not found", name);
+		return null;
+	}
+	def callInt(name: string, args: Array<Value>) -> int {
+		var r = call(name, args);
+		match (r) {
+			Value(vals) => if (vals.length == 1 && Value.I32.?(vals[0])) return int.view(Value.I32.!(vals[0]).val);
+			_ => ;
+		}
+		t.fail2("expected %s to return an i32, got %q", name, r.render);
+		return -1;
+	}
+	// Makes a generator yielding {start} .. {start + 9}, suspended at its first yield.
+	def make(start: int) -> Continuation {
+		var k = callCont("make", [Values.box_i(start)]);
+		if (!Continuations.isNull(k)) assertLast(start);
+		return k;
+	}
+	// Steps a generator, which must yield {expected}, or finish if {expected < 0}.
+	def next(k: Continuation, expected: int) -> Continuation {
+		var n = callCont("next", [Value.Cont(k)]);
+		if (expected < 0) {
+			if (!Continuations.isNull(n)) t.fail("expected generator to finish");
+		} else {
+			if (Continuations.isNull(n)) t.fail1("expected generator to yield %d, but it finished", expected);
+			else assertLast(expected);
+		}
+		return n;
+	}
+	def assertLast(expected: int) {
+		var got = callInt("last", []);
+		if (got != expected) t.fail2("expected generator to yield %d, got %d", expected, got);
+	}
+	// Takes a fresh stack and drops it, so that its segment is reclaimable only after a GC.
+	def dropFresh() #no-inline {
+		if (M.getFreshStack() == null) t.fail("expected a fresh stack to drop");
+	}
 	// Runs the exported Wasm function {name} on {x} until it suspends, returning its stack.
 	def suspended(name: string, x: int) -> NativeStack {
 		var k = callCont(name, [Values.box_i(x)]);
@@ -405,8 +461,8 @@ def runTest(f: StackCompressionTester -> void, t: StackCompressionTester) {
 
 def EMPTY_STRUCT = StructDecl.new(false, ValueTypes.NO_HEAPTYPES, []);
 def obj() -> Value { return Value.Ref(ObjectModel.newStruct(EMPTY_STRUCT)); }
-def DEEP_X = 3;
-def DEEP_SUM = 5050 + 101 * DEEP_X; // sum of (d + x) for d in 0..100
+// The result of {make_deep}: the sum of (d + x) for d in 0..100.
+def deepSum(x: int) -> int { return 5050 + 101 * x; }
 
 def test_can_compress_states(t: StackCompressionTester) {
 	var f = t.subFunc();
@@ -583,10 +639,10 @@ def test_gen_frames(t: StackCompressionTester) {
 }
 
 def test_deep_frames(t: StackCompressionTester) {
-	var s = t.suspended("make_deep", DEEP_X);
+	var s = t.suspended("make_deep", 3);
 	t.assertCompress(s);
 	for (i < 3) Target.forceGC();
-	t.assertResult(Result.Value([Values.box_i(DEEP_SUM)]), s.resume());
+	t.assertResult(Result.Value([Values.box_i(deepSum(3))]), s.resume());
 }
 
 def test_chain_top_roundtrip(t: StackCompressionTester) {
@@ -621,4 +677,151 @@ def test_throw_after_decompress(t: StackCompressionTester) {
 		Throw(thrown) => if (!Exception.?(thrown)) t.t.fail1("expected an exception, got %q", thrown.render);
 		_ => t.t.fail1("expected an exception, got %q", r.render);
 	}
+}
+
+def test_mid_explicit(t: StackCompressionTester) {
+	var k = t.make(100);
+	var s = t.stackOf(k);
+	t.assertState(StackState.SUSPENDED, s);
+	t.assertCompress(s); // three frames deep, with v128 and struct locals
+	k = t.next(k, 101); // the Wasm resume decompresses
+	if (t.stackOf(k) != s) t.t.fail("expected the continuation to keep its stack");
+	t.assertState(StackState.SUSPENDED, s);
+	for (i = 2; i < 10; i++) {
+		t.assertCompress(t.stackOf(k));
+		k = t.next(k, 100 + i);
+	}
+	t.assertCompress(t.stackOf(k));
+	t.next(k, -1);
+}
+
+def test_mid_wasm_twice(t: StackCompressionTester) {
+	var k = t.make(7);
+	var s = t.stackOf(k);
+	t.assertCompress(s);
+	t.assertDecompress(s);
+	t.assertCompress(s);
+	for (i < 3) Target.forceGC();
+	k = t.next(k, 8);
+	k = t.next(k, 9);
+}
+
+def test_mid_wasm_bind(t: StackCompressionTester) {
+	var k = t.callCont("make_asker", [Values.box_i(3)]);
+	t.assertCompress(t.stackOf(k));
+	t.t.assert_eq(37, t.callInt("answer", [Value.Cont(k), Values.box_i(7)])); // cont.bind decompresses
+}
+
+def test_mid_gc_wasm(t: StackCompressionTester) {
+	var gens = Array<Continuation>.new(8);
+	for (i < gens.length) {
+		gens[i] = t.make(i * 10);
+		t.assertCompress(t.stackOf(gens[i]));
+	}
+	for (i < 3) Target.forceGC();
+	for (j = 1; j < 10; j++) {
+		for (i < gens.length) {
+			gens[i] = t.next(gens[i], i * 10 + j);
+			if ((i + j) % 2 == 0) t.assertCompress(t.stackOf(gens[i]));
+		}
+		Target.forceGC();
+	}
+	for (i < gens.length) t.next(gens[i], -1);
+}
+
+def test_chain_top(t: StackCompressionTester) {
+	// The continuation's top stack runs {inner}, whose parent {mid} waits for it.
+	var k = t.callCont("make_chain", [Values.box_i(5)]);
+	var top = t.stackOf(k);
+	var mid = NativeStack.!(top.parent);
+	if (mid == null) return t.t.fail("expected the continuation to be a chain of stacks");
+	t.assertState(StackState.CALL_CHILD, mid);
+	t.assertCompress(top);
+	for (i < 3) Target.forceGC();
+	t.t.assert_eq(11, t.callInt("finish", [Value.Cont(k)]));
+}
+
+def test_deep_frames_wasm(t: StackCompressionTester) {
+	var k = t.callCont("make_deep", [Values.box_i(7)]);
+	t.assertLast(7);
+	t.assertCompress(t.stackOf(k));
+	Target.forceGC();
+	t.t.assert_eq(deepSum(7), t.callInt("finish", [Value.Cont(k)]));
+}
+
+def test_used_after_compress(t: StackCompressionTester) {
+	var k = t.callCont("make_deep", [Values.box_i(1)]);
+	t.assertCompress(t.stackOf(k));
+	t.t.assert_eq(deepSum(1), t.callInt("finish", [Value.Cont(k)]));
+	t.assertTrap(TrapReason.USED_CONTINUATION, t.call("finish", [Value.Cont(k)]));
+	// A continuation consumed by {cont.bind} after compression stays unusable.
+	var a = t.callCont("make_asker", [Values.box_i(2)]);
+	t.assertCompress(t.stackOf(a));
+	t.t.assert_eq(25, t.callInt("answer", [Value.Cont(a), Values.box_i(5)]));
+	t.assertTrap(TrapReason.USED_CONTINUATION, t.call("answer", [Value.Cont(a), Values.box_i(5)]));
+}
+
+def test_trap_after_decompress_wasm(t: StackCompressionTester) {
+	var k = t.callCont("make_trapper", [Values.box_i(3)]);
+	t.assertCompress(t.stackOf(k));
+	t.assertTrap(TrapReason.UNREACHABLE, t.call("finish", [Value.Cont(k)]));
+}
+
+def test_throw_after_decompress_wasm(t: StackCompressionTester) {
+	var k = t.callCont("make_thrower", [Values.box_i(9)]);
+	t.assertCompress(t.stackOf(k));
+	t.t.assert_eq(9, t.callInt("catch", [Value.Cont(k)]));
+}
+
+def test_resume_null(t: StackCompressionTester) {
+	t.assertTrap(TrapReason.NULL_DEREF, t.call("resume_null", []));
+}
+
+def test_entry_cont_arg(t: StackCompressionTester) {
+	// A compressed entry stack whose bound argument is the continuation of another compressed stack.
+	var k = t.callCont("make_deep", [Values.box_i(2)]);
+	var s = M.getFreshStack().reset(t.exported("finish")).bind([Value.Cont(k)]);
+	t.assertCompress(t.stackOf(k));
+	t.assertCompress(s);
+	for (i < 3) Target.forceGC();
+	t.assertResult(Result.Value([Values.box_i(deepSum(2))]), s.resume());
+}
+
+def test_compress_from_host_call(t: StackCompressionTester) {
+	// Stacks are compressed while Wasm frames are live on other stacks.
+	var gens = Array<Continuation>.new(5);
+	for (i < gens.length) gens[i] = t.make(i * 10);
+	var hf = HostFunction.new("compress_all", SigCache.v_i, compressAll(t, gens, _));
+	t.assertResult(Result.Value([Values.box_i(gens.length)]), M.runOnFreshStack(hf, []));
+	for (j = 1; j < 10; j++) {
+		for (i < gens.length) gens[i] = t.next(gens[i], i * 10 + j);
+	}
+	for (k in gens) t.next(k, -1);
+}
+def compressAll(t: StackCompressionTester, gens: Array<Continuation>, args: Range<Value>) -> HostResult {
+	var count = 0;
+	for (k in gens) if (M.compressStack(t.stackOf(k))) count++;
+	return HostResult.Value1(Values.box_i(count));
+}
+
+def test_decompress_traps_in_wasm(t: StackCompressionTester) {
+	t.gen();
+	t.limit(2);
+	var k = t.callCont("make_once", [Values.box_i(5)]);
+	t.assertCompress(t.stackOf(k));
+	var hog = M.getFreshStack(); // leaves one segment, which the call itself takes
+	if (hog == null) return t.t.fail("expected a segment to hold");
+	t.assertTrap(TrapReason.OUT_OF_STACKS, t.call("finish", [Value.Cont(k)]));
+	t.assertState(StackState.COMPRESSED, t.stackOf(k)); // a failed resume leaves the continuation intact
+	M.recycleStack(hog);
+	t.t.assert_eq(1005, t.callInt("finish", [Value.Cont(k)]));
+}
+
+def test_decompress_via_gc_wasm(t: StackCompressionTester) {
+	t.gen();
+	t.limit(2);
+	var k = t.callCont("make_once", [Values.box_i(5)]);
+	t.assertCompress(t.stackOf(k));
+	t.dropFresh(); // decompression must force a GC to reclaim this segment
+	t.t.assert_eq(1005, t.callInt("finish", [Value.Cont(k)]));
 }
