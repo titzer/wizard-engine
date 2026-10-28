@@ -45,9 +45,9 @@ def X_ = void(
 	TT("compress_from_host_call", test_compress_from_host_call),
 	TT("decompress_traps_in_wasm", test_decompress_traps_in_wasm),
 	TT("decompress_via_gc_wasm", test_decompress_via_gc_wasm),
-	T("victim_suspended_only", test_victim_suspended_only),
-	T("victim_round_robin", test_victim_round_robin),
-	T("victim_not_recycled", test_victim_not_recycled),
+	T("sweep_compresses_suspended", test_sweep_compresses_suspended),
+	T("sweep_batches", test_sweep_batches),
+	T("recycled_not_compressed", test_recycled_not_compressed),
 	T("decompress_compresses_other", test_decompress_compresses_other),
 	T("disabled_no_compress", test_disabled_no_compress),
 	TT("gens_round_robin", test_gens_round_robin),
@@ -137,10 +137,10 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		StackTuning.enableCompression = saved_compression;
 		limit_total = -1;
 	}
-	// Enables compression under a limit of {extra} more segments.
+	// Enables compression under a limit of {extra} more segments; pinning must not sweep.
 	def compressing(extra: int) {
-		StackTuning.enableCompression = true;
 		limit(extra);
+		StackTuning.enableCompression = true;
 	}
 	// Pins all existing segments, then allows at most {extra} more.
 	def limit(extra: int) {
@@ -628,18 +628,16 @@ def test_decompress_via_gc_wasm(t: StackCompressionTester) {
 	t.t.assert_eq(1005, t.callInt("finish", [Value.Cont(k)]));
 }
 
-def test_victim_suspended_only(t: StackCompressionTester) {
+def test_sweep_compresses_suspended(t: StackCompressionTester) {
 	var s1 = t.suspended("make_once", 10), s2 = t.suspended("make_once", 20), s3 = t.suspended("make_once", 30);
 	t.compressing(1);
 	var empty = M.getFreshStack();
-	// All segments are now owned; the next allocation must compress a SUSPENDED stack.
+	// All segments are now owned; the next allocation sweeps, compressing every SUSPENDED stack.
 	var fresh = M.getFreshStack();
 	t.assertState(StackState.EMPTY, empty);
 	t.assertState(StackState.EMPTY, fresh);
-	var compressed = 0;
-	for (s in [s1, s2, s3]) if (s.state() == StackState.COMPRESSED) compressed++;
-	t.t.assert_eq(1, compressed);
-	t.checkInvariants("victim");
+	for (s in [s1, s2, s3]) t.assertState(StackState.COMPRESSED, s);
+	t.checkInvariants("sweep");
 	M.recycleStack(empty);
 	M.recycleStack(fresh);
 	t.assertResult(Result.Value([Values.box_i(1010)]), s1.resume());
@@ -647,23 +645,27 @@ def test_victim_suspended_only(t: StackCompressionTester) {
 	t.assertResult(Result.Value([Values.box_i(1030)]), s3.resume());
 }
 
-def test_victim_round_robin(t: StackCompressionTester) {
+def test_sweep_batches(t: StackCompressionTester) {
 	var stacks = Array<NativeStack>.new(4);
 	for (i < stacks.length) stacks[i] = t.suspended("make_once", i);
 	t.compressing(0);
-	// Each further allocation compresses a different stack.
+	var before = C.numCompressed;
 	var fresh = Array<NativeStack>.new(4);
-	for (i < fresh.length) {
-		fresh[i] = M.getFreshStack();
-		var compressed = 0;
-		for (s in stacks) if (s.state() == StackState.COMPRESSED) compressed++;
-		t.t.assert_eq(i + 1, compressed);
+	fresh[0] = M.getFreshStack(); // one sweep compresses all four stacks
+	for (s in stacks) t.assertState(StackState.COMPRESSED, s);
+	t.t.assert_eq(before + 4, C.numCompressed);
+	// The remaining allocations are served from the cache without another sweep.
+	for (i = 1; i < fresh.length; i++) fresh[i] = M.getFreshStack();
+	for (s in fresh) {
+		if (s == null) return t.t.fail("expected a cached stack");
+		t.assertState(StackState.EMPTY, s);
 	}
+	t.t.assert_eq(before + 4, C.numCompressed);
 	for (s in fresh) M.recycleStack(s);
 	for (i < stacks.length) t.assertResult(Result.Value([Values.box_i(1000 + i)]), stacks[i].resume());
 }
 
-def test_victim_not_recycled(t: StackCompressionTester) {
+def test_recycled_not_compressed(t: StackCompressionTester) {
 	var a = t.suspended("make_once", 7), b = t.suspended("make_once", 1);
 	t.compressing(0);
 	M.recycleStack(b); // a recycled stack is cleared, so never compressed
