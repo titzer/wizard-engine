@@ -48,8 +48,17 @@ The available monitors and their options are as follows:
 | `memstats` |                                            | Monitors memory accesses and reports statistics per page of memory.                                 |
 | `opcodes`  |                                            | Reports the static and dynamic count of instructions, broken down by opcode.                        |
 | [`profile`](ProfileMonitor.md)  | `{depth=<num>\|calls=<function pattern*>}` | Collects performance profiling data, with options for depth or function pattern.                    |
+| `stackdepth` |                                          | Reports the distribution of Wasm stack depths observed at `suspend` instructions.                   |
 | `timeout`  | `{<num>}`                                  | Terminates program execution after a given number of instructions.                                  |
 | `tracepoints` | `{<func-filter>:min_pc..max_pc}`        | Traces a function's value stack at given locations.                                                 |
+
+### Stack depth at suspension
+
+The `stackdepth` monitor records the number of active Wasm frames immediately before each
+`suspend` instruction executes. Depth is one-based and local to the current stack segment;
+host frames and parent continuation segments are not included. Its text report includes a
+histogram, mean, mode, p50, p90, p99, and maximum. The global `-csv` option emits the histogram
+as comma-separated values.
 
 ## Debugger
 
