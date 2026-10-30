@@ -5,6 +5,7 @@ def fatal = System.error("NativeStackError", _);
 def PAGE_SIZE = 4096u;
 
 // Manages native memory mappings for native stacks.
+// TODO[rv]: clean this up; remove the residual structure from master's stack management
 component NativeStackManager {
 	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
 	var total: int;			// number of segments in {all}
@@ -13,15 +14,48 @@ component NativeStackManager {
 	// Gets a stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
 		if (Trace.stack) Trace.OUT.puts("Requested fresh x86_stack...\n");
-		if (cache == null) {
-			var ok = tryAllocatingNewStacks() || tryReclaimingSegments() || tryCollectingAndReclaiming() || tryCompressingStacks();
-			if (!ok) return null;
-		}
-
+		if (cache == null && !refill()) return null;
 		var result = cache;
 		cache = cache.next_stack;
 		result.next_stack = null;
 		return result.clear();
+	}
+	// Requires {segment} to be unowned; leaves {stack} empty.
+	def attach(stack: NativeStack, segment: NativeStackSegment) {
+		stack.range = segment;
+		segment.stack.set(stack);
+		stack.clear();
+		if (Trace.stack && Debug.stack) Trace.OUT.put2("attachSegment start=0x%x, end=0x%x", segment.start - Pointer.NULL, segment.end - Pointer.NULL).ln();
+	}
+	def detach(stack: NativeStack) -> NativeStackSegment {
+		var segment = stack.range;
+		segment.stack.set(null);
+		stack.range = null;
+		return segment;
+	}
+	def compressStack(stack: NativeStack) -> bool {
+		if (!NativeStackCompression.canCompress(stack)) return false;
+		addToCache(NativeStackCompression.compress(stack));
+		return true;
+	}
+	// Gets an unowned segment, which must be attached before the next refill, or {null} if out of stacks.
+	def acquireSegment() -> NativeStackSegment {
+		var s = getFreshStack();
+		return if(s == null, null, detach(s));
+	}
+	// Refills the cache from new segments or a sweep, forcing a GC if the first sweep finds nothing.
+	private def refill() -> bool {
+		if (tryAllocatingNewStacks()) return true;
+		if (sweep() > 0) return true;
+		if (all == null) return false;
+		Target.forceGC(); // weak references are only cleared by a GC
+		return sweep() > 0;
+	}
+	private def addToCache(segment: NativeStackSegment) {
+		var stack = NativeStack.new();
+		attach(stack, segment);
+		stack.next_stack = cache;
+		cache = stack;
 	}
 	private def tryAllocatingNewStacks() -> bool {
 		var size = EngineOptions.STACK_SIZE.get();
@@ -40,35 +74,22 @@ component NativeStackManager {
 			// insert redzone roughly in the middle of the mapping.
 			var rzStart = t.0 + ((size >> 1) & ~(PAGE_SIZE - 1u)), rzEnd = rzStart + PAGE_SIZE;
 			if (!RedZones.addRedZone(rzStart, rzEnd)) fatal("could not protect value stack red zone");
-			var curr = NativeStack.new(segment);
-			segment.stack.set(curr);
-			curr.next_stack = cache;
-			cache = curr;
+			addToCache(segment);
 			total++;
 		}
 		return cache != null; // OK if succeeded in allocating at least one
 	}
-	private def tryReclaimingSegments() -> bool {
-		var ok = false;
+	// Caches the segments of dead stacks and, with compression enabled, of every compressible stack.
+	private def sweep() -> int {
+		var count = 0;
 		for (p = all; p != null; p = p.next) {
-			if (p.stack.get() == null) { // weak reference was cleared by GC, can reclaim
-				var s = NativeStack.new(p);
-				p.stack.set(s);
-				s.next_stack = cache;
-				cache = s;
-				ok = true;
-			}
+			var s = p.stack.get();
+			if (s == null) addToCache(p);
+			else if (StackTuning.enableCompression && NativeStackCompression.canCompress(s)) addToCache(NativeStackCompression.compress(s));
+			else continue;
+			count++;
 		}
-		return ok;
-	}
-	// Weak references are only cleared by a GC, so force one to find dead stacks.
-	private def tryCollectingAndReclaiming() -> bool {
-		if (all == null) return false;
-		Target.forceGC();
-		return tryReclaimingSegments();
-	}
-	private def tryCompressingStacks() -> bool {
-		return false;
+		return count;
 	}
 	// Checks whether a fault at {addr} hit the guard page above a stack segment, which indicates
 	// an engine bug, such as reading a frame that is not there. If so, fails with an error.
@@ -81,6 +102,7 @@ component NativeStackManager {
 		}
 	}
 	def recycleStack(stack: NativeStack) {
+		stack.clear(); // so that it is never chosen for compression
 		stack.next_stack = cache;
 		cache = stack;
 	}

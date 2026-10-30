@@ -30,6 +30,9 @@ def X_ = void(
 	T("run_on_fresh_stack_gc", test_run_on_fresh_stack_gc),
 	T("out_of_stacks_host", test_out_of_stacks_host),
 	T("out_of_stacks_cont_new", test_out_of_stacks_cont_new),
+	T("attach_detach", test_attach_detach),
+	T("moved_segment_kept", test_moved_segment_kept),
+	T("reattach_runs", test_reattach_runs),
 	()
 );
 
@@ -95,6 +98,24 @@ private class NativeStackManagerTester extends ExeTester {
 		}
 		return r;
 	}
+	// Not inlined, so that the fresh stack is dead once this returns.
+	def moveSegmentToNewStack() -> NativeStack #no-inline {
+		var a = fresh();
+		var b = NativeStack.new();
+		M.attach(b, M.detach(a));
+		if (a.range != null) t.fail("expected detached stack to have no segment");
+		return b;
+	}
+	def checkMovedSegment() -> NativeStackSegment #no-inline {
+		var b = moveSegmentToNewStack();
+		var seg = b.range;
+		Target.forceGC();
+		Target.forceGC();
+		if (seg.stack.get() != b) t.fail("expected moved segment to be owned by the new stack");
+		if (M.getFreshStack() != null) t.fail("expected no segment to be reclaimable while the new owner lives");
+		if (b.range != seg || seg.stack.get() != b) t.fail("expected the new owner to keep the segment");
+		return seg;
+	}
 	// Checks global invariants of the manager.
 	def checkInvariants(where: string) {
 		var count = 0, size = EngineOptions.STACK_SIZE.get();
@@ -115,7 +136,7 @@ private class NativeStackManagerTester extends ExeTester {
 		if (limit_total >= 0 && M.total > limit_total) t.fail3("%s: expected at most %d segments, got %d", where, limit_total, M.total);
 		// Every stack in the cache owns its segment.
 		for (s = M.cache; s != null; s = s.next_stack) {
-			var seg = NativeStackSegment.!(s.range);
+			var seg = s.range;
 			if (seg.stack.get() != s) t.fail1("%s: cached stack does not own its segment", where);
 		}
 	}
@@ -183,7 +204,7 @@ def EMPTY_STRUCT = StructDecl.new(false, ValueTypes.NO_HEAPTYPES, []);
 def test_fresh_empty(t: NativeStackManagerTester) {
 	var s = t.fresh();
 	t.t.assert_eq(u64.view(EngineOptions.STACK_SIZE.get()), s.range.size());
-	var seg = NativeStackSegment.!(s.range);
+	var seg = s.range;
 	if (seg.stack.get() != s) t.t.fail("expected segment to point back at its stack");
 	t.checkInvariants("fresh");
 }
@@ -226,7 +247,7 @@ def test_weak_ref_survives_gc(t: NativeStackManagerTester) {
 	Target.forceGC();
 	Target.forceGC();
 	for (s in stacks) {
-		var seg = NativeStackSegment.!(s.range);
+		var seg = s.range;
 		if (seg.stack.get() != s) t.t.fail("expected weak reference to live stack to survive GC");
 	}
 	t.checkInvariants("after GC");
@@ -265,7 +286,7 @@ def test_reclaim_skips_live(t: NativeStackManagerTester) {
 	t.assertAllIn(stacks, dropped);
 	t.assertNoneIn(stacks, live_starts);
 	for (s in live) {
-		if (NativeStackSegment.!(s.range).stack.get() != s) t.t.fail("expected live stack to keep its segment");
+		if (s.range.stack.get() != s) t.t.fail("expected live stack to keep its segment");
 	}
 	t.checkInvariants("skips live");
 }
@@ -389,6 +410,40 @@ def test_out_of_stacks_host(t: NativeStackManagerTester) {
 	t.restore();
 	t.limit_total = -1;
 	t.assertResult(Result.Value([Values.box_i(7)]), M.runOnFreshStack(hf, []));
+}
+
+def test_attach_detach(t: NativeStackManagerTester) {
+	var s = t.fresh();
+	var seg = s.range;
+	if (M.detach(s) != seg) t.t.fail("expected detach to return the attached segment");
+	if (s.range != null) t.t.fail("expected detached stack to have no segment");
+	if (seg.stack.get() != null) t.t.fail("expected detached segment to have no owner");
+	M.attach(s, seg);
+	if (s.range != seg) t.t.fail("expected attach to set the segment");
+	if (seg.stack.get() != s) t.t.fail("expected attach to set the owner");
+	if (s.state() != StackState.EMPTY || s.vsp != seg.start || s.rsp != seg.end) t.t.fail("expected attach to leave the stack empty");
+	t.checkInvariants("attach");
+}
+
+def test_moved_segment_kept(t: NativeStackManagerTester) {
+	// A segment moved to another stack is reclaimed only when the new owner dies.
+	t.limit(1);
+	var seg = t.checkMovedSegment();
+	Target.forceGC();
+	if (seg.stack.get() != null) t.t.fail("expected the moved segment to be unowned after its new owner died");
+	var s = t.fresh();
+	if (s.range != seg) t.t.fail("expected the moved segment to be reclaimed");
+	t.checkInvariants("moved");
+}
+
+def test_reattach_runs(t: NativeStackManagerTester) {
+	var f = t.subFunc();
+	var s = t.fresh();
+	var seg = s.range;
+	for (i < 3) M.attach(s, M.detach(s));
+	if (s.range != seg || seg.stack.get() != s) t.t.fail("expected reattached stack to own its segment");
+	t.assertResult(Result.Value([Values.box_i(2)]), s.reset(f).bind([Values.box_i(7), Values.box_i(5)]).resume());
+	t.checkInvariants("reattach");
 }
 
 def test_out_of_stacks_cont_new(t: NativeStackManagerTester) {

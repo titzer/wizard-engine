@@ -1,0 +1,74 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Compresses suspended stacks into the heap to free their segments, and decompresses them before use.
+component NativeStackCompression {
+	var numCompressed: int;
+	var numDecompressed: int;
+
+	// Returns {true} if {stack} is suspended with only interpreter and SPC frames.
+	def canCompress(stack: NativeStack) -> bool {
+		if (stack.state_ != StackState.SUSPENDED) return false;
+		var range = stack.range;
+		if (range == null) return false;
+		var end = range.end;
+		// [end - 8] holds the parent's rsp, [end - 16] the return-parent stub.
+		if (stack.parent_rsp_ptr != end + -Pointer.SIZE) return false;
+		var srp = stack.rsp, count = 0, bottom_sfp = Pointer.NULL;
+		while (srp >= range.start && srp < end) {
+			var retip = srp.load<Pointer>();
+			var code = RiRuntime.findUserCode(retip);
+			match (code) {
+				x: X86_64InterpreterCode, x: X86_64SpcModuleCode => {
+					count++;
+					bottom_sfp = srp + Pointer.SIZE;
+					srp = code.nextFrame(retip, srp).1;
+				}
+				x: X86_64ReturnParentStub => {
+					if (count == 0 || srp != end + -2 * Pointer.SIZE) return false;
+					// Values below the bottom frame would be lost.
+					return NativeFrameHandle.Interpreter(bottom_sfp).vfp() == range.start;
+				}
+				_ => return false; // the enter-func stub, inlined frames, trap stubs, or host frames
+			}
+		}
+		return false;
+	}
+	// Requires {canCompress(stack)}; returns the detached segment.
+	def compress(stack: NativeStack) -> NativeStackSegment {
+		var parent_rsp = stack.parent_rsp_ptr.load<Pointer>();
+		var c = StackCompression.compressStack(stack);
+		var segment = NativeStackManager.detach(stack);
+		if (Trace.stack) Trace.OUT.put2("compress stack @ 0x%x, freeing segment 0x%x",
+			Pointer.atObject(stack) - Pointer.NULL, segment.start - Pointer.NULL).ln();
+		stack.vsp = stack.rsp = Pointer.NULL;
+		stack.parent_rsp_ptr = Pointer.NULL;
+		stack.saved_parent_rsp = parent_rsp;
+		stack.compressed = c;
+		stack.state_ = StackState.COMPRESSED;
+		numCompressed++;
+		return segment;
+	}
+	// Decompresses {stack}, if compressed, onto a fresh segment; returns {false} if none is available.
+	def decompress(stack: NativeStack) -> bool {
+		if (stack.state_ != StackState.COMPRESSED) return true;
+		var segment = NativeStackManager.acquireSegment();
+		if (segment == null) return false;
+		var c = stack.compressed, parent_rsp = stack.saved_parent_rsp;
+		var func = stack.func, results = stack.return_results, parent = stack.parent, bottom = stack.bottom;
+		if (Trace.stack) Trace.OUT.put2("decompress stack @ 0x%x onto segment 0x%x",
+			Pointer.atObject(stack) - Pointer.NULL, segment.start - Pointer.NULL).ln();
+		NativeStackManager.attach(stack, segment);
+		Target.writeFramesToStack(stack, StackCompression.decompressFrames(c));
+		stack.func = func;
+		stack.return_results = results;
+		stack.parent = parent;
+		stack.bottom = bottom;
+		stack.parent_rsp_ptr.store<Pointer>(parent_rsp);
+		stack.saved_parent_rsp = Pointer.NULL;
+		stack.compressed = null;
+		stack.state_ = StackState.SUSPENDED;
+		numDecompressed++;
+		return true;
+	}
+}
