@@ -16,7 +16,10 @@ component X86_64LinuxExeTest {
 				("load_oob0", test_load_oob0),
 				("call1005", test_call1005),		// intended to trigger OSR
 				("osr_accessor", test_osr_accessor),
-				("recompile_after_probe", test_recompile_after_probe)
+				("recompile_after_probe", test_recompile_after_probe),
+				("frame_var_write", test_frame_var_write),
+				("inlined_frame_var_write", test_inlined_frame_var_write),
+				("frame_var_deopt", test_frame_var_deopt)
 				]) {
 				// register strategy/test pair
 				UnitTests.registerT(strategy.0, test.0, newTester, test.1);
@@ -129,4 +132,111 @@ def test_recompile_after_probe(i: ExeTester) {
 	def inserter = ClosureProbe.new(Instrumentation.insertLocalProbe, (i.module, g.func_index, 1, CountProbe.new()));
 	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 10, inserter);
 	i.args_i(5).assert2_i(66);
+}
+
+// Checks that frame variable 0 holds the number of earlier firings, then increments it. Also
+// records whether a write turned a compiled frame into an interpreter frame.
+private class FrameVarCounter extends Probe {
+	var fires: int;
+	var compiled_fires: int;
+	var wrong: bool;
+	var deopted: bool;
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		def accessor = NativeFrameAccessor.!(dynamicLoc.frame.getFrameAccessor());
+		def compiled = accessor.isSpc();
+		if (compiled) compiled_fires++;
+		if (Values.unbox_i(accessor.getFrameVar(0)) != fires) wrong = true;
+		accessor.getWriter().setFrameVar(0, Values.box_i(++fires));
+		if (compiled && !accessor.isSpc()) deopted = true;
+		return ProbeAction.Continue;
+	}
+}
+
+// A frame variable keeps every value written to it for the whole activation, in compiled code
+// without a deopt, and across the tier-up part way through this loop under int:dyn.
+def test_frame_var_write(i: ExeTester) {
+	def p = FrameVarCounter.new();
+	i.sig(SigCache.i_i);
+	i.codev([
+		u8.!(Opcode.LOOP.code), NONE,
+		u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.I32_CONST.code), 1,
+		u8.!(Opcode.I32_SUB.code),
+		u8.!(Opcode.LOCAL_TEE.code), 0,
+		u8.!(Opcode.BR_IF.code), 0,
+		u8.!(Opcode.END.code),
+		u8.!(Opcode.I32_CONST.code), 7
+	]);
+	i.func.frame_var_tags = [BpTypeCode.I32.code];
+	Instrumentation.insertLocalProbe(i.module, i.func.func_index, 3, p);
+
+	i.args_i(20).assert2_i(7);
+	i.t.assert_eq(20, p.fires);
+	i.t.assert_eq(false, p.wrong);
+	i.t.assert_eq(false, p.deopted);
+	i.t.assert_eq(true, p.compiled_fires > 0);
+}
+
+// An inlined callee's frame variable starts at 0 and is written without a deopt or clobbering the
+// operand above it. Here g(x) = x is probed at its nop, with x live.
+def test_inlined_frame_var_write(i: ExeTester) {
+	def depth_before = SpcTuning.maxInlineDepth;
+	SpcTuning.maxInlineDepth = 1;
+	def g = i.newFunction(SigCache.i_i, [u8.!(Opcode.LOCAL_GET.code), 0, u8.!(Opcode.NOP.code)]);
+	g.frame_var_tags = [BpTypeCode.I32.code];
+	i.sig(SigCache.i_i);
+	i.code([u8.!(Opcode.LOCAL_GET.code), 0,
+		u8.!(Opcode.CALL.code), byte.!(g.func_index)]);
+	def p = FrameVarCounter.new();
+	Instrumentation.insertLocalProbe(i.module, g.func_index, 3, p);
+	i.args_i(5).assert2_i(5);
+	SpcTuning.maxInlineDepth = depth_before;
+	i.t.assert_eq(1, p.fires);
+	i.t.assert_eq(false, p.wrong);
+	i.t.assert_eq(false, p.deopted);
+}
+
+// Writes frame variable 0 and then local 0, which deopts a compiled frame.
+private class FrameVarThenLocalWriter extends Probe {
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		def writer = dynamicLoc.frame.getFrameAccessor().getWriter();
+		writer.setFrameVar(0, Values.box_i(42));
+		writer.setLocal(0, Values.box_i(9));
+		return ProbeAction.Continue;
+	}
+}
+// Records whether frame variable 0's slot holds the I32 42 in every byte the interpreter writes,
+// which are an 8-byte tag followed by the value zero-extended to 16 bytes.
+private class FrameVarSlotChecker extends Probe {
+	var same: bool;
+	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		def accessor = NativeFrameAccessor.!(dynamicLoc.frame.getFrameAccessor());
+		def rep = Target.tagging;
+		def tp = accessor.handle.vfp() + accessor.decl.num_locals * rep.slot_size;
+		def vp = tp + rep.tag_size;
+		same = tp.load<u64>() == u64.view(BpTypeCode.I32.code) && vp.load<u64>() == 42;
+		if (rep.value_size > 8) same = same && (vp + 8).load<u64>() == 0;
+		return ProbeAction.Continue;
+	}
+}
+
+// A frame variable written by compiled code is laid out as the interpreter lays it out, when the
+// interpreter reads it after a deopt. {dirty} first leaves a v128 in its slot.
+def test_frame_var_deopt(i: ExeTester) {
+	def dirty_sig = i.newSig([ValueType.I32, ValueType.V128], SigCache.arr_v);
+	def dirty = i.newFunction(dirty_sig, []);
+	def f = i.newFunction(SigCache.i_i, [u8.!(Opcode.NOP.code), u8.!(Opcode.NOP.code), u8.!(Opcode.LOCAL_GET.code), 0]);
+	f.frame_var_tags = [BpTypeCode.I32.code];
+	def writer = FrameVarThenLocalWriter.new();
+	def checker = FrameVarSlotChecker.new();
+	Instrumentation.insertLocalProbe(i.module, f.func_index, 1, writer);
+	Instrumentation.insertLocalProbe(i.module, f.func_index, 2, checker);
+	i.sig(SigCache.v_i);
+	i.code([u8.!(Opcode.I32_CONST.code), 1,
+		Opcode.V128_CONST.prefix, u8.!(Opcode.V128_CONST.code), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		u8.!(Opcode.CALL.code), byte.!(dirty.func_index),
+		u8.!(Opcode.I32_CONST.code), 5,
+		u8.!(Opcode.CALL.code), byte.!(f.func_index)]);
+	i.noargs().assert2_i(9);
+	i.t.assert_eq(true, checker.same);
 }
