@@ -174,6 +174,16 @@ for target in $TEST_TARGETS; do
     do_script virgil/test
 done
 
+# Virgil tests compiled to Wasm GC
+for target in $TEST_TARGETS; do
+    export TEST_TARGET=$target
+    if [ "$target" = v3i ]; then # TODO: runs really, really slow on v3i
+	skip virgil-gc "runs too slowly"
+        continue
+    fi
+    do_script virgil/test-gc
+done
+
 # Wasi tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
