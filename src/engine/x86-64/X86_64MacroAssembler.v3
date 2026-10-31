@@ -219,6 +219,41 @@ class X86_64MacroAssembler extends MacroAssembler {
 		}
 	}
 
+	def emit_load_elem(st: MemStorageKind, dst: Reg, base: Reg, index: Reg, scale: byte, offset: int) {
+		var addr = X86_64Addr.new(G(base), G(index), scale, offset);
+		checkImplicitNullCheck(base);
+		match (st) {
+			I8 => asm.d.movbsx_r_m(G(dst), addr);
+			U8 => asm.d.movbzx_r_m(G(dst), addr);
+			I16 => asm.d.movwsx_r_m(G(dst), addr);
+			U16 => asm.d.movwzx_r_m(G(dst), addr);
+			I32, U32 => asm.movd_r_m(G(dst), addr);
+			U64 => asm.movq_r_m(G(dst), addr);
+			F32 => asm.movss_s_m(X(dst), addr);
+			F64 => asm.movsd_s_m(X(dst), addr);
+			V128 => asm.movdqu_s_m(X(dst), addr);
+		}
+	}
+	def emit_store_elem(st: MemStorageKind, base: Reg, index: Reg, scale: byte, offset: int, val: Reg) {
+		var addr = X86_64Addr.new(G(base), G(index), scale, offset);
+		checkImplicitNullCheck(base);
+		match (st) {
+			I8, U8 => asm.q.movb_m_r(addr, G(val));
+			I16, U16 => asm.q.movw_m_r(addr, G(val));
+			I32, U32 => asm.movd_m_r(addr, G(val));
+			U64 => asm.movq_m_r(addr, G(val));
+			F32 => asm.movss_m_s(addr, X(val));
+			F64 => asm.movsd_m_s(addr, X(val));
+			V128 => asm.movdqu_m_s(addr, X(val));
+		}
+	}
+
+	// Records the source location for an access through {base}, if it is an implicit null check.
+	private def checkImplicitNullCheck(base: Reg) {
+		if (implicitNullCheck == SpcConsts.NO_REG || implicitNullCheck != base) return;
+		recordCurSourceLoc();
+		implicitNullCheck = SpcConsts.NO_REG;
+	}
 	private def handle_large_offset(index: Reg, offset: u32) -> (X86_64Gpr, int) {
 		var ioffset = int.view(offset), r = G(index);
 		if (ioffset != offset) { // too large for signed encoding, add explicitly
@@ -247,6 +282,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_mov_r_m(kind: ValueKind, reg: Reg, ma: MasmAddr) {
 		var addr = A(ma);
+		checkImplicitNullCheck(ma.base);
 		match (kind) {
 			I32 => asm.movd_r_m(G(reg), addr);
 			I64, REF => asm.movq_r_m(G(reg), addr);
@@ -289,20 +325,26 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.movd_r_i(G(reg), int.view(u32.!(long.view(abs))));
 	}
 	def emit_mov_r_Object(reg: Reg, obj: Object) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(obj))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(obj))), fun => Pointer.atObject(obj));
+	}
+	def emit_mov_r_StructDeclInfo(reg: Reg, info: StructDeclInfo) {
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(info))), fun => Pointer.atObject(info));
+	}
+	def emit_mov_r_ArrayDeclInfo(reg: Reg, info: ArrayDeclInfo) {
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(info))), fun => Pointer.atObject(info));
 	}
 	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(array))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(array))), fun => Pointer.atObject(array));
 	}
 	def emit_mov_r_Function(reg: Reg, func: Function) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(func))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(func))), fun => Pointer.atObject(func));
 	}
 	def emit_mov_r_Instance(reg: Reg, instance: Instance) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(instance))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(instance))), fun => Pointer.atObject(instance));
 	}
 	def emit_mov_r_Continuation(reg: Reg, cont: Continuation) {
 		// {reg} is an XMM register holding (stack, version) in its low/high 8 bytes.
-		addEmbeddedRefOffset(asm.movq_r_p(scratch, long.view(Pointer.atObject(cont.stack))));
+		addEmbeddedRef(asm.movq_r_p(scratch, long.view(Pointer.atObject(cont.stack))), fun => Pointer.atObject(cont.stack));
 		asm.pinsrq_s_r_i(X(reg), scratch, 0);
 		asm.movq_r_i(scratch, int.view(cont.version));
 		asm.pinsrq_s_r_i(X(reg), scratch, 1);
@@ -310,6 +352,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 
 	def emit_mov_m_r(kind: ValueKind, ma: MasmAddr, reg: Reg) {
 		var addr = A(ma);
+		checkImplicitNullCheck(ma.base);
 		match (kind) {
 			I32 => asm.movd_m_r(addr, G(reg));
 			I64, REF => asm.movq_m_r(addr, G(reg));
@@ -747,7 +790,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			IS_WASM_FUNC, IS_NOT_WASM_FUNC => {
 				asm.d.cmp_m_i(G(reg).plus(0), offsets.WasmFunction_typeId);
 			}
-			I1_ZERO, I1_ONE => {
+			I1_ZERO, I1_ONE, REF_I31, REF_NOT_I31 => { // i31 references have the low bit set
 				asm.d.test_r_i(G(reg), 1);
 			}
 			_ => {
@@ -762,17 +805,30 @@ class X86_64MacroAssembler extends MacroAssembler {
 		var cond = if(cond.zero, X86_64Conds.Z, X86_64Conds.NZ);
 		asm.jc_rel_far(cond, X86_64MasmLabel.!(label).label);
 	}
-	def emit_breq_r_i(r: Reg, val: int, label: MasmLabel) {
-		asm.d.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.Z, X86_64MasmLabel.!(label).label);
+	def emit_br_r_r(kind: ValueKind, cond: MasmCmpBr, r1: Reg, r2: Reg, label: MasmLabel) {
+		widthOf(kind).cmp_r_r(G(r1), G(r2));
+		asm.jc_rel_far(cmpCond(cond), X86_64MasmLabel.!(label).label);
 	}
-	def emit_breq_r_l(r: Reg, val: int, label: MasmLabel) {
-		asm.q.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.Z, X86_64MasmLabel.!(label).label);
+	def emit_br_r_i(kind: ValueKind, cond: MasmCmpBr, reg: Reg, val: int, label: MasmLabel) {
+		widthOf(kind).cmp_r_i(G(reg), val);
+		asm.jc_rel_far(cmpCond(cond), X86_64MasmLabel.!(label).label);
 	}
-	def emit_brne_r_i(r: Reg, val: int, label: MasmLabel) {
-		asm.d.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.NZ, X86_64MasmLabel.!(label).label);
+	private def widthOf(kind: ValueKind) -> X86_64Assembler {
+		return if(kind == ValueKind.I32, asm.d, asm.q);
+	}
+	private def cmpCond(cond: MasmCmpBr) -> X86_64Cond {
+		match (cond) {
+			EQ => return X86_64Conds.Z;
+			NE => return X86_64Conds.NZ;
+			LT_S => return X86_64Conds.L;
+			LE_S => return X86_64Conds.LE;
+			GT_S => return X86_64Conds.G;
+			GE_S => return X86_64Conds.GE;
+			LT_U => return X86_64Conds.C;
+			LE_U => return X86_64Conds.NA;
+			GT_U => return X86_64Conds.A;
+			GE_U => return X86_64Conds.NC;
+		}
 	}
 	def emit_br_table_r(reg: Reg, labels: Array<MasmLabel>) {
 		// XXX: simplify the label patching logic by improving X86_64Assembler
@@ -810,13 +866,13 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_inc_metric(metric: Metric) {
 		if (!metric.enabled) return;
-		addEmbeddedRefOffset(asm.movq_r_p(scratch, long.view(Pointer.atObject(metric))));
+		addEmbeddedRef(asm.movq_r_p(scratch, long.view(Pointer.atObject(metric))), fun => Pointer.atObject(metric));
 		asm.q.add_m_i(scratch.plus(getOffsets().Metric_val), 1);
 	}
 	def emit_increment_CountProbe(tmp: Reg, probe: CountProbe, increment: u64) {
 		var r1 = G(tmp);
 		var refOffset = asm.movq_r_p(r1, long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		var addr = r1.plus(getOffsets().CountProbe_count);
 		if (increment == 1) {
 			asm.inc_m(addr);
@@ -831,7 +887,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_OperandProbe_i_v_fire(probe: OperandProbe_i_v, value_reg: Reg) {
 		var codePtr = CiRuntime.unpackClosure<OperandProbe_i_v, u32, void>(probe.fire_i).0;
 		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		asm.movq_r_l(scratch, long.view(codePtr)); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
 		recordRetSourceLoc();
@@ -839,7 +895,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_MemoryReadProbe_fire(probe: MemoryReadProbe) {
 		var codePtr = CiRuntime.unpackClosure<MemoryReadProbe, (u64, u64, u64), void>(probe.fire_probe).0;
 		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		asm.movq_r_l(scratch, long.view(codePtr)); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
 		recordRetSourceLoc();
