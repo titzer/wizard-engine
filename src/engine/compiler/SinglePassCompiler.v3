@@ -125,6 +125,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var codegen_offset: u64 = 0;
 
 	var intrinsified_read_probe: MemoryReadProbe = null;
+	// Emits inline code for GC object accesses, if the object model supports it.
+	def omc = ObjectModelCompilers.instance;
 
 	new() {
 		masm.unimplemented = unsupported;
@@ -459,15 +461,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		// spill everything
 		state.emitSaveAll(resolver, spillMode);
-		// compute VSP for potential frame access
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-		// load stack
-		masm.emit_get_curstack(regs.runtime_arg0);
-		// store %sp
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		// commit VSP for potential frame access, and %sp
+		emitCommitVsp(regs.vsp);
+		emitPushStackRsp(regs.runtime_arg0);
 		// reload WasmFunction
 		masm.emit_mov_r_m(ValueKind.REF, regs.runtime_arg1, frame.wasm_func_slot);
 		// load PC
@@ -475,8 +471,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// call runtime
 		masm.emit_call_runtime_Probe_instr();
 		// restore {stack.rsp}
-		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
+		emitPopStackRsp();
 		emit_reload_regs();
 		if (!spillMode.free_regs) state.emitRestoreAll(resolver);
 	}
@@ -731,12 +726,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def visit_THROW(tag_index: u31) {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitCommitVsp(regs.vsp);
+		emitPushStackRsp(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
 		masm.emit_call_runtime_op(Opcode.THROW);
@@ -746,12 +737,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	}
 	def visit_THROW_REF() {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitCommitVsp(regs.vsp);
+		emitPushStackRsp(regs.runtime_arg0);
 		popFixedReg(regs.runtime_arg1);
 		masm.emit_call_runtime_op(Opcode.THROW_REF);
 		setUnreachable();
@@ -1654,12 +1641,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Call the runtime to throw the tag's exception into the continuation.
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
-		emit_compute_vsp(vsp, state.sp);
-		emit_spill_vsp(vsp);
-		masm.emit_store_curstack_vsp(vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitCommitVsp(vsp);
+		emitPushStackRsp(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
 		masm.emit_call_runtime_RESUME_THROW();
@@ -1727,12 +1710,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 
 		// Call the runtime to throw the exnref into the continuation.
 		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
-		emit_compute_vsp(vsp, state.sp);
-		emit_spill_vsp(vsp);
-		masm.emit_store_curstack_vsp(vsp);
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitCommitVsp(vsp);
+		emitPushStackRsp(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_call_runtime_RESUME_THROW_REF();
 
@@ -1789,38 +1768,134 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 		return false;
 	}
+	//====================================================================
+	// Wasm GC objects
+	//====================================================================
+	// Decisions about inlining GC operations with the object model compiler.
+	private def shouldInlineGcAccess() -> bool {
+		return omc != null && SpcTuning.inlineGcAccess;
+	}
+	private def shouldInlineGcAlloc() -> bool {
+		return omc != null && SpcTuning.inlineGcAlloc;
+	}
+	private def shouldInlineCast() -> bool {
+		return shouldInlineGcAccess() && state.peek().kind() == ValueKind.REF;
+	}
+	private def shouldUseHardwareNullChecks() -> bool {
+		return SpcTuning.hardwareNullChecks;
+	}
+	// Emits a null check of the reference {sv}, which has been popped into a register.
+	private def emitNullCheck(sv: SpcVal) -> NullCheck {
+		if (sv.isConst()) {
+			if (sv.const != 0) return NullCheck.NON_NULL;
+			emitTrap(TrapReason.NULL_DEREF);
+			setUnreachable();
+			return NullCheck.STATIC_NULL;
+		}
+		if (shouldUseHardwareNullChecks()) return NullCheck.IMPLICIT;
+		masm.emit_br_r(sv.reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+		return NullCheck.CHECKED;
+	}
+	// Emits an access to the object in {obj} with {emit}, after a null check with outcome {check}. For an
+	// implicit null check, the first access through {obj} records the source location, so that a
+	// fault there is a null dereference.
+	private def emitAccess(check: NullCheck, obj: Reg, emit: void -> void) {
+		if (check == NullCheck.IMPLICIT) masm.armImplicitNullCheck(obj);
+		emit();
+		masm.disarmImplicitNullCheck();
+	}
+	// Pushes the value in the temporary {reg} onto the abstract stack.
+	private def pushReg(kind: ValueKind, reg: Reg) {
+		regAlloc.assign(reg, int.!(state.sp));
+		state.push(SpcConsts.kindToFlags(kind) | IN_REG, reg, 0);
+	}
+	// Whether values of kinds {a} and {b} are allocated to the same class of registers.
+	def isSameRegClass(a: ValueKind, b: ValueKind) -> bool {
+		var poolMap = config.poolMap;
+		return poolMap.kindToPool[a.tag] == poolMap.kindToPool[b.tag];
+	}
 	def visit_STRUCT_NEW(struct_index: u31) {
-		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op1n(Opcode.STRUCT_NEW, struct_index, u32.!(decl.field_types.length), ValueTypes.ONE_STRUCTREF_TYPE, true);
+		var decl = StructDecl.!(module.heaptypes[struct_index]), count = decl.field_types.length;
+		if (!shouldInlineGcAlloc()) return emit_call_runtime_op1n(Opcode.STRUCT_NEW, struct_index, u32.!(count), ValueTypes.ONE_STRUCTREF_TYPE, true);
+		var dst = allocTmp(ValueKind.REF);
+		omc.emitStructNew(this, decl, dst);
+		emitInitFromSlots(state.sp - u32.!(count), count, fun (i: int, val: Reg) => omc.emitStructSet(this, decl, u31.!(i), dst, val));
+		dropN(u32.!(count));
+		pushReg(ValueKind.REF, dst);
 	}
 	def visit_STRUCT_NEW_DEFAULT(struct_index: u31) {
 		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op1n(Opcode.STRUCT_NEW_DEFAULT, struct_index, 0, ValueTypes.ONE_STRUCTREF_TYPE, true);
+		if (!shouldInlineGcAlloc()) return emit_call_runtime_op1n(Opcode.STRUCT_NEW_DEFAULT, struct_index, 0, ValueTypes.ONE_STRUCTREF_TYPE, true);
+		var dst = allocTmp(ValueKind.REF);
+		omc.emitStructNew(this, decl, dst);
+		pushReg(ValueKind.REF, dst);
 	}
 	def visit_STRUCT_GET(struct_index: u31, field_index: u31) {
-		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op2n(Opcode.STRUCT_GET, struct_index, field_index, 1, [decl.field_types[field_index].valtype], true);
+		visitStructGet(Opcode.STRUCT_GET, struct_index, field_index, false);
 	}
 	def visit_STRUCT_GET_S(struct_index: u31, field_index: u31) {
-		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op2n(Opcode.STRUCT_GET_S, struct_index, field_index, 1, [decl.field_types[field_index].valtype], true);
+		visitStructGet(Opcode.STRUCT_GET_S, struct_index, field_index, true);
 	}
 	def visit_STRUCT_GET_U(struct_index: u31, field_index: u31) {
-		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op2n(Opcode.STRUCT_GET_U, struct_index, field_index, 1, [decl.field_types[field_index].valtype], true);
+		visitStructGet(Opcode.STRUCT_GET_U, struct_index, field_index, false);
+	}
+	private def visitStructGet(op: Opcode, struct_index: u31, field_index: u31, signed: bool) {
+		var decl = StructDecl.!(module.heaptypes[struct_index]), vt = decl.field_types[field_index].valtype;
+		if (!shouldInlineGcAccess()) return emit_call_runtime_op2n(op, struct_index, field_index, 1, [vt], true);
+		var obj = popReg(), check = emitNullCheck(obj);
+		if (check == NullCheck.STATIC_NULL) return;
+		var kind = ValueTypes.kind(vt), dst = allocRegTos(kind);
+		emitAccess(check, obj.reg, fun => omc.emitStructGet(this, decl, field_index, signed, dst, obj.reg));
+		state.push(SpcConsts.kindToFlags(kind) | IN_REG, dst, 0);
 	}
 	def visit_STRUCT_SET(struct_index: u31, field_index: u31) {
 		var decl = StructDecl.!(module.heaptypes[struct_index]);
-		emit_call_runtime_op2n(Opcode.STRUCT_SET, struct_index, field_index, 2, ValueTypes.NONE, true);
+		if (!shouldInlineGcAccess()) return emit_call_runtime_op2n(Opcode.STRUCT_SET, struct_index, field_index, 2, ValueTypes.NONE, true);
+		var val = popReg(), obj = popReg(), check = emitNullCheck(obj);
+		if (check == NullCheck.STATIC_NULL) return;
+		emitAccess(check, obj.reg, fun => omc.emitStructSet(this, decl, field_index, obj.reg, val.reg));
 	}
 	def visit_ARRAY_NEW(ht_index: u31) {
 		emit_call_runtime_op1n(Opcode.ARRAY_NEW, ht_index, 2, ValueTypes.ONE_ARRAYREF_TYPE, true);
 	}
 	def visit_ARRAY_NEW_DEFAULT(ht_index: u31) {
-		emit_call_runtime_op1n(Opcode.ARRAY_NEW_DEFAULT, ht_index, 1, ValueTypes.ONE_ARRAYREF_TYPE, true);
+		if (!shouldInlineGcAlloc()) return emit_call_runtime_op1n(Opcode.ARRAY_NEW_DEFAULT, ht_index, 1, ValueTypes.ONE_ARRAYREF_TYPE, true);
+		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
+		var dst = allocTmp(ValueKind.REF), length = ensureReg(state.peek(), state.sp - 1);
+		omc.emitArrayNew(this, decl, length, -1, dst);
+		dropN(1);
+		pushReg(ValueKind.REF, dst);
 	}
 	def visit_ARRAY_NEW_FIXED(ht_index: u31, length: u31) {
-		emit_call_runtime_op2n(Opcode.ARRAY_NEW_FIXED, ht_index, length, length, ValueTypes.ONE_ARRAYREF_TYPE, true);
+		if (!shouldInlineGcAlloc() || length > Execute.limits.max_array_length) {
+			return emit_call_runtime_op2n(Opcode.ARRAY_NEW_FIXED, ht_index, length, length, ValueTypes.ONE_ARRAYREF_TYPE, true);
+		}
+		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
+		var dst = allocTmp(ValueKind.REF), lreg = allocTmp(ValueKind.I32);
+		masm.emit_mov_r_i(lreg, length);
+		omc.emitArrayNew(this, decl, lreg, length, dst);
+		emitInitFromSlots(state.sp - length, length, fun (i: int, val: Reg) => omc.emitArrayInit(this, decl, dst, i, val));
+		dropN(length);
+		pushReg(ValueKind.REF, dst);
+	}
+	// Initializes a new object from the {count} values in the slots starting at {base}. Values not in
+	// registers are loaded into one temporary per register pool.
+	private def emitInitFromSlots(base: u32, count: int, init: (int, Reg) -> void) {
+		var poolMap = config.poolMap, tmps = Array<Reg>.new(poolMap.numRegPools);
+		for (i < count) { // allocate temporaries first, since allocation may spill
+			var sv = state.state[base + u32.!(i)], pool = poolMap.kindToPool[sv.kind().tag];
+			if (!sv.inReg() && tmps[pool] == NO_REG) tmps[pool] = allocTmp(sv.kind());
+		}
+		for (i < count) {
+			var slot = base + u32.!(i), sv = state.state[slot], reg = sv.reg;
+			if (!sv.inReg()) {
+				var kind = sv.kind();
+				reg = tmps[poolMap.kindToPool[kind.tag]];
+				if (sv.isConst()) masm.emit_mov_r_k(kind, reg, sv.const);
+				else masm.emit_mov_r_s(kind, reg, slot);
+			}
+			init(i, reg);
+		}
 	}
 	def visit_ARRAY_NEW_DATA(ht_index: u31, data_index: u31) {
 		emit_call_runtime_op2n(Opcode.ARRAY_NEW_DATA, ht_index, data_index, 2, ValueTypes.ONE_ARRAYREF_TYPE, true);
@@ -1829,32 +1904,37 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op2n(Opcode.ARRAY_NEW_ELEM, ht_index, elem_index, 2, ValueTypes.ONE_ARRAYREF_TYPE, true);
 	}
 	def visit_ARRAY_GET(ht_index: u31) {
-		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
-		emit_call_runtime_op1n(Opcode.ARRAY_GET, ht_index, 2, [decl.elem_types[0].valtype], true);
+		visitArrayGet(Opcode.ARRAY_GET, ht_index, false);
 	}
 	def visit_ARRAY_GET_S(ht_index: u31) {
-		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
-		emit_call_runtime_op1n(Opcode.ARRAY_GET_S, ht_index, 2, [decl.elem_types[0].valtype], true);
+		visitArrayGet(Opcode.ARRAY_GET_S, ht_index, true);
 	}
 	def visit_ARRAY_GET_U(ht_index: u31) {
-		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
-		emit_call_runtime_op1n(Opcode.ARRAY_GET_U, ht_index, 2, [decl.elem_types[0].valtype], true);
+		visitArrayGet(Opcode.ARRAY_GET_U, ht_index, false);
+	}
+	private def visitArrayGet(op: Opcode, ht_index: u31, signed: bool) {
+		var decl = ArrayDecl.!(module.heaptypes[ht_index]), vt = decl.elem_types[0].valtype;
+		if (!shouldInlineGcAccess()) return emit_call_runtime_op1n(op, ht_index, 2, [vt], true);
+		var index = popReg(), obj = popReg(), check = emitNullCheck(obj);
+		if (check == NullCheck.STATIC_NULL) return;
+		var kind = ValueTypes.kind(vt), dst = allocRegTos(kind);
+		emitAccess(check, obj.reg, fun => omc.emitArrayGet(this, decl, signed, dst, obj.reg, index.reg));
+		state.push(SpcConsts.kindToFlags(kind) | IN_REG, dst, 0);
 	}
 	def visit_ARRAY_SET(ht_index: u31) {
-		emit_call_runtime_op1n(Opcode.ARRAY_SET, ht_index, 3, ValueTypes.NONE, true);
+		if (!shouldInlineGcAccess()) return emit_call_runtime_op1n(Opcode.ARRAY_SET, ht_index, 3, ValueTypes.NONE, true);
+		var decl = ArrayDecl.!(module.heaptypes[ht_index]);
+		var val = popReg(), index = popReg(), obj = popReg(), check = emitNullCheck(obj);
+		if (check == NullCheck.STATIC_NULL) return;
+		emitAccess(check, obj.reg, fun => omc.emitArraySet(this, decl, obj.reg, index.reg, val.reg));
 	}
 	def visit_ARRAY_LEN() {
-		emit_call_runtime_op1n(Opcode.ARRAY_LEN, 0, 1, SigCache.arr_i, true);
-		/* Direct array-length access needs to be moved into the object model.
-		var sv = popReg();
-		var label = masm.newTrapLabel(TrapReason.NULL_DEREF); // XXX: constant-fold nullcheck
-		masm.emit_breq_r_l(sv.reg, 0, label);
-		var tmp = allocTmp(ValueKind.REF);
+		if (!shouldInlineGcAccess()) return emit_call_runtime_op1n(Opcode.ARRAY_LEN, 0, 1, SigCache.arr_i, true);
+		var obj = popReg(), check = emitNullCheck(obj);
+		if (check == NullCheck.STATIC_NULL) return;
 		var dst = allocRegTos(ValueKind.I32);
-		masm.emit_v3_WasmArray_vals_r_r(tmp, sv.reg);
-		masm.emit_v3_Array_length_r_r(dst, tmp);
+		emitAccess(check, obj.reg, fun => omc.emitArrayLen(this, dst, obj.reg));
 		state.push(KIND_I32 | IN_REG, dst, 0);
-		*/
 	}
 	def visit_ARRAY_FILL(ht_index: u31) {
 		emit_call_runtime_op1n(Opcode.ARRAY_FILL, ht_index, 4, ValueTypes.NONE, true);
@@ -1874,48 +1954,128 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// XXX: statically eliminate null and i31 if possible
 		var result = allocTmpFixed(ValueKind.REF, regs.runtime_ret0);
 		state.emitSaveAll(resolver, runtimeSpillMode);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
+		emitCommitVsp(regs.vsp);
 		// XXX: if a RT function cannot trap, maybe skip setting {rsp}?
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-		masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitPushStackRsp(regs.runtime_arg0);
 		emit_load_instance(regs.runtime_arg1);
 		masm.emit_mov_r_i(regs.runtime_arg2, nullable);
 		masm.emit_mov_r_i(regs.runtime_arg3, ht_val);
 		masm.emit_call_runtime_cast();
-		masm.emit_get_curstack(regs.runtime_arg0);
-		masm.emit_pop_NativeStack_rsp_r_r(regs.runtime_arg0);
+		emitPopStackRsp();
 		emit_reload_regs();
 		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 		return result;
 	}
+	// Emits a call to the runtime function at {code}, which may allocate and trigger a GC but must not
+	// trap, passing {args} and receiving its result in {result}. Preserves the abstract state and all
+	// registers except temporaries, so it can be used on a conditional path.
+	def emitCallRuntimePreserving(code: Pointer, args: Array<Reg>, result: Reg) {
+		state.emitSaveAll(resolver, SpillMode.SAVE_ONLY);
+		emitV3Args(args); // first, since entering the runtime uses other registers
+		var tmp = masm.getV3ReturnReg(ValueKind.REF, 0); // clobbered by the call anyway
+		emitCommitVsp(tmp);
+		emitPushStackRsp(tmp);
+		emitCallV3(code, result);
+		emitPopStackRsp();
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+	}
+	// Emits a call to the runtime to test the non-null reference on top of the abstract stack against the
+	// heap type {ht_val}, leaving a boolean in {result}. Preserves the abstract state and all registers
+	// except temporaries, so it can be used on a conditional path.
+	def emitCallRuntimeCast(ht_val: int, result: Reg) {
+		state.emitSaveAll(resolver, SpillMode.SAVE_ONLY);
+		emitCommitVsp(regs.vsp);
+		emitPushStackRsp(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_i(regs.runtime_arg2, 0);
+		masm.emit_mov_r_i(regs.runtime_arg3, ht_val);
+		masm.emit_call_runtime_cast();
+		masm.emit_mov_r_r(ValueKind.I32, result, regs.runtime_ret0);
+		emitPopStackRsp();
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+	}
+	// Emits an inline test of the reference on top of the abstract stack against the heap type {ht_val},
+	// branching to {fail} if the test fails and falling through if it succeeds. Leaves the abstract
+	// stack unchanged.
+	private def emitCastTest(nullable: bool, maybe_null: bool, ht_val: int, fail: MasmLabel) {
+		var obj = ensureReg(state.peek(), state.sp - 1);
+		// Allocate all temporaries before any branch, since allocation may spill.
+		var tmp1 = allocTmp(ValueKind.REF), tmp2 = allocTmp(ValueKind.REF);
+		var ok = masm.newLabel(it.pc);
+		if (maybe_null) masm.emit_br_r(obj, MasmBrCond.REF_NULL, if(nullable, ok, fail));
+		match (ht_val) {
+			BpHeapTypeCode.ANY.val,
+			BpHeapTypeCode.EXTERN.val => ; // any non-null reference
+			BpHeapTypeCode.I31.val => masm.emit_br_r(obj, MasmBrCond.REF_NOT_I31, fail);
+			BpHeapTypeCode.NONE.val,
+			BpHeapTypeCode.NOFUNC.val,
+			BpHeapTypeCode.NOEXTERN.val,
+			BpHeapTypeCode.NOEXN.val,
+			BpHeapTypeCode.NOCONT.val => masm.emit_br(fail);
+			_ => {
+				// i31s pass {eq} and fail all other remaining types.
+				masm.emit_br_r(obj, MasmBrCond.REF_I31, if(ht_val == BpHeapTypeCode.EQ.val, ok, fail));
+				omc.emitCastTest(this, obj, ht_val, fail, tmp1, tmp2);
+			}
+		}
+		masm.bindLabel(ok);
+	}
+	private def emitRefTest(nullable: bool, ht_val: int) {
+		var dst = allocTmp(ValueKind.I32);
+		var fail = masm.newLabel(it.pc), done = masm.newLabel(it.pc);
+		emitCastTest(nullable, true, ht_val, fail);
+		masm.emit_mov_r_i(dst, 1);
+		masm.emit_br(done);
+		masm.bindLabel(fail);
+		masm.emit_mov_r_i(dst, 0);
+		masm.bindLabel(done);
+		pop();
+		pushReg(ValueKind.I32, dst);
+	}
+	private def emitBrOnCast(imm: BrOnCastImm, on_fail: bool) {
+		var target = state.getControl(imm.depth);
+		var fail = masm.newLabel(it.pc), skip = masm.newLabel(it.pc);
+		emitCastTest(imm.null2(), imm.null1(), imm.ht2, fail);
+		if (on_fail) {
+			masm.emit_br(skip);
+			masm.bindLabel(fail);
+		}
+		state.emitTransfer(target, resolver);
+		masm.emit_br(target.label);
+		masm.bindLabel(if(on_fail, skip, fail));
+	}
 	def visit_REF_TEST(ht_val: int) {
+		if (shouldInlineCast()) return emitRefTest(false, ht_val);
 		var result = emit_call_runtime_doCast(0, ht_val);
 		masm.emit_binop_r_i(Opcode.I32_AND, result, 1); // XXX: eliminate masking of Virgil bool
 		allocFixed(ValueKind.I32, result, state.sp - 1); // use Runtime return reg
 		state.overwrite(KIND_I32 | IN_REG, result, 0);
 	}
 	def visit_REF_TEST_NULL	(ht_val: int) {
+		if (shouldInlineCast()) return emitRefTest(true, ht_val);
 		var result = emit_call_runtime_doCast(2, ht_val);
 		masm.emit_binop_r_i(Opcode.I32_AND, result, 1); // XXX: eliminate masking of Virgil bool
 		allocFixed(ValueKind.I32, result, state.sp - 1); // use Runtime return reg
 		state.overwrite(KIND_I32 | IN_REG, result, 0);
 	}
 	def visit_REF_CAST(ht_val: int) {
+		if (shouldInlineCast()) return emitCastTest(false, true, ht_val, newTrapLabel(TrapReason.FAILED_CAST));
 		var result = emit_call_runtime_doCast(0, ht_val);
 		var label = masm.newTrapLabel(TrapReason.FAILED_CAST);
 		masm.emit_br_r(result, MasmBrCond.I1_ZERO, label);
 		// fallthru and do nothing on cast success
 	}
 	def visit_REF_CAST_NULL(ht_val: int) {
+		if (shouldInlineCast()) return emitCastTest(true, true, ht_val, newTrapLabel(TrapReason.FAILED_CAST));
 		var result = emit_call_runtime_doCast(2, ht_val);
 		var label = masm.newTrapLabel(TrapReason.FAILED_CAST);
 		masm.emit_br_r(result, MasmBrCond.I1_ZERO, label);
 		// fallthru and do nothing on cast success
 	}
 	def visit_BR_ON_CAST(imm: BrOnCastImm) {
+		if (shouldInlineCast()) return emitBrOnCast(imm, false);
 		var target = state.getControl(imm.depth);
 		var nullable: byte = if(imm.null2(), 2, 0);
 		var result = emit_call_runtime_doCast(nullable, imm.ht2); // XXX: statically elimate null, i31
@@ -1924,6 +2084,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		// fallthru and do nothing on cast fail
 	}
 	def visit_BR_ON_CAST_FAIL(imm: BrOnCastImm) {
+		if (shouldInlineCast()) return emitBrOnCast(imm, true);
 		var target = state.getControl(imm.depth);
 		var nullable: byte = if(imm.null2(), 2, 0);
 		var result = emit_call_runtime_doCast(nullable, imm.ht2); // XXX: statically elimate null, i31
@@ -2028,76 +2189,75 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		emit_call_runtime_op2n(op, arg1, arg2, count, op.sig.results, canTrap);
 	}
 	def emit_call_runtime_op1n(op: Opcode, arg1: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
-		state.emitSaveAll(resolver, runtimeSpillMode);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-
-		def emit = fun {
-			masm.emit_get_curstack(regs.runtime_arg0);
-			masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-			masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
-			emit_load_instance(regs.runtime_arg1);
-			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
-			masm.emit_call_runtime_op(op);
-		};
-		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
- 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
-		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
-		dropN(args);
-		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
-		emit_reload_regs();
-		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
+		emit_call_runtime_opn(op, [arg1], args, results, canTrap);
 	}
 	def emit_call_runtime_op2n(op: Opcode, arg1: u31, arg2: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
+		emit_call_runtime_opn(op, [arg1, arg2], args, results, canTrap);
+	}
+	def emit_call_runtime_op3n(op: Opcode, arg1: u31, arg2: u31, arg3: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
+		emit_call_runtime_opn(op, [arg1, arg2, arg3], args, results, canTrap);
+	}
+	// Calls the runtime implementation of {op} with immediates {imms}, consuming {args} values from the
+	// abstract stack and producing {results}.
+	private def emit_call_runtime_opn(op: Opcode, imms: Array<u31>, args: u32, results: Array<ValueType>, canTrap: bool) {
 		state.emitSaveAll(resolver, runtimeSpillMode);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-
+		emitCommitVsp(regs.vsp);
+		def immRegs = [regs.runtime_arg2, regs.runtime_arg3, regs.runtime_arg4];
 		def emit = fun {
-			masm.emit_get_curstack(regs.runtime_arg0);
-			masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-			masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
+			emitPushStackRsp(regs.runtime_arg0);
 			emit_load_instance(regs.runtime_arg1);
-			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
-			masm.emit_mov_r_i(regs.runtime_arg3, arg2);
+			for (i < imms.length) masm.emit_mov_r_i(immRegs[i], imms[i]);
 			masm.emit_call_runtime_op(op);
 		};
 		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
  		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
-		masm.emit_get_curstack(regs.scratch);
-		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
+		emitPopStackRsp();
 		dropN(args);
 		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		emit_reload_regs();
 		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
 	}
-	def emit_call_runtime_op3n(op: Opcode, arg1: u31, arg2: u31, arg3: u31, args: u32, results: Array<ValueType>, canTrap: bool) {
-		state.emitSaveAll(resolver, runtimeSpillMode);
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-
-		def emit = fun {
-			masm.emit_get_curstack(regs.runtime_arg0);
-			masm.emit_v3_set_NativeStack_rsp_r_r(regs.runtime_arg0, regs.sp);
-			masm.emit_push_NativeStack_rsp_r_r(regs.runtime_arg0);
-			emit_load_instance(regs.runtime_arg1);
-			masm.emit_mov_r_i(regs.runtime_arg2, arg1);
-			masm.emit_mov_r_i(regs.runtime_arg3, arg2);
-			masm.emit_mov_r_i(regs.runtime_arg4, arg3);
-			masm.emit_call_runtime_op(op);
-		};
-		// Reconstruct stack frames across runtime calls that might (Wasm-level) trap.
- 		if (canTrap) withReconstructedInlinedFrames(emit); else emit();
+	// A call into the runtime, which may walk the current stack, must first commit that stack's state:
+	// its value stack pointer ({emitCommitVsp}) and its stack pointer, which is pushed around the call
+	// ({emitPushStackRsp} and {emitPopStackRsp}).
+	def emitCommitVsp(tmp: Reg) {
+		emit_compute_vsp(tmp, state.sp);
+		emit_spill_vsp(tmp);
+		masm.emit_store_curstack_vsp(tmp);
+	}
+	// Leaves the current stack in {stack}.
+	def emitPushStackRsp(stack: Reg) {
+		masm.emit_get_curstack(stack);
+		masm.emit_v3_set_NativeStack_rsp_r_r(stack, regs.sp);
+		masm.emit_push_NativeStack_rsp_r_r(stack);
+	}
+	def emitPopStackRsp() {
 		masm.emit_get_curstack(regs.scratch);
 		masm.emit_pop_NativeStack_rsp_r_r(regs.scratch);
-		dropN(args);
-		for (t in results) state.push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
-		emit_reload_regs();
-		if (!runtimeSpillMode.free_regs) state.emitRestoreAll(resolver);
+	}
+	// Moves {args} into the Virgil calling convention's parameter registers, after the receiver.
+	// Supports up to two arguments.
+	def emitV3Args(args: Array<Reg>) {
+		var p0 = masm.getV3ParamReg(ValueKind.REF, 1), p1 = masm.getV3ParamReg(ValueKind.REF, 2);
+		if (args.length > 1 && args[1] == p0) {
+			if (args[0] == p1) { // swap
+				masm.emit_mov_r_r(ValueKind.REF, regs.scratch, p0);
+				masm.emit_mov_r_r(ValueKind.REF, p0, p1);
+				masm.emit_mov_r_r(ValueKind.REF, p1, regs.scratch);
+			} else {
+				masm.emit_mov_r_r(ValueKind.REF, p1, args[1]);
+				if (args[0] != p0) masm.emit_mov_r_r(ValueKind.REF, p0, args[0]);
+			}
+		} else {
+			if (args.length > 0 && args[0] != p0) masm.emit_mov_r_r(ValueKind.REF, p0, args[0]);
+			if (args.length > 1 && args[1] != p1) masm.emit_mov_r_r(ValueKind.REF, p1, args[1]);
+		}
+	}
+	// Calls the Virgil function at {code}, whose arguments are in place, and moves its result to {result}.
+	def emitCallV3(code: Pointer, result: Reg) {
+		masm.emit_mov_r_l(regs.scratch, code - Pointer.NULL);
+		masm.emit_call_r(regs.scratch);
+		masm.emit_mov_r_r(ValueKind.REF, result, masm.getV3ReturnReg(ValueKind.REF, 0));
 	}
 	def emitBrIf(sv: SpcVal, cond: MasmBrCond, label: MasmLabel, target: SpcControl, emptyTransfer: bool, repush: BrRepush) {
 		if (sv.isConst()) {
@@ -2860,6 +3020,13 @@ enum BrRepush(taken: bool, not_taken: bool) {
 }
 
 // When spilling all registers, controls the update to the abstract state, if any.
+// Outcomes of a null check of a reference.
+enum NullCheck {
+	STATIC_NULL,	// statically null; a trap was emitted and the rest is unreachable
+	NON_NULL,	// statically non-null; nothing was emitted
+	CHECKED,	// an explicit check was emitted
+	IMPLICIT	// the first access through the reference faults if it is null
+}
 enum SpillMode(free_regs: bool, remember_stored: bool) {
 	SAVE_ONLY(false, false),		// save registers and constants, don't update state
 	SAVE_AND_REMEMBER_STORED(false, true),	// save registers and constants, remember slots are stored

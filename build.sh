@@ -150,6 +150,8 @@ if [ -z "$OBJECT_MODEL_SRC" ]; then
 fi
 
 ENGINE="$ENGINE $OBJECT_MODEL_SRC"
+# Object model support for the JIT, if any (JIT targets only).
+OBJECT_MODEL_JIT_SRC=$(ls ${OBJECT_MODEL_DIR}/jit/*.v3 2> /dev/null)
 
 PROGRAM=$1
 TARGET=$2
@@ -243,8 +245,8 @@ case "$TARGET" in
 	exec v3c-arm64-linux -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.arm64-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 	;;
     x86-64-linux|x86_64_linux)
-	TARGET_SRC=$TARGET_X86_64
-	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_X86_64"; fi
+	TARGET_SRC="$TARGET_X86_64 $OBJECT_MODEL_JIT_SRC"
+	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_SRC"; fi
 	exec v3c-x86-64-linux -symbols -heap-size=1700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 	STATUS=$?
 	if [ $STATUS != 0 ]; then

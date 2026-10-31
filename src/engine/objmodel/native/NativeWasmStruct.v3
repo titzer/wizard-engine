@@ -40,7 +40,7 @@ class NativeWasmStruct extends WasmStruct descriptor NativeStructDeclInfo {
 			}
 			I31REF => {
 				match (v) {
-					I31(val) => fptr.store<Pointer>(Pointer.NULL + 1 + (i32.view(val) << 1)); // tagged i31
+					I31(val) => fptr.store<u64>((u64.view(val) << 1) | 1); // tagged i31, zero-extended like on the value stack
 					Ref(obj) => fptr.store<Object>(obj);
 					_ => ; // should not happen
 				}
@@ -57,38 +57,76 @@ class NativeWasmStruct extends WasmStruct descriptor NativeStructDeclInfo {
 
 // Allocation routines.
 component NativeWasmStructs {
+	// Allocates a struct, or returns {null} if {decl} is too large for this object model.
 	def newStruct(decl: StructDecl) -> NativeWasmStruct {
-		return NativeWasmStruct.new(getStructInfo(decl));
+		var info = getInfo(decl);
+		return if(info != null, NativeWasmStruct.new(info));
 	}
 	def newStructFromValues(decl: StructDecl, vals: Range<Value>) -> NativeWasmStruct {
 		var obj = newStruct(decl);
+		// XXX: constant expressions cannot trap yet
+		if (obj == null) failLayout(decl, StringBuilder.new().put1("too large for native object model (limit is %d words)", MAX_WORDS).toString());
 		for (i < vals.length) obj.setField(u31.!(i), vals[i]);
 		return obj;
 	}
+	// For compiled code: allocates a struct with zero fields.
+	def allocStruct(info: NativeStructDeclInfo) -> NativeWasmStruct {
+		return NativeWasmStruct.new(info);
+	}
+	// Gets the descriptor for {decl}, laying it out if necessary, or {null} if it is too large.
+	def getInfo(decl: StructDecl) -> NativeStructDeclInfo {
+		var info = decl.getInfo<NativeStructDeclInfo>();
+		if (info == null) info = makeStructInfo(decl);
+		return info;
+	}
+
+	// For compiled code: the offset of the display in descriptors.
+	def getDisplayOffset() -> int {
+		if (display_offset < 0) {
+			var d = NativeStructDeclInfo.new(null, null, 0);
+			display_offset = int.view(Pointer.atField(d.display) - Pointer.atObject(d));
+		}
+		return display_offset;
+	}
+	// For compiled code: the Virgil class id of {NativeWasmStruct}, which its descriptors hold.
+	def getClassId() -> int {
+		if (class_id < 0) {
+			var d = NativeStructDeclInfo.new(null, null, 0);
+			class_id = (Pointer.atObject(d) + RiGc.DESC_TID_OFFSET).load<int>();
+		}
+		return class_id;
+	}
+	private var display_offset = -1, class_id = -1;
 }
 
 // The descriptor for all instances of a Wasm struct declaration. The Virgil runtime stores the
-// (aligned) size and reference map of instances in the descriptor itself.
-private class NativeStructDeclInfo extends StructDeclInfo describes NativeWasmStruct {
+// (aligned) size and reference map of instances in the descriptor itself. Since declarations are
+// canonicalized, descriptors are unique per type, and code compiled by the JIT can test types by
+// comparing descriptors, using the display for subtype tests.
+class NativeStructDeclInfo extends StructDeclInfo describes NativeWasmStruct {
 	def decl: StructDecl;
 	def field_info: Array<NativeFieldInfo>;
 	def byte_size: int;	// end of the last field, where subtypes append their fields
+	var display = NO_DISPLAY; // the descriptors of the supertype chain and this one, indexed by depth
 	new(decl, field_info, byte_size) { }
+
+	def depth() -> int { return display.length - 1; }
 }
 
 // The descriptor's 32-bit reference map has one bit per word plus a terminator bit, which limits
 // objects to 31 words including the header. Larger structs are not supported yet.
 def MAX_WORDS = 31;
 def NO_FIELDS = Array<NativeFieldInfo>.new(0);
+def NO_DISPLAY = Array<NativeStructDeclInfo>.new(0);
 
-def getStructInfo(decl: StructDecl) -> NativeStructDeclInfo {
-	var info = decl.getInfo<NativeStructDeclInfo>();
-	if (info != null) return info;
+// Lays out {decl} and makes its descriptor, or returns {null} if it is too large.
+def makeStructInfo(decl: StructDecl) -> NativeStructDeclInfo {
 	// Lay out the fields of {decl} after those of its supertype, or after the base object.
 	var sdecl = decl.getFirstSuperType();
 	var inherited = NO_FIELDS, base: NativeStructDeclInfo, base_size: int;
 	if (sdecl != null) {
-		base = getStructInfo(StructDecl.!(sdecl));
+		base = NativeWasmStructs.getInfo(StructDecl.!(sdecl));
+		if (base == null) return null;
 		inherited = base.field_info;
 		base_size = base.byte_size;
 	} else {
@@ -97,12 +135,13 @@ def getStructInfo(decl: StructDecl) -> NativeStructDeclInfo {
 	}
 	var b = StructLayoutBuilder.new(RiGc.REF_SIZE, base_size, RiGc.getDescriptorRefmap(Pointer.atObject(base)));
 	b.inherit(inherited).extend(decl.field_types[inherited.length ...]);
-	if (b.words() > MAX_WORDS) failLayout(decl, StringBuilder.new().put1("too large for native object model (limit is %d words)", MAX_WORDS).toString());
+	if (b.words() > MAX_WORDS) return null;
 	if (Debug.paranoid) {
 		var msg = b.check(decl.field_types);
 		if (msg != null) failLayout(decl, msg);
 	}
-	info = NativeStructDeclInfo.new(decl, b.fields.extract(), b.size);
+	var info = NativeStructDeclInfo.new(decl, b.fields.extract(), b.size);
+	info.display = Arrays.append(info, base.display);
 	CiRuntime.setDescriptorExtension(info, b.getRefmapI32(), b.alignedSize());
 	decl.addInfo(info);
 	return info;
