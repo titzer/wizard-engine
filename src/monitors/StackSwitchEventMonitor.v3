@@ -7,7 +7,7 @@ def monitor_ = MonitorRegistry.add(
 	StackSwitchEventMonitor.new());
 
 // The kinds of stack-switching opcodes that the monitor observes. {cont.new} and {cont.bind}
-// create continuations rather than switching stacks, so they are counted but not traced.
+// create continuations rather than switching stacks. Both are counted, and {cont.new} is also traced.
 def STACK_SWITCH_OPCODES = [
 	Opcode.CONT_NEW,
 	Opcode.CONT_BIND,
@@ -18,20 +18,25 @@ def STACK_SWITCH_OPCODES = [
 	Opcode.SWITCH
 ];
 
-// One executed stack switch. The fields below are filled in when control lands.
-class StackSwitchEvent(site: StackSwitchSite, gap: u64) {
+// One executed stack switch or {cont.new}. The fields below are filled in when control lands.
+class StackSwitchEvent(site: StackSwitchSiteStats, gap: long) {
 	var dest_func = -1;
 	var dest_pc = -1;
-	var live: int; // stacks created by {cont.new} that are live after this event
+	var live: int; // the main stack and the stacks created by {cont.new} that are live after this event
 	var bytes: u64; // bytes of values and frames on the stack that executed this stack switch
 	var values: int; // locals and operands on the stack that executed this stack switch
 	var frames: int; // frames on the stack that executed this stack switch
 	var chain: int; // stacks from the stack that executed this stack switch up through its parents
+	var to_bytes: u64; // bytes of values and frames on the stack where control landed
+	var to_values: int; // locals and operands on the stack where control landed
+	var to_frames: int; // frames on the stack where control landed
+	var stack = -1; // the number of the stack that executed this event, as in the stack lifetimes table
+	var to_stack = -1; // the number of the stack where control landed
 }
 
 // One stack created by {cont.new}, from its creation until it returns or is unwound. {created} and
 // {ended} are the numbers of events executed by then.
-class StackLife(func_index: int, created: int) extends StackMonitorData {
+class StackLifetimeStats(number: int, func_index: int, created: int) extends StackMonitorData {
 	var ended = -1;
 	var how = StackEnd.LIVE;
 	var resumes: u64;
@@ -54,10 +59,8 @@ enum StackEnd {
 }
 
 // A stack-switching site: its static fields are constant for a given program-counter.
-class StackSwitchSite(func_index: int, pc: int, op: Opcode, tag: int) { }
-
-// What was observed at one site over all of its executions.
-class StackSwitchSiteStats(site: StackSwitchSite) {
+// What was observed at the site over all of its executions.
+class StackSwitchSiteStats(func_index: int, pc: int, op: Opcode, tag: int) {
 	var count: u64;
 	// Where control landed after this site executed, with a count per destination.
 	def dests = Vector<(int, int, u64)>.new();
@@ -75,22 +78,18 @@ class StackSwitchSiteStats(site: StackSwitchSite) {
 	}
 }
 
-// A {cont.new} or {cont.bind} site and the number of continuations it created.
-class ContSiteStats(func_index: int, pc: int, op: Opcode) {
-	var count: u64;
-}
-
-// Cannot extend {CountProbe}, because SPC intrinsifies count probes without checking for an
-// overridden {fire}, which would drop the events this site records.
+// placed at each stack switching site: suspend, switch, resume, resume_throw and resume_throw_ref
 class StackSwitchProbe(monitor: StackSwitchEventMonitor, site_stats: StackSwitchSiteStats) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
+		// records this execution as a stack switch event
 		def e = monitor.addEvent(site_stats);
 
 		// Counts the resume of the stacks that this stack switch resumes. {land} counts the suspend.
-		def op = site_stats.site.op;
-		monitor.running = Target.curStack();
+		def op = site_stats.op;
+		monitor.running = Target.curStack(); // current stack
+		// if it's resuming a continuation note down the target
 		if (op != Opcode.SUSPEND) {
-			// The continuation to resume or switch to is on top of the operand stack.
+			// GET TARGET INFORMATION from top of stack
 			match (dynamicLoc.frame.getFrameAccessor().getTopOfStack()) {
 				Cont(c) => {
 					monitor.resumed = c.stack;
@@ -103,11 +102,13 @@ class StackSwitchProbe(monitor: StackSwitchEventMonitor, site_stats: StackSwitch
 				_ => ;
 			}
 		}
+		// for other kinds of switch, get it from the landing probe (dynamically)
 
 		// Records the bytes, values, frames and parent chain of the stack that executes this stack switch.
 		def stack = monitor.running;
+		e.stack = monitor.stackNumber(stack);
 		def accessor = dynamicLoc.frame.getFrameAccessor();
-		e.bytes = stack.usedBytes();
+		e.bytes = stack.usedBytes() - u64.!(Pointer.SIZE); // minus probe return address
 		e.values = stack.numValues();
 		e.frames = accessor.depth() + 1;
 		for (s = stack; s != null; s = s.parent) e.chain++;
@@ -118,19 +119,21 @@ class StackSwitchProbe(monitor: StackSwitchEventMonitor, site_stats: StackSwitch
 			if (e.bytes > life.max_bytes) life.max_bytes = e.bytes;
 			if (e.frames > life.max_frames) life.max_frames = e.frames;
 		}
+
+		// set target for the monitor to collect on the LandingProbe
 		monitor.pending = e; // the next instruction executed is this stack switch's destination
 		monitor.pending_stats = site_stats;
 		return ProbeAction.Continue;
 	}
 }
 
-// A site of an opcode that is counted but not traced. Adds no behavior to {CountProbe}, so SPC
-// can intrinsify it.
-class ContCountProbe(site_stats: ContSiteStats) extends CountProbe { }
+// counts dynamic counts at each cont.new and cont.bind
+class ContCountProbe(site_stats: StackSwitchSiteStats) extends CountProbe { }
 
 // Placed after each {cont.new}, where the new continuation is on top of the operand stack. Starts
 // the life of the stack that the {cont.new} created and counts the function it was created from.
-class CreateProbe(monitor: StackSwitchEventMonitor) extends Probe {
+// Also adds an event for the {cont.new} at {site_stats}.
+class CreateProbe(monitor: StackSwitchEventMonitor, site_stats: StackSwitchSiteStats) extends Probe {
 	def fire(dynamicLoc: DynamicLoc) -> ProbeAction {
 		// get top of stack
 		match (dynamicLoc.frame.getFrameAccessor().getTopOfStack()) {
@@ -138,25 +141,33 @@ class CreateProbe(monitor: StackSwitchEventMonitor) extends Probe {
 				// Skips a null continuation, which a branch to this instruction can carry.
 				if (Continuations.isNull(c)) return ProbeAction.Continue;
 
-				// if the stack already has a StackLife attached to it, skip
+				// if the stack already has a StackLifetimeStats attached to it, skip
 				if (c.stack.monitor_data != null) return ProbeAction.Continue;
 
 				// get the actual function for the continuation
 				def func = c.stack.startFunc();
 				def func_index = if(WasmFunction.?(func), WasmFunction.!(func).decl.func_index, -1);
+
+				// adds an event for creating continuation
+				def e = StackSwitchEvent.new(site_stats, -1);
+				monitor.stats.events.put(e);
+				def cur = Target.curStack();
+				e.stack = monitor.stackNumber(cur);
 				def created = monitor.stats.events.length; // current event number
 
 				// Counts the continuation created from {func_index}.
 				// XXX func_index from the defining module (does not support imported functions)
 				if (func_index >= 0) monitor.stats.cont_funcs[func_index] += 1;
 
-				// create the new StackLife
-				def life = StackLife.new(func_index, created);
+				// start to track lifetime for this stack
+				def number = monitor.stats.stacks.length + 1;
+				def life = StackLifetimeStats.new(number, func_index, created);
 				monitor.stats.stacks.put(life);
 
 				// set up stack's monitor data
 				c.stack.monitor_data = life;
 				monitor.live++;
+				e.live = monitor.live;
 			}
 			_ => ;
 		}
@@ -196,6 +207,7 @@ class ReturnProbe(monitor: StackSwitchEventMonitor, site_stats: StackSwitchSiteS
 
 		// Adds a return event from this site.
 		def e = monitor.addEvent(site_stats);
+		e.stack = monitor.stackNumber(returned);
 
 		// Ends the record of the returned stack as RETURNED.
 		monitor.end(returned, StackEnd.RETURNED);
@@ -223,7 +235,6 @@ class EventSiteVisitor extends BytecodeInstrumenter {
 	def monitor: StackSwitchEventMonitor;
 	def stats = monitor.stats;
 	def landing = LandingProbe.new(monitor);
-	def creation = CreateProbe.new(monitor);
 	def blocks = BasicBlockIterator.new();
 
 	// A call or a stack switch can run other code before the rest of its block, so it ends the block.
@@ -242,8 +253,7 @@ class EventSiteVisitor extends BytecodeInstrumenter {
 			for (pc < sites.length) {
 				if (sites[pc] == null) continue;
 				bi.at(pc, -1).current();
-				def site = StackSwitchSite.new(func.func_index, pc, Opcode.RETURN, -1);
-				def site_stats = StackSwitchSiteStats.new(site);
+				def site_stats = StackSwitchSiteStats.new(func.func_index, pc, Opcode.RETURN, -1);
 				stats.stack_switch_sites.put(site_stats);
 				def next = bi.nextPc();
 				def probe = ReturnProbe.new(monitor, site_stats);
@@ -293,7 +303,7 @@ class EventSiteVisitor extends BytecodeInstrumenter {
 	def add(op: Opcode, tag: int) {
 		stats.static_count[op.tag]++;
 		stats.func_sites[bi.func.func_index] += 1;
-		def site_stats = StackSwitchSiteStats.new(StackSwitchSite.new(bi.func.func_index, bi.pc, op, tag));
+		def site_stats = StackSwitchSiteStats.new(bi.func.func_index, bi.pc, op, tag);
 		stats.stack_switch_sites.put(site_stats);
 		insertProbeHere(StackSwitchProbe.new(monitor, site_stats));
 		// A suspended stack is later resumed at the next instruction, and a resumed continuation
@@ -320,21 +330,23 @@ class EventSiteVisitor extends BytecodeInstrumenter {
 			insertLanding(bi.func, pc);
 		}
 	}
-	// Adds a count-only site for an opcode that is not traced.
-	def count(op: Opcode) {
+	// Adds a count-only site for an opcode that is not traced, and returns it.
+	def count(op: Opcode) -> StackSwitchSiteStats {
 		stats.static_count[op.tag]++;
 		stats.func_sites[bi.func.func_index] += 1;
-		def site_stats = ContSiteStats.new(bi.func.func_index, bi.pc, op);
+		def site_stats = StackSwitchSiteStats.new(bi.func.func_index, bi.pc, op, -1);
 		stats.cont_sites.put(site_stats);
 		def probe = ContCountProbe.new(site_stats);
 		monitor.count_probes.put(probe);
 		insertProbeHere(probe);
+		return site_stats;
 	}
 
 	def visit_CONT_NEW(cont: u31) {
-		count(Opcode.CONT_NEW);
+		def site_stats = count(Opcode.CONT_NEW);
 		def next = bi.nextPc();
-		Instrumentation.insertLocalProbe(module, bi.func.func_index, next, creation);
+		def probe = CreateProbe.new(monitor, site_stats);
+		Instrumentation.insertLocalProbe(module, bi.func.func_index, next, probe);
 	}
 	def visit_CONT_BIND(in_cont: u31, out_cont: u31) { count(Opcode.CONT_BIND); }
 	def visit_SUSPEND(tag: u31) { add(Opcode.SUSPEND, int.view(tag)); }
@@ -346,15 +358,15 @@ class EventSiteVisitor extends BytecodeInstrumenter {
 
 // Everything the probes record and the report reads.
 class StackSwitchStats {
-	def events = Vector<StackSwitchEvent>.new();
-	def static_count = Array<u64>.new(Opcode.count);
-	def stack_switch_sites = Vector<StackSwitchSiteStats>.new();
-	def cont_sites = Vector<ContSiteStats>.new();
+	def events = Vector<StackSwitchEvent>.new();	// every stack switch, return and {cont.new}, in execution order
+	def static_count = Array<u64>.new(Opcode.count);	// instructions of each opcode in the module, indexed by opcode tag
+	def stack_switch_sites = Vector<StackSwitchSiteStats>.new();	// suspend, switch and resume-family sites, and the return site after each resume-family site
+	def cont_sites = Vector<StackSwitchSiteStats>.new();	// {cont.new} and {cont.bind} sites
 	def clause_on = Vector<u64>.new();	// resume sites with an (on $tag $label) clause
 	def clause_switch = Vector<u64>.new();	// resume sites with an (on $tag switch) clause
 	def cont_funcs = Vector<u64>.new();	// continuations created from each function by {cont.new}
 	def func_sites = Vector<u64>.new();	// stack-switching instructions in each function
-	def stacks = Vector<StackLife>.new();	// every stack created by {cont.new}, in creation order
+	def stacks = Vector<StackLifetimeStats>.new();	// every stack created by {cont.new}, in creation order
 	var module: Module;	// for rendering function names
 
 	// Sets size for the per-function and per-tag vvectors for {module}.
@@ -376,7 +388,7 @@ class StackSwitchStats {
 		var v = Vector<(int, int, Opcode, int, u64)>.new();
 		for (i < stack_switch_sites.length) {
 			var s = stack_switch_sites[i];
-			if (s.count > 0) v.put((s.site.func_index, s.site.pc, s.site.op, s.site.tag, s.count));
+			if (s.count > 0) v.put((s.func_index, s.pc, s.op, s.tag, s.count));
 		}
 		for (i < cont_sites.length) {
 			var s = cont_sites[i];
@@ -388,7 +400,7 @@ class StackSwitchStats {
 	// Dynamic executions of {op}, summed over its sites.
 	def dynamicCount(op: Opcode) -> u64 {
 		var sum = 0uL;
-		for (i < stack_switch_sites.length) if (stack_switch_sites[i].site.op == op) sum += stack_switch_sites[i].count;
+		for (i < stack_switch_sites.length) if (stack_switch_sites[i].op == op) sum += stack_switch_sites[i].count;
 		for (i < cont_sites.length) if (cont_sites[i].op == op) sum += cont_sites[i].count;
 		return sum;
 	}
@@ -401,7 +413,7 @@ class StackSwitchEventMonitor extends Monitor {
 	def gap = CountProbe.new(); // Num. instructions executed since the last stack-switching op.
 	var pending: StackSwitchEvent; // the event of the last suspend, switch or resume whose destination is not yet recorded
 	var pending_stats: StackSwitchSiteStats; // the site stats of {pending}
-	var live: int; // the number of stacks created by {cont.new} that have not returned or been unwound
+	var live = 1; // the number of the main stack and the stacks created by {cont.new} that have not returned or been unwound
 	var running: WasmStack; // the current stack as of the last stack switch, return or landing
 	var resumed: WasmStack; // the stack that the last resume or switch switched to
 
@@ -450,24 +462,37 @@ class StackSwitchEventMonitor extends Monitor {
 	// Adds an event for {site_stats} and resets {gap} for the next event.
 	def addEvent(site_stats: StackSwitchSiteStats) -> StackSwitchEvent {
 		// {gap} already counts this op instruction, thus {gap - 1}.
-		def e = StackSwitchEvent.new(site_stats.site, gap.count - 1);
+		def e = StackSwitchEvent.new(site_stats, long.view(gap.count - 1));
 		stats.events.put(e);
 		site_stats.count++;
 		gap.count = 0;
 		return e;
 	}
 	// Records {dynamicLoc} as the destination of {e} from {site_stats} and saves {live} in {e}.
+	// Also records the bytes, values and frames of the stack where control landed.
 	def setDest(e: StackSwitchEvent, site_stats: StackSwitchSiteStats, dynamicLoc: DynamicLoc) {
 		e.dest_func = dynamicLoc.func.decl.func_index;
 		e.dest_pc = dynamicLoc.pc;
 		e.live = live;
+		def stack = Target.curStack();
+		e.to_stack = stackNumber(stack);
+		def accessor = dynamicLoc.frame.getFrameAccessor();
+		// Leaves out the return address of the call to this probe, which the stack's saved pointer includes.
+		e.to_bytes = stack.usedBytes() - u64.!(Pointer.SIZE);
+		e.to_values = stack.numValues();
+		e.to_frames = accessor.depth() + 1;
 		site_stats.recordDest(e.dest_func, e.dest_pc);
 	}
 	// Returns the life of {stack}, or null if it is not a live stack created by {cont.new}.
-	def find(stack: WasmStack) -> StackLife {
+	def find(stack: WasmStack) -> StackLifetimeStats {
 		if (stack == null) return null;
-		def life = StackLife.!(stack.monitor_data);
+		def life = StackLifetimeStats.!(stack.monitor_data);
 		return if(life != null && life.how == StackEnd.LIVE, life);
+	}
+	// Returns the number of {stack} in the stack lifetimes table, or 0 for the main stack.
+	def stackNumber(stack: WasmStack) -> int {
+		def life = StackLifetimeStats.!(stack.monitor_data);
+		return if(life != null, life.number, 0);
 	}
 	// Ends the life of {stack} as {how}, if it is live.
 	def end(stack: WasmStack, how: StackEnd) {
@@ -564,8 +589,8 @@ def reportDests(out: TraceBuilder, stats: StackSwitchStats) {
 		var s = stats.stack_switch_sites[i];
 		if (s.count == 0) continue;
 		// Source line, then one row per distinct destination of this site.
-		out.puts("func ").putd(s.site.func_index).puts(" +").putd(s.site.pc).puts(" ").puts(s.site.op.mnemonic);
-		if (s.site.tag >= 0) out.puts(" tag ").putd(s.site.tag);
+		out.puts("func ").putd(s.func_index).puts(" +").putd(s.pc).puts(" ").puts(s.op.mnemonic);
+		if (s.tag >= 0) out.puts(" tag ").putd(s.tag);
 		out.puts(" -> ").putd(s.dests.length).puts(if(s.dests.length == 1, " target", " targets")).ln();
 		if (s.dests.length == 0) continue;
 		destTable.putTableHeader(out);
@@ -606,9 +631,9 @@ def reportTags(out: TraceBuilder, stats: StackSwitchStats) {
 	for (i < stats.stack_switch_sites.length) {
 		def s = stats.stack_switch_sites[i];
 		// Skip sites without a suspension tag: no tag at all, or a resume_throw's exception tag.
-		if (s.site.tag < 0 || s.site.op == Opcode.RESUME_THROW) continue;
-		counts[s.site.tag] += s.count;
-		sites[s.site.tag]++;
+		if (s.tag < 0 || s.op == Opcode.RESUME_THROW) continue;
+		counts[s.tag] += s.count;
+		sites[s.tag]++;
 	}
 	out.ln().beginColor(Color.UNDERLINE).puts("ssevent: tag usage").endColors().ln();
 	tagTable.putTableHeader(out);
@@ -693,7 +718,7 @@ def reportCounts(out: TraceBuilder, stats: StackSwitchStats) {
 def eventTable = initEventTable();
 def initEventTable() -> TraceTable {
 	var t = TraceTable.new(["#", "Function", "PC", "Opcode", "Tag", "ToFunction", "ToPC", "Gap", "Live",
-		"Bytes", "Values", "Frames", "Chain"]);
+		"Bytes", "Values", "Frames", "Chain", "ToBytes", "ToValues", "ToFrames", "Stack", "ToStack"]);
 	t.cells[0].set(6,  Justification.RIGHT, Color.NONE);
 	t.cells[1].set(10, Justification.RIGHT, Color.FUNC);
 	t.cells[2].set(6,  Justification.RIGHT, Color.LINE);
@@ -703,17 +728,34 @@ def initEventTable() -> TraceTable {
 	t.cells[6].set(6,  Justification.RIGHT, Color.LINE);
 	t.cells[7].set(9,  Justification.RIGHT, Color.COUNT);
 	t.cells[8].set(6,  Justification.RIGHT, Color.COUNT);
-	t.cells[9].set(9,  Justification.RIGHT, Color.COUNT);
-	t.cells[10].set(7, Justification.RIGHT, Color.COUNT);
-	t.cells[11].set(7, Justification.RIGHT, Color.COUNT);
+	t.cells[9].set(9,  Justification.RIGHT, Color.HIGH);
+	t.cells[10].set(7, Justification.RIGHT, Color.DEFAULT);
+	t.cells[11].set(7, Justification.RIGHT, Color.DEFAULT);
 	t.cells[12].set(6, Justification.RIGHT, Color.COUNT);
+	t.cells[13].set(9, Justification.RIGHT, Color.HIGH);
+	t.cells[14].set(9, Justification.RIGHT, Color.DEFAULT);
+	t.cells[15].set(9, Justification.RIGHT, Color.DEFAULT);
+	t.cells[16].set(6, Justification.RIGHT, Color.CONST);
+	t.cells[17].set(8, Justification.RIGHT, Color.CONST);
 	return t;
 }
+// The color of each event-table cell when it holds a measurement.
+def eventColors = Arrays.map(eventTable.cells, TableCell.color);
 
 // Fills the shared event-table cells for one event, numerically (so the text and CSV
 // renderers produce identical values).
 def fillRow(i: int, e: StackSwitchEvent) {
 	var s = e.site;
+	// Grays out the cells of this row that hold a placeholder instead of a measurement.
+	def measured = s.op != Opcode.RETURN && s.op != Opcode.CONT_NEW;
+	def landed = e.dest_func >= 0;
+	colorEventCell(4, s.tag < 0);
+	colorEventCell(5, !landed);
+	colorEventCell(6, !landed);
+	colorEventCell(7, s.op == Opcode.CONT_NEW);
+	for (k = 9; k < 13; k++) colorEventCell(k, !measured);
+	for (k = 13; k < 16; k++) colorEventCell(k, !landed);
+	colorEventCell(17, !landed);
 	eventTable.cells[0].putd(i + 1);
 	eventTable.cells[1].putd(s.func_index);
 	eventTable.cells[2].putd(s.pc);
@@ -721,12 +763,21 @@ def fillRow(i: int, e: StackSwitchEvent) {
 	eventTable.cells[4].putd(s.tag);     // -1 when the opcode names no tag
 	eventTable.cells[5].putd(e.dest_func); // -1 if control never landed
 	eventTable.cells[6].putd(e.dest_pc);
-	eventTable.cells[7].putd(e.gap);
+	eventTable.cells[7].putd(e.gap); // -1 for a {cont.new}
 	eventTable.cells[8].putd(e.live);
 	eventTable.cells[9].putd(e.bytes); // 0 for a return
 	eventTable.cells[10].putd(e.values);
 	eventTable.cells[11].putd(e.frames);
 	eventTable.cells[12].putd(e.chain);
+	eventTable.cells[13].putd(e.to_bytes); // 0 for a {cont.new}
+	eventTable.cells[14].putd(e.to_values);
+	eventTable.cells[15].putd(e.to_frames);
+	eventTable.cells[16].putd(e.stack);
+	eventTable.cells[17].putd(e.to_stack); // -1 for a {cont.new}
+}
+// Sets cell {i} of the event table to gray if it holds a placeholder, or to its own color if not.
+def colorEventCell(i: int, placeholder: bool) {
+	eventTable.cells[i].color = if(placeholder, Color.INACTIVE, eventColors[i]);
 }
 
 def lifeTable = initLifeTable();
