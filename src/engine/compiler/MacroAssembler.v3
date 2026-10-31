@@ -28,6 +28,8 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	var current_fid: int = -1;		// current function id, if any
 	var newTrapLabel: TrapReason -> MasmLabel;
 	var embeddedRefOffsets: Vector<int>;
+	var implicitNullCheck: Reg;		// if set, the next access through this register records a source location
+	var embeddedRefs: Vector<void -> Pointer>;	// get the current addresses, since the GC may move objects
 	var offsets = Target.getOffsets();
 
 	new() {
@@ -157,6 +159,15 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_Array_length_r_r(dst: Reg, array: Reg) {
 		emit_mov_r_m(ValueKind.I32, dst, MasmAddr(array, getOffsets().Array_length));
 	}
+	// Loads the descriptor of a described object, i.e. one of a class with a descriptor or in the
+	// same hierarchy as one.
+	def emit_v3_getDescriptor_r_r(dst: Reg, obj: Reg) {
+		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(obj, getOffsets().Object_descriptor));
+	}
+	// Loads the id of the class that a descriptor describes.
+	def emit_v3_getDescribedClassId_r_r(dst: Reg, desc: Reg) {
+		emit_mov_r_m(ValueKind.I32, dst, MasmAddr(desc, getOffsets().Descriptor_classId));
+	}
 	def emit_v3_Array_bounds_check_rr(array: Reg, index: Reg, oob_label: MasmLabel) {
 		// Generic code, may be overridden to be more efficient
 		var scratch = regConfig.scratch;
@@ -273,6 +284,12 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_storew_r_r_r_i(kind: ValueKind, val: Reg, base: Reg, index: Reg, offset: u32);
 	def emit_store_r_r_r_i(kind: ValueKind, val: Reg, base: Reg, index: Reg, offset: u32);
 
+	// Loads and stores of a value of storage kind {st} at {base} + {index} * {scale} + {offset}, for
+	// accessing V3 objects. {index} may be {NO_REG}; {scale} must be 1, 2, 4, or 8. Sub-word loads
+	// are extended to 32 bits; {U64} also loads and stores references.
+	def emit_load_elem(st: MemStorageKind, dst: Reg, base: Reg, index: Reg, scale: byte, offset: int);
+	def emit_store_elem(st: MemStorageKind, base: Reg, index: Reg, scale: byte, offset: int, val: Reg);
+
 	def emit_mov_r_r(kind: ValueKind, reg: Reg, reg2: Reg);
 	def emit_mov_r_m(kind: ValueKind, reg: Reg, addr: MasmAddr);
 	def emit_mov_r_k(kind: ValueKind, reg: Reg, val: int) {
@@ -294,6 +311,8 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_mov_r_d64(reg: Reg, val: u64);
 	def emit_mov_r_q(reg: Reg, low: u64, high: u64);
 	def emit_mov_r_Object(reg: Reg, obj: Object);
+	def emit_mov_r_StructDeclInfo(reg: Reg, info: StructDeclInfo);
+	def emit_mov_r_ArrayDeclInfo(reg: Reg, info: ArrayDeclInfo);
 	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>);
 	def emit_mov_r_Function(reg: Reg, func: Function);
 	def emit_mov_r_Instance(reg: Reg, instance: Instance);
@@ -339,9 +358,9 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_br_r(reg: Reg, cond: MasmBrCond, label: MasmLabel);
 	def emit_br_m(addr: MasmAddr, cond: MasmBrCond, label: MasmLabel);
 
-	def emit_breq_r_i(reg: Reg, val: int, label: MasmLabel);
-	def emit_breq_r_l(reg: Reg, val: int, label: MasmLabel);
-	def emit_brne_r_i(reg: Reg, val: int, label: MasmLabel);
+	// Compares values of {kind} and branches if {cond} holds.
+	def emit_br_r_r(kind: ValueKind, cond: MasmCmpBr, r1: Reg, r2: Reg, label: MasmLabel);
+	def emit_br_r_i(kind: ValueKind, cond: MasmCmpBr, reg: Reg, val: int, label: MasmLabel);
 
 	def emit_br_table_r(reg: Reg, labels: Array<MasmLabel>);
 
@@ -450,12 +469,41 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			REF_NONNULL		=> return MasmBrCond.REF_NULL;
 			IS_WASM_FUNC		=> return MasmBrCond.IS_NOT_WASM_FUNC;
 			IS_NOT_WASM_FUNC	=> return MasmBrCond.IS_WASM_FUNC;
+			REF_I31			=> return MasmBrCond.REF_NOT_I31;
+			REF_NOT_I31		=> return MasmBrCond.REF_I31;
 		}
 	}
 
-	def addEmbeddedRefOffset(offset: int) {
-		if (embeddedRefOffsets == null) embeddedRefOffsets = Vector.new();
+	// Records that the code at {offset} embeds the address of an object, which {addr} returns.
+	// Implicit (hardware) null checks: the next memory access through {obj} records the current source
+	// location, so that a fault there can be reported as a null dereference.
+	def armImplicitNullCheck(obj: Reg) {
+		implicitNullCheck = obj;
+	}
+	def disarmImplicitNullCheck() {
+		implicitNullCheck = SpcConsts.NO_REG;
+	}
+	// Bump-allocates {size} bytes, or {size_reg} bytes if not {NO_REG}, into {dst} using Virgil's heap
+	// allocation pointers, branching to {slow} if the allocation space is exhausted. The memory is zero.
+	def emit_v3_bump_alloc(dst: Reg, size: int, size_reg: Reg, t1: Reg, t2: Reg, slow: MasmLabel) {
+		emit_mov_r_l(t1, CiRuntime.heapCurLoc - Pointer.NULL);
+		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(t1, 0));
+		emit_mov_r_r(ValueKind.REF, t2, dst);
+		if (size_reg == SpcConsts.NO_REG) emit_addw_r_i(t2, size);
+		else emit_addw_r_r(t2, size_reg);
+		emit_mov_r_l(t1, CiRuntime.heapEndLoc - Pointer.NULL);
+		emit_mov_r_m(ValueKind.REF, t1, MasmAddr(t1, 0));
+		emit_br_r_r(ValueKind.REF, MasmCmpBr.GT_U, t2, t1, slow);
+		emit_mov_r_l(t1, CiRuntime.heapCurLoc - Pointer.NULL);
+		emit_mov_m_r(ValueKind.REF, MasmAddr(t1, 0), t2);
+	}
+	def addEmbeddedRef(offset: int, addr: void -> Pointer) {
+		if (embeddedRefOffsets == null) {
+			embeddedRefOffsets = Vector.new();
+			embeddedRefs = Vector.new();
+		}
 		embeddedRefOffsets.put(offset);
+		embeddedRefs.put(addr);
 	}
 }
 // Conditions for single-value branches
@@ -469,5 +517,11 @@ enum MasmBrCond		(zero: bool, 	i32: bool) {
 	REF_NULL	(true,		false),
 	REF_NONNULL	(false,		false),
 	IS_WASM_FUNC	(true,		false),
-	IS_NOT_WASM_FUNC(false,		false)
+	IS_NOT_WASM_FUNC(false,		false),
+	REF_I31		(false,		false),
+	REF_NOT_I31	(true,		false)
+}
+// Conditions for comparing two values and branching.
+enum MasmCmpBr {
+	EQ, NE, LT_S, LE_S, GT_S, GE_S, LT_U, LE_U, GT_U, GE_U
 }
