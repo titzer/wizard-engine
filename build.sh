@@ -156,7 +156,7 @@ OBJECT_MODEL_JIT_SRC=$(ls ${OBJECT_MODEL_DIR}/jit/*.v3 2> /dev/null)
 PROGRAM=$1
 TARGET=$2
 
-if [ "$TARGET" =~ x86 ]; then
+if [[ "$TARGET" =~ x86 ]]; then
     if [ "$DEBUG_GC" = 1 ]; then
 	append_comma_sep REDEFS "RiGc.debug=true"
     fi
