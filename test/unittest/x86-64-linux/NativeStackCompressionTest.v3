@@ -1,7 +1,7 @@
 // Copyright 2026 Wizard authors. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
-// Tests for compressing suspended native stacks and resuming them from host and Wasm code in every tier.
+// Tests for compressing suspended native stacks, the clock that picks them, and resuming them in every tier.
 
 def M: NativeStackManager;
 def C: NativeStackCompression;
@@ -47,8 +47,19 @@ def X_ = void(
 	TT("decompress_via_gc_wasm", test_decompress_via_gc_wasm),
 	TT("new_in_wasm", test_new_in_wasm),
 	TT("new_traps_in_wasm", test_new_traps_in_wasm),
-	T("sweep_compresses_suspended", test_sweep_compresses_suspended),
-	T("sweep_batches", test_sweep_batches),
+	T("sweep_one_per_request", test_sweep_one_per_request),
+	T("second_chance", test_second_chance),
+	T("hot_set_single_sweep", test_hot_set_single_sweep),
+	T("pinned_at_entry", test_pinned_at_entry),
+	T("decompress_sets_referenced", test_decompress_sets_referenced),
+	T("host_resume_sets_referenced", test_host_resume_sets_referenced),
+	T("clear_resets_flags", test_clear_resets_flags),
+	T("gc_before_compress", test_gc_before_compress),
+	T("backoff_doubles", test_backoff_doubles),
+	T("backoff_resets", test_backoff_resets),
+	T("fallback_gc", test_fallback_gc),
+	TT("resume_sets_referenced", test_resume_sets_referenced),
+	TT("switch_sets_referenced", test_switch_sets_referenced),
 	T("recycled_not_compressed", test_recycled_not_compressed),
 	T("decompress_compresses_other", test_decompress_compresses_other),
 	T("disabled_no_compress", test_disabled_no_compress),
@@ -125,11 +136,27 @@ def GEN_MODULE: Array<byte> = [
 
 ];
 
+// {switch_park} switches into a new stack, which counts and parks at a suspend; {finish} resumes it.
+def SWITCH_MODULE: Array<byte> = [
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x17, 0x06, 0x60, 0x00, 0x01, 0x7f, 0x5d,
+	0x00, 0x60, 0x01, 0x63, 0x01, 0x01, 0x7f, 0x5d, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x63,
+	0x01, 0x03, 0x06, 0x05, 0x02, 0x00, 0x05, 0x02, 0x00, 0x0d, 0x05, 0x02, 0x00, 0x00, 0x00, 0x04,
+	0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b, 0x07, 0x20, 0x03, 0x0b, 0x73, 0x77, 0x69, 0x74,
+	0x63, 0x68, 0x5f, 0x70, 0x61, 0x72, 0x6b, 0x00, 0x02, 0x06, 0x66, 0x69, 0x6e, 0x69, 0x73, 0x68,
+	0x00, 0x03, 0x05, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x00, 0x04, 0x09, 0x06, 0x01, 0x03, 0x00, 0x02,
+	0x01, 0x00, 0x0a, 0x40, 0x05, 0x0d, 0x00, 0x23, 0x00, 0x41, 0x01, 0x6a, 0x24, 0x00, 0xe2, 0x01,
+	0x23, 0x00, 0x0b, 0x0c, 0x00, 0xd2, 0x00, 0xe0, 0x03, 0xe6, 0x03, 0x00, 0x41, 0xe3, 0x00, 0x0b,
+	0x16, 0x00, 0x02, 0x63, 0x01, 0xd2, 0x01, 0xe0, 0x01, 0xe3, 0x01, 0x02, 0x01, 0x00, 0x00, 0x01,
+	0x00, 0x1a, 0xd0, 0x75, 0x0f, 0x0b, 0x0b, 0x07, 0x00, 0x20, 0x00, 0xe3, 0x01, 0x00, 0x0b, 0x04,
+	0x00, 0x23, 0x00, 0x0b,
+];
+
 private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 	def saved_max = StackTuning.maxStacks;
 	def saved_compression = StackTuning.enableCompression;
 	var held: Array<NativeStack>;	// stacks pinned by {limit}
 	var instance: Instance;
+	var sw_instance: Instance;
 	var limit_total = -1;
 
 	new() { Execute.tiering = tiering; }
@@ -149,6 +176,8 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		StackTuning.maxStacks = M.total;
 		M.cache = null;
 		M.free = null;
+		M.gc_backoff = 0;
+		M.gc_credit = 0;
 		Target.forceGC();
 		var free = 0;
 		for (seg = M.all; seg != null; seg = seg.next) if (seg.stack.get() == null) free++;
@@ -158,9 +187,10 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		limit_total = StackTuning.maxStacks;
 	}
 	def checkInvariants(where: string) {
-		var count = 0;
+		var count = 0, hand_ok = M.hand == null;
 		for (seg = M.all; seg != null; seg = seg.next) {
 			count++;
+			if (seg == M.hand) hand_ok = true;
 			var s = seg.stack.get();
 			if (s == null) continue;
 			if (s.range != seg) t.fail1("%s: owning stack does not point back at its segment", where);
@@ -170,6 +200,8 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 			if (seg.stack.get() != null) t.fail1("%s: free segment has an owner", where);
 		}
 		if (count != M.total) t.fail1("%s: segment count mismatch", where);
+		if (!hand_ok) t.fail1("%s: clock hand is not a mapped segment", where);
+		if (M.gc_credit > M.gc_backoff || M.gc_backoff > M.total) t.fail1("%s: bad GC backoff state", where);
 		if (limit_total >= 0 && M.total > limit_total) t.fail3("%s: expected at most %d segments, got %d", where, limit_total, M.total);
 	}
 	def assertState(expected: StackState, s: NativeStack) {
@@ -182,6 +214,9 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 	}
 	def assertResult(expected: Result, got: Result) {
 		if (!expected.equals(got)) t.fail2("expected %q, got %q", expected.render, got.render);
+	}
+	def assertFlags(expected: byte, s: NativeStack) {
+		if (s.flags != expected) t.fail2("expected flags %d, got %d", int.view(expected), int.view(s.flags));
 	}
 	// Checks that {s} is a new stack: suspended at function entry without a segment.
 	def assertNew(s: NativeStack) {
@@ -218,33 +253,49 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		return WasmFunction.!(inst.functions[0]);
 	}
 	def gen() -> this {
-		if (instance != null) return;
-		var err = ErrorGen.new("GEN_MODULE");
+		if (instance == null) instance = load(GEN_MODULE, "GEN_MODULE");
+	}
+	def sw() -> this {
+		if (sw_instance == null) sw_instance = load(SWITCH_MODULE, "SWITCH_MODULE");
+	}
+	// Parses, instantiates and prepares the module {bytes} for the tier under test.
+	def load(bytes: Array<byte>, name: string) -> Instance {
+		var err = ErrorGen.new(name);
 		var limits = Limits.new().set(Extension.set.all);
-		var bp = BinParser.new(Extension.set.all, limits, err, "GEN_MODULE");
+		var bp = BinParser.new(Extension.set.all, limits, err, name);
 		bp.tiering = tiering;
-		var module = bp.push(GEN_MODULE, 0, GEN_MODULE.length).finish();
-		if (!err.ok()) return t.fail(err.error_msg);
-		instance = Instantiator.new(Extension.set.all, module, [], err).run();
-		if (!err.ok()) return t.fail(err.error_msg);
+		var module = bp.push(bytes, 0, bytes.length).finish();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		var inst = Instantiator.new(Extension.set.all, module, [], err).run();
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
 		tiering.onTestModule(module);
-		for (f in instance.functions) {
+		for (f in inst.functions) {
 			if (WasmFunction.?(f)) tiering.onTestRun(WasmFunction.!(f), err);
 		}
-		if (!err.ok()) return t.fail(err.error_msg);
+		if (!err.ok()) { t.fail(err.error_msg); return null; }
+		return inst;
 	}
 	def call(name: string, args: Array<Value>) -> Result {
 		gen();
-		for (i < instance.module.exports.length) {
-			if (Strings.equal(name, instance.module.exports[i].0)) {
-				return Execute.call(Function.!(instance.exports[i]), args);
+		return callOn(instance, name, args);
+	}
+	def swCall(name: string, args: Array<Value>) -> Result {
+		sw();
+		return callOn(sw_instance, name, args);
+	}
+	def callOn(inst: Instance, name: string, args: Array<Value>) -> Result {
+		for (i < inst.module.exports.length) {
+			if (Strings.equal(name, inst.module.exports[i].0)) {
+				return Execute.call(Function.!(inst.exports[i]), args);
 			}
 		}
 		t.fail1("export %s not found", name);
 		return Result.Value([]);
 	}
 	def callCont(name: string, args: Array<Value>) -> Continuation {
-		var r = call(name, args);
+		return contOf(name, call(name, args));
+	}
+	def contOf(name: string, r: Result) -> Continuation {
 		match (r) {
 			Value(vals) => if (vals.length == 1 && Value.Cont.?(vals[0])) return Value.Cont.!(vals[0]).val;
 			_ => ;
@@ -264,7 +315,9 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		return null;
 	}
 	def callInt(name: string, args: Array<Value>) -> int {
-		var r = call(name, args);
+		return intOf(name, call(name, args));
+	}
+	def intOf(name: string, r: Result) -> int {
 		match (r) {
 			Value(vals) => if (vals.length == 1 && Value.I32.?(vals[0])) return int.view(Value.I32.!(vals[0]).val);
 			_ => ;
@@ -657,38 +710,197 @@ def test_decompress_via_gc_wasm(t: StackCompressionTester) {
 	t.t.assert_eq(1005, t.callInt("finish", [Value.Cont(k)]));
 }
 
-def test_sweep_compresses_suspended(t: StackCompressionTester) {
-	var s1 = t.suspended("make_once", 10), s2 = t.suspended("make_once", 20), s3 = t.suspended("make_once", 30);
-	t.compressing(1);
-	var empty = M.getFreshStack();
-	// All segments are now owned; the next allocation sweeps, compressing every SUSPENDED stack.
-	var fresh = M.getFreshStack();
-	t.assertState(StackState.EMPTY, empty);
-	t.assertState(StackState.EMPTY, fresh);
-	for (s in [s1, s2, s3]) t.assertState(StackState.COMPRESSED, s);
-	t.checkInvariants("sweep");
-	M.recycleStack(empty);
-	M.recycleStack(fresh);
-	t.assertResult(Result.Value([Values.box_i(1010)]), s1.resume());
-	t.assertResult(Result.Value([Values.box_i(1020)]), s2.resume());
-	t.assertResult(Result.Value([Values.box_i(1030)]), s3.resume());
+def countCompressed(stacks: Array<NativeStack>) -> int {
+	var count = 0;
+	for (s in stacks) if (s.state() == StackState.COMPRESSED) count++;
+	return count;
 }
 
-def test_sweep_batches(t: StackCompressionTester) {
+def test_sweep_one_per_request(t: StackCompressionTester) {
 	var stacks = Array<NativeStack>.new(4);
 	for (i < stacks.length) stacks[i] = t.suspended("make_once", i);
 	t.compressing(0);
-	var fresh = Array<NativeStack>.new(4);
-	fresh[0] = M.getFreshStack(); // one sweep compresses all four stacks
-	for (s in stacks) t.assertState(StackState.COMPRESSED, s);
-	// The remaining allocations take the segments the sweep freed.
-	for (i = 1; i < fresh.length; i++) fresh[i] = M.getFreshStack();
-	for (s in fresh) {
-		if (s == null) return t.t.fail("expected a cached stack");
-		t.assertState(StackState.EMPTY, s);
+	// All segments are owned; each allocation compresses exactly one cold stack, never more.
+	var fresh = Array<NativeStack>.new(stacks.length);
+	for (i < fresh.length) {
+		fresh[i] = M.getFreshStack();
+		if (fresh[i] == null) return t.t.fail("expected a fresh stack");
+		t.assertState(StackState.EMPTY, fresh[i]);
+		t.t.assert_eq(i + 1, countCompressed(stacks));
+		t.checkInvariants("sweep");
 	}
 	for (s in fresh) M.recycleStack(s);
 	for (i < stacks.length) t.assertResult(Result.Value([Values.box_i(1000 + i)]), stacks[i].resume());
+}
+
+def test_second_chance(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1), b = t.suspended("make_once", 2);
+	t.assertFlags(M.REFERENCED, a); // set by the resume that ran it
+	t.compressing(0);
+	b.flags = 0; // cold, as if the hand had already passed it once
+	M.hand = a.range;
+	var fresh = M.getFreshStack(); // the hand clears {a}'s bit and compresses {b}
+	t.assertState(StackState.COMPRESSED, b);
+	t.assertState(StackState.SUSPENDED, a);
+	t.assertFlags(0, a);
+	var fresh2 = M.getFreshStack(); // now {a} is cold
+	t.assertState(StackState.COMPRESSED, a);
+	t.checkInvariants("second chance");
+	M.recycleStack(fresh);
+	M.recycleStack(fresh2);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+	t.assertResult(Result.Value([Values.box_i(1002)]), b.resume());
+}
+
+def test_hot_set_single_sweep(t: StackCompressionTester) {
+	// Every suspended stack is referenced: one allocation clears the bits in a first revolution and evicts in a second.
+	var a = t.suspended("make_once", 1), b = t.suspended("make_once", 2), c = t.suspended("make_once", 3);
+	t.compressing(0);
+	M.hand = a.range;
+	var fresh = M.getFreshStack();
+	if (fresh == null) return t.t.fail("expected a fresh stack");
+	t.assertState(StackState.COMPRESSED, a); // the first stack after the hand once the bits are clear
+	for (s in [b, c]) {
+		t.assertState(StackState.SUSPENDED, s);
+		t.assertFlags(0, s);
+	}
+	t.checkInvariants("hot set");
+	M.recycleStack(fresh);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+}
+
+def test_pinned_at_entry(t: StackCompressionTester) {
+	var e = M.getFreshStack().reset(t.subFunc()).bind([Values.box_i(9)]); // uncompressible, at function entry
+	var b = t.suspended("make_once", 7);
+	t.compressing(0);
+	M.hand = e.range;
+	var fresh = M.getFreshStack(); // the hand pins {e} and compresses {b} on its second revolution
+	t.assertState(StackState.SUSPENDED, e);
+	t.assertFlags(M.PINNED, e);
+	t.assertState(StackState.COMPRESSED, b);
+	t.checkInvariants("pinned");
+	t.assertResult(Result.Value([Values.box_i(5)]), e.bind([Values.box_i(4)]).resume()); // running clears the pin
+	t.assertFlags(0, e);
+	M.recycleStack(fresh);
+	t.assertResult(Result.Value([Values.box_i(1007)]), b.resume());
+}
+
+def test_decompress_sets_referenced(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1);
+	t.assertCompress(a);
+	a.flags = 0;
+	t.assertDecompress(a);
+	t.assertFlags(M.REFERENCED, a); // so that the next sweep does not take the segment straight back
+	var b = t.suspended("make_once", 2);
+	t.compressing(0);
+	b.flags = 0;
+	M.hand = a.range;
+	var fresh = M.getFreshStack();
+	t.assertState(StackState.SUSPENDED, a);
+	t.assertFlags(0, a);
+	t.assertState(StackState.COMPRESSED, b);
+	M.recycleStack(fresh);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+	t.assertResult(Result.Value([Values.box_i(1002)]), b.resume());
+}
+
+def test_host_resume_sets_referenced(t: StackCompressionTester) {
+	var hf = HostFunction.new("check_flags", SigCache.v_i, checkReferenced(t, _));
+	var s = M.getFreshStack().reset(hf);
+	s.flags = M.PINNED; // as if the clock had pinned it at function entry
+	t.assertResult(Result.Value([Values.box_i(7)]), s.resume()); // a host resume writes the whole byte
+	t.assertFlags(0, s); // cleared with the rest of the stack on return
+}
+def checkReferenced(t: StackCompressionTester, args: Range<Value>) -> HostResult {
+	var cur = X86_64Runtime.curStack;
+	if (cur.flags != M.REFERENCED) t.t.fail("expected the running stack to be referenced and not pinned");
+	return HostResult.Value1(Values.box_i(7));
+}
+
+def test_clear_resets_flags(t: StackCompressionTester) {
+	var s = M.getFreshStack();
+	s.flags = M.REFERENCED | M.PINNED;
+	M.recycleStack(s);
+	var s2 = M.getFreshStack();
+	if (s2 != s) return t.t.fail("expected the recycled stack to be reused");
+	t.assertFlags(0, s2);
+}
+
+def test_gc_before_compress(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1);
+	t.compressing(1);
+	a.flags = 0; // cold, so the hand would compress it if it ran first
+	var dropped = allocAndDrop(t.subFunc()); // takes the one extra segment, dead on return
+	var c = M.getFreshStack(); // the GC comes first and reclaims the dead stack's segment
+	if (c.range.start != dropped) t.t.fail("expected the dead stack's segment to be reclaimed");
+	t.assertState(StackState.SUSPENDED, a);
+	t.t.assert_eq(0, M.gc_backoff); // a productive GC keeps the manager eager
+	M.recycleStack(c);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+}
+
+def test_backoff_doubles(t: StackCompressionTester) {
+	var stacks = Array<NativeStack>.new(7);
+	for (i < stacks.length) stacks[i] = t.suspended("make_once", i);
+	t.compressing(0);
+	var gcs = M.forced_gcs;
+	var fresh = Array<NativeStack>.new(stacks.length);
+	for (i < fresh.length) {
+		fresh[i] = M.getFreshStack(); // only live stacks, so every forced GC is unproductive
+		t.t.assert_eq(i + 1, countCompressed(stacks));
+	}
+	t.t.assert_eq(gcs + 3, M.forced_gcs); // on misses 1, 3 and 7
+	t.t.assert_eq(7, M.gc_backoff);
+	for (s in fresh) M.recycleStack(s);
+	for (i < stacks.length) t.assertResult(Result.Value([Values.box_i(1000 + i)]), stacks[i].resume());
+}
+
+def test_backoff_resets(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1), b = t.suspended("make_once", 2);
+	t.compressing(0);
+	var hold = M.getFreshStack(); // an unproductive GC, then one compression
+	t.t.assert_eq(1, M.gc_backoff);
+	var dropped = allocAndDrop(t.subFunc()); // skips the GC and compresses the other stack; dead on return
+	t.t.assert_eq(2, countCompressed([a, b]));
+	var c = M.getFreshStack(); // the GC is due again and finds the dead stack
+	if (c.range.start != dropped) t.t.fail("expected the dead stack's segment to be reclaimed");
+	t.t.assert_eq(0, M.gc_backoff);
+	M.recycleStack(hold);
+	M.recycleStack(c);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+	t.assertResult(Result.Value([Values.box_i(1002)]), b.resume());
+}
+
+def test_fallback_gc(t: StackCompressionTester) {
+	t.compressing(1);
+	var dropped = allocAndDrop(t.subFunc()); // takes the extra segment, dead on return
+	M.gc_backoff = 4;
+	M.gc_credit = 4; // the scheduled GC is skipped, and nothing is compressible
+	var c = M.getFreshStack(); // so the fallback GC must reclaim the dead stack's segment
+	if (c == null || c.range.start != dropped) return t.t.fail("expected the fallback GC to reclaim the dead segment");
+	t.t.assert_eq(0, M.gc_backoff);
+	t.t.assert_eq(0, M.gc_credit);
+}
+
+def test_resume_sets_referenced(t: StackCompressionTester) {
+	var k = t.make(100);
+	var s = t.stackOf(k);
+	s.flags = M.PINNED; // as if the clock had pinned it
+	k = t.next(k, 101); // the Wasm resume runs it until its next yield
+	if (t.stackOf(k) != s) return t.t.fail("expected the continuation to keep its stack");
+	t.assertState(StackState.SUSPENDED, s);
+	t.assertFlags(M.REFERENCED, s);
+	t.next(k, 102);
+}
+
+def test_switch_sets_referenced(t: StackCompressionTester) {
+	// The switch target is a new stack, so only the switch itself can have referenced it.
+	var k = t.contOf("switch_park", t.swCall("switch_park", []));
+	var s = t.stackOf(k);
+	t.assertState(StackState.SUSPENDED, s);
+	t.assertFlags(M.REFERENCED, s);
+	t.t.assert_eq(1, t.intOf("count", t.swCall("count", [])));
+	t.t.assert_eq(1, t.intOf("finish", t.swCall("finish", [Value.Cont(k)])));
 }
 
 def test_recycled_not_compressed(t: StackCompressionTester) {
@@ -732,6 +944,8 @@ def test_disabled_no_compress(t: StackCompressionTester) {
 	t.assertState(StackState.SUSPENDED, a);
 	t.assertState(StackState.SUSPENDED, b);
 	t.assertState(StackState.EMPTY, c);
+	t.assertFlags(M.REFERENCED, a); // with compression off, the hand leaves the bits alone
+	t.assertFlags(M.REFERENCED, b);
 }
 def allocAndDrop(f: Function) -> Pointer #no-inline {
 	return M.getFreshStack().reset(f).range.start;

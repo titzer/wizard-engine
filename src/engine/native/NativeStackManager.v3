@@ -6,10 +6,16 @@ def PAGE_SIZE = 4096u;
 
 // Manages native memory mappings for native stacks.
 component NativeStackManager {
+	def REFERENCED: byte = 1;	// {NativeStack.flags} bit: resumed since the clock hand last passed
+	def PINNED: byte = 2;		// {NativeStack.flags} bit: not compressible until it runs again
 	var all: NativeStackSegment;	// all segments ever mapped; never unmapped
 	var total: int;			// number of segments in {all}
 	var free: NativeStackSegment;	// unowned segments, linked by {next_free}
 	var cache: NativeStack;		// finished stacks that still own a segment; pushed by the return-parent stub
+	var hand: NativeStackSegment;	// clock hand into {all}; {null} restarts from the head
+	var gc_backoff: int;		// misses between forced GCs; doubles after an unproductive one
+	var gc_credit: int;		// misses left to skip before the next forced GC
+	var forced_gcs: int;		// number of forced GCs, for tracing and tests
 
 	// Gets an empty stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
@@ -52,13 +58,24 @@ component NativeStackManager {
 		segment.next_free = null;
 		return segment;
 	}
-	// Refills {free} from new mappings or a sweep, forcing a GC if the first sweep finds nothing.
+	// Refills {free} from new mappings, a forced GC under exponential backoff, or the clock.
 	private def refill() -> bool {
 		if (mapSegments() > 0) return true;
-		if (sweep() > 0) return true;
 		if (total == 0) return false;
+		var skipped = gc_credit > 0;
+		if (skipped) gc_credit--;
+		else if (collectDead()) return true;
+		if (reclaim()) return true;
+		return skipped && collectDead();
+	}
+	private def collectDead() -> bool {
+		forced_gcs++;
 		Target.forceGC(); // weak references are only cleared by a GC
-		return sweep() > 0;
+		var count = sweepDead();
+		gc_backoff = if(count > 0, 0, Ints.min(2 * gc_backoff + 1, total));
+		gc_credit = gc_backoff;
+		if (Trace.stack) Trace.OUT.put2("forced GC reclaimed %d segments, backoff %d", count, gc_backoff).ln();
+		return count > 0;
 	}
 	private def popCache() -> NativeStack {
 		var result = cache;
@@ -108,14 +125,41 @@ component NativeStackManager {
 		}
 		return count;
 	}
-	// Frees dead segments and, with compression on, compressible stacks' segments; requires {free} empty.
-	private def sweep() -> int {
+	// Frees one segment by advancing the clock hand (on compression).
+	private def reclaim() -> bool {
+		// With compression, one revolution clears the referenced bits and the next can evict.
+		var budget = if(StackTuning.enableCompression, 2 * total, total);
+		while (budget-- > 0) {
+			if (hand == null) hand = all;
+			var p = hand;
+			hand = p.next;
+			var s = p.stack.get();
+			if (s == null) {
+				push(p);
+				return true;
+			}
+			if (!StackTuning.enableCompression || s.state_ != StackState.SUSPENDED) continue;
+			if ((s.flags & REFERENCED) != 0) {
+				if (Trace.stack) Trace.OUT.put1("clock: second chance for stack @ 0x%x", Pointer.atObject(s) - Pointer.NULL).ln();
+				s.flags = 0; // second chance
+				continue;
+			}
+			if ((s.flags & PINNED) != 0) continue;
+			if (!NativeStackCompression.canCompress(s)) {
+				s.flags = PINNED; // its frames cannot change until it runs, which clears the bit
+				continue;
+			}
+			NativeStackCompression.compress(s);
+			return true;
+		}
+		return false;
+	}
+	// Frees the segments of all dead stacks, whose weak references a GC cleared; requires {free} empty.
+	private def sweepDead() -> int {
 		var count = 0;
 		for (p = all; p != null; p = p.next) {
-			var s = p.stack.get();
-			if (s == null) push(p);
-			else if (StackTuning.enableCompression && NativeStackCompression.canCompress(s)) NativeStackCompression.compress(s);
-			else continue;
+			if (p.stack.get() != null) continue;
+			push(p);
 			count++;
 		}
 		return count;
