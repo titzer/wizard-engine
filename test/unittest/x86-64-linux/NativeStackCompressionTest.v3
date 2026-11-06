@@ -54,6 +54,10 @@ def X_ = void(
 	T("decompress_sets_referenced", test_decompress_sets_referenced),
 	T("host_resume_sets_referenced", test_host_resume_sets_referenced),
 	T("clear_resets_flags", test_clear_resets_flags),
+	T("gc_before_compress", test_gc_before_compress),
+	T("backoff_doubles", test_backoff_doubles),
+	T("backoff_resets", test_backoff_resets),
+	T("fallback_gc", test_fallback_gc),
 	TT("resume_sets_referenced", test_resume_sets_referenced),
 	TT("switch_sets_referenced", test_switch_sets_referenced),
 	T("recycled_not_compressed", test_recycled_not_compressed),
@@ -172,6 +176,8 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		StackTuning.maxStacks = M.total;
 		M.cache = null;
 		M.free = null;
+		M.gc_backoff = 0;
+		M.gc_credit = 0;
 		Target.forceGC();
 		var free = 0;
 		for (seg = M.all; seg != null; seg = seg.next) if (seg.stack.get() == null) free++;
@@ -195,6 +201,7 @@ private class StackCompressionTester(t: Tester, tiering: ExecutionStrategy) {
 		}
 		if (count != M.total) t.fail1("%s: segment count mismatch", where);
 		if (!hand_ok) t.fail1("%s: clock hand is not a mapped segment", where);
+		if (M.gc_credit > M.gc_backoff || M.gc_backoff > M.total) t.fail1("%s: bad GC backoff state", where);
 		if (limit_total >= 0 && M.total > limit_total) t.fail3("%s: expected at most %d segments, got %d", where, limit_total, M.total);
 	}
 	def assertState(expected: StackState, s: NativeStack) {
@@ -817,6 +824,62 @@ def test_clear_resets_flags(t: StackCompressionTester) {
 	var s2 = M.getFreshStack();
 	if (s2 != s) return t.t.fail("expected the recycled stack to be reused");
 	t.assertFlags(0, s2);
+}
+
+def test_gc_before_compress(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1);
+	t.compressing(1);
+	a.flags = 0; // cold, so the hand would compress it if it ran first
+	var dropped = allocAndDrop(t.subFunc()); // takes the one extra segment, dead on return
+	var c = M.getFreshStack(); // the GC comes first and reclaims the dead stack's segment
+	if (c.range.start != dropped) t.t.fail("expected the dead stack's segment to be reclaimed");
+	t.assertState(StackState.SUSPENDED, a);
+	t.t.assert_eq(0, M.gc_backoff); // a productive GC keeps the manager eager
+	M.recycleStack(c);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+}
+
+def test_backoff_doubles(t: StackCompressionTester) {
+	var stacks = Array<NativeStack>.new(7);
+	for (i < stacks.length) stacks[i] = t.suspended("make_once", i);
+	t.compressing(0);
+	var gcs = M.forced_gcs;
+	var fresh = Array<NativeStack>.new(stacks.length);
+	for (i < fresh.length) {
+		fresh[i] = M.getFreshStack(); // only live stacks, so every forced GC is unproductive
+		t.t.assert_eq(i + 1, countCompressed(stacks));
+	}
+	t.t.assert_eq(gcs + 3, M.forced_gcs); // on misses 1, 3 and 7
+	t.t.assert_eq(7, M.gc_backoff);
+	for (s in fresh) M.recycleStack(s);
+	for (i < stacks.length) t.assertResult(Result.Value([Values.box_i(1000 + i)]), stacks[i].resume());
+}
+
+def test_backoff_resets(t: StackCompressionTester) {
+	var a = t.suspended("make_once", 1), b = t.suspended("make_once", 2);
+	t.compressing(0);
+	var hold = M.getFreshStack(); // an unproductive GC, then one compression
+	t.t.assert_eq(1, M.gc_backoff);
+	var dropped = allocAndDrop(t.subFunc()); // skips the GC and compresses the other stack; dead on return
+	t.t.assert_eq(2, countCompressed([a, b]));
+	var c = M.getFreshStack(); // the GC is due again and finds the dead stack
+	if (c.range.start != dropped) t.t.fail("expected the dead stack's segment to be reclaimed");
+	t.t.assert_eq(0, M.gc_backoff);
+	M.recycleStack(hold);
+	M.recycleStack(c);
+	t.assertResult(Result.Value([Values.box_i(1001)]), a.resume());
+	t.assertResult(Result.Value([Values.box_i(1002)]), b.resume());
+}
+
+def test_fallback_gc(t: StackCompressionTester) {
+	t.compressing(1);
+	var dropped = allocAndDrop(t.subFunc()); // takes the extra segment, dead on return
+	M.gc_backoff = 4;
+	M.gc_credit = 4; // the scheduled GC is skipped, and nothing is compressible
+	var c = M.getFreshStack(); // so the fallback GC must reclaim the dead stack's segment
+	if (c == null || c.range.start != dropped) return t.t.fail("expected the fallback GC to reclaim the dead segment");
+	t.t.assert_eq(0, M.gc_backoff);
+	t.t.assert_eq(0, M.gc_credit);
 }
 
 def test_resume_sets_referenced(t: StackCompressionTester) {

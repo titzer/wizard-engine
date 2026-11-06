@@ -13,6 +13,9 @@ component NativeStackManager {
 	var free: NativeStackSegment;	// unowned segments, linked by {next_free}
 	var cache: NativeStack;		// finished stacks that still own a segment; pushed by the return-parent stub
 	var hand: NativeStackSegment;	// clock hand into {all}; {null} restarts from the head
+	var gc_backoff: int;		// misses between forced GCs; doubles after an unproductive one
+	var gc_credit: int;		// misses left to skip before the next forced GC
+	var forced_gcs: int;		// number of forced GCs, for tracing and tests
 
 	// Gets an empty stack with a segment, or {null} if none is available.
 	def getFreshStack() -> NativeStack {
@@ -55,13 +58,24 @@ component NativeStackManager {
 		segment.next_free = null;
 		return segment;
 	}
-	// Refills {free} from new mappings or the clock, forcing a GC if the clock finds nothing.
+	// Refills {free} from new mappings, a forced GC under exponential backoff, or the clock.
 	private def refill() -> bool {
 		if (mapSegments() > 0) return true;
-		if (reclaim()) return true;
 		if (total == 0) return false;
+		var skipped = gc_credit > 0;
+		if (skipped) gc_credit--;
+		else if (collectDead()) return true;
+		if (reclaim()) return true;
+		return skipped && collectDead();
+	}
+	private def collectDead() -> bool {
+		forced_gcs++;
 		Target.forceGC(); // weak references are only cleared by a GC
-		return sweepDead() > 0;
+		var count = sweepDead();
+		gc_backoff = if(count > 0, 0, Ints.min(2 * gc_backoff + 1, total));
+		gc_credit = gc_backoff;
+		if (Trace.stack) Trace.OUT.put2("forced GC reclaimed %d segments, backoff %d", count, gc_backoff).ln();
+		return count > 0;
 	}
 	private def popCache() -> NativeStack {
 		var result = cache;
@@ -111,7 +125,7 @@ component NativeStackManager {
 		}
 		return count;
 	}
-	// Frees one segment by advancing the clock hand: a dead one, else by compressing a cold stack.
+	// Frees one segment by advancing the clock hand (on compression).
 	private def reclaim() -> bool {
 		// With compression, one revolution clears the referenced bits and the next can evict.
 		var budget = if(StackTuning.enableCompression, 2 * total, total);
