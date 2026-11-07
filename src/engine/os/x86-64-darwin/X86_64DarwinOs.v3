@@ -23,6 +23,18 @@ component OsMem {
 		if (!syscallOk(r)) return Pointer.NULL;
 		return Pointer.NULL + r.0;
 	}
+	// Returns a region near the program code into which machine code can be generated at runtime,
+	// or {(NULL, NULL)} if code can be executed directly from the data segment.
+	// The Mach-O {__DATA} segment is not executable, so use the {__RT_TEXT} segment, which
+	// is reserved with the {-runtime-code-size} compiler option.
+	// The last {OsSignal.TRAMPOLINE_SIZE} bytes of the region are reserved for the signal trampoline.
+	def runtimeCodeRegion() -> (Pointer, Pointer) {
+		var start = CiRuntime.RUNTIME_CODE_START, end = CiRuntime.RUNTIME_CODE_END;
+		if (start == Pointer.NULL || (end - start) <= OsSignal.TRAMPOLINE_SIZE) {
+			System.error("OsMem", "no runtime code region; build with -runtime-code-size");
+		}
+		return (start, end + -OsSignal.TRAMPOLINE_SIZE);
+	}
 	def mprotect(start: Pointer, size: u64, prot: int) -> bool {
 		return syscallOk(Darwin.syscall(SYS_mprotect, (start, size, prot)));
 	}
@@ -30,7 +42,7 @@ component OsMem {
 		return syscallOk(Darwin.syscall(SYS_munmap, (start, size)));
 	}
 	// The kernel signals a failed system call by setting the carry flag (and returning errno).
-	private def syscallOk<T>(t: T) -> bool {
+	def syscallOk<T>(t: T) -> bool {
 		def CF_FLAG = 1;
 		match (t) {
 			x: (long, long, long) => return (x.2 & CF_FLAG) == 0;
@@ -70,5 +82,59 @@ component OsSignal {
 	}
 	private def mcontext(ucontext: Pointer) -> Pointer {
 		return (ucontext + UC_MCONTEXT).load<Pointer>();
+	}
+
+	// Signal trampoline support.
+	// XXX: Virgil's {CiRuntime.signalStub} is installed as the trampoline by the Virgil runtime, but
+	// it expects siginfo in the wrong register and simply returns instead of calling sigreturn(),
+	// so signals cannot be resumed. Until that is fixed upstream, install a trampoline that wraps it.
+	def TRAMPOLINE_SIZE = 4096;
+	private def SYS_sigreturn = 0x20000B8;
+	private def SA_ONSTACK = 0x0001;
+	private def SA_SIGINFO = 0x0040;
+	private var installed = false;
+
+	// Install the signal trampoline for the signals used by generated code.
+	// Must be called before generated code may raise signals.
+	def installHandlers() {
+		if (installed) return;
+		installed = true;
+		var tramp = CiRuntime.RUNTIME_CODE_END + -TRAMPOLINE_SIZE;
+		genTrampoline(tramp);
+		for (signum in [SIGFPE, SIGBUS, SIGSEGV]) {
+			if (!sigaction(signum, tramp)) System.error("OsSignal", "sigaction failed");
+		}
+	}
+	// The kernel enters the trampoline with:
+	//   %rdi = catcher, %rsi = infostyle, %rdx = signum, %rcx = siginfo, %r8 = ucontext, %r9 = token
+	// {CiRuntime.signalStub} expects %rdx = signum, %rsi = siginfo, %r8 = ucontext.
+	private def genTrampoline(tramp: Pointer) {
+		var R: X86_64Regs;
+		var buf = Array<byte>.new(64);
+		var w = DataWriter.new().reset(buf, 0, 0);
+		var asm = X86_64Assemblers.create64(w);
+		asm.pushq_r(R.R8);			// save ucontext
+		asm.pushq_r(R.RSI);			// save infostyle
+		asm.pushq_r(R.R9);			// save token
+		asm.movq_r_r(R.RSI, R.RCX);		// siginfo
+		asm.movq_r_l(R.RAX, CiRuntime.signalStub - Pointer.NULL);
+		asm.icall_r(R.RAX);			// call signalStub -> RiRuntime.signal()
+		asm.popq_r(R.RDX);			// token
+		asm.popq_r(R.RSI);			// infostyle
+		asm.popq_r(R.RDI);			// ucontext
+		asm.movd_r_i(R.RAX, SYS_sigreturn);	// sigreturn(ucontext, infostyle, token)
+		asm.syscall();
+		asm.invalid();				// sigreturn does not return
+		var len = w.atEnd().pos;
+		for (i < len) (tramp + i).store<byte>(buf[i]);
+	}
+	private def sigaction(signum: int, tramp: Pointer) -> bool {
+		// struct __sigaction { sa_handler; sa_tramp; sa_mask: u32; sa_flags: i32 }
+		var sa = Array<long>.new(3);
+		sa[0] = tramp - Pointer.NULL;		// sa_handler (unused by the trampoline)
+		sa[1] = tramp - Pointer.NULL;		// sa_tramp
+		sa[2] = long.view(SA_ONSTACK | SA_SIGINFO) << 32; // sa_mask = 0, sa_flags
+		var r = Darwin.syscall(DarwinConst.SYS_sigaction, (signum, Pointer.atContents(sa), Pointer.NULL));
+		return OsMem.syscallOk(r);
 	}
 }

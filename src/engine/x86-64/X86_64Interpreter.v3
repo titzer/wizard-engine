@@ -456,7 +456,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 	}
 	def genHostCallStub() {
-		var m_curStack = MasmAddr(Reg(0), int.!(offsets.X86_64Runtime_curStack - Pointer.NULL));
 		var r_stack = xenv.tmp0;
 		var r_func = xenv.func_arg;
 
@@ -634,8 +633,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm.d.movbzx_r_m(typeGpr, ip_ptr);	// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
 		// check for extended LEB, abstract type, or type with immediate
-		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
-		asm.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
+		asm.test_m_i(typeTagTableAddr(typeGpr, r_tmp3), TYPE_HAS_IMM | TYPE_IS_LEB);
 		genConditionalJumpDeferred(C.NZ, fun retpoint {
 			// slowpath: handle extended LEB, types with immediates, and abstract types
 			var type_not_leb = X86_64Label.new();
@@ -644,8 +642,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			genSkipLeb0(r_tmp0);
 			asm.bind(type_not_leb);
 			// check for types that have an immediate
-			var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
-			asm.d.test_m_i(typeGpr.plus(typeTableAddr), TYPE_HAS_IMM);
+			asm.d.test_m_i(typeTagTableAddr(typeGpr, r_tmp3), TYPE_HAS_IMM);
 			asm.jc_rel_far(C.Z, retpoint);
 			// {ip} now points at the immediate parameter of the type.
 			// Read the heap-type SLEB tag the slot with CONTREF if it is a continuation type, else REF_NULL.
@@ -1200,7 +1197,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		bindHandler(Opcode.THROW_REF); {
 			computeCurIpForTrap(-1);
 			computePcFromCurIp();
-			asm.movd_r_m(r_tmp0, vsph[-1].value);
+			asm.movq_r_m(r_tmp0, vsph[-1].value);
 			decrementVsp();
 			masm.emit_get_curstack(xenv.tmp1);
 			saveCallerIVars();
@@ -3932,13 +3929,28 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		if (FeatureDisable.complexBlockTypes) return genSkipLeb();
 		genSkipValueType(r_tmp0, r_tmp3);
 	}
+	// Returns an address for the type tag table entry indexed by {index}. If the table is not
+	// addressable with a 32-bit absolute address, {tmp} is used to hold the table's address.
+	def typeTagTableAddr(index: X86_64Gpr, tmp: X86_64Gpr) -> X86_64Addr {
+		var addr = ic.start + typeTagTableOffset;
+		if (masm.isAbs32(addr)) return index.plus(int.view(addr - Pointer.NULL));
+		asm.lea(tmp, IcCodeRef.new(typeTagTableOffset)); // RIP-relative LEA
+		return tmp.plusR(index, 1, 0);
+	}
+	// Returns an address for the entry of {table} indexed by {index} with the given {scale}.
+	// If the table is not addressable with a 32-bit absolute address, {tmp} is used.
+	def fixedTableAddr(table: IcCodeRef, index: X86_64Gpr, scale: byte, tmp: X86_64Gpr) -> X86_64Addr {
+		var addr = ic.start + table.offset;
+		if (masm.isAbs32(addr)) return X86_64Addr.new(null, index, scale, int.view(addr - Pointer.NULL));
+		asm.lea(tmp, table); // RIP-relative LEA
+		return tmp.plusR(index, scale, 0);
+	}
 	def genSkipValueType(tmp1: X86_64Gpr, tmp2: X86_64Gpr) {
 		var done = X86_64Label.new();
 		asm.d.movbzx_r_m(tmp1, ip_ptr);		// load first byte
 		asm.q.inc_r(r_ip);			// increment pointer
 		// check for extended LEB, or type with immediate
-		var typeTableAddr = int.!((ic.start + typeTagTableOffset) - Pointer.NULL);
-		asm.test_m_i(tmp1.plus(typeTableAddr), TYPE_HAS_IMM | TYPE_IS_LEB);
+		asm.test_m_i(typeTagTableAddr(tmp1, tmp2), TYPE_HAS_IMM | TYPE_IS_LEB);
 		asm.jc_rel_near(C.Z, done);
 		// TODO: ref and ref null are the only types with immediate, check for <= BpTypeCode.REF
 		// handle extended LEB, types with immediates, and abstract types
@@ -3948,7 +3960,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSkipLeb0(tmp2);
 		asm.bind(type_not_leb);
 		// check for types that have an immediate
-		asm.d.test_m_i(tmp1.plus(typeTableAddr), TYPE_HAS_IMM);
+		asm.d.test_m_i(typeTagTableAddr(tmp1, tmp2), TYPE_HAS_IMM);
 		asm.jc_rel_near(C.Z, done);
 		genSkipLeb0(tmp1);
 		asm.bind(done);
@@ -4010,8 +4022,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 				if (table == null) {
 					asm.movd_r_m(base, r_dispatch.plusR(opcode, 4, 0));
 				} else {
-					var addr = ic.start + table.offset;
-					asm.movd_r_m(base, X86_64Addr.new(null, opcode, 4, int.!(addr - Pointer.NULL)));
+					asm.movd_r_m(base, fixedTableAddr(table, opcode, 4, base));
 				}
 				if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 				asm.ijmp_r(base);
@@ -4021,9 +4032,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
 					asm.ijmp_m(r_dispatch.plusR(opcode, 8, 0));
 				} else {
-					var addr = ic.start + table.offset;
+					var addr = fixedTableAddr(table, opcode, 8, base);
 					if (dispatchJmpOffset < 0) dispatchJmpOffset = w.pos;
-					asm.ijmp_m(X86_64Addr.new(null, opcode, 8, int.!(addr - Pointer.NULL)));
+					asm.ijmp_m(addr);
 				}
 			}
 		}
@@ -4237,8 +4248,9 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	}
 	def refRuntimeCall<P, R>(f: P -> R) -> Pointer {
 		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(f).0;
-		var abs = ptr - Pointer.NULL;
-		if (abs > u32.max) fatal("runtime call address not in 4GB");
+		// Runtime calls are direct (rel32) calls from the interpreter code.
+		var delta = ptr - ic.start;
+		if (delta != long.!(int.view(delta))) fatal("runtime call address not within 2GB of interpreter code");
 		return ptr;
 	}
 	def reportOom(w: DataWriter, nlength: int) -> DataWriter {

@@ -6,7 +6,7 @@ def PAGE_SIZE = 4096u;
 def PAGE_SIZE_i: int = 4096;
 def PREGEN_MAGIC_WORD = 0x7ACEBEEF778899AAu;
 def PREGEN_CODE_MARKER = 0x7FAACCEE;
-def INL_SIZE = 92 * 1024;
+def INL_SIZE = (if(FastIntTuning.dispatchEntrySize > 4, 132, 92)) * 1024; // larger dispatch tables need more space
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
 def pregen_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE_i);
@@ -64,7 +64,7 @@ class X86_64PreGenStub(
 	// Get the start of this stub.
 	def getEntry() -> Pointer {
 		X86_64PreGenStubs.gen();
-		return Pointer.atContents(pregen_buffer) + offsets.start;
+		return I.interpreterCode.start + offsets.start;
 	}
 }
 
@@ -162,7 +162,20 @@ component X86_64PreGenStubs {
 		return true;
 	}
 	def deserializeOrGenerateCode() -> X86_64InterpreterCode {
-		var start = Pointer.atContents(pregen_buffer);
+		// The code is generated into (or was pre-generated into) {pregen_buffer}. If the OS
+		// cannot execute code in the data segment, it is copied to a runtime code region and
+		// executes there; it is generated as if located there.
+		var buf = Pointer.atContents(pregen_buffer);
+		var start = buf;
+		var exec = OsMem.runtimeCodeRegion();
+		var copy = exec.0 != Pointer.NULL;
+		if (copy) {
+			if ((exec.1 - exec.0) < pregen_buffer.length) {
+				System.error("X86_64PreGenStubs", Strings.format2("runtime code region too small (%d bytes, need %d)",
+					exec.1 - exec.0, pregen_buffer.length));
+			}
+			start = exec.0;
+		}
 		var range = MemoryRange.new(start, start + pregen_buffer.length);
 
 		Debug.beforePregen();
@@ -213,6 +226,13 @@ component X86_64PreGenStubs {
 			ic.header.codeEnd = w.atEnd().pos;
 			ic.header.codeMarker = PREGEN_CODE_MARKER;
 		}
+		if (copy) {
+			if (Debug.pregen) {
+				Trace.OUT.put3("Copying pregen code [0x%x ... 0x%x] to runtime code region at 0x%x",
+					buf - Pointer.NULL, (buf + ic.header.codeEnd) - Pointer.NULL, start - Pointer.NULL).ln();
+			}
+			for (i < ic.header.codeEnd) (start + i).store<byte>(pregen_buffer[i]);
+		}
 		// Finish the interpreter code.
 		ic.end = range.start + ic.header.codeEnd;
 		ic.setV3Entry();
@@ -223,11 +243,16 @@ component X86_64PreGenStubs {
 				ic.header.fastDispatchTableOffset);
 
 		// Write-protect the executable code for security and debugging
-		Mmap.protect(range.start + ic.header.codeStart, u64.!(ic.header.codeEnd - ic.header.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC);
+		if (!Mmap.protect(range.start + ic.header.codeStart, u64.!(ic.header.codeEnd - ic.header.codeStart), Mmap.PROT_READ | Mmap.PROT_EXEC)) {
+			System.error("X86_64PreGenStubs", "could not make interpreter code executable");
+		}
 
 		// The host call stub is part of interpreter code (TODO: does it need to be?)
 		hostCallStub.start = ic.start + ic.header.hostCallStubOffset;
 		hostCallStub.end = ic.start + ic.header.hostCallStubEnd;
+
+		// Install OS-specific signal handling needed for traps in generated code.
+		OsSignal.installHandlers();
 
 		// Register user code objects with the Virgil runtime.
 		RiRuntime.registerUserCode(ic);
