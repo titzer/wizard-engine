@@ -161,7 +161,7 @@ if [[ "$TARGET" =~ x86 ]]; then
 	append_comma_sep REDEFS "RiGc.debug=true"
     fi
     if [ "$GC_STATS" = 1 ]; then
-	append_comma_sep REDEFS "RiGc.stats=true"
+	append_comma_sep REDEFS "GcStats.enabled=true"
 	append_comma_sep REDEFS "RiGc.verbose=true"
     fi
     if [ "$NO_JIT" = 1 ]; then
