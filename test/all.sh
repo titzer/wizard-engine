@@ -55,10 +55,15 @@ if [ "$TEST_TARGETS" = "" ]; then
     fi
 fi
 
+# Returns success if the target has the native (fast interpreter and JIT) execution tiers.
+function has_native_tiers() {
+    [[ "$1" = "x86-64-linux" || "$1" = "x86-64-darwin" ]]
+}
+
 function do_script() {
     script=$1
     $SCRIPT_LOC/${script}.sh || exit_if_failure $?
-    if [[ "$TEST_TARGET" = "x86-64-linux" && $DEFAULT_MODES = 1 ]]; then
+    if has_native_tiers "$TEST_TARGET" && [[ $DEFAULT_MODES = 1 ]]; then
         TEST_MODE=jit $SCRIPT_LOC/${script}.sh || exit_if_failure $?
         TEST_MODE=lazy $SCRIPT_LOC/${script}.sh || exit_if_failure $?
         TEST_MODE=dyn $SCRIPT_LOC/${script}.sh || exit_if_failure $?
@@ -122,7 +127,7 @@ done
 # Inlining tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" != "x86-64-linux" ]; then
+    if ! has_native_tiers "$target"; then
         skip inline "no JIT support"
         continue
     fi
@@ -141,7 +146,7 @@ done
 # Fast call tests
 for target in $TEST_TARGETS; do
     export TEST_TARGET=$target
-    if [ "$target" != "x86-64-linux" ]; then
+    if ! has_native_tiers "$target"; then
         skip fastcall "no fast interpreter support"
         continue
     fi

@@ -47,7 +47,7 @@ function run_tests() {
 	done
 
 	# Run the stack-switching tests again with few native stacks, forcing stack compression.
-	if [ "$TEST_TARGET" = "x86-64-linux" ]; then
+	if [[ "$TEST_TARGET" = "x86-64-linux" || "$TEST_TARGET" = "x86-64-darwin" ]]; then
 		TESTS=$(ls test/regress/ext:stack-switching/*.bin.wast)
 		$CMD --expected=$WIZENG_LOC/test/regress/stacks/compression.failures --ext:all --max-stacks=16 --stack-compression $TESTS
 	fi

@@ -76,7 +76,9 @@ DEBUG_MONITORS="src/monitors/debug/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 OS_X86_64_LINUX="src/engine/os/x86-64-linux/*.v3"
+OS_X86_64_DARWIN="src/engine/os/x86-64-darwin/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
+UNITTEST_X86_64="test/unittest/x86-64/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
 WASM_MODE="src/WasmMode.v3"
@@ -170,6 +172,11 @@ if [[ "$TARGET" =~ x86 ]]; then
     fi
 fi
 
+if [[ "$TARGET" =~ x86-64-darwin|x86_64_darwin ]]; then
+    # Code is above 4GB on darwin; dispatch entries must hold 64-bit addresses.
+    append_comma_sep REDEFS "FastIntTuning.dispatchEntrySize=8"
+fi
+
 function make_build_file() {
 	local target=$TARGET
 
@@ -207,7 +214,10 @@ case "$PROGRAM" in
 	SOURCES="$ENGINE $UNITTEST"
 	case "$TARGET" in
 	    x86-64-linux|x86_64_linux)
-		SOURCES="$SOURCES $UNITTEST_X86_64_LINUX $MODULES $WASI $WASI_X86_64_LINUX"
+		SOURCES="$SOURCES $UNITTEST_X86_64 $UNITTEST_X86_64_LINUX $MODULES $WASI $WASI_X86_64_LINUX"
+		;;
+	    x86-64-darwin|x86_64_darwin)
+		SOURCES="$SOURCES $UNITTEST_X86_64"
 		;;
 	esac
 	;;
@@ -240,7 +250,10 @@ case "$TARGET" in
 	exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 	;;
     x86-64-darwin|x86_64_darwin)
-	exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+	TARGET_SRC="$TARGET_X86_64 $OS_X86_64_DARWIN $OBJECT_MODEL_JIT_SRC"
+	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_SRC"; fi
+	# The interpreter code is copied into the runtime code region (__RT_TEXT), since __DATA is not executable.
+	exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m -runtime-code-size=256k $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 	;;
     arm64-linux|arm64_linux)
 	exec v3c-arm64-linux -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.arm64-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3

@@ -26,6 +26,7 @@ ENGINE=src/engine/*.v3 src/engine/compression/*.v3 src/engine/v3/*.v3 src/util/*
 MONITORS=src/monitors/*.v3 src/monitors/test/*.v3
 JIT=src/engine/compiler/*.v3
 X86_64=src/engine/native/*.v3 src/engine/x86-64/*.v3 src/engine/os/x86-64-linux/*.v3
+X86_64_DARWIN=src/engine/native/*.v3 src/engine/x86-64/*.v3 src/engine/os/x86-64-darwin/*.v3
 WAVE=src/modules/wave/*.v3
 WASI=src/modules/wasi/*.v3
 WASI_X86_64_LINUX=src/modules/wasi/x86-64-linux/*.v3
@@ -33,7 +34,8 @@ WALI=src/modules/wali/*.v3
 WALI_X86_64_LINUX=src/modules/wali/x86-64-linux/*.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
-UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
+UNITTEST_X86_64=test/unittest/x86-64/*.v3
+UNITTEST_X86_64_LINUX=$(UNITTEST_X86_64) test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -93,13 +95,13 @@ bin/objdump.x86-64-linux: $(OBJDUMP) $(X86_64) build.sh
 	./build.sh objdump x86-64-linux
 
 # x86-64-darwin targets
-bin/unittest.x86-64-darwin: $(UNITTEST) build.sh
+bin/unittest.x86-64-darwin: $(UNITTEST) $(UNITTEST_X86_64) $(X86_64_DARWIN) $(JIT) build.sh
 	./build.sh unittest x86-64-darwin
 
-bin/wizeng.x86-64-darwin: $(WIZENG) $(MONITORS) build.sh
+bin/wizeng.x86-64-darwin: $(WIZENG) $(MONITORS) $(X86_64_DARWIN) $(JIT) build.sh
 	./build.sh ${WIZENG_BUILD_SH_ARGS} wizeng x86-64-darwin
 
-bin/objdump.x86-64-darwin: $(OBJDUMP) build.sh
+bin/objdump.x86-64-darwin: $(OBJDUMP) $(X86_64_DARWIN) build.sh
 	./build.sh objdump x86-64-darwin
 
 # interpreter targets
