@@ -75,6 +75,7 @@ TEST_MONITORS="src/monitors/test/*.v3"
 DEBUG_MONITORS="src/monitors/debug/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
+OS_X86_64_LINUX="src/engine/os/x86-64-linux/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
@@ -245,7 +246,7 @@ case "$TARGET" in
 	exec v3c-arm64-linux -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.arm64-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 	;;
     x86-64-linux|x86_64_linux)
-	TARGET_SRC="$TARGET_X86_64 $OBJECT_MODEL_JIT_SRC"
+	TARGET_SRC="$TARGET_X86_64 $OS_X86_64_LINUX $OBJECT_MODEL_JIT_SRC"
 	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_SRC"; fi
 	exec v3c-x86-64-linux -symbols -heap-size=1700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 	STATUS=$?
