@@ -11,8 +11,23 @@ def filter_ = monitor_.options.addAlias(
 
 var ticks: void -> u64;
 var filter: DeclFilter;
+
+var current: FuncEntry;		// profiled function currently executing, or null if none
+var since: u64;			// tick at which {current} began executing
+
+def transition(next: FuncEntry) {
+	if (current == next) return; // fast path: no change
+	var now = u64.view(ticks());
+	if (current != null) current.cumul += now - since;
+	current = next;
+	since = now;
+}
+
+def NONE_PROBE = TransitionProbe.new(null); // used for functions excluded by the filter
+def ARRIVE: byte = 1, LEAVE: byte = 2;
+
 class FuncProfileMonitor extends Monitor {
-	def entries = Vector<EnterProbe>.new();
+	def entries = Vector<FuncEntry>.new();
 	// format: --monitors=fprofile{<filter>}
 	def configure(args: string) -> string {
 		if (args != null) filter = filter_.val;
@@ -26,95 +41,99 @@ class FuncProfileMonitor extends Monitor {
 		for (i < module.functions.length) {
 			var f = module.functions[i];
 			if (f.imp != null) continue;
-			if (filter != null && !filter.matches(module, f)) continue;
-			var prev_call = false;
-			var enter = EnterProbe.new(module, f);
-			var exit = ExitProbe.new(enter);
-			var call = NestedCallProbe.new(enter);
-			var ret = NestedReturnProbe.new(enter);
-			entries.put(enter);
-			Instrumentation.insertFuncEntryProbe(module, f.func_index, enter);
-			for (bi = BytecodeIterator.new().reset(f); bi.more(); bi.next()) {
-				if (prev_call) {
-					Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, ret);
-					prev_call = false;
-				}
-				match (bi.current()) {
-					CALL, CALL_INDIRECT, CALL_REF => {
-						Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, call);
-						prev_call = true;
-					}
-					RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => {
-						Instrumentation.insertLocalProbe(module, f.func_index, bi.pc, exit);
-					}
+			// All functions get transition probes so that time is never attributed to a profiled
+			// function while an unprofiled function is executing.
+			var arrive: Probe, leave: Probe;
+			if (filter == null || filter.matches(module, f)) {
+				var entry = FuncEntry.new(module, f);
+				entries.put(entry);
+				Instrumentation.insertFuncEntryProbe(module, f.func_index, EntryProbe.new(entry));
+				arrive = TransitionProbe.new(entry);
+				leave = NONE_PROBE;
+			} else {
+				Instrumentation.insertFuncEntryProbe(module, f.func_index, NONE_PROBE);
+				arrive = leave = NONE_PROBE;
+			}
+			var sites = findSites(bi, f);
+			for (pc < sites.length) {
+				match (sites[pc]) {
+					ARRIVE => Instrumentation.insertLocalProbe(module, f.func_index, pc, arrive);
+					LEAVE => Instrumentation.insertLocalProbe(module, f.func_index, pc, leave);
 					_ => ;
 				}
 			}
-			Instrumentation.insertLocalProbe(module, f.func_index, f.cur_bytecode.length - 1, exit);
 		}
 	}
 	def onFinish(i: Instance, r: Result) {
+		transition(null); // close out the last interval, e.g. if an exception escaped to the host
 		output(out, entries);
 	}
 }
 
-def compareEntries(a: EnterProbe, b: EnterProbe) -> bool {
+// Computes the arrive and leave sites for {f}, indexed by pc. A pc that is both an arrive and a
+// leave site is a leave site, since control leaves the function again immediately.
+def findSites(bi: BytecodeIterator, f: FuncDecl) -> Array<byte> {
+	var sites = Array<byte>.new(f.orig_bytecode.length);
+	for (it = bi.reset(f); it.more(); it.next()) {
+		match (bi.current()) {
+			CALL, CALL_INDIRECT, CALL_REF, SUSPEND, SWITCH => {
+				sites[bi.pc] = LEAVE;
+				arrive(sites, bi.nextPc()); // return from callee, or resumption of this stack
+			}
+			RESUME, RESUME_THROW, RESUME_THROW_REF => {
+				sites[bi.pc] = LEAVE;
+				arrive(sites, bi.nextPc()); // continuation returned
+				// suspension handlers (`on $tag $label` clauses); switch clauses do not land here
+				var resume_sites = f.handlers.resume_sites;
+				var table = if(resume_sites != null && bi.pc < resume_sites.length, resume_sites[bi.pc]);
+				if (table != null) {
+					for (i < ResumeSites.header(table).switch_start_index) {
+						arrive(sites, ResumeSites.entry(table, i).handler_pc);
+					}
+				}
+			}
+			RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => {
+				sites[bi.pc] = LEAVE;
+			}
+			_ => ;
+		}
+	}
+	sites[sites.length - 1] = LEAVE; // final end
+	// exception handlers
+	for (e in f.handlers.ex_handlers) {
+		if (e.tag == Modules.EX_TAG_DELEGATE) continue; // delegate redirects the search; doesn't land
+		match (e.info) {
+			Direct(handler_pc, ex_slot, val_stack_top, sidetable_pos) => arrive(sites, handler_pc);
+			Sidetable(push_exnref, sidetable_entry) => arrive(sites, f.sidetable.getCatchEntry(sidetable_entry).handler_pc);
+		}
+	}
+	return sites;
+}
+
+def arrive(sites: Array<byte>, pc: int) {
+	if (sites[pc] == 0) sites[pc] = ARRIVE;
+}
+
+def compareEntries(a: FuncEntry, b: FuncEntry) -> bool {
 	return a.cumul > b.cumul;
 }
 
-
-private class EnterProbe(module: Module, func: FuncDecl) extends Probe {
+private class FuncEntry(module: Module, func: FuncDecl) {
 	var count: u64;
 	var cumul: u64;
-	var start: u64;
-	var nested_start: u64;
-	var stack: Vector<(u64, u64)>;
+}
 
+private class EntryProbe(entry: FuncEntry) extends Probe {
 	def fire(loc: DynamicLoc) -> ProbeAction {
-		count++;
-		if (start != 0) {
-			// recursive invocation; allocate stack entry
-			if (stack == null) stack = Vector.new();
-			stack.put(start, nested_start);
-			start = u64.view(ticks());
-		} else {
-			start = u64.view(ticks());
-		}
+		entry.count++;
+		transition(entry);
 		return ProbeAction.Continue;
 	}
 }
 
-private class ExitProbe(p: EnterProbe) extends Probe {
+private class TransitionProbe(next: FuncEntry) extends Probe {
 	def fire(loc: DynamicLoc) -> ProbeAction {
-		var end = u64.view(ticks());
-		var diff = end - p.start;
-		p.cumul += diff;
-		p.start = 0;
-		if (p.stack != null && p.stack.length > 0) {
-			var nlength = p.stack.length - 1;
-			var t = p.stack[nlength];
-			p.start = t.0;
-			p.nested_start = t.1;
-			p.stack.resize(nlength);
-		}
-		return ProbeAction.Continue;
-	}
-}
-
-private class NestedCallProbe(p: EnterProbe) extends Probe {
-	def fire(loc: DynamicLoc) -> ProbeAction {
-		var time = u64.view(ticks());
-		p.nested_start = time;
-		return ProbeAction.Continue;
-	}
-}
-
-private class NestedReturnProbe(p: EnterProbe) extends Probe {
-	def fire(loc: DynamicLoc) -> ProbeAction {
-		if (p.nested_start == 0) return ProbeAction.Continue; // not paired with a call in this func
-		var time = u64.view(ticks());
-		p.cumul -= time - p.nested_start;
-		p.nested_start = 0;
+		transition(next);
 		return ProbeAction.Continue;
 	}
 }
@@ -129,7 +148,7 @@ def initTable() -> TraceTable {
 	return t;
 }
 
-def output(out: TraceBuilder, entries: Vector<EnterProbe>) {
+def output(out: TraceBuilder, entries: Vector<FuncEntry>) {
 	var C = table.cells;
 	var total = 0uL;
 	C[0].color = Color.COVERED;
