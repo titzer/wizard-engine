@@ -21,6 +21,7 @@ class NativeStack extends WasmStack {
 
 	// Handler table (for inline suspend/switch).
 	var handlers: Array<byte>;
+	var handler_tags: Array<Tag>;	// tags that {handlers} indexes
 	var handler_tier: HandlerTier;
 	var next_stack: NativeStack;
 
@@ -248,23 +249,22 @@ class NativeStack extends WasmStack {
 		if (Trace.stack) {
 			Trace.OUT.put1("searching for handler on stack[rsp=0x%x]", rsp - Pointer.NULL).ln();
 		}
+		var found = findHandlerEntry(false, tag);
+		if (found < 0) return false;
+		var e = ResumeSites.entry(handlers, found);
+		if (Trace.stack) {
+			Trace.OUT.put1("  found suspend handler: pc=%d,", e.handler_pc);
+			Trace.OUT.put1(" stp=%d", e.stp_pos).ln();
+		}
 		// Increment by {Pointer.SIZE} to skip the return address pushed by {resume}.
 		var h = NativeFrameHandles.from(rsp + Pointer.SIZE);
-		var func = h.wasm_func();
-		var handler = func.decl.findSuspensionHandler(func.instance, tag, h.computePc());
-		shadowCheckHandlerTable(false, h, func, tag, handler);
-		if (handler.handler_pc < 0) return false; // not found
-		if (Trace.stack) {
-			Trace.OUT.put1("  found suspend handler: pc=%d,", handler.handler_pc);
-			Trace.OUT.put1(" stp=%d", handler.sidetable_pos).ln();
-		}
 		// Reset current stack to handler position.
 		if (NativeFrameHandle.Spc.?(h)) {
 			var sh = NativeFrameHandle.Spc.!(h);
-			sh.writeSpcState(handler.handler_pc);
-			sh.redirectToHandlerStub(func.decl, handler);
+			sh.writeSpcState(e.handler_pc);
+			sh.srp().store<Pointer>(Pointer.NULL + e.stub_addr);
 		} else {
-			h.writeInterpreterState(func.decl, handler.handler_pc, handler.sidetable_pos);
+			h.writeInterpreterState(h.wasm_func().decl, e.handler_pc, e.stp_pos);
 			// Set top address to suspension entry stub.
 			var ic = X86_64PreGenStubs.getInterpreterCode();
 			var stub = ic.start + ic.header.intSuspendEntryOffset;
@@ -276,50 +276,23 @@ class NativeStack extends WasmStack {
 			).ln();
 		}
 		// perform implicit popping for ctlxfer
-		var vfp = h.vfp();
-		var stack_top = handler.val_stack_top + func.decl.num_locals;
-		var vsp = vfp + (stack_top * valuerep.slot_size);
-		this.vsp = vsp;
+		this.vsp = h.vfp() + (e.vsp_slots * valuerep.slot_size);
 		h.set_vsp(this.vsp);
 		return true;
 	}
 	def tryHandleSwitch(tag: Tag) -> bool {
-		// Increment by {Pointer.SIZE} to skip the return address.
-		var h = NativeFrameHandles.from(rsp + Pointer.SIZE);
-		var func = h.wasm_func();
-		var handler = func.decl.findSwitchHandler(func.instance, tag, h.computePc());
-		shadowCheckHandlerTable(true, h, func, tag, handler);
-		if (handler.handler_pc < 0) return false; // not found
+		if (findHandlerEntry(true, tag) < 0) return false;
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
 		return true;
 	}
-	// TODO[rv]: remove after fully tested
-	private def shadowCheckHandlerTable(is_switch: bool, h: NativeFrameHandle, func: WasmFunction, tag: Tag, handler: ExHandler) {
-		if (handlers == null) return fatal("no handler table published on a stack inside a resume");
-		var tier = if(NativeFrameHandle.Spc.?(h), HandlerTier.SPC, HandlerTier.INTERPRETER);
-		if (handler_tier != tier) return fatal(Strings.format2("handler table published by tier %s for a tier %s frame", handler_tier.name, tier.name));
-		var decl = func.decl, sites = decl.handlers.resume_sites;
-		if (sites == null || sites[h.computePc()] != handlers) return fatal("published handler table is not the top frame's resume site");
-		if (h.instance() != func.instance) return fatal("frame instance differs from its function's instance");
-		var tags = h.instance().tags, hdr = ResumeSites.header(handlers);
+	// Finds the clause for {tag} in the published handler table directly.
+	private def findHandlerEntry(is_switch: bool, tag: Tag) -> int {
+		var hdr = ResumeSites.header(handlers);
 		var start = if(is_switch, hdr.switch_start_index, 0), end = if(is_switch, hdr.count, hdr.switch_start_index);
-		var found = -1;
 		for (i = start; i < end; i++) {
-			if (!StackTuning.disableTagChecks && tags[ResumeSites.entry(handlers, i).tag_index] != tag) continue;
-			found = i;
-			break;
+			if (StackTuning.disableTagChecks || handler_tags[ResumeSites.entry(handlers, i).tag_index] == tag) return i;
 		}
-		if ((found < 0) != (handler.handler_pc < 0)) return fatal("handler table and decoder disagree on finding a handler");
-		if (found < 0) return;
-		var e = ResumeSites.entry(handlers, found);
-		if (e.handler_pc != handler.handler_pc) return fatal("handler table has the wrong handler_pc");
-		if (e.stp_pos != handler.sidetable_pos) return fatal("handler table has the wrong sidetable_pos");
-		if (e.vsp_slots != handler.val_stack_top + decl.num_locals) return fatal("handler table has the wrong vsp_slots");
-		if (!is_switch && NativeFrameHandle.Spc.?(h)) {
-			var dest = decl.handlers.get_handler_dest(handler.index);
-			var stub = decl.target_code.spc_entry + X86_64MasmLabel.!(dest.stub_label).label.pos;
-			if (e.stub_addr != (stub - Pointer.NULL)) return fatal("handler table has the wrong stub_addr");
-		}
+		return -1;
 	}
 	private def findExHandler(ip: Pointer, code: RiUserCode, pos: StackFramePos, ex: Exception) -> bool {
 		var stack = pos.stack;
@@ -404,6 +377,7 @@ class NativeStack extends WasmStack {
 		func = null;
 		bound = null;
 		handlers = null;
+		handler_tags = null;
 		handler_tier = HandlerTier.NONE;
 		monitor_data = null;
 	}
