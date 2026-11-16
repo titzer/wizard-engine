@@ -16,8 +16,12 @@ component Target {
 
 	def newMemory = NativeWasmMemory.new;
 	def forceGC = RiGc.forceGC;
-	def newWasmStack = NativeStackManager.getFreshStack;
+	def newWasmStack = NativeStack.new; // gets a segment only when first materialized
 	def recycleWasmStack = NativeStackManager.recycleStack;
+	// Returns the stack that is running.
+	def curStack() -> WasmStack {
+		return X86_64Runtime.curStack;
+	}
 	def tagging = Tagging.new(!FeatureDisable.valueTags, !FeatureDisable.simd);
 
 	private var offsets: V3Offsets;
@@ -61,6 +65,7 @@ component Target {
 			}
 		}
 		f.target_code = TargetCode(addr);
+		X86_64Spc.fillHandlerStubAddrs(f);
 		Debug.afterCompile(f, u64.view(addr - Pointer.NULL));
 	}
 	// {addr} is patched into the dispatch table; {entry}, past the prologue's ip and curpc
@@ -193,10 +198,10 @@ component Target {
 	}
 	def redzones_add(mapping: Mapping, offset: u32, size: u32) -> bool {
 		for (i < REDZONE_RETRIES) {
-			if (RedZones.addRedZone(mapping, offset, size)) return true;
+			if (RedZones.addRedZoneInMapping(mapping, offset, size)) return true;
 			forceGC();
 		}
-		return RedZones.addRedZone(mapping, offset, size);
+		return RedZones.addRedZoneInMapping(mapping, offset, size);
 	}
 
 	// Stack compression: read the frames of a stack into an array of target independent frames representation.
@@ -227,9 +232,6 @@ type SpcResultForStub(wf: WasmFunction, entrypoint: Pointer, thrown: Throwable) 
 class TargetHandlerDest(is_dummy: bool) {
 	var stub_label: MasmLabel;
 	var dest_label: MasmLabel;
-
-	// Full signature of the stack at dest.
-	var dest_stack: Array<ValueType>;
 }
 
 class X86_64ExecutionStrategy extends ExecutionStrategy {
@@ -405,27 +407,15 @@ class X86_64SpcStrategy extends X86_64ExecutionStrategy {
 
 		var gen_before_us = System.ticksUs();
 		var module = wf.instance.module;
-		// A module that was never prepared for this target has no code region yet. This
-		// happens for the inner module of an environment, whose functions are created at
-		// runtime by {func.new}; allocate a region for it on demand.
-		if (module.target_module.spc_code == null) {
-			allocateCodeForModule(module, MINIMUM_CODE_SIZE + X86_64Spc.estimateCodeSizeFor(wf.decl));
-		}
-		var code = module.target_module.spc_code;
+		var code = ensureCodeForModule(module, wf.decl);
 		var compiler = newCompiler(module.filename, false, null); // XXX: cache per-thread
 		var masm = X86_64MacroAssembler.!(compiler.masm), w = masm.asm.w;
 
 		var success = compiler.gen(module, wf.decl, null);
 
 		// Check for remaining code space
-		var regionSize = code.mapping.range.size();
-		var remaining = regionSize - u64.!(code.codeEnd);
 		var codeSize = w.atEnd().pos;
-		if (codeSize > remaining) {
-			if (Trace.compiler) Trace.OUT.put3("exhausted code space for module (%d of %d bytes remaining, need %d)",
-				remaining, regionSize, codeSize).ln();
-			success = false;
-		}
+		if (!code.hasSpaceFor(codeSize)) success = false;
 
 		var entrypoint: Pointer;
 		if (success) {
@@ -496,8 +486,8 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 		var length = u64.view(w.atEnd().pos) + ballast;
 		var mapping = Mmap.reserve(length, Mmap.PROT_WRITE), range = mapping.range; // TODO: handle failure
 		var masm = X86_64MacroAssembler.!(compiler.masm);
-		masm.setTargetAddress(u64.view(range.start - Pointer.NULL));
-		Target.copyInto(mapping.range, 0, w);
+		def code = X86_64SpcModuleCode.new(mapping, false);
+		code.appendCode(masm);
 		// TODO: for security, move embedded references out of the code region and make it non-writable
 		Mmap.protect(range.start, u64.!(range.end - range.start), Mmap.PROT_WRITE | Mmap.PROT_READ | Mmap.PROT_EXEC);
 		for (i < bounds.length) {
@@ -512,17 +502,6 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 				X86_64Spc.setInterpreterFallback(f);
 			}
 		}
-		// XXX: reduce duplication with {X86_64SpcModuleCode.appendCode}.
-		var code = X86_64SpcModuleCode.new(mapping, false);
-		if (masm.source_locs != null) {
-			code.sourcePcs = Vector.new();
-			code.sourcePcs.putv(masm.source_locs);
-		}
-		if (masm.embeddedRefOffsets != null) {
-			if (code.embeddedRefOffsets == null) code.embeddedRefOffsets = Vector.new();
-			code.embeddedRefOffsets.putv(masm.embeddedRefOffsets);
-		}
-
 		module.target_module = TargetModule(code);
 		RiRuntime.registerUserCode(code);
 		module.target_module.spc_code.keepAlive();
@@ -587,16 +566,16 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 			return TargetOsrInfo(Pointer.NULL, null);
 		}
 		var label = compiler.genOsr(module, wf.decl, pc, null);
-		if (label == null) {
-			// OSR compile failed
+		var code = ensureCodeForModule(module, wf.decl);
+		var masm = X86_64MacroAssembler.!(compiler.masm);
+		var codeSize = masm.w.end();
+		if (label == null || !code.hasSpaceFor(codeSize)) {
+			// OSR compile failed or exhausted code space
 			wf.decl.tierup_trigger = int.max; // no point in trying for a while
 			if (wf.decl.func_index >= module.functions.length) Metrics.spc_new_time_us.updateDiff(u64.view(gen_before_us));
 			if (wf.decl.fast_call_idx >= 0) Metrics.spc_fast_time_us.updateDiff(u64.view(gen_before_us));
 			return TargetOsrInfo(Pointer.NULL, null);
 		}
-		var code = module.target_module.spc_code;
-		var masm = X86_64MacroAssembler.!(compiler.masm);
-		var codeSize = masm.w.end();
 		var entrypoint = code.appendCode(masm);
 		var offset = X86_64MasmLabel.!(label).label.pos;
 		if (Trace.compiler) Trace.OUT.put3("func[%d].osr_entry (+%d): break *0x%x", wf.decl.func_index, pc, (entrypoint + offset) - Pointer.NULL).ln();
@@ -633,6 +612,13 @@ def allocateCodeForModule(module: Module, codeSize: int) {
 		module.filename, (mapping.range.start - Pointer.NULL), (mapping.range.end - Pointer.NULL)).ln();
 }
 
+// Returns the code region for {module}, allocating one if necessary.
+def ensureCodeForModule(module: Module, func: FuncDecl) -> X86_64SpcModuleCode {
+	if (module.target_module.spc_code == null) {
+		allocateCodeForModule(module, MINIMUM_CODE_SIZE + X86_64Spc.estimateCodeSizeFor(func));
+	}
+	return module.target_module.spc_code;
+}
 def applyJitFilter(module: Module, func: FuncDecl, how: string) -> bool {
 	var filter = CompilerOptions.JIT_FILTER.get();
 	if (filter == null || filter.matches(module, func)) return true;
@@ -640,12 +626,10 @@ def applyJitFilter(module: Module, func: FuncDecl, how: string) -> bool {
 	return false;
 }
 
-def RDTSC_FUNC = X86_64PreGenFunc<void, u64>.new("rdtsc", null, genRdtsc);
-
-def genRdtsc(ic: X86_64InterpreterCode, w: DataWriter) {
+def RDTSC_FUNC = X86_64PreGenFunc<void, u64>.new("rdtsc", null, fun (ic: X86_64InterpreterCode, w: DataWriter) {
 	def asm = X86_64Assemblers.create64(w);
 	asm.rdtsc();
 	asm.q.shl_r_i(X86_64Regs.RDX, 32);
 	asm.q.or_r_r(X86_64Regs.RAX, X86_64Regs.RDX); // XXX: use V3 return register symbolic constant
 	asm.ret();
-}
+});

@@ -20,7 +20,12 @@ TESTS="$@"
 
 function run_tests() {
 	if [ "$TESTS" =  "" ]; then
-		for dir in core gen fastcall; do
+		DIRS="core gen fastcall"
+		# Tests with very many stacks are too slow on interpreted targets.
+		if [ "$TEST_TARGET" != "v3i" ]; then
+		    DIRS="$DIRS stacks"
+		fi
+		for dir in $DIRS; do
 		    TESTS=$(ls test/regress/$dir/*.bin.wast)
 		    FLAGS=
 		    if [ -e test/regress/$dir/flags ]; then
@@ -40,6 +45,12 @@ function run_tests() {
 		$CMD $arg $TESTS
 	fi
 	done
+
+	# Run the stack-switching tests again with few native stacks, forcing stack compression.
+	if [ "$TEST_TARGET" = "x86-64-linux" ]; then
+		TESTS=$(ls test/regress/ext:stack-switching/*.bin.wast)
+		$CMD --expected=$WIZENG_LOC/test/regress/stacks/compression.failures --ext:all --max-stacks=16 --stack-compression $TESTS
+	fi
 	else
 		$CMD $TESTS
 	fi

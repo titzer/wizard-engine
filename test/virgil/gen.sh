@@ -18,13 +18,20 @@ for D in $TEST_DIRS; do
     cp $VIRGIL_LOC/test/$D/*.v3 src/
 done
 
-CMD="v3c -target=wasm-test -output=bin/ -multiple src/*.v3"
+# Compile the tests for Wasm (into bin/) and for Wasm GC (into bin-gc/).
+function compile() {
+    local name=$1 target=$2 dir=$3
+    CMD="v3c -target=$target -output=$dir/ -multiple src/*.v3"
 
-printf "Compiling ${CYAN}virgil${NORM} tests: "
+    printf "Compiling ${CYAN}%-10s${NORM} tests: " $name
 
-LOG=$T/gen.sh.log
-if [ $PROGRESS_PIPE = 1 ]; then
-    $CMD | tee $LOG | $PROGRESS
-else
-    $CMD | tee $LOG
-fi
+    LOG=$T/gen.sh.$name.log
+    if [ $PROGRESS_PIPE = 1 ]; then
+        $CMD | tee $LOG | $PROGRESS
+    else
+        $CMD | tee $LOG
+    fi
+}
+
+compile virgil wasm-test bin
+compile virgil-gc wasm-gc-test bin-gc

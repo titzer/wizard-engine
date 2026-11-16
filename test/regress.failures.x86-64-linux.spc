@@ -9,6 +9,7 @@ test/regress/ext:threads/atomic_load_i64.bin.wast
 test/regress/ext:threads/atomic_notify0.bin.wast
 test/regress/ext:threads/atomic_or_i32.bin.wast
 test/regress/ext:threads/atomic_or_i64.bin.wast
+test/regress/ext:threads/atomic_or_i64_mem0.bin.wast
 test/regress/ext:threads/atomic_store_i32.bin.wast
 test/regress/ext:threads/atomic_store_i64.bin.wast
 test/regress/ext:threads/atomic_sub_i32.bin.wast
@@ -25,12 +26,3 @@ test/regress/ext:legacy-eh/try_delegate1.bin.wast
 test/regress/ext:legacy-eh/try_delegate3.bin.wast
 test/regress/ext:legacy-eh/try_delegate4.bin.wast
 test/regress/ext:legacy-eh/try_delegate5.bin.wast
-
-test/regress/ext:jit-interface/func_new0.bin.wast
-test/regress/ext:jit-interface/func_new_args.bin.wast
-test/regress/ext:jit-interface/func_new_invalid_env.bin.wast
-test/regress/ext:jit-interface/func_new_scope_func.bin.wast
-test/regress/ext:jit-interface/func_new_scope_global.bin.wast
-test/regress/ext:jit-interface/func_new_scope_memory.bin.wast
-test/regress/ext:jit-interface/func_new_trap_invalid.bin.wast
-test/regress/ext:jit-interface/func_new_trap_oob.bin.wast

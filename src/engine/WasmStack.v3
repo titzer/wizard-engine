@@ -51,43 +51,53 @@ class ExecStack extends Object {
 	}
 }
 
-// A suspendable stack that can be used to instantiate a continuation.
-class VersionedStack extends ExecStack {
-	var version: u64;
-}
+// A record that a monitor ties to a {WasmStack}.
+class StackMonitorData { }
 
 // A stack on which Wasm code can be executed, storing both values and execution frames.
-class WasmStack extends VersionedStack {
+class WasmStack extends ExecStack {
+	var version: u64;
 	var parent: WasmStack;
-
-	// ext:stack-switching
-	// Denotes the bottom stack of a suspended continuation (with {this} as the top stack).
-	// Should be set when {state() == SUSPENDED}, and {null} otherwise.
-	var cont_bottom: WasmStack;
+	var bottom: WasmStack;
+	var monitor_data: StackMonitorData; // set by a monitor to tie its own record to this stack
 
 	// Gets the state of this stack.
 	def state() -> StackState;
+	// Gets the function that this stack was reset to run.
+	def startFunc() -> Function;
+	// Gets the number of bytes of values and frames on this stack, as of its last saved stack pointers.
+	def usedBytes() -> u64;
 	// Requires {state == EMPTY}.
 	// Resets this stack to be {SUSPENDED}, awaiting arguments for {func}.
 	def reset(func: Function) -> this;
-	// Requires {state == SUSPENDED}.
-	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
-	// when enough arguments are pushed.
+	// Requires {state == SUSPENDED} or {state == COMPRESSED}.
+	// Pushes {args} incrementally onto the value stack.
 	def bind(args: Range<Value>) -> this;
-	// Requires {state == RESUMABLE}.
+	// Requires {state == SUSPENDED}.
 	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
 	// or suspends itself.
 	def resume() -> Result;
-	// Gets a {FrameLoc} for the top of the stack.
-	def where() -> FrameLoc;
-	// Gets the caller of a given {FrameLoc}.
-	def caller(loc: FrameLoc) -> FrameLoc;
 	// Clears this stack, forcibly removing all its frames.
 	def clear() -> this;
-	// Tries to handle a suspension and return the {ExHandler} representing the handler, or a
-	// dummy one with {handler_pc == -1} if not found.
-	def tryHandleSuspension(tag: Tag) -> ExHandler;
-	def tryHandleSwitch(tag: Tag) -> ExHandler;
+	// Tries to handle a suspension, transferring to the handler and returning {true} if successful.
+	def tryHandleSuspension(tag: Tag) -> bool;
+	// Tries to handle a switch, transferring to the handler and returning {true} if successful.
+	def tryHandleSwitch(tag: Tag) -> bool;
+	// Unwind to a parent stack if {tryHandle} finds a handler for {tag}.
+	def unwindChain(tag: Tag, tryHandle: (WasmStack, Tag) -> bool) -> Continuation {
+		var prev = this; // stack == <top of stack chain>
+		while (prev.parent != null) {
+			var parent = prev.parent;
+			if (tryHandle(parent, tag)) {
+				this.bottom = prev;
+				return Continuations.makeContinuation(this);
+			} else {
+				if (Trace.stack) Trace.OUT.puts("  handler not found").ln();
+			}
+			prev = parent;
+		}
+		return Continuations.NULL;
+	}
 }
 
 // States in which a {WasmStack} can be.
@@ -95,10 +105,8 @@ enum StackState {
 	EMPTY,			// contains no frames
 	SUSPENDED,		// contains one or more frames, waiting for inputs
 	CALL_CHILD,		// waiting for child stack to return
-	RESUMABLE,		// all inputs set; can be resumed
 	RUNNING,		// currently running Wasm or host code
-	RETURNING,		// used internally
-	THROWING,		// used internally
+	COMPRESSED,		// suspended, with its frames held in the heap
 }
 
 // Provides access to the state of an executing frame.

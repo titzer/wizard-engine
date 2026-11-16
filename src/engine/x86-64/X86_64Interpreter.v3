@@ -137,6 +137,7 @@ class X86_64InterpreterCode extends RiUserCode {
 			}
 			SIGBUS, SIGSEGV => {
 				var addr = RiOs.getAccessAddress(siginfo, ucontext);
+				NativeStackManager.checkGuardPageFault(addr, ip);
 				if (RedZones.isInRedZone(addr)) {
 					def RETADDR_SIZE = Pointer.SIZE;
 					var handler_ip = X86_64Runtime.curStack.handleOverflow(ip, sp + NativeInterpreterFrame.size + RETADDR_SIZE);
@@ -2512,15 +2513,13 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		}
 		bindHandler(Opcode.RESUME); {
 			var cont_id = xenv.tmp0;
-			computeCurIpForTrap(-1);
-			computePcFromCurIp();
-			saveCallerIVars();
+			saveResumeIVars();
+			genMaterializeTopCont();
 			genReadUleb32(G(cont_id)); // read signature index
 
-			var cont = xenv.xmm0; // (stack, version) in low/high 8 bytes
 			var contStack = xenv.tmp1;
-			genPopCont(cont);
-			masm.emit_validate_and_consume_cont(contStack, cont);
+			decrementVsp();
+			masm.emit_validate_and_consume_cont(contStack, MasmAddr(xenv.vsp, valuerep.tag_size));
 
 			// move parameter values from %curStack to %cont.top
 			var r_nvals = cont_id; // reuse due to non-overlapping live ranges
@@ -2531,36 +2530,17 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			masm.emit_v3_Array_length_r_r(r_nvals, xenv.scratch);
 			masm.emit_cont_mv(xenv.vsp, contStack, r_nvals, xenv.tmp3, xenv.tmp4, xenv.xmm0);
 
-			// chain {cont to {curStack}, then set {m_curStack} to {cont.top}.
-			var curStack = xenv.tmp4;
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_NativeStack_rsp_r_r(curStack);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(false);
-			endHandler();
-			// switch to child stack
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(xenv.tmp4, contStack, false);
 		}
 		bindHandler(Opcode.RESUME_THROW); {
 			var tag_id = xenv.tmp0;
-			computeCurIpForTrap(-1);
-			computePcFromCurIp();
-			saveCallerIVars();
+			saveResumeIVars();
 			genSkipLeb(); // skip signature index
 			genReadUleb32(G(tag_id)); // read tag index
 
-			var cont = xenv.xmm0; // (stack, version) in low/high 8 bytes
 			var contStack = xenv.tmp1;
-			genPopCont(cont);
-			masm.emit_validate_and_consume_cont(contStack, cont);
+			decrementVsp();
+			masm.emit_validate_and_consume_cont(contStack, MasmAddr(xenv.vsp, valuerep.tag_size));
 
 			var curStack = xenv.tmp4;
 			masm.emit_get_curstack(curStack);
@@ -2570,38 +2550,20 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			);
 			restoreCallerIVars();
 			/* === only reachable when continuation handles the error === */
-			genPopCont(cont); // XXX: make RT function return {Continuation} directly
-			// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
-			masm.emit_ref_from_ref_u64(contStack, cont);
+			decrementVsp(); // XXX: make RT function return {Continuation} directly
+			masm.emit_load_cont_stack(contStack, MasmAddr(xenv.vsp, valuerep.tag_size));
 
-			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_NativeStack_rsp_r_r(curStack);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(true);
-			endHandler();
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(curStack, contStack, true);
 		}
 		bindHandler(Opcode.RESUME_THROW_REF); {
-			computeCurIpForTrap(-1);
-			computePcFromCurIp();
-			saveCallerIVars();
+			saveResumeIVars();
 			genSkipLeb(); // skip signature index
 
-			var cont = xenv.xmm0; // (stack, version) in low/high 8 bytes
 			var ex = xenv.tmp0;
 			var contStack = xenv.tmp1;
-			genPopCont(cont);
+			decrementVsp();
+			masm.emit_validate_and_consume_cont(contStack, MasmAddr(xenv.vsp, valuerep.tag_size));
 			genPopInto(G(ex));
-			masm.emit_validate_and_consume_cont(contStack, cont);
 
 			var curStack = xenv.tmp4;
 			masm.emit_get_curstack(curStack);
@@ -2611,25 +2573,10 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			);
 			restoreCallerIVars();
 			/* === only reachable when continuation handles the error === */
-			genPopCont(cont); // XXX: make RT function return {Continuation} directly
-			// extract {cont.stack} (the low 8 bytes of the XMM register) into contStack.
-			masm.emit_ref_from_ref_u64(contStack, cont);
+			decrementVsp(); // XXX: make RT function return {Continuation} directly
+			masm.emit_load_cont_stack(contStack, MasmAddr(xenv.vsp, valuerep.tag_size));
 
-			// chain {cont} to {curStack}, then set {m_curStack} to {cont.top}.
-			masm.emit_get_curstack(curStack);
-			masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
-			masm.emit_v3_set_NativeStack_rsp_r_r(curStack, xenv.sp);
-			// reserve space for call addr
-			masm.emit_push_NativeStack_rsp_r_r(curStack);
-			masm.emit_chain_cont_to_parent(curStack, contStack);
-
-			var stub_resume = X86_64Label.new();
-			asm.call_rel_far(stub_resume);
-			/* === CHILD STACK RETURNS HERE === */
-			genOnResumeFinish(false);
-			endHandler();
-			asm.bind(stub_resume);
-			masm.emit_switch_to_stack(contStack);
+			genResumeChain(curStack, contStack, false);
 		}
 		bindHandler(Opcode.SUSPEND); {
 			var tag_index = r_tmp0;
@@ -2688,11 +2635,12 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			endHandler();
 
 			asm.bind(switchStub); {
+				// Switch to the target stack and return to its resume address. The top of the
+				// target is not necessarily an interpreter frame (e.g. a function entry), so
+				// interpreter state is not restored here; each resume point restores its own.
 				masm.emit_get_curstack(xenv.scratch);
 				masm.emit_v3_NativeStack_rsp_r_r(xenv.sp, xenv.scratch);
 				masm.emit_v3_NativeStack_vsp_r_r(xenv.vsp, xenv.scratch);
-				restoreCallerIVars();
-				restoreDispatchTableReg();
 				masm.emit_pop_r(ValueKind.REF, xenv.scratch);
 				masm.emit_jump_r(xenv.scratch);
 			}
@@ -2985,9 +2933,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// generate code for runtime calls with 1 LEB that cannot trap.
 		for (t in [
 			(Opcode.MEMORY_GROW, refRuntimeCall(RT.MEMORY_GROW)),
-			(Opcode.TABLE_GROW, refRuntimeCall(RT.TABLE_GROW)),
-			(Opcode.STRUCT_NEW, refRuntimeCall(RT.STRUCT_NEW)),
-			(Opcode.STRUCT_NEW_DEFAULT, refRuntimeCall(RT.STRUCT_NEW_DEFAULT))
+			(Opcode.TABLE_GROW, refRuntimeCall(RT.TABLE_GROW))
 		]) {
 			bindHandler(t.0);
 			genReadUleb32(r_tmp0);
@@ -3004,6 +2950,8 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 			(Opcode.TABLE_SET, refRuntimeCall(RT.TABLE_SET)),
 			(Opcode.MEMORY_FILL, refRuntimeCall(RT.MEMORY_FILL)),
 			(Opcode.TABLE_FILL, refRuntimeCall(RT.TABLE_FILL)),
+			(Opcode.STRUCT_NEW, refRuntimeCall(RT.STRUCT_NEW)),
+			(Opcode.STRUCT_NEW_DEFAULT, refRuntimeCall(RT.STRUCT_NEW_DEFAULT)),
 			(Opcode.ARRAY_NEW, refRuntimeCall(RT.ARRAY_NEW)),
 			(Opcode.ARRAY_NEW_DEFAULT, refRuntimeCall(RT.ARRAY_NEW_DEFAULT)),
 			(Opcode.ARRAY_GET, refRuntimeCall(RT.ARRAY_GET)),
@@ -3206,10 +3154,11 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		asm_mov_m_r: (X86_64Addr, X86_64Gpr) -> T) {
 		bindHandler(opcode);
 		def data: X86_64Addr = vsph[-1].value;
-		def idx: X86_64Gpr = r_tmp0;
-		def val: X86_64Gpr = r_tmp1;
-		def mem_addr = decode_memarg(vsph[-2].value, idx, val);
-		load_imm8(idx);
+		def val: X86_64Gpr = r_tmp0;
+		def addr: X86_64Gpr = r_tmp1;
+		def idx: X86_64Gpr = r_tmp2;
+		def mem_addr = decode_memarg(vsph[-2].value, addr, val); // should load memarg first per the bytecode order
+		load_imm8(idx); // then load imm, without clobbering the address
 		asm.q.lea(val, data); // load address of the vector, val as a temp variable
 		asm_mov_r_m(val, X86_64Addr.new(val, idx, size, 0)); // extract the lane from the value stack
 		asm_mov_m_r(mem_addr, val);
@@ -3343,7 +3292,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdUnop_x_r(Opcode.I8X16_BITMASK, asm.pmovmskb_r_s);
 		genSimdUnop_x_r(Opcode.I32X4_BITMASK, asm.movmskps_r_s);
 		genSimdUnop_x_r(Opcode.I64X2_BITMASK, asm.movmskpd_r_s);
-		genSimdUnop_x_r(Opcode.I16X8_BITMASK, masm.emit_i16x8_bitmask);
+		genSimdUnop_xxtmp_r(Opcode.I16X8_BITMASK, masm.emit_i16x8_bitmask);
 
 		// V128 shifts
 		for (t in [
@@ -3388,7 +3337,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.I8X16_MAX_U, asm.pmaxub_s_s);
 		genSimdBinop(Opcode.I8X16_AVGR_U, asm.pavgb_s_s);
 		genSimdBinop(Opcode.I8X16_EQ, asm.pcmpeqb_s_s);
-		genSimdBinop(Opcode.I8X16_NE, masm.emit_i8x16_ne);
+		genSimdBinop(Opcode.I8X16_NE, masm.emit_i8x16_ne(_, _, r_xmm2));
 		genSimdBinop(Opcode.I8X16_ADD_SAT_S, asm.paddsb_s_s);
 		genSimdBinop(Opcode.I8X16_ADD_SAT_U, asm.paddusb_s_s);
 		genSimdBinop(Opcode.I8X16_SUB_SAT_S, asm.psubsb_s_s);
@@ -3412,7 +3361,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.I16X8_MAX_U, asm.pmaxuw_s_s);
 		genSimdBinop(Opcode.I16X8_AVGR_U, asm.pavgw_s_s);
 		genSimdBinop(Opcode.I16X8_EQ, asm.pcmpeqw_s_s);
-		genSimdBinop(Opcode.I16X8_NE, masm.emit_i16x8_ne);
+		genSimdBinop(Opcode.I16X8_NE, masm.emit_i16x8_ne(_, _, r_xmm2));
 		genSimdBinop(Opcode.I16X8_ADD_SAT_S, asm.paddsw_s_s);
 		genSimdBinop(Opcode.I16X8_ADD_SAT_U, asm.paddusw_s_s);
 		genSimdBinop(Opcode.I16X8_SUB_SAT_S, asm.psubsw_s_s);
@@ -3439,7 +3388,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.I32X4_MAX_S, asm.pmaxsd_s_s);
 		genSimdBinop(Opcode.I32X4_MAX_U, asm.pmaxud_s_s);
 		genSimdBinop(Opcode.I32X4_EQ, asm.pcmpeqd_s_s);
-		genSimdBinop(Opcode.I32X4_NE, masm.emit_i32x4_ne);
+		genSimdBinop(Opcode.I32X4_NE, masm.emit_i32x4_ne(_, _, r_xmm2));
 		genSimdBinop(Opcode.I32X4_EXTMUL_LOW_I16X8_S, masm.emit_i32x4_extmul(_, _, r_xmm2, true, true));
 		genSimdBinop(Opcode.I32X4_EXTMUL_LOW_I16X8_U, masm.emit_i32x4_extmul(_, _, r_xmm2, true, false));
 		genSimdBinop(Opcode.I32X4_EXTMUL_HIGH_I16X8_S, masm.emit_i32x4_extmul(_, _, r_xmm2, false, true));
@@ -3456,7 +3405,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		genSimdBinop(Opcode.I64X2_SUB, asm.psubq_s_s);
 		genSimdBinop(Opcode.I64X2_MUL, masm.emit_i64x2_mul(_, _, r_xmm2, r_xmm3));
 		genSimdBinop(Opcode.I64X2_EQ, asm.pcmpeqq_s_s);
-		genSimdBinop(Opcode.I64X2_NE, masm.emit_i64x2_ne);
+		genSimdBinop(Opcode.I64X2_NE, masm.emit_i64x2_ne(_, _, r_xmm2));
 		genSimdBinop(Opcode.I64X2_EXTMUL_LOW_I32X4_S, masm.emit_i64x2_extmul(_, _, r_xmm2, true, true));
 		genSimdBinop(Opcode.I64X2_EXTMUL_LOW_I32X4_U, masm.emit_i64x2_extmul(_, _, r_xmm2, true, false));
 		genSimdBinop(Opcode.I64X2_EXTMUL_HIGH_I32X4_S, masm.emit_i64x2_extmul(_, _, r_xmm2, false, true));
@@ -4214,6 +4163,50 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 	def computePcFromCurIp() {
 		if (!FeatureDisable.stacktraces) asm.q.sub_r_m(r_curpc, m_code);
 	}
+	def saveResumeIVars() {
+		masm.emit_compute_pc(-1);
+		saveCallerIVars();
+		if (FeatureDisable.stacktraces) masm.emit_save_ivar(xenv.curpc);
+	}
+	// Loads the handler table of the resume at the frame's saved pc into {r_tmp}.
+	def genLoadHandlerTable(r_tmp: Reg) {
+		var t = G(r_tmp);
+		masm.emit_restore_ivar(xenv.curpc); // runtime calls clobber {r_curpc}
+		asm.movq_r_m(t, r_func_decl.plus(offsets.FuncDecl_handlers));
+		asm.movq_r_m(t, t.plus(offsets.FuncHandlerInfo_resume_sites));
+		masm.emit_v3_Array_elem_r_rr(ValueKind.REF, r_tmp, r_tmp, xenv.curpc);
+	}
+	private def genMaterializeTopCont() {
+		var done = X86_64Label.new();
+		asm.movq_r_m(r_tmp1, vsph[-1].value);		// %tmp1 = cont.stack
+		asm.q.cmp_r_i(r_tmp1, 0);
+		asm.jc_rel_far(X86_64Conds.Z, done);		// null continuation traps later
+		asm.q.cmp_m_i(r_tmp1.plus(offsets.NativeStack_range), 0);
+		asm.jc_rel_far(X86_64Conds.NZ, done);		// already has a segment
+		masm.emit_get_curstack(xenv.tmp1);
+		callRuntime(refRuntimeCall(X86_64RT.runtime_MATERIALIZE_CONT), [r_tmp1], true);
+		restoreCallerIVars();
+		asm.bind(done);
+	}
+	// Parks the current stack, publishes the handler table, chains {contStack} under it and switches.
+	def genResumeChain(curStack: Reg, contStack: Reg, skip_tag: bool) {
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_NativeStack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_reserve_return_slot(curStack);
+		genLoadHandlerTable(xenv.tmp0);
+		masm.emit_chain_cont_to_parent(curStack, contStack, xenv.tmp0, HandlerTier.INTERPRETER);
+		var stub_resume = X86_64Label.new();
+		asm.call_rel_far(stub_resume);
+		/* === CHILD STACK RETURNS HERE === */
+		genOnResumeFinish(skip_tag);
+		endHandler();
+		// Stub: make the continuation current, switch to its rsp and jump to its resume address.
+		asm.bind(stub_resume);
+		masm.emit_set_curstack(contStack);
+		masm.emit_v3_NativeStack_rsp_r_r(xenv.sp, contStack);
+		masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+		masm.emit_jump_r(xenv.scratch);
+	}
 	// All traps are generated out-of-line and call into the runtime.
 	def genTraps() {
 		w.atEnd();
@@ -4282,15 +4275,6 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		decrementVsp();
 		asm.movq_r_m(reg, vsph[0].value);
 	}
-	// Pops a continuation value from the value stack into the XMM register {reg},
-	// which receives the 16-byte (stack, version) pair.
-	private def genPopCont(reg: Reg) {
-		decrementVsp();
-		asm.movq_r_m(r_scratch, vsph[0].value);
-		asm.pinsrq_s_r_i(X(reg), r_scratch, 0);
-		asm.movd_r_m(r_scratch, vsph[0].value.plus(8));
-		asm.pinsrq_s_r_i(X(reg), r_scratch, 1);
-	}
 	// Given {idx} containing a heap-type SLEB value (negative = abstract heap-type code,
 	// non-negative = index into instance.heaptypes), emits code that jumps to {is_cont_label}
 	// if the encoded type is a continuation, and falls through otherwise.
@@ -4353,7 +4337,7 @@ class X86_64InterpreterGen(ic: X86_64InterpreterCode, w: DataWriter) {
 		// adjust sidetable
 		asm.q.add_r_i(r_stp, Sidetable_ResumeEntry.size);
 		// calculate length of handler entries in sidetable
-		asm.q.imul_r_i(handler_length, Sidetable_SuspendHandlerEntry.size);
+		asm.q.imul_r_i(handler_length, Sidetable_CatchEntry.size);
 		asm.q.add_r_r(r_stp, handler_length);
 	}
 }

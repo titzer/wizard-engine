@@ -33,10 +33,12 @@ cd $HERE
 
 # Mirrors the source set that build.sh uses for the v3i target, plus BinBuilder, which is
 # reused from the unit tests to encode sections and patch their LEB sizes.
-exec $V3I -fun-exprs -simple-bodies \
+exec $V3I -lang:fun-exprs -lang:simple-bodies -lang:descriptors \
     $VIRGIL_LIB_UTIL/*.v3 \
     $WIZENG_LOC/src/engine/*.v3 \
     $WIZENG_LOC/src/engine/compression/*.v3 \
+    $WIZENG_LOC/src/engine/objmodel/*.v3 \
+    $WIZENG_LOC/src/engine/objmodel/boxed/*.v3 \
     $WIZENG_LOC/src/engine/v3/*.v3 \
     $WIZENG_LOC/src/util/*.v3 \
     $WIZENG_LOC/test/unittest/BinBuilder.v3 \

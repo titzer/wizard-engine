@@ -1,0 +1,43 @@
+;; INNER_CALIBRATION = 1000
+;; Dispatches on the type of a value with a chain of br_on_cast, as in a type switch.
+(module
+  (type $A (sub (struct (field i32))))
+  (type $B (sub $A (struct (field i32) (field i32))))
+  (type $C (sub $A (struct (field i32) (field i64))))
+  (type $D (sub $A (struct (field i32) (field f64))))
+  (func $main (export "main")
+    (local $y i32)
+
+    (local.set $y (i32.const 1 (;$REPEAT;)))
+    (loop $l
+      (drop (call $dispatch (struct.new_default $D) (i32.const 1 (;$INNER_ITERATIONS;))))
+      (local.tee $y (i32.sub (local.get $y) (i32.const 1)))
+      (br_if $l)
+    )
+  )
+  (func $dispatch (param $x anyref) (param $n i32) (result i32)
+    (local $sum i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (local.get $n)))
+        (local.set $sum (i32.add (local.get $sum)
+          (block $out (result i32)
+            (drop (block $isD (result (ref $D))
+              (drop (block $isC (result (ref $C))
+                (drop (block $isB (result (ref $B))
+                  (local.get $x)
+                  (br_on_cast $isB anyref (ref $B))
+                  (br_on_cast $isC anyref (ref $C))
+                  (br_on_cast $isD anyref (ref $D))
+                  (drop)
+                  (br $out (i32.const 0))))
+                (br $out (i32.const 1))))
+              (br $out (i32.const 2))))
+            (i32.const 3))))
+        (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+        (br $l)
+      )
+    )
+    (local.get $sum)
+  )
+)

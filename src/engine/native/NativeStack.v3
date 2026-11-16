@@ -6,46 +6,60 @@
 // See diagram at the end of the file for mapping layout.
 class NativeStack extends WasmStack {
 	def valuerep = Target.tagging;
-	def size: u32;
-	var mapping: Mapping;
+	var range: NativeStackSegment;
 	var vsp: Pointer;
 	var rsp: Pointer;
 	var func: Function; // TODO: move into "enter-func-stub"
 	var parent_rsp_ptr: Pointer;
-	var params_arity = -1;
 	var return_results: Array<ValueType>;
-	var state_: StackState;
+	var state_: StackState = StackState.EMPTY;
+	var flags: byte;		// clock flags as defined in {NativeStackManager}
+	var compressed: CompressedStack;	// frames while {COMPRESSED}
+	// XXX: merge into compressed?
+	var saved_parent_rsp: Pointer; // contents of the parent rsp slot while {COMPRESSED}
+	var bound: Array<Value>;	// arguments bound while without a segment
+
+	// Handler table (for inline suspend/switch).
+	var handlers: Array<byte>;
+	var handler_tier: HandlerTier;
 	var next_stack: NativeStack;
 
-	new(size) {
-		mapping = Target.mmap_reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
-		if (mapping == null) fatal("out of memory allocating value stack");
-		// insert redzone roughly in the middle of the mapping.
-		def PAGE_SIZE = 4096u;
-		var redzone_start = (size >> 1) & ~(PAGE_SIZE - 1u);
-		if (!Target.redzones_add(mapping, redzone_start, PAGE_SIZE)) {
-			fatal("could not protect value stack red zone");
-		}
-		clear();
+	new() {
 		if (valuerep.tagged) RiGc.registerScanner(this, NativeStack.scan);
-		if (Trace.stack && Debug.stack) Trace.OUT.put2("newStack start=0x%x, end=0x%x", mapping.range.start - Pointer.NULL, mapping.range.end - Pointer.NULL).ln();
+		bottom = this;
 	}
 	// Gets the state of this stack.
 	def state() -> StackState {
 		return state_;
 	}
+	// Gets the function that this stack was reset to run.
+	def startFunc() -> Function {
+		return func;
+	}
+	// Gets the number of bytes of values and frames on this stack, as of its last saved stack pointers.
+	def usedBytes() -> u64 {
+		def values = vsp - range.start;
+		def frames = range.end - (rsp + Pointer.SIZE);
+		return u64.view(values + frames);
+	}
 	// Requires {state == EMPTY}.
 	def reset0(func: Function, remaining_params: int) -> this {
 		checkState("reset()", StackState.EMPTY);
 		this.func = func;
-		params_arity = remaining_params;
 		return_results = func.sig.results;
-		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
+		state_ = StackState.SUSPENDED;
 		parent_rsp_ptr = pushRspPointer(Pointer.NULL); // placeholder for parent pointer
 		pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
 	}
-	// Requires {state == EMPTY}.
+	// Requires {state == EMPTY}
 	def reset(func: Function) -> this {
+		if (range == null) {
+			checkState("reset()", StackState.EMPTY);
+			this.func = func;
+			return_results = func.sig.results;
+			state_ = StackState.SUSPENDED;
+			return;
+		}
 		reset0(func, func.sig.params.length);
 		pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
 	}
@@ -53,36 +67,54 @@ class NativeStack extends WasmStack {
 	def resetForFrameWrites(func: Function) -> this {
 		reset0(func, 0);
 	}
-	// Requires {state == SUSPENDED}.
-	// Pushes {args} incrementally onto the value stack and transitions to {state == RESUMABLE}
-	// when enough arguments are pushed.
+	// Requires {state == SUSPENDED} or {state == COMPRESSED}.
 	def bind(args: Range<Value>) -> this {
 		if (args.length == 0) return;
-		checkState("bind()", StackState.SUSPENDED);
-		if (params_arity < args.length) fatal(Strings.format2("bind() expected %d arguments, got %d", params_arity, args.length));
-		for (v in args) push(v);
-		params_arity -= args.length;
-		if (params_arity == 0) state_ = StackState.RESUMABLE;
+		if (state_ != StackState.SUSPENDED && state_ != StackState.COMPRESSED) {
+			fatal(Strings.format1("bind() requires state == SUSPENDED or COMPRESSED, got %s", state_.name));
+		}
+		if (range != null) {
+			for (v in args) push(v);
+		} else {
+			var vals = Ranges.dup(args);
+			bound = if(bound == null, vals, Arrays.concat(bound, vals));
+		}
 	}
-	// Requires {state == RESUMABLE}.
+	// Assign segment to this stack. Idempotent when already assigned.
+	def materialize() -> bool {
+		if (range != null) return true;
+		if (state_ == StackState.COMPRESSED) {
+			if (!NativeStackCompression.decompress(this)) return false;
+		} else if (state_ == StackState.SUSPENDED) {
+			if (!NativeStackManager.attachSegment(this)) return false;
+			parent_rsp_ptr = pushRspPointer(Pointer.NULL); // placeholder for parent pointer
+			pushRspPointer(STACK_RETURN_PARENT_STUB.getEntry() + NOP_ENTRY);
+			pushRspPointer(STACK_ENTER_FUNC_STUB.getEntry() + NOP_ENTRY);
+		} else {
+			return true;
+		}
+		if (bound != null) for (v in bound) push(v);
+		bound = null;
+		return true;
+	}
+	// Requires {state == SUSPENDED}.
 	// Resumes running the Wasm or host code in this stack until that code either returns, throws,
 	// or suspends itself.
 	def resume() -> Result {
-		checkState("resume()", StackState.RESUMABLE);
+		if (!materialize()) return Result.Throw(Trap.new(TrapReason.OUT_OF_STACKS, null, null));
+		checkState("resume()", StackState.SUSPENDED);
 		if (Trace.stack) traceFrames("stack.resume", rsp + RETADDR_SIZE);
-		var bottom = this;
-		while (bottom.parent != null) bottom = NativeStack.!(bottom.parent); // find bottom of this stack
+		var bottom = NativeStack.!(this.bottom);
 		state_ = StackState.RUNNING;
+		flags = NativeStackManager.REFERENCED;
 		var thrown = V3_STACK_RESUME_FUNC.get()(this, bottom);
 		if (thrown != null) return Result.Throw(thrown);
-		var r = popResult(return_results);
+		var rt = return_results;
+		var r = Array<Value>.new(rt.length);
+		for (i = r.length - 1; i >= 0; i--) r[i] = pop(rt[i]);
 		clear();
-		return r;
+		return Result.Value(r);
 	}
-	// Gets a {FrameLoc} for the top of the stack.
-	def where() -> FrameLoc;
-	// Gets the caller of a given {FrameLoc}.
-	def caller(loc: FrameLoc) -> FrameLoc;
 	// "Throw" a trap on this stack.
 	def trap(reason: TrapReason) -> Throwable {
 		var thrown = throw(Trap.new(reason, null, null));
@@ -97,6 +129,7 @@ class NativeStack extends WasmStack {
 			var ex = Exception.!(thrown);
 			var result = walk(findExHandler, ex, prev_srp, true);
 			var pos = result.1;
+			clearCrossedHandlers(pos.stack);
 			var new_srp = pos.frame.srp();
 			if (Trace.stack) {
 				if (result.0) Trace.OUT.put1("walk found handler at frame[sfp=0x%x]", pos.frame.sfp - Pointer.NULL).ln();
@@ -110,8 +143,9 @@ class NativeStack extends WasmStack {
 		var trace = if (gatherTrace, Vector<(WasmFunction, int)>.new());
 		var result = walk(if(gatherTrace, addFrameToTrace), trace, prev_srp, true);
 		var new_srp = result.1.frame.srp();
+		clearCrossedHandlers(result.1.stack);
 		// Unwind this stack to the return parent stub and overwrite the caller's return IP.
-		this.vsp = mapping.range.start; // clear value stack
+		this.vsp = range.start; // clear value stack
 		if (new_srp != prev_srp) unwind(prev_srp, new_srp);
 
 		// Append the (reversed) stacktrace to the throwable.
@@ -127,12 +161,14 @@ class NativeStack extends WasmStack {
 		var srp = start_srp;
 
 		var tableWidth = 0;
-		if (Trace.stack) {
+		// Tracing allocates, so is disabled during GC.
+		var trace = Trace.stack && !RiGc.inGC();
+		if (trace) {
 			Trace.OUT.puts("Stack walk trace:").ln();
 			tableWidth = walkTraceTable.putTableHeader(Trace.OUT);
 		}
 		// Walk the execution frames from the highest RSP address to the lowest.
-		while (srp < stack.mapping.range.end) {
+		while (srp < stack.range.end) {
 			var retip = srp.load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			var sfp = srp + RETADDR_SIZE;
@@ -146,33 +182,33 @@ class NativeStack extends WasmStack {
 				x: X86_64SpcTrapsStub => {
 					if (f != null && !f(retip, code, pos, param)) {
 						// Early termination from frame predicate.
-						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
+						if (trace) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
 						return (true, pos);
 					} else {
 						// Continue to previous frame.
-						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
+						if (trace) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
 						srp = code.nextFrame(retip, srp).1;
 					}
 				}
 				x: X86_64ReturnParentStub => {
 					if (stack.parent == null || !continue_to_parent) {
 						// End of stack frames. Terminate stack walk.
-						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
+						if (trace) printWalkStep(stack, retip, sfp, code, "Finish", tableWidth);
 						return (false, pos);
 					} else {
 						// Continue to parent stack.
-						if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Parent Stack", tableWidth);
+						if (trace) printWalkStep(stack, retip, sfp, code, "To Parent Stack", tableWidth);
 						stack = NativeStack.!(stack.parent);
 						srp = stack.rsp;
 					}
 				}
 				null => {
-					if (Trace.stack) printWalkStep(stack, retip, sfp, code, "Unknown", tableWidth);
+					if (trace) printWalkStep(stack, retip, sfp, code, "Unknown", tableWidth);
 					return (false, StackFramePos(this, TargetFrame(Pointer.NULL)));
 				}
 				_ => {
 					// Unrecognized frame: continue to previous frame.
-					if (Trace.stack) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
+					if (trace) printWalkStep(stack, retip, sfp, code, "To Prev Frame", 0);
 					srp = code.nextFrame(retip, srp).1;
 				}
 			}
@@ -196,7 +232,7 @@ class NativeStack extends WasmStack {
 		Trace.OUT.puts(when);
 		if (Debug.stack) Trace.OUT.put1(" rsp=0x%x", rsp - Pointer.NULL);
 		Trace.OUT.ln();
-		while (sfp >= mapping.range.start && sfp < mapping.range.end) {
+		while (sfp >= range.start && sfp < range.end) {
 			var retip = (sfp + -RETADDR_SIZE).load<Pointer>();
 			var code = RiRuntime.findUserCode(retip);
 			if (code == null) break;
@@ -208,7 +244,7 @@ class NativeStack extends WasmStack {
 	def setRsp(ptr: Pointer) -> this {
 		rsp = ptr;
 	}
-	def tryHandleSuspension(tag: Tag) -> ExHandler {
+	def tryHandleSuspension(tag: Tag) -> bool {
 		if (Trace.stack) {
 			Trace.OUT.put1("searching for handler on stack[rsp=0x%x]", rsp - Pointer.NULL).ln();
 		}
@@ -216,10 +252,8 @@ class NativeStack extends WasmStack {
 		var h = NativeFrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSuspensionHandler(func.instance, tag, h.computePc());
-		if (handler.handler_pc < 0) { // not found
-			if (Trace.stack) Trace.OUT.puts("  suspension handler not found, continue to unwind").ln();
-			return handler;
-		}
+		shadowCheckHandlerTable(false, h, func, tag, handler);
+		if (handler.handler_pc < 0) return false; // not found
 		if (Trace.stack) {
 			Trace.OUT.put1("  found suspend handler: pc=%d,", handler.handler_pc);
 			Trace.OUT.put1(" stp=%d", handler.sidetable_pos).ln();
@@ -247,19 +281,45 @@ class NativeStack extends WasmStack {
 		var vsp = vfp + (stack_top * valuerep.slot_size);
 		this.vsp = vsp;
 		h.set_vsp(this.vsp);
-		return handler;
+		return true;
 	}
-	def tryHandleSwitch(tag: Tag) -> ExHandler {
+	def tryHandleSwitch(tag: Tag) -> bool {
 		// Increment by {Pointer.SIZE} to skip the return address.
 		var h = NativeFrameHandles.from(rsp + Pointer.SIZE);
 		var func = h.wasm_func();
 		var handler = func.decl.findSwitchHandler(func.instance, tag, h.computePc());
-		if (handler.handler_pc < 0) { // not found
-			if (Trace.stack) Trace.OUT.puts("  switch handler not found, continue to unwind").ln();
-			return handler;
-		}
+		shadowCheckHandlerTable(true, h, func, tag, handler);
+		if (handler.handler_pc < 0) return false; // not found
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
-		return handler;
+		return true;
+	}
+	// TODO[rv]: remove after fully tested
+	private def shadowCheckHandlerTable(is_switch: bool, h: NativeFrameHandle, func: WasmFunction, tag: Tag, handler: ExHandler) {
+		if (handlers == null) return fatal("no handler table published on a stack inside a resume");
+		var tier = if(NativeFrameHandle.Spc.?(h), HandlerTier.SPC, HandlerTier.INTERPRETER);
+		if (handler_tier != tier) return fatal(Strings.format2("handler table published by tier %s for a tier %s frame", handler_tier.name, tier.name));
+		var decl = func.decl, sites = decl.handlers.resume_sites;
+		if (sites == null || sites[h.computePc()] != handlers) return fatal("published handler table is not the top frame's resume site");
+		if (h.instance() != func.instance) return fatal("frame instance differs from its function's instance");
+		var tags = h.instance().tags, hdr = ResumeSites.header(handlers);
+		var start = if(is_switch, hdr.switch_start_index, 0), end = if(is_switch, hdr.count, hdr.switch_start_index);
+		var found = -1;
+		for (i = start; i < end; i++) {
+			if (!StackTuning.disableTagChecks && tags[ResumeSites.entry(handlers, i).tag_index] != tag) continue;
+			found = i;
+			break;
+		}
+		if ((found < 0) != (handler.handler_pc < 0)) return fatal("handler table and decoder disagree on finding a handler");
+		if (found < 0) return;
+		var e = ResumeSites.entry(handlers, found);
+		if (e.handler_pc != handler.handler_pc) return fatal("handler table has the wrong handler_pc");
+		if (e.stp_pos != handler.sidetable_pos) return fatal("handler table has the wrong sidetable_pos");
+		if (e.vsp_slots != handler.val_stack_top + decl.num_locals) return fatal("handler table has the wrong vsp_slots");
+		if (!is_switch && NativeFrameHandle.Spc.?(h)) {
+			var dest = decl.handlers.get_handler_dest(handler.index);
+			var stub = decl.target_code.spc_entry + X86_64MasmLabel.!(dest.stub_label).label.pos;
+			if (e.stub_addr != (stub - Pointer.NULL)) return fatal("handler table has the wrong stub_addr");
+		}
 	}
 	private def findExHandler(ip: Pointer, code: RiUserCode, pos: StackFramePos, ex: Exception) -> bool {
 		var stack = pos.stack;
@@ -287,7 +347,7 @@ class NativeStack extends WasmStack {
 			var vsp = vfp + (slot_num * valuerep.slot_size);
 			stack.vsp = vsp;
 			if (Trace.exception) Trace.OUT.put3("  push %d vfp=0x%x, vsp=0x%x", ex.vals.length, vfp - Pointer.NULL, vsp - Pointer.NULL).ln();
-			for (v in ex.vals) stack.push(v);
+			if (handler.push_vals) for (v in ex.vals) stack.push(v);
 			if (handler.ex_slot >= 0) {
 				if (Trace.exception) Trace.OUT.put2("  set_ex_slot vfp=0x%x, ex_slot=%d", vfp - Pointer.NULL, handler.ex_slot).ln();
 				var ptr = vfp + (func.decl.num_locals + handler.ex_slot) * valuerep.slot_size;
@@ -323,8 +383,9 @@ class NativeStack extends WasmStack {
 		// Unwind the stack, skipping the top frame (which might have triggered the overflow)
 		var result = walk<void>(null, (), sfp + -RETADDR_SIZE, true);
 		var new_srp = result.1.frame.srp();
+		clearCrossedHandlers(result.1.stack);
 		// Unwind without updating any return addresses.
-		this.vsp = mapping.range.start; // clear value stack
+		this.vsp = range.start; // clear value stack
 		if (new_srp != this.rsp) unwind(Pointer.NULL, new_srp);
 		// Instead, return from the signal to the stack overflow stub, which will unwind with a Trap.STACK_OVERFLOW throwable.
 		if (Trace.stack) traceFrames("stack.overflow (after)", this.rsp + RETADDR_SIZE);
@@ -333,14 +394,26 @@ class NativeStack extends WasmStack {
 	// Empties all the frames on this stack and sets it back to the {StackState.EMPTY} state.
 	def clear() -> this {
 		state_ = StackState.EMPTY;
-		vsp = mapping.range.start;
-		rsp = mapping.range.end;
-		params_arity = -1;
+		flags = 0;
+		vsp = if(range != null, range.start);
+		rsp = if(range != null, range.end);
 		return_results = null;
 		parent =  null;
-		cont_bottom = null;
+		bottom = this;
 		parent_rsp_ptr = Pointer.NULL;
 		func = null;
+		bound = null;
+		handlers = null;
+		handler_tier = HandlerTier.NONE;
+		monitor_data = null;
+	}
+	// TODO[rv]: remove after fully tested
+	private def clearCrossedHandlers(stop: NativeStack) {
+		for (s = this; s != stop && s.parent != null; s = NativeStack.!(s.parent)) {
+			var p = NativeStack.!(s.parent);
+			p.handlers = null;
+			p.handler_tier = HandlerTier.NONE;
+		}
 	}
 	def pushRspPointer(p: Pointer) -> Pointer {
 		rsp = rsp + -Pointer.SIZE;
@@ -486,11 +559,12 @@ class NativeStack extends WasmStack {
 	}
 	// GC callback to scan (tagged) values on this stack
 	def scan() {
+		if (range == null) return;
 		if (Trace.gc) {
 			Trace.OUT.put1("scanStack obj=0x%x", u64.view(Pointer.atObject(this) - Pointer.NULL)).ln();
 		}
 		// Iterate values on the value stack.
-		for (p = mapping.range.start; p < vsp; p += valuerep.slot_size) {
+		for (p = range.start; p < vsp; p += valuerep.slot_size) {
 			var tag = p.load<byte>();
 			if (Trace.gc) {
 				Trace.OUT.put2("scanValue @ 0x%x = %x", u64.view(p - Pointer.NULL), tag).ln();
@@ -510,7 +584,7 @@ class NativeStack extends WasmStack {
 	def readValue(base: Pointer, offset: int) -> Value {
 		if (!valuerep.tagged) fatal("untyped frame access requires value tagging to be enabled");
 		var tp = base + offset * valuerep.slot_size;
-		if (!mapping.range.contains(tp)) System.error("FrameAccessError", "out of bounds");
+		if (!range.contains(tp)) System.error("FrameAccessError", "out of bounds");
 		var vp = tp + valuerep.tag_size;
 		var tag = tp.load<u8>() & '\x7F';
 		match (tag) {
@@ -527,6 +601,7 @@ class NativeStack extends WasmStack {
 			BpTypeCode.ARRAYREF.code,
 			BpTypeCode.FUNCREF.code,
 			BpTypeCode.EXNREF.code,
+			BpTypeCode.NULLEXNREF.code,
 			BpTypeCode.NULLFUNCREF.code => return Value.Ref(vp.load<Object>());
 
 			BpTypeCode.I32.code => return Value.I32(vp.load<u32>());
@@ -534,7 +609,8 @@ class NativeStack extends WasmStack {
 			BpTypeCode.F32.code => return Value.F32(vp.load<u32>());
 			BpTypeCode.F64.code => return Value.F64(vp.load<u64>());
 			BpTypeCode.V128.code => return Value.V128(vp.load<u64>(), (vp + 8).load<u64>());
-			BpTypeCode.CONTREF.code => {
+			BpTypeCode.CONTREF.code,
+			BpTypeCode.NULLCONTREF.code => {
 				var stack = vp.load<WasmStack>();
 				var version = (vp + 8).load<u64>();
 				return Value.Cont(Continuation(stack, version));
@@ -618,17 +694,14 @@ class NativeStack extends WasmStack {
 		var bits = vp.load<u64>();
 		return (bits & 1) == 1;
 	}
-	def popResult(rt: Array<ValueType>) -> Result {
-		var r = Array<Value>.new(rt.length);
-		for (i = r.length - 1; i >= 0; i--) r[i] = pop(rt[i]);
-		return Result.Value(r);
-	}
-	def fatal(msg: string) {
-		System.error("NativeStackError", msg);
-	}
 }
 
+def fatal = System.error("NativeStackError", _);
+
 type StackFramePos(stack: NativeStack, frame: TargetFrame) #unboxed;
+
+// Which tier published the handler table on a stack.
+enum HandlerTier { NONE, INTERPRETER, SPC }
 
 component NativeStacks {
 	var RESUME_STUB_POINTER: Pointer;
@@ -779,6 +852,8 @@ def STACK_RETURN_PARENT_STUB = X86_64PreGenStub.new("stack-return-parent", X86_6
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.NativeStack_parent), 0);
 	// mov [%stack.parent_rsp_ptr], nullptr
 	masm.emit_mov_m_l(MasmAddr(r_stack, masm.offsets.NativeStack_parent_rsp_ptr), 0);
+	// clear its published handler table
+	masm.emit_clear_handlers(r_parent);
 
 	// l_return:
 	masm.bindLabel(l_return);

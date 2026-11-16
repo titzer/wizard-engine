@@ -1,7 +1,7 @@
 # Building and Testing Wizard
 
 The Wizard engine runs on all the platforms that its implementation language, Virgil, supports.
-However, it runs best and fastest on `x86-64-linux`, where it has special support for native memories and handwritten assembly.
+However, it runs best and fastest on `x86-64-linux`, where it has special support for native memories, a fast interpreter in handwritten assembly, and a baseline JIT compiler.
 Use the steps below to build and test the Wizard engine.
 
 ## Get Virgil
