@@ -1,4 +1,4 @@
-;; 39 distinct fast functions: exercises the full fast-call table (slots FAST_CALL0..FAST_CALL38).
+;; 39 distinct fast functions: exercises the full fast-call table (slots FAST_CALL_0..FAST_CALL_38).
 (module
   (func $f0 (export "fast:f0") (param i32) (result i32)
     local.get 0  i32.const 0  i32.add)

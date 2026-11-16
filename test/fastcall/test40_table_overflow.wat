@@ -1,4 +1,4 @@
-;; 40 functions exported with fast: names; the 40th exceeds FAST_CALL_OPCODES (39).
+;; 40 functions exported with fast: names; the 40th exceeds the 39 numbered slots (FAST_CALL_0..FAST_CALL_38).
 ;; The 40th function must fall back to a regular call rather than crashing.
 ;; All 40 calls must produce correct results.
 (module
