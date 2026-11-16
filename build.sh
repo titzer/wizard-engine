@@ -5,10 +5,13 @@ OBJECT_MODEL_DIRS="src/engine/objmodel"
 function exit_usage() {
     echo "Usage: build.sh [options] <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|arm64-linux|jvm|wasm-wave|v3i>"
     echo "Options:"
-    echo "  --nojit                 disable the JIT compiler"
+    echo "  --O2                    enable Virgil -O2 optimization level"
+    echo "  --O3                    enable Virgil -O3 optimization level"
     echo "  --test-monitors         include the test monitors"
     echo "  --debug                 include the debug monitors"
+    echo "  --nojit                 disable the JIT compiler (native targets)"
     echo "  --debug-gc              enable GC debugging (native targets)"
+    echo "  --gc-stats              enable GC statistics (native targets)"
     echo "  --no-spec-test          exclude the spec test mode"
     echo "  --no-wasm-run           exclude the Wasm run mode"
     echo "  --cbd                   include the canonical bytecode description interpreter"
@@ -92,8 +95,17 @@ OBJECT_MODEL=boxed
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --O2)
+            V3C_OPTS+="$V3C_OPTS -O2"
+            ;;
+        --O3)
+            V3C_OPTS+="$V3C_OPTS -O3"
+            ;;
+        --gc-stats)
+            GC_STATS=1
+            ;;
         --nojit)
-            append_comma_sep REDEFS "SpcTuning.disable=true"
+	    NO_JIT=1
             ;;
         --test-monitors)
             MONITORS="$MONITORS $TEST_MONITORS"
@@ -138,12 +150,23 @@ if [ -z "$OBJECT_MODEL_SRC" ]; then
 fi
 
 ENGINE="$ENGINE $OBJECT_MODEL_SRC"
+# Object model support for the JIT, if any (JIT targets only).
+OBJECT_MODEL_JIT_SRC=$(ls ${OBJECT_MODEL_DIR}/jit/*.v3 2> /dev/null)
 
 PROGRAM=$1
 TARGET=$2
 
-if [[ "$TARGET" =~ x86 && $DEBUG_GC = 1 ]]; then
-    V3C_OPTS="$V3C_OPTS -redef-field=RiGc.debug=true"
+if [[ "$TARGET" =~ x86 ]]; then
+    if [ "$DEBUG_GC" = 1 ]; then
+	append_comma_sep REDEFS "RiGc.debug=true"
+    fi
+    if [ "$GC_STATS" = 1 ]; then
+	append_comma_sep REDEFS "GcStats.enabled=true"
+	append_comma_sep REDEFS "RiGc.verbose=true"
+    fi
+    if [ "$NO_JIT" = 1 ]; then
+        append_comma_sep REDEFS "SpcTuning.disable=true"
+    fi
 fi
 
 function make_build_file() {
@@ -201,6 +224,8 @@ BUILD_FILE=$(make_build_file)
 PREGEN=${PREGEN:=1}
 
 LANG_OPTS="-lang:fun-exprs -lang:simple-bodies -lang:descriptors"
+
+# Add field redefinitions
 if [ "$REDEFS" != "" ]; then
     V3C_OPTS="$V3C_OPTS -redef-field=$REDEFS"
 fi
@@ -220,9 +245,10 @@ case "$TARGET" in
 	exec v3c-arm64-linux -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.arm64-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 	;;
     x86-64-linux|x86_64_linux)
-	TARGET_SRC=$TARGET_X86_64
-	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_X86_64"; fi
-	exec v3c-x86-64-linux -symbols -heap-size=1700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
+	TARGET_SRC="$TARGET_X86_64 $OBJECT_MODEL_JIT_SRC"
+	if [ "$CBD" = true ]; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_SRC"; fi
+	# Not exec: the pregen step below must run after compilation.
+	v3c-x86-64-linux -symbols -heap-size=1700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 	STATUS=$?
 	if [ $STATUS != 0 ]; then
 	    exit $STATUS

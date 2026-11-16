@@ -5,14 +5,12 @@ class V3Interpreter extends WasmStack {
 	var instrTracer: InstrTracer;
 	def values = ArrayStack<Value>.new();	// storage of all WasmValues
 	var state_: StackState;
-	var goto_stack: V3Interpreter; // set when state_ == {CALL_CHILD|SUSPENDED|THROWING}
 	var cache: V3Frame;			// cache of all V3Frame objects (bottom of stack)
 	var frame: V3Frame;
 	var host_frame: HostFrame;
-	var host_outcall: HostFunction;
+	var host_outcall: HostFunction;	// host function being called, if any (for stacktraces)
 	def codeptr = CodePtr.new(null);	// pointer into code
-	var thrown: Throwable;			// trap reason, if any
-	var params_arity = -1;
+	var thrown: Throwable;			// unhandled trap or exception, if any
 	var return_arity = -1;
 
 	var suspend_pc: int = -1;
@@ -22,61 +20,78 @@ class V3Interpreter extends WasmStack {
 	def state() -> StackState {
 		return state_;
 	}
+	def startFunc() -> Function {
+		return if(frame != null, frame.func);
+	}
+	def usedBytes() -> u64 {
+		return 0;
+	}
 	def reset(func: Function) -> this {
 		checkState("reset()", StackState.EMPTY);
 		pushFrame(func, 0);
-		params_arity = func.sig.params.length;
 		return_arity = func.sig.results.length;
 		suspend_pc = -1;
 		thrown = null;
 		parent = null;
-		state_ = if(params_arity == 0, StackState.RESUMABLE, StackState.SUSPENDED);
+		state_ = StackState.SUSPENDED;
 	}
 	def bind(args: Range<Value>) -> this {
-		if (args.length == 0 && state_ == StackState.RESUMABLE) return;
+		if (args.length == 0) return;
 		checkState("bind()", StackState.SUSPENDED);
-		if (params_arity < args.length) fatal(Strings.format2("bind() expected %d arguments, got %d", params_arity, args.length));
 		values.pushr(args);
-		params_arity -= args.length;
-		if (params_arity == 0) state_ = StackState.RESUMABLE;
 	}
 	def resume() -> Result {
-		checkState("resume()", StackState.RESUMABLE);
+		checkState("resume()", StackState.SUSPENDED);
 		thrown = null;
-		goto_stack = null;
-
-		// Set the initial state to running and loop until return, throw, or suspend.
 		state_ = StackState.RUNNING;
-		while (state_ == StackState.RUNNING) {
-			// Run Wasm code until it either traps, suspends, or makes a host outcall.
-			runWasmCode();
-			// Run host calls until they either trap, return, or tail-call Wasm.
-			runHostCall();
-		}
 
-		// Return the appropriate result.
-		match (state_) {
-			THROWING => {
-				var t = thrown, cont = goto_stack;
-				clear();
-				if (cont == null) return Result.Throw(t);
-				else return Result.Switch(cont); // handler found on parent stack
+		while (true) {
+			// Run Wasm code until it returns from the bottom frame, traps, throws, or switches stacks.
+			if (frame != null) {
+				var target = runWasmCode();
+				if (target != null) {
+					if (frame == null) clear(); // exception handled on another stack
+					return Result.Switch(target);
+				}
 			}
-			RETURNING => {
-				var top = values.top;
+			// No frames remain; either a trap, a return, or a top-level host call.
+			if (thrown != null) {
+				var t = thrown;
+				clear();
+				return Result.Throw(t);
+			}
+			var hf = host_outcall;
+			if (hf == null) {
 				var vals = Ranges.dup(values.peekn(return_arity));
 				clear();
 				return Result.Value(vals);
 			}
-			SUSPENDED, CALL_CHILD => {
-				return Result.Switch(goto_stack);
-			}
-			_ => {
-				clear();
-				var trap = Trap.new(TrapReason.ERROR, Strings.format1("invalid interpreter state: %s", state_.name), null);
-				return Result.Throw(trap);
+			// Run a top-level host call, which may tail-call more host code or Wasm.
+			var sig = hf.sig;
+			match (invokeHost(hf)) {
+				Throw(t) => {
+					var target = doThrow(t);
+					if (target != null) {
+						clear();
+						return Result.Switch(target);
+					}
+				}
+				Value0 => checkReturnArity(sig.results.length);
+				Value1(val) => {
+					values.push(val);
+					checkReturnArity(sig.results.length);
+				}
+				ValueN(vals) => {
+					values.pusha(vals);
+					checkReturnArity(sig.results.length);
+				}
+				TailCall(f, args) => {
+					values.pusha(args);
+					pushFrame(f, args.length);
+				}
 			}
 		}
+		return Result.Throw(null); // unreachable
 	}
 	def popAllFrames(stacktrace: bool) -> StackSegment {
 		var result: StackSegment;
@@ -101,10 +116,8 @@ class V3Interpreter extends WasmStack {
 		frame = null;
 		host_outcall = null;
 		return_arity = -1;
-		params_arity = -1;
 		codeptr.reset(null, 0, 0);
 		suspend_pc = -1;
-		goto_stack = null;
 		thrown = null;
 	}
 
@@ -199,9 +212,10 @@ class V3Interpreter extends WasmStack {
 		values.top = dest + count;
 	}
 
-	def runWasmCode() {
-		while (state_ == StackState.RUNNING) {
-			if (frame == null || host_outcall != null) return;
+	// Runs Wasm code while there are Wasm frames, returning a non-null stack if execution
+	// should switch to that stack.
+	def runWasmCode() -> V3Interpreter {
+		while (frame != null) {
 			var func = frame.func, pc = frame.pc;
 			if (pc == 0) {
 				// Enter the function and initialize locals.
@@ -213,7 +227,8 @@ class V3Interpreter extends WasmStack {
 				if (func.decl.entry_probed) {
 					var throwable = Instrumentation.fireLocalProbes(DynamicLoc(func, 0, TargetFrame(frame)));
 					if (throwable != null) {
-						throw(throwable);
+						var target = doThrow(throwable);
+						if (target != null) return target;
 						continue;
 					}
 				}
@@ -223,7 +238,8 @@ class V3Interpreter extends WasmStack {
 			if (Instrumentation.probes != null) {
 				var throwable = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, TargetFrame(frame)));
 				if (throwable != null) {
-					throw(throwable);
+					var target = doThrow(throwable);
+					if (target != null) return target;
 					continue;
 				}
 			}
@@ -234,56 +250,56 @@ class V3Interpreter extends WasmStack {
 				// Fire local probe(s).
 				var throwable = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, TargetFrame(frame)));
 				if (throwable != null) {
-					throw(throwable);
+					var target = doThrow(throwable);
+					if (target != null) return target;
 					continue;
 				}
 				opcode = codeptr.read_orig_opcode(frame.func.decl.orig_bytecode[pc]);
 			} else {
 				opcode = codeptr.read_opcode();
 			}
-			execOp(pc, opcode);
+			var target = execOp(pc, opcode);
+			if (target != null) return target;
 		}
+		return null;
 	}
-	def runHostCall() {
-		var hf: HostFunction;
-		while ((hf = host_outcall) != null) {
-			if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-			var sig = hf.sig, arity = sig.params.length;
-			var oldVsp = values.top;
-			var result = hf.invoke(values.peekn(arity));
-			host_outcall = null;
-			var newVsp = oldVsp - arity;
-			values.top = newVsp;
-			match (result) {
-				Throw(thrown) => {
-					host_outcall = hf; // needed for stacktrace
-					return void(throw(thrown));
-				}
-				Value0 => {
-					return doHostReturn(newVsp, sig);
-				}
-				Value1(val) => {
-					values.push(val);
-					return doHostReturn(newVsp, sig);
-				}
-				ValueN(vals) => {
-					values.pusha(vals);
-					return doHostReturn(newVsp, sig);
-				}
-				TailCall(f, args) => {
+	// Invokes a host function on the arguments on top of the value stack, popping them.
+	def invokeHost(hf: HostFunction) -> HostResult {
+		if (Trace.interpreter) Execute.traceCallHostFunction(hf);
+		var arity = hf.sig.params.length;
+		var oldVsp = values.top;
+		host_outcall = hf;
+		var result = hf.invoke(values.peekn(arity));
+		values.top = oldVsp - arity;
+		if (!HostResult.Throw.?(result)) host_outcall = null; // keep for stacktrace
+		return result;
+	}
+	// Calls {f} from the current frame, or, if no frames remain because of a tail call,
+	// sets up a top-level host call. Returns a non-null stack if execution should switch to it.
+	def doCallFunction(f: Function) -> V3Interpreter {
+		if (frame != null) codeptr.at(frame.pc);
+		while (HostFunction.?(f)) {
+			var hf = HostFunction.!(f);
+			if (frame == null) { // top-level host call is handled in resume()
+				host_outcall = hf;
+				return null;
+			}
+			match (invokeHost(hf)) {
+				Throw(t) => return doThrow(t);
+				Value0 => ;
+				Value1(val) => values.push(val);
+				ValueN(vals) => values.pusha(vals);
+				TailCall(tf, args) => {
 					values.pusha(args);
-					pushFrame(f, args.length);
+					f = tf;
+					continue;
 				}
 			}
+			advanceCaller();
+			return null;
 		}
-	}
-	def doHostReturn(fp: int, sig: SigDecl) {
-		if (frame == null) doReturn(fp, sig);
-		else advanceCaller();
-	}
-	def doCallFunction(f: Function) {
-		if (frame != null) codeptr.at(frame.pc);
 		pushFrame(f, f.sig.params.length);
+		return null;
 	}
 	def doReturn(fp: int, sig: SigDecl) {
 		var count = sig.results.length;
@@ -291,13 +307,17 @@ class V3Interpreter extends WasmStack {
 		frame = popFrame();
 
 		if (frame == null) {  // popped top frame, finished execution
-			if (return_arity != count) fatal(Strings.format2("top-level return expected %d vals, got %d", return_arity, count));
-			state_ = StackState.RETURNING;
+			checkReturnArity(count);
 		} else { // advance past caller's call instruction
 			advanceCaller();
 		}
 	}
-	def execOp(pc: int, opcode: Opcode) {
+	private def checkReturnArity(count: int) {
+		if (return_arity != count) fatal(Strings.format2("top-level return expected %d vals, got %d", return_arity, count));
+	}
+	// Executes a single instruction, returning a non-null stack if execution should switch to it.
+	def execOp(pc: int, opcode: Opcode) -> V3Interpreter {
+		var target: V3Interpreter;
 		if (Debug.interpreter && Trace.interpreter) traceStack();
 		match (opcode) {
 			UNREACHABLE => {
@@ -332,7 +352,7 @@ class V3Interpreter extends WasmStack {
 				var index = codeptr.read_uleb31();
 				var tag = frame.func.instance.tags[index];
 				var ex = Exception.new(tag, popN(tag.decl.fields), null);
-				throw(ex);
+				target = doThrow(ex);
 			}
 			RETHROW => {
 				var sidetable = frame.func.decl.sidetable;
@@ -344,12 +364,12 @@ class V3Interpreter extends WasmStack {
 				}
 				frame.stp += 4;
 				var exval = values.elems[frame.fp + frame.func.decl.num_locals + ex_slot];
-				throw(Exception.!(Value.Ref.!(exval).val));
+				target = doThrow(Exception.!(Value.Ref.!(exval).val));
 			}
 			THROW_REF => {
 				var exval = popr();
-				if (exval.val == null) return void(trap(TrapReason.NULL_DEREF));
-				throw(Exception.!(exval.val));
+				if (exval.val == null) return doTrap(TrapReason.NULL_DEREF);
+				target = doThrow(Exception.!(exval.val));
 			}
 			END => {
 				if (codeptr.available() == 0) doReturn(frame.fp, frame.func.sig);
@@ -1254,23 +1274,22 @@ class V3Interpreter extends WasmStack {
 			}
 			RESUME => {
 				var cont_idx = codeptr.read_uleb31();
-				var handlers = codeptr.read_handlers();
+				var h_ = codeptr.skip_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
 				var cont = popContinuation();
-				if (Continuations.isNull(cont)) return void(trap(TrapReason.NULL_DEREF));
-				if (Continuations.isUsed(cont)) return void(trap(TrapReason.USED_CONTINUATION));
+				if (Continuations.isNull(cont)) return doTrap(TrapReason.NULL_DEREF);
+				if (Continuations.isUsed(cont)) return doTrap(TrapReason.USED_CONTINUATION);
 				var stack = V3Interpreter.!(cont.stack);
 				Continuations.setUsed(cont);
 
 				stack.bind(popN(cont_type.sig.params));
-				resumeContinuation(stack);
-				return; // skip setting frame.pc = codeptr.pos
+				return resumeContinuation(stack); // skip setting frame.pc = codeptr.pos
 			}
 			RESUME_THROW => {
 				var cont_idx = codeptr.read_uleb31();
 				var tag_idx = codeptr.read_uleb31();
-				var handlers = codeptr.read_handlers();
+				var h_ = codeptr.skip_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
 				var cont = popContinuation();
@@ -1278,8 +1297,8 @@ class V3Interpreter extends WasmStack {
 				var tag = frame.func.instance.tags[tag_idx];
 				var ex: Throwable = Exception.new(tag, popN(tag.sig.params), null);
 
-				if (Continuations.isNull(cont)) return void(trap(TrapReason.NULL_DEREF));
-				if (Continuations.isUsed(cont)) return void(trap(TrapReason.USED_CONTINUATION));
+				if (Continuations.isNull(cont)) return doTrap(TrapReason.NULL_DEREF);
+				if (Continuations.isUsed(cont)) return doTrap(TrapReason.USED_CONTINUATION);
 				if (Trace.stack) Trace.OUT.put2("resume_throw %q %q", tag.render, cont.render).ln();
 				var cont_stack = cont.stack;
 				Continuations.setUsed(cont);
@@ -1291,20 +1310,19 @@ class V3Interpreter extends WasmStack {
 					Handled(stack) => {
 						if (Trace.stack) Trace.OUT.put1("tag %q handled in continuation, resuming", tag.render).ln();
 						var handler = V3Interpreter.!(stack);
-						handler.state_ = StackState.RESUMABLE;
-						handler.cont_bottom = cont_stack.cont_bottom;
-						resumeContinuation(handler);
-						return; // skip setting frame.pc = codeptr.pos
+						handler.state_ = StackState.SUSPENDED;
+						handler.bottom = cont_stack.bottom;
+						return resumeContinuation(handler); // skip setting frame.pc = codeptr.pos
 					}
 					Unhandled => {
 						if (Trace.stack) Trace.OUT.put1("tag %q not handled in continuation, throwing", tag.render).ln();
-						throw(ex);
+						target = doThrow(ex);
 					}
 				}
 			}
 			RESUME_THROW_REF => {
 				var cont_idx = codeptr.read_uleb31();
-				var handlers = codeptr.read_handlers();
+				var h_ = codeptr.skip_handlers();
 
 				var cont_type = ContDecl.!(frame.func.instance.heaptypes[cont_idx]);
 				var cont = popContinuation();
@@ -1312,8 +1330,8 @@ class V3Interpreter extends WasmStack {
 				var ex = Exception.!(popr().val);
 				if (Trace.stack) Trace.OUT.put1("resume_throw_ref %q", cont.render).ln();
 
-				if (Continuations.isNull(cont)) return void(trap(TrapReason.NULL_DEREF));
-				if (Continuations.isUsed(cont)) return void(trap(TrapReason.USED_CONTINUATION));
+				if (Continuations.isNull(cont)) return doTrap(TrapReason.NULL_DEREF);
+				if (Continuations.isUsed(cont)) return doTrap(TrapReason.USED_CONTINUATION);
 				var cont_stack = cont.stack;
 				Continuations.setUsed(cont);
 
@@ -1324,14 +1342,13 @@ class V3Interpreter extends WasmStack {
 					Handled(stack) => {
 						if (Trace.stack) Trace.OUT.put1("ex %q handled in continuation, resuming", ex.render).ln();
 						var handler = V3Interpreter.!(stack);
-						handler.state_ = StackState.RESUMABLE;
-						handler.cont_bottom = cont_stack.cont_bottom;
-						resumeContinuation(handler);
-						return; // skip setting frame.pc = codeptr.pos
+						handler.state_ = StackState.SUSPENDED;
+						handler.bottom = cont_stack.bottom;
+						return resumeContinuation(handler); // skip setting frame.pc = codeptr.pos
 					}
 					Unhandled => {
 						if (Trace.stack) Trace.OUT.put1("ex %q not handled in continuation, throwing", ex.render).ln();
-						throw(ex);
+						target = doThrow(ex);
 					}
 				}
 			}
@@ -1340,16 +1357,15 @@ class V3Interpreter extends WasmStack {
 				var tag = frame.func.instance.tags[tag_idx];
 
 				state_ = StackState.SUSPENDED;
-				params_arity = tag.sig.results.length;
 
-				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSuspension);
-				if (Continuations.isNull(cont)) return void(trap(TrapReason.INVALID_SUSPEND));
-				var bottom = cont.stack.cont_bottom;
+				var cont = this.unwindChain(tag, WasmStack.tryHandleSuspension);
+				if (Continuations.isNull(cont)) return doTrap(TrapReason.INVALID_SUSPEND);
+				var bottom = cont.stack.bottom;
 				var handler = V3Interpreter.!(bottom.parent);
 				bottom.parent = null;
 				handler.pushN(popN(tag.sig.params));
 				handler.push(Value.Cont(cont));
-				goto_stack = handler;
+				target = handler;
 				suspend_pc = frame.pc;
 			}
 			SWITCH => {
@@ -1362,8 +1378,8 @@ class V3Interpreter extends WasmStack {
 				var tag = frame.func.instance.tags[tag_idx];
 				var target_cont_decl = ContDecl.!(frame.func.instance.heaptypes[target_cont_idx]);
 				var target_cont = popContinuation();
-				if (Continuations.isNull(target_cont)) return void(trap(TrapReason.NULL_DEREF));
-				if (Continuations.isUsed(target_cont)) return void(trap(TrapReason.USED_CONTINUATION));
+				if (Continuations.isNull(target_cont)) return doTrap(TrapReason.NULL_DEREF);
+				if (Continuations.isUsed(target_cont)) return doTrap(TrapReason.USED_CONTINUATION);
 
 				// -1 to exclude continuation parameter
 				var target_params = target_cont_decl.sig.params;
@@ -1373,19 +1389,18 @@ class V3Interpreter extends WasmStack {
 				var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
 
 				state_ = StackState.SUSPENDED;
-				params_arity = this_cont_decl.sig.params.length;
 
-				var cont = Runtime.unwindStackChain(this, frame.func.instance, tag_idx, WasmStack.tryHandleSwitch);
-				if (Continuations.isNull(cont)) return void(trap(TrapReason.INVALID_SUSPEND));
-				var handler = V3Interpreter.!(cont.stack.cont_bottom.parent);
-				cont.stack.cont_bottom.parent = null;
+				var cont = this.unwindChain(tag, WasmStack.tryHandleSwitch);
+				if (Continuations.isNull(cont)) return doTrap(TrapReason.INVALID_SUSPEND);
+				var handler = V3Interpreter.!(cont.stack.bottom.parent);
+				cont.stack.bottom.parent = null;
 
 				var stack = target_cont.stack;
 				Continuations.setUsed(target_cont);
-				stack.cont_bottom.parent = handler;
+				stack.bottom.parent = handler;
 				stack.bind(vals);
 				stack.bind([Value.Cont(cont)]);
-				goto_stack = V3Interpreter.!(stack);
+				target = V3Interpreter.!(stack);
 				suspend_pc = frame.pc;
 			}
 			INVALID => trap(TrapReason.INVALID_OPCODE);
@@ -1395,6 +1410,7 @@ class V3Interpreter extends WasmStack {
 //			}
 		}
 		if (frame != null) frame.pc = codeptr.pos;
+		return target;
 	}
 	def decodeMemArgAndGetMemoryRange(size: byte) -> MaybeTrap<Range<byte>> {
 		var memarg = codeptr.read_MemArg();
@@ -1595,7 +1611,7 @@ class V3Interpreter extends WasmStack {
 		var v = pops();
 		var t = decodeMemArgAndGetMemoryRange(accessor.size);
 		var idx = codeptr.read1(); // get lane immediate
-		if (t.reason != TrapReason.NONE) trap(t.reason);
+		if (t.reason != TrapReason.NONE) return void(trap(t.reason));
 		// Extract lane
 		var low = v.0, high = v.1;
 		var val: T;
@@ -1682,7 +1698,7 @@ class V3Interpreter extends WasmStack {
 	def onChildTerminate(vals: Array<Value>) {
 		if (Trace.stack) Trace.OUT.put1("onChildTerminate parent_stack[pc=%d]", frame.pc).ln();
 		values.pusha(vals);
-		state_ = StackState.RESUMABLE;
+		state_ = StackState.SUSPENDED;
 		// advance past resume instruction
 		var code = frame.func.decl.cur_bytecode;
 		codeptr.reset(code, frame.pc, code.length);
@@ -1692,18 +1708,15 @@ class V3Interpreter extends WasmStack {
 		// XXX: do not use sidetable for this
 		var entry = frame.func.decl.sidetable.getResumeEntry(frame.stp);
 		frame.stp += Sidetable_ResumeEntry.size / 4;
-		frame.stp += entry.nhandlers * Sidetable_SuspendHandlerEntry.size / 4;
+		frame.stp += entry.nhandlers * Sidetable_CatchEntry.size / 4;
 		match (opcode) {
 			RESUME, RESUME_THROW, RESUME_THROW_REF => ;
 			_ => fail(Strings.format1("expected resume instruction in child terminate, got %s", opcode.name));
 		}
 	}
-	def tryHandleSuspension(tag: Tag) -> ExHandler {
+	def tryHandleSuspension(tag: Tag) -> bool {
 		var handler = frame.func.decl.findSuspensionHandler(frame.func.instance, tag, frame.pc);
-		if (handler.handler_pc < 0) { // not found
-			if (Trace.stack) Trace.OUT.puts("  suspension handler not found, continue to unwind").ln();
-			return handler;
-		}
+		if (handler.handler_pc < 0) return false; // not found
 		if (Trace.stack) {
 			Trace.OUT.put1("  found suspend handler: pc=%d,", handler.handler_pc);
 			Trace.OUT.put1(" stp=%d", handler.sidetable_pos).ln();
@@ -1713,27 +1726,28 @@ class V3Interpreter extends WasmStack {
 		frame.pc = handler.handler_pc;
 		frame.stp = handler.sidetable_pos;
 		codeptr.reset(code, frame.pc, code.length);
-		state_ = StackState.RESUMABLE;
-		return handler;
+		state_ = StackState.SUSPENDED;
+		return true;
 	}
-	def tryHandleSwitch(tag: Tag) -> ExHandler {
+	def tryHandleSwitch(tag: Tag) -> bool {
 		var handler = frame.func.decl.findSwitchHandler(frame.func.instance, tag, frame.pc);
-		if (handler.handler_pc < 0) { // not found
-			if (Trace.stack) Trace.OUT.puts("  switch handler not found, continue to unwind").ln();
-			return handler;
-		}
+		if (handler.handler_pc < 0) return false; // not found
 		if (Trace.stack) Trace.OUT.puts("  found switch handler").ln();
-		return handler;
+		return true;
 	}
-	def onChildThrow(t: Throwable) {
-		state_ = StackState.RESUMABLE;
-		throw(t);
-	}
-	def resumeContinuation(stack: V3Interpreter) {
+	def resumeContinuation(stack: V3Interpreter) -> V3Interpreter {
 		state_ = StackState.CALL_CHILD;
-		stack.cont_bottom.parent = this;
-		stack.cont_bottom = null;
-		goto_stack = V3Interpreter.!(stack);
+		stack.bottom.parent = this;
+		stack.bottom = null;
+		return stack;
+	}
+	// Throws {t}, returning a non-null stack if it was handled on that other stack.
+	def doThrow(t: Throwable) -> V3Interpreter {
+		match (throw(t)) {
+			Handled(stack) => if (stack != this) return V3Interpreter.!(stack);
+			Unhandled => ;
+		}
+		return null;
 	}
 	def throw(t: Throwable) -> ThrowResult {
 		if (Trace.stack) Trace.OUT.put1("throw on stack: %q", t.render).ln();
@@ -1745,9 +1759,7 @@ class V3Interpreter extends WasmStack {
 						if (stack == this) { // don't transfer
 							return ThrowResult.Handled(this);
 						} else { // go to handler stack
-							state_ = StackState.THROWING;
-							goto_stack = stack;
-							goto_stack.state_ = StackState.RESUMABLE;
+							stack.state_ = StackState.SUSPENDED;
 							return ThrowResult.Handled(stack);
 						}
 					}
@@ -1765,13 +1777,14 @@ class V3Interpreter extends WasmStack {
 		var handler = f.func.decl.findExHandler(f.func.instance, ex.tag, f.pc);
 		if (handler.handler_pc >= 0) {
 			frame = f;
+			host_outcall = null; // a throwing host call is complete
 			var code = f.func.decl.cur_bytecode;
 			f.pc = handler.handler_pc;
 			f.stp = handler.sidetable_pos;
 			codeptr.reset(code, f.pc, code.length);
 			// TODO: clean up frame math here
 			values.top = f.fp + handler.val_stack_top + f.func.decl.num_slots();
-			for (v in ex.vals) values.push(v);
+			if (handler.push_vals) for (v in ex.vals) values.push(v);
 			if (handler.ex_slot >= 0) {
 				if (Trace.exception) Trace.OUT.put2("  set_ex_slot fp=%d, ex_slot=%d", f.fp, handler.ex_slot).ln();
 				values.elems[f.fp + f.func.decl.num_locals + handler.ex_slot] = Value.Ref(ex);
@@ -1788,20 +1801,22 @@ class V3Interpreter extends WasmStack {
 	private def trapWith(t: Throwable) {
 		var segment = popAllFrames(true);
 		if (segment != null) t = t.prependFrames(segment.frames).prependHostFunction(segment.host);
-		state_ = StackState.THROWING;
 		thrown = t; // unhandled exception
 	}
 
 	def trap(reason: TrapReason) -> Throwable {
 		var stacktrace = popAllFrames(true);
 		thrown = Trap.new(reason, null, stacktrace);
-		state_ = StackState.THROWING;
 		return thrown;
+	}
+	// Traps with {reason} and returns {null}, for use in {execOp}.
+	private def doTrap(reason: TrapReason) -> V3Interpreter {
+		trap(reason);
+		return null;
 	}
 	def fail(msg: string) {
 		var stacktrace = popAllFrames(true);
 		thrown = InternalError.new(msg, stacktrace);
-		state_ = StackState.THROWING;
 	}
 	def pop() -> Value { return values.pop(); }
 	def popV(t: ValueType) -> Value { return values.pop(); }

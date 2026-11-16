@@ -1,0 +1,16 @@
+;; table.grow with a delta that wraps the u64 size computation to a small value
+(module
+  (table i64 5 funcref)
+  (func (export "grow") (param i64) (result i64)
+    (table.grow (ref.null func) (local.get 0))
+  )
+  (func (export "size") (result i64) (table.size))
+)
+(assert_return (invoke "grow" (i64.const 0xFFFF_FFFF_FFFF_FFFB)) (i64.const -1))
+(assert_return (invoke "size") (i64.const 5))
+(assert_return (invoke "grow" (i64.const 0xFFFF_FFFF_FFFF_FFFC)) (i64.const -1))
+(assert_return (invoke "size") (i64.const 5))
+(assert_return (invoke "grow" (i64.const 0x8000_0000_0000_0000)) (i64.const -1))
+(assert_return (invoke "size") (i64.const 5))
+(assert_return (invoke "grow" (i64.const 2)) (i64.const 5))
+(assert_return (invoke "size") (i64.const 7))

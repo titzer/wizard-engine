@@ -136,6 +136,10 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_pop_NativeStack_rsp_r_r(stk: Reg) {
 		asm.q.add_m_i(G(stk).plus(offsets.NativeStack_rsp), Pointer.SIZE);
 	}
+	def emit_reserve_return_slot(stk: Reg) {
+		asm.q.lea(scratch, R.RSP.plus(0 - Pointer.SIZE));
+		asm.movq_m_r(G(stk).plus(offsets.NativeStack_rsp), scratch);
+	}
 
 	def emit_loadbsx_r_r_r_i(kind: ValueKind, dst: Reg, base: Reg, index: Reg, offset: u32) {
 		var t = handle_large_offset(index, offset);
@@ -215,6 +219,41 @@ class X86_64MacroAssembler extends MacroAssembler {
 		}
 	}
 
+	def emit_load_elem(st: MemStorageKind, dst: Reg, base: Reg, index: Reg, scale: byte, offset: int) {
+		var addr = X86_64Addr.new(G(base), G(index), scale, offset);
+		checkImplicitNullCheck(base);
+		match (st) {
+			I8 => asm.d.movbsx_r_m(G(dst), addr);
+			U8 => asm.d.movbzx_r_m(G(dst), addr);
+			I16 => asm.d.movwsx_r_m(G(dst), addr);
+			U16 => asm.d.movwzx_r_m(G(dst), addr);
+			I32, U32 => asm.movd_r_m(G(dst), addr);
+			U64 => asm.movq_r_m(G(dst), addr);
+			F32 => asm.movss_s_m(X(dst), addr);
+			F64 => asm.movsd_s_m(X(dst), addr);
+			V128 => asm.movdqu_s_m(X(dst), addr);
+		}
+	}
+	def emit_store_elem(st: MemStorageKind, base: Reg, index: Reg, scale: byte, offset: int, val: Reg) {
+		var addr = X86_64Addr.new(G(base), G(index), scale, offset);
+		checkImplicitNullCheck(base);
+		match (st) {
+			I8, U8 => asm.q.movb_m_r(addr, G(val));
+			I16, U16 => asm.q.movw_m_r(addr, G(val));
+			I32, U32 => asm.movd_m_r(addr, G(val));
+			U64 => asm.movq_m_r(addr, G(val));
+			F32 => asm.movss_m_s(addr, X(val));
+			F64 => asm.movsd_m_s(addr, X(val));
+			V128 => asm.movdqu_m_s(addr, X(val));
+		}
+	}
+
+	// Records the source location for an access through {base}, if it is an implicit null check.
+	private def checkImplicitNullCheck(base: Reg) {
+		if (implicitNullCheck == SpcConsts.NO_REG || implicitNullCheck != base) return;
+		recordCurSourceLoc();
+		implicitNullCheck = SpcConsts.NO_REG;
+	}
 	private def handle_large_offset(index: Reg, offset: u32) -> (X86_64Gpr, int) {
 		var ioffset = int.view(offset), r = G(index);
 		if (ioffset != offset) { // too large for signed encoding, add explicitly
@@ -243,6 +282,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_mov_r_m(kind: ValueKind, reg: Reg, ma: MasmAddr) {
 		var addr = A(ma);
+		checkImplicitNullCheck(ma.base);
 		match (kind) {
 			I32 => asm.movd_r_m(G(reg), addr);
 			I64, REF => asm.movq_r_m(G(reg), addr);
@@ -285,17 +325,26 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.movd_r_i(G(reg), int.view(u32.!(long.view(abs))));
 	}
 	def emit_mov_r_Object(reg: Reg, obj: Object) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(obj))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(obj))), fun => Pointer.atObject(obj));
+	}
+	def emit_mov_r_StructDeclInfo(reg: Reg, info: StructDeclInfo) {
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(info))), fun => Pointer.atObject(info));
+	}
+	def emit_mov_r_ArrayDeclInfo(reg: Reg, info: ArrayDeclInfo) {
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(info))), fun => Pointer.atObject(info));
+	}
+	def emit_mov_r_Array<T>(reg: Reg, array: Array<T>) {
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(array))), fun => Pointer.atObject(array));
 	}
 	def emit_mov_r_Function(reg: Reg, func: Function) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(func))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(func))), fun => Pointer.atObject(func));
 	}
 	def emit_mov_r_Instance(reg: Reg, instance: Instance) {
-		addEmbeddedRefOffset(asm.movq_r_p(G(reg), long.view(Pointer.atObject(instance))));
+		addEmbeddedRef(asm.movq_r_p(G(reg), long.view(Pointer.atObject(instance))), fun => Pointer.atObject(instance));
 	}
 	def emit_mov_r_Continuation(reg: Reg, cont: Continuation) {
 		// {reg} is an XMM register holding (stack, version) in its low/high 8 bytes.
-		addEmbeddedRefOffset(asm.movq_r_p(scratch, long.view(Pointer.atObject(cont.stack))));
+		addEmbeddedRef(asm.movq_r_p(scratch, long.view(Pointer.atObject(cont.stack))), fun => Pointer.atObject(cont.stack));
 		asm.pinsrq_s_r_i(X(reg), scratch, 0);
 		asm.movq_r_i(scratch, int.view(cont.version));
 		asm.pinsrq_s_r_i(X(reg), scratch, 1);
@@ -303,6 +352,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 
 	def emit_mov_m_r(kind: ValueKind, ma: MasmAddr, reg: Reg) {
 		var addr = A(ma);
+		checkImplicitNullCheck(ma.base);
 		match (kind) {
 			I32 => asm.movd_m_r(addr, G(reg));
 			I64, REF => asm.movq_m_r(addr, G(reg));
@@ -310,6 +360,9 @@ class X86_64MacroAssembler extends MacroAssembler {
 			F64 => asm.movsd_m_s(addr, X(reg));
 			V128, REF_U64 => asm.movdqu_m_s(addr, X(reg));
 		}
+	}
+	def emit_mov_m_b(ma: MasmAddr, val: byte) {
+		asm.movb_m_i(A(ma), val);
 	}
 	def emit_mov_m_i(ma: MasmAddr, val: int) {
 		asm.movd_m_i(A(ma), val);
@@ -737,7 +790,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			IS_WASM_FUNC, IS_NOT_WASM_FUNC => {
 				asm.d.cmp_m_i(G(reg).plus(0), offsets.WasmFunction_typeId);
 			}
-			I1_ZERO, I1_ONE => {
+			I1_ZERO, I1_ONE, REF_I31, REF_NOT_I31 => { // i31 references have the low bit set
 				asm.d.test_r_i(G(reg), 1);
 			}
 			_ => {
@@ -752,17 +805,30 @@ class X86_64MacroAssembler extends MacroAssembler {
 		var cond = if(cond.zero, X86_64Conds.Z, X86_64Conds.NZ);
 		asm.jc_rel_far(cond, X86_64MasmLabel.!(label).label);
 	}
-	def emit_breq_r_i(r: Reg, val: int, label: MasmLabel) {
-		asm.d.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.Z, X86_64MasmLabel.!(label).label);
+	def emit_br_r_r(kind: ValueKind, cond: MasmCmpBr, r1: Reg, r2: Reg, label: MasmLabel) {
+		widthOf(kind).cmp_r_r(G(r1), G(r2));
+		asm.jc_rel_far(cmpCond(cond), X86_64MasmLabel.!(label).label);
 	}
-	def emit_breq_r_l(r: Reg, val: int, label: MasmLabel) {
-		asm.q.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.Z, X86_64MasmLabel.!(label).label);
+	def emit_br_r_i(kind: ValueKind, cond: MasmCmpBr, reg: Reg, val: int, label: MasmLabel) {
+		widthOf(kind).cmp_r_i(G(reg), val);
+		asm.jc_rel_far(cmpCond(cond), X86_64MasmLabel.!(label).label);
 	}
-	def emit_brne_r_i(r: Reg, val: int, label: MasmLabel) {
-		asm.d.cmp_r_i(G(r), val);
-		asm.jc_rel_far(X86_64Conds.NZ, X86_64MasmLabel.!(label).label);
+	private def widthOf(kind: ValueKind) -> X86_64Assembler {
+		return if(kind == ValueKind.I32, asm.d, asm.q);
+	}
+	private def cmpCond(cond: MasmCmpBr) -> X86_64Cond {
+		match (cond) {
+			EQ => return X86_64Conds.Z;
+			NE => return X86_64Conds.NZ;
+			LT_S => return X86_64Conds.L;
+			LE_S => return X86_64Conds.LE;
+			GT_S => return X86_64Conds.G;
+			GE_S => return X86_64Conds.GE;
+			LT_U => return X86_64Conds.C;
+			LE_U => return X86_64Conds.NA;
+			GT_U => return X86_64Conds.A;
+			GE_U => return X86_64Conds.NC;
+		}
 	}
 	def emit_br_table_r(reg: Reg, labels: Array<MasmLabel>) {
 		// XXX: simplify the label patching logic by improving X86_64Assembler
@@ -800,13 +866,13 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_inc_metric(metric: Metric) {
 		if (!metric.enabled) return;
-		addEmbeddedRefOffset(asm.movq_r_p(scratch, long.view(Pointer.atObject(metric))));
+		addEmbeddedRef(asm.movq_r_p(scratch, long.view(Pointer.atObject(metric))), fun => Pointer.atObject(metric));
 		asm.q.add_m_i(scratch.plus(getOffsets().Metric_val), 1);
 	}
 	def emit_increment_CountProbe(tmp: Reg, probe: CountProbe, increment: u64) {
 		var r1 = G(tmp);
 		var refOffset = asm.movq_r_p(r1, long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		var addr = r1.plus(getOffsets().CountProbe_count);
 		if (increment == 1) {
 			asm.inc_m(addr);
@@ -821,7 +887,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_OperandProbe_i_v_fire(probe: OperandProbe_i_v, value_reg: Reg) {
 		var codePtr = CiRuntime.unpackClosure<OperandProbe_i_v, u32, void>(probe.fire_i).0;
 		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		asm.movq_r_l(scratch, long.view(codePtr)); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
 		recordRetSourceLoc();
@@ -829,7 +895,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_MemoryReadProbe_fire(probe: MemoryReadProbe) {
 		var codePtr = CiRuntime.unpackClosure<MemoryReadProbe, (u64, u64, u64), void>(probe.fire_probe).0;
 		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), long.view(Pointer.atObject(probe)));
-		addEmbeddedRefOffset(refOffset);
+		addEmbeddedRef(refOffset, fun => Pointer.atObject(probe));
 		asm.movq_r_l(scratch, long.view(codePtr)); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
 		recordRetSourceLoc();
@@ -872,6 +938,9 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_call_runtime_RESUME_THROW() {
 		emit_call_runtime(X86_64RT.runtime_handle_resume_throw);
 	}
+	def emit_call_runtime_MATERIALIZE_CONT() {
+		emit_call_runtime(X86_64RT.runtime_MATERIALIZE_CONT);
+	}
 	def emit_call_runtime_RESUME_THROW_REF() {
 		emit_call_runtime(X86_64RT.runtime_resume_throw_ref);
 	}
@@ -893,6 +962,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			MEMORY_COPY => emit_call_runtime(RT.MEMORY_COPY);
 			MEMORY_FILL => emit_call_runtime(RT.MEMORY_FILL);
 			TABLE_INIT => emit_call_runtime(RT.TABLE_INIT);
+			FUNC_NEW => emit_call_runtime(RT.FUNC_NEW);
 			TABLE_COPY => emit_call_runtime(RT.TABLE_COPY);
 			TABLE_GROW => emit_call_runtime(RT.TABLE_GROW);
 			TABLE_FILL => emit_call_runtime(RT.TABLE_FILL);
@@ -946,20 +1016,120 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.jc_rel_near(C.Z, done);
 		asm.d.shl_r_i(r_count, valuerep.slot_size_log);
 		asm.bind(copy);
-		if (valuerep.value_size == 16) { // 16-byte (SIMD) values
-			asm.movdqu_s_m(r_xmm0, r_src.plusR(r_count, 1, - valuerep.value_size));
-			asm.movdqu_m_s(r_dst.plusR(r_count, 1, - valuerep.value_size), r_xmm0);
-		} else { // 8-byte values
-			asm.movq_r_m(scratch, r_src.plusR(r_count, 1, - Pointer.SIZE));
-			asm.movq_m_r(r_dst.plusR(r_count, 1, - Pointer.SIZE), scratch);
-		}
-		if (valuerep.tagged) {
-			asm.movb_r_m(scratch, r_src.plusR(r_count, 1, - valuerep.slot_size)); // copy tags
-			asm.movb_m_r(r_dst.plusR(r_count, 1, - valuerep.slot_size), scratch);
-		}
+		emit_slot_copy(r_dst.plusR(r_count, 1, - valuerep.slot_size), r_src.plusR(r_count, 1, - valuerep.slot_size), r_xmm0);
 		asm.d.sub_r_i(r_count, valuerep.slot_size);
 		asm.jc_rel_near(C.NZ, copy);
 		asm.bind(done);
+	}
+	def emit_value_copy_n(r_dst: Reg, r_src: Reg, n: int, r_xmm: Reg) {
+		var dst = G(r_dst), src = G(r_src), xmm = X(r_xmm);
+		for (i < n) emit_slot_copy(dst.plus(i * valuerep.slot_size), src.plus(i * valuerep.slot_size), xmm);
+	}
+	// Copies one value-stack slot, tag and payload, from the slot at {src} to the slot at {dst}.
+	def emit_slot_copy(dst: X86_64Addr, src: X86_64Addr, r_xmm0: X86_64Xmmr) {
+		var payload = valuerep.slot_size - valuerep.value_size;
+		if (valuerep.value_size == 16) {
+			asm.movdqu_s_m(r_xmm0, src.plus(payload));
+			asm.movdqu_m_s(dst.plus(payload), r_xmm0);
+		} else {
+			asm.movq_r_m(scratch, src.plus(payload));
+			asm.movq_m_r(dst.plus(payload), scratch);
+		}
+		if (valuerep.tagged) {
+			asm.movb_r_m(scratch, src);
+			asm.movb_m_r(dst, scratch);
+		}
+	}
+	def emit_store_continuation(r_addr: Reg, offset: int, r_cont: Reg) {
+		var addr = G(r_addr), cont = G(r_cont);
+		asm.movb_m_i(addr.plus(offset), Continuations.valueTag);
+		asm.movq_m_r(addr.plus(offset + valuerep.tag_size), cont);
+		asm.movq_r_m(scratch, cont.plus(offsets.NativeStack_version));
+		asm.movq_m_r(addr.plus(offset + valuerep.tag_size + 8), scratch);
+	}
+	def emit_handler_search(is_switch: bool, r_tag: Reg, r_cur: Reg, r_parent: Reg, r_prev: Reg, r_entry: Reg, r_cnt: Reg, r_ptags: Reg, l_trap: MasmLabel) {
+		var tag = G(r_tag), parent = G(r_parent), prev = G(r_prev), entry = G(r_entry), cnt = G(r_cnt), ptags = G(r_ptags);
+		var l_link = X86_64Label.new(), l_entry = X86_64Label.new(), l_climb = X86_64Label.new(), l_found = X86_64Label.new();
+		asm.movq_r_r(prev, G(r_cur));
+		asm.bind(l_link);
+		asm.movq_r_m(parent, prev.plus(offsets.NativeStack_parent));
+		asm.test_r_r(parent, parent);
+		asm.jc_rel_far(C.Z, X86_64MasmLabel.!(l_trap).label);
+		var check_tags = !StackTuning.disableTagChecks;
+		if (check_tags) {
+			asm.movq_r_m(ptags, parent.plus(offsets.NativeStack_rsp));
+			asm.movq_r_m(ptags, ptags.plus(Pointer.SIZE + NativeInterpreterFrame.instance.offset));
+			asm.movq_r_m(ptags, ptags.plus(offsets.Instance_tags));
+		}
+		asm.movq_r_m(entry, parent.plus(offsets.NativeStack_handlers));
+		if (is_switch) {
+			asm.movd_r_m(cnt, entry.plus(offsets.Array_contents + ResumeSiteHeader.count.offset));
+			asm.movd_r_m(scratch, entry.plus(offsets.Array_contents + ResumeSiteHeader.switch_start_index.offset));
+			asm.d.sub_r_r(cnt, scratch);
+			asm.q.imul_r_i(scratch, ResumeHandlerEntry.size);
+			asm.q.lea(entry, X86_64Addr.new(entry, scratch, 1, offsets.Array_contents + ResumeSiteHeader.size));
+		} else {
+			asm.movd_r_m(cnt, entry.plus(offsets.Array_contents + ResumeSiteHeader.switch_start_index.offset));
+			asm.q.add_r_i(entry, offsets.Array_contents + ResumeSiteHeader.size);
+		}
+		asm.d.test_r_r(cnt, cnt);
+		if (check_tags) {
+			asm.jc_rel_near(C.Z, l_climb);
+			asm.bind(l_entry);
+			asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.tag_index.offset));
+			asm.q.cmp_r_m(tag, X86_64Addr.new(ptags, scratch, 8, offsets.Array_contents));
+			asm.jc_rel_near(C.Z, l_found);
+			asm.q.add_r_i(entry, ResumeHandlerEntry.size);
+			asm.d.dec_r(cnt);
+			asm.jc_rel_near(C.NZ, l_entry);
+		} else {
+			// Unsafe: assume a single tag, so the first handler clause matches.
+			asm.jc_rel_near(C.NZ, l_found);
+		}
+		asm.bind(l_climb);
+		asm.movq_r_r(prev, parent);
+		asm.jmp_rel_near(l_link);
+		asm.bind(l_found);
+	}
+	def emit_replace_child_chain(r_parent: Reg, r_prev: Reg, r_target: Reg, r_bottom: Reg, r_tmp: Reg) {
+		var target = G(r_target), parent = G(r_parent), prev = G(r_prev), bottom = G(r_bottom), tmp = G(r_tmp);
+		asm.movq_r_m(bottom, target.plus(offsets.NativeStack_bottom));
+		asm.movq_m_r(bottom.plus(offsets.NativeStack_parent), parent);
+		asm.movq_r_m(tmp, prev.plus(offsets.NativeStack_parent_rsp_ptr));
+		asm.movq_r_m(scratch, tmp.plus(0));
+		asm.movq_m_i(tmp.plus(0), 0);
+		asm.movq_r_m(tmp, bottom.plus(offsets.NativeStack_parent_rsp_ptr));
+		asm.movq_m_r(tmp.plus(0), scratch);
+		asm.movq_m_i(prev.plus(offsets.NativeStack_parent), 0);
+	}
+	def emit_suspend_reentry(r_parent: Reg, r_entry: Reg, r_dst: Reg, r_psfp: Reg) {
+		var parent = G(r_parent), entry = G(r_entry), dst = G(r_dst), psfp = G(r_psfp);
+		var l_int = X86_64Label.new(), l_done = X86_64Label.new();
+		asm.movq_r_m(psfp, parent.plus(offsets.NativeStack_rsp));
+		asm.q.add_r_i(psfp, Pointer.SIZE);
+		asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.handler_pc.offset));
+		asm.movd_m_r(psfp.plus(NativeInterpreterFrame.curpc.offset), scratch);
+		asm.cmpb_m_i(parent.plus(offsets.NativeStack_handler_tier), HandlerTier.SPC.tag);
+		asm.jc_rel_near(C.NZ, l_int);
+		asm.movq_m_i(psfp.plus(NativeInterpreterFrame.accessor.offset), 0);
+		asm.movq_r_m(scratch, entry.plus(ResumeHandlerEntry.stub_addr.offset));
+		asm.movq_m_r(psfp.plus(0 - Pointer.SIZE), scratch);
+		asm.jmp_rel_near(l_done);
+		asm.bind(l_int);
+		asm.movq_r_m(dst, psfp.plus(NativeInterpreterFrame.code.offset));
+		asm.q.lea(scratch, X86_64Addr.new(dst, scratch, 1, offsets.Array_contents));
+		asm.movq_m_r(psfp.plus(NativeInterpreterFrame.ip.offset), scratch);
+		asm.movd_r_m(scratch, entry.plus(ResumeHandlerEntry.stp_pos.offset));
+		asm.movq_r_m(dst, psfp.plus(NativeInterpreterFrame.sidetable.offset));
+		asm.q.lea(scratch, X86_64Addr.new(dst, scratch, 4, offsets.Array_contents));
+		asm.movq_m_r(psfp.plus(NativeInterpreterFrame.stp.offset), scratch);
+		var ic = X86_64PreGenStubs.getInterpreterCode();
+		asm.movq_r_l(scratch, (ic.start + ic.header.intSuspendEntryOffset) - Pointer.NULL);
+		asm.movq_m_r(psfp.plus(0 - Pointer.SIZE), scratch);
+		asm.bind(l_done);
+		asm.movd_r_m(dst, entry.plus(ResumeHandlerEntry.vsp_slots.offset));
+		asm.q.shl_r_i(dst, valuerep.slot_size_log);
+		asm.q.add_r_m(dst, psfp.plus(NativeInterpreterFrame.vfp.offset));
 	}
 
 	def emit_get_curstack(r: Reg) {
@@ -1135,22 +1305,22 @@ class X86_64MacroAssembler extends MacroAssembler {
 		// 5. Add 3 and 4.
 		asm.paddq_s_s(lhs, tmp2);
 	}
-	def emit_v128_ne<T>(dst: X86_64Xmmr, src: X86_64Xmmr, f: (X86_64Xmmr, X86_64Xmmr) -> T) {
+	def emit_v128_ne<T>(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr, f: (X86_64Xmmr, X86_64Xmmr) -> T) {
 		f(dst, src);
-		f(src, src);
-		asm.pxor_s_s(dst, src);
+		f(scratch, scratch);
+		asm.pxor_s_s(dst, scratch);
 	}
-	def emit_i8x16_ne(dst: X86_64Xmmr, src: X86_64Xmmr) {
-		emit_v128_ne(dst, src, asm.pcmpeqb_s_s);
+	def emit_i8x16_ne(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
+		emit_v128_ne(dst, src, scratch, asm.pcmpeqb_s_s);
 	}
-	def emit_i16x8_ne(dst: X86_64Xmmr, src: X86_64Xmmr) {
-		emit_v128_ne(dst, src, asm.pcmpeqw_s_s);
+	def emit_i16x8_ne(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
+		emit_v128_ne(dst, src, scratch, asm.pcmpeqw_s_s);
 	}
-	def emit_i32x4_ne(dst: X86_64Xmmr, src: X86_64Xmmr) {
-		emit_v128_ne(dst, src, asm.pcmpeqd_s_s);
+	def emit_i32x4_ne(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
+		emit_v128_ne(dst, src, scratch, asm.pcmpeqd_s_s);
 	}
-	def emit_i64x2_ne(dst: X86_64Xmmr, src: X86_64Xmmr) {
-		emit_v128_ne(dst, src, asm.pcmpeqq_s_s);
+	def emit_i64x2_ne(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
+		emit_v128_ne(dst, src, scratch, asm.pcmpeqq_s_s);
 	}
 	def emit_v128_gt_u<T>(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr,
 		pmax: (X86_64Xmmr, X86_64Xmmr) -> T, pcmp: (X86_64Xmmr, X86_64Xmmr) -> T) {
@@ -1192,10 +1362,11 @@ class X86_64MacroAssembler extends MacroAssembler {
 		emit_v128_ge(dst, src, asm.pminud_s_s, asm.pcmpeqd_s_s);
 	}
 	def emit_i64x2_ge_s(dst: X86_64Xmmr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
-		asm.pcmpgtq_s_s(src, dst);
-		asm.pcmpeqd_s_s(scratch, scratch);
-		emit_v128_xorps(src, scratch);
-		asm.movaps_s_s(dst, src);
+		// ge_s(dst, src) == !(src > dst)
+		asm.movaps_s_s(scratch, src);
+		asm.pcmpgtq_s_s(scratch, dst);
+		asm.pcmpeqd_s_s(dst, dst);
+		emit_v128_xorps(dst, scratch);
 	}
 	def emit_i8x16_shl(dst: X86_64Xmmr, shift: X86_64Gpr, tmp1: X86_64Gpr, tmp2: X86_64Xmmr, tmp3: X86_64Xmmr) {
 		// Take shift value modulo 8.
@@ -1333,9 +1504,10 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_i32x4_alltrue(dst: X86_64Gpr, src: X86_64Xmmr, tmp: X86_64Xmmr) { emit_v128_alltrue(dst, src, tmp, asm.pcmpeqd_s_s); }
 	def emit_i64x2_alltrue(dst: X86_64Gpr, src: X86_64Xmmr, tmp: X86_64Xmmr) { emit_v128_alltrue(dst, src, tmp, asm.pcmpeqq_s_s); }
 
-	def emit_i16x8_bitmask(dst: X86_64Gpr, src: X86_64Xmmr) {
-		asm.packsswb_s_s(src, src);
-		asm.pmovmskb_r_s(dst, src);
+	def emit_i16x8_bitmask(dst: X86_64Gpr, src: X86_64Xmmr, scratch: X86_64Xmmr) {
+		// Only the high 8 bytes (packed from src) are used; the low 8 bytes are garbage.
+		asm.packsswb_s_s(scratch, src);
+		asm.pmovmskb_r_s(dst, scratch);
 		asm.shr_r_i(dst, 8);
 	}
 	def emit_i8x16_popcnt(dst: X86_64Xmmr, tmp1: X86_64Gpr, xtmp1: X86_64Xmmr, xtmp2: X86_64Xmmr, mask: X86_64Xmmr) {
@@ -1572,7 +1744,11 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 
 	def emit_set_stack_state(stk: Reg, state: StackState) {
-		emit_mov_m_i(MasmAddr(stk, offsets.NativeStack_state), state.tag);
+		emit_mov_m_b(MasmAddr(stk, offsets.NativeStack_state), byte.view(state.tag));
+	}
+	def emit_br_stack_materialized(stk: Reg, label: MasmLabel) {
+		asm.q.cmp_m_i(G(stk).plus(offsets.NativeStack_range), 0);
+		asm.jc_rel_far(X86_64Conds.NZ, X86_64MasmLabel.!(label).label);
 	}
 
 	// Moves values from the current stack to %cont.top.

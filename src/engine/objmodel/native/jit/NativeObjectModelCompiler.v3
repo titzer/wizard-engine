@@ -1,0 +1,223 @@
+// Copyright 2026 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// The native object model supports inline object access in the JIT.
+component ObjectModelCompilers {
+	def instance: ObjectModelCompiler = NativeObjectModelCompiler.new();
+}
+
+// Emits inline code for accesses to native structs, whose fields are at fixed offsets from the start
+// of the object, and to specialized arrays, whose elements are stored in a Virgil array {vals}.
+class NativeObjectModelCompiler extends ObjectModelCompiler {
+	def emitStructGet(spc: SinglePassCompiler, decl: StructDecl, index: u31, signed: bool, dst: Reg, obj: Reg) {
+		var info = NativeWasmStructs.getInfo(decl);
+		if (info == null) return spc.emitTrap(TrapReason.UNREACHABLE); // too large, so no instances exist
+		var f = info.field_info[index];
+		spc.masm.emit_load_elem(FieldStorage.toMemStorage(f.kind, signed), dst, obj, NO_REG, 1, f.offset);
+	}
+	def emitStructSet(spc: SinglePassCompiler, decl: StructDecl, index: u31, obj: Reg, val: Reg) {
+		var info = NativeWasmStructs.getInfo(decl);
+		if (info == null) return spc.emitTrap(TrapReason.UNREACHABLE); // too large, so no instances exist
+		var f = info.field_info[index];
+		spc.masm.emit_store_elem(FieldStorage.toMemStorage(f.kind, false), obj, NO_REG, 1, f.offset, val);
+	}
+	def emitStructNew(spc: SinglePassCompiler, decl: StructDecl, dst: Reg) {
+		var masm = spc.masm, info = NativeWasmStructs.getInfo(decl);
+		if (info == null) return spc.emitTrap(TrapReason.OOM); // too large for this object model
+		var t1 = spc.allocTmp(ValueKind.REF);
+		var done: MasmLabel;
+		if (SpcTuning.inlineGcBump) {
+			// Bump-allocate and store the descriptor in the header; the heap is zeroed.
+			var t2 = spc.allocTmp(ValueKind.REF), slow = masm.newLabel(spc.it.pc);
+			done = masm.newLabel(spc.it.pc);
+			masm.emit_v3_bump_alloc(dst, RiGc.getDescriptorSize(Pointer.atObject(info)), NO_REG, t1, t2, slow);
+			masm.emit_mov_r_StructDeclInfo(t1, info);
+			masm.emit_mov_m_r(ValueKind.REF, MasmAddr(dst, masm.getOffsets().Object_descriptor), t1);
+			masm.emit_br(done);
+			masm.bindLabel(slow);
+		}
+		masm.emit_mov_r_StructDeclInfo(t1, info);
+		var code = CiRuntime.unpackClosure<NativeObjectModelCompiler, NativeStructDeclInfo, NativeWasmStruct>(NativeWasmStructs.allocStruct).0;
+		spc.emitCallRuntimePreserving(code, [t1], dst);
+		if (done != null) masm.bindLabel(done);
+	}
+	def emitArrayNew(spc: SinglePassCompiler, decl: ArrayDecl, length: Reg, fixed_length: int, dst: Reg) {
+		var masm = spc.masm, info = V3SpecializedWasmArrays.getAllocInfo(decl), offsets = masm.getOffsets();
+		if (fixed_length < 0) masm.emit_br_r_i(ValueKind.I32, MasmCmpBr.GT_U, length, int.view(Execute.limits.max_array_length), spc.newTrapLabel(TrapReason.OOM));
+		var t1 = spc.allocTmp(ValueKind.REF);
+		// A sample array gives the representation of the wrapper and of the Virgil array with the elements.
+		var sample = Pointer.atObject(V3SpecializedWasmArrays.allocArray(info, 0));
+		var desc = sample.load<Pointer>(), vals_tid = (sample + offsets.V3SpecializedWasmArray_vals).load<Pointer>().load<int>();
+		var inHeap = desc >= CiRuntime.HEAP_START && desc < CiRuntime.HEAP_END; // would move
+		var done: MasmLabel;
+		if (SpcTuning.inlineGcBump && !inHeap) {
+			// Bump-allocate the wrapper followed by the array, then initialize both headers and the
+			// wrapper's fields; the heap is zeroed.
+			var t2 = spc.allocTmp(ValueKind.REF), slow = masm.newLabel(spc.it.pc);
+			var wrapper_size = RiGc.objectSize(sample), elem_size = elemSize(offsets, V3SpecializedWasmArrays.getStorageKind(decl));
+			var header_size = offsets.Array_contents, align = RiGc.REF_SIZE;
+			done = masm.newLabel(spc.it.pc);
+			if (fixed_length >= 0) {
+				var array_size = FieldStorage.alignUp(header_size + fixed_length * elem_size, align);
+				masm.emit_v3_bump_alloc(dst, wrapper_size + array_size, NO_REG, t1, t2, slow);
+			} else {
+				var size = spc.allocTmp(ValueKind.I64);
+				masm.emit_mov_r_r(ValueKind.I64, size, length);
+				masm.emit_shlw_r_i(size, u6.view(Ints.log(u32.view(elem_size))));
+				masm.emit_addw_r_i(size, wrapper_size + header_size + align - 1);
+				masm.emit_binop_r_i(Opcode.I64_AND, size, 0 - align);
+				masm.emit_v3_bump_alloc(dst, 0, size, t1, t2, slow);
+			}
+			masm.emit_mov_r_l(t1, desc - Pointer.NULL);
+			masm.emit_mov_m_r(ValueKind.REF, MasmAddr(dst, offsets.Object_descriptor), t1);
+			masm.emit_mov_r_ArrayDeclInfo(t1, info);
+			masm.emit_mov_m_r(ValueKind.REF, MasmAddr(dst, offsets.V3SpecializedWasmArray_info), t1);
+			masm.emit_mov_r_r(ValueKind.REF, t1, dst);
+			masm.emit_addw_r_i(t1, wrapper_size);
+			masm.emit_mov_m_r(ValueKind.REF, MasmAddr(dst, offsets.V3SpecializedWasmArray_vals), t1);
+			masm.emit_mov_m_i(MasmAddr(t1, 0), vals_tid);
+			masm.emit_mov_m_r(ValueKind.I32, MasmAddr(t1, offsets.Array_length), length);
+			masm.emit_br(done);
+			masm.bindLabel(slow);
+		}
+		masm.emit_mov_r_ArrayDeclInfo(t1, info);
+		var code = CiRuntime.unpackClosure<NativeObjectModelCompiler, (ArrayDeclInfo, u32), WasmArray>(V3SpecializedWasmArrays.allocArray).0;
+		spc.emitCallRuntimePreserving(code, [t1, length], dst);
+		if (done != null) masm.bindLabel(done);
+	}
+	def emitArrayInit(spc: SinglePassCompiler, decl: ArrayDecl, obj: Reg, index: int, val: Reg) {
+		// Uses the scratch register to avoid a temporary per element.
+		var masm = spc.masm, kind = V3SpecializedWasmArrays.getStorageKind(decl), offsets = masm.getOffsets();
+		var vals = masm.regConfig.scratch, offset = offsets.Array_contents + index * elemSize(offsets, kind);
+		masm.emit_mov_r_m(ValueKind.REF, vals, MasmAddr(obj, offsets.V3SpecializedWasmArray_vals));
+		match (kind) {
+			Bytes(access) => masm.emit_store_elem(access, vals, NO_REG, 1, offset, val);
+			Ref => masm.emit_store_elem(MemStorageKind.U64, vals, NO_REG, 1, offset, val);
+			RefI31 => {
+				// The new element is (0, null); store either the tagged i31 or the reference.
+				var is_i31 = masm.newLabel(spc.it.pc), done = masm.newLabel(spc.it.pc);
+				masm.emit_br_r(val, MasmBrCond.REF_I31, is_i31);
+				masm.emit_store_elem(MemStorageKind.U64, vals, NO_REG, 1, offset + REF_SIZE, val);
+				masm.emit_br(done);
+				masm.bindLabel(is_i31);
+				masm.emit_store_elem(MemStorageKind.U32, vals, NO_REG, 1, offset, val);
+				masm.bindLabel(done);
+			}
+			RefU64 => masm.emit_store_elem(MemStorageKind.V128, vals, NO_REG, 1, offset, val);
+		}
+	}
+	def emitArrayGet(spc: SinglePassCompiler, decl: ArrayDecl, signed: bool, dst: Reg, obj: Reg, index: Reg) {
+		var masm = spc.masm, kind = V3SpecializedWasmArrays.getStorageKind(decl);
+		// Reuse {dst} for {vals} if possible.
+		var vals = if(spc.isSameRegClass(ValueTypes.kind(decl.elem_types[0].valtype), ValueKind.REF) && kind != FieldStorageKind.RefI31, dst, spc.allocTmp(ValueKind.REF));
+		masm.emit_mov_r_m(ValueKind.REF, vals, MasmAddr(obj, masm.getOffsets().V3SpecializedWasmArray_vals));
+		masm.emit_v3_Array_bounds_check_rr(vals, index, spc.newTrapLabel(TrapReason.ARRAY_OOB));
+		var e = emitScaledIndex(spc, kind, index), offset = masm.getOffsets().Array_contents;
+		match (kind) {
+			Bytes(access) => masm.emit_load_elem(FieldStorage.withSign(access, signed), dst, vals, e.0, e.1, offset);
+			Ref => masm.emit_load_elem(MemStorageKind.U64, dst, vals, e.0, e.1, offset);
+			RefI31 => {
+				// The element is a pair (u32, Object); the u32 holds a tagged i31, or 0.
+				var done = masm.newLabel(spc.it.pc);
+				masm.emit_load_elem(MemStorageKind.U32, dst, vals, e.0, e.1, offset);
+				masm.emit_br_r(dst, MasmBrCond.REF_I31, done);
+				masm.emit_load_elem(MemStorageKind.U64, dst, vals, e.0, e.1, offset + REF_SIZE);
+				masm.bindLabel(done);
+			}
+			RefU64 => masm.emit_load_elem(MemStorageKind.V128, dst, vals, e.0, e.1, offset);
+		}
+	}
+	def emitArraySet(spc: SinglePassCompiler, decl: ArrayDecl, obj: Reg, index: Reg, val: Reg) {
+		var masm = spc.masm, kind = V3SpecializedWasmArrays.getStorageKind(decl);
+		var vals = spc.allocTmp(ValueKind.REF);
+		masm.emit_mov_r_m(ValueKind.REF, vals, MasmAddr(obj, masm.getOffsets().V3SpecializedWasmArray_vals));
+		masm.emit_v3_Array_bounds_check_rr(vals, index, spc.newTrapLabel(TrapReason.ARRAY_OOB));
+		var e = emitScaledIndex(spc, kind, index), offset = masm.getOffsets().Array_contents;
+		match (kind) {
+			Bytes(access) => masm.emit_store_elem(access, vals, e.0, e.1, offset, val);
+			Ref => masm.emit_store_elem(MemStorageKind.U64, vals, e.0, e.1, offset, val);
+			RefI31 => {
+				// Store the pair (tagged i31, null) or (0, reference).
+				var zero = spc.allocTmp(ValueKind.REF);
+				var is_i31 = masm.newLabel(spc.it.pc), done = masm.newLabel(spc.it.pc);
+				masm.emit_mov_r_l(zero, 0);
+				masm.emit_br_r(val, MasmBrCond.REF_I31, is_i31);
+				masm.emit_store_elem(MemStorageKind.U32, vals, e.0, e.1, offset, zero);
+				masm.emit_store_elem(MemStorageKind.U64, vals, e.0, e.1, offset + REF_SIZE, val);
+				masm.emit_br(done);
+				masm.bindLabel(is_i31);
+				masm.emit_store_elem(MemStorageKind.U32, vals, e.0, e.1, offset, val);
+				masm.emit_store_elem(MemStorageKind.U64, vals, e.0, e.1, offset + REF_SIZE, zero);
+				masm.bindLabel(done);
+			}
+			RefU64 => masm.emit_store_elem(MemStorageKind.V128, vals, e.0, e.1, offset, val);
+		}
+	}
+	def emitArrayLen(spc: SinglePassCompiler, dst: Reg, obj: Reg) {
+		var masm = spc.masm;
+		masm.emit_mov_r_m(ValueKind.REF, dst, MasmAddr(obj, masm.getOffsets().V3SpecializedWasmArray_vals));
+		masm.emit_v3_Array_length_r_r(dst, dst);
+	}
+	def emitCastTest(spc: SinglePassCompiler, obj: Reg, ht_val: int, fail: MasmLabel, tmp1: Reg, tmp2: Reg) {
+		var masm = spc.masm;
+		if (ht_val >= 0) {
+			var decl = spc.module.heaptypes[ht_val];
+			if (StructDecl.?(decl)) return emitStructCastTest(spc, obj, StructDecl.!(decl), fail, tmp1, tmp2);
+		}
+		// All Wasm references are objects in the class hierarchy of {NativeWasmStruct}, which has a
+		// descriptor, so all have a descriptor that holds their class id.
+		var classId = NativeWasmStructs.getClassId();
+		masm.emit_v3_getDescriptor_r_r(tmp1, obj);
+		masm.emit_v3_getDescribedClassId_r_r(tmp1, tmp1);
+		if (ht_val == BpHeapTypeCode.STRUCT.val) return masm.emit_br_r_i(ValueKind.I32, MasmCmpBr.NE, tmp1, classId, fail);
+		// Structs pass {eq} and fail other types; other objects need a runtime check.
+		var ok = masm.newLabel(spc.it.pc);
+		masm.emit_br_r_i(ValueKind.I32, MasmCmpBr.EQ, tmp1, classId, if(ht_val == BpHeapTypeCode.EQ.val, ok, fail));
+		spc.emitCallRuntimeCast(ht_val, tmp1);
+		masm.emit_br_r(tmp1, MasmBrCond.I1_ZERO, fail);
+		masm.bindLabel(ok);
+	}
+	// Since declarations are canonicalized, an object is an instance of {decl} or a subtype if its
+	// descriptor is {decl}'s descriptor, or it has {decl}'s descriptor in its display at the same depth.
+	private def emitStructCastTest(spc: SinglePassCompiler, obj: Reg, decl: StructDecl, fail: MasmLabel, tmp1: Reg, tmp2: Reg) {
+		var masm = spc.masm, info = NativeWasmStructs.getInfo(decl);
+		if (info == null) return masm.emit_br(fail); // too large, so no instances exist
+		masm.emit_v3_getDescriptor_r_r(tmp1, obj);
+		masm.emit_mov_r_StructDeclInfo(tmp2, info);
+		if (decl.final) return masm.emit_br_r_r(ValueKind.REF, MasmCmpBr.NE, tmp1, tmp2, fail); // no subtypes
+		var ok = masm.newLabel(spc.it.pc);
+		masm.emit_br_r_r(ValueKind.REF, MasmCmpBr.EQ, tmp1, tmp2, ok);
+		// Not an exact match; check that {obj} is a struct before checking the display.
+		masm.emit_v3_getDescribedClassId_r_r(tmp2, tmp1);
+		masm.emit_br_r_i(ValueKind.I32, MasmCmpBr.NE, tmp2, NativeWasmStructs.getClassId(), fail);
+		var depth = info.depth();
+		masm.emit_mov_r_m(ValueKind.REF, tmp1, MasmAddr(tmp1, NativeWasmStructs.getDisplayOffset()));
+		masm.emit_mov_r_i(tmp2, depth);
+		masm.emit_v3_Array_bounds_check_rr(tmp1, tmp2, fail);
+		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp1, tmp1, depth);
+		masm.emit_mov_r_StructDeclInfo(tmp2, info);
+		masm.emit_br_r_r(ValueKind.REF, MasmCmpBr.NE, tmp1, tmp2, fail);
+		masm.bindLabel(ok);
+	}
+	// Returns the index register and scale to address an element of {kind}.
+	private def emitScaledIndex(spc: SinglePassCompiler, kind: FieldStorageKind, index: Reg) -> (Reg, byte) {
+		var size = elemSize(spc.masm.getOffsets(), kind);
+		if (size <= 8) return (index, byte.view(size));
+		// Scaling by 16 is not supported by addressing modes; scale explicitly.
+		var scaled = spc.allocTmp(ValueKind.I64);
+		spc.masm.emit_mov_r_r(ValueKind.I64, scaled, index);
+		spc.masm.emit_shlw_r_i(scaled, 4);
+		return (scaled, 1);
+	}
+}
+
+def NO_REG = SpcConsts.NO_REG;
+def REF_SIZE = RiGc.REF_SIZE;
+// The size of an element in the Virgil array that stores elements of {kind}.
+def elemSize(offsets: V3Offsets, kind: FieldStorageKind) -> int {
+	match (kind) {
+		Bytes(access) => return access.size;
+		Ref => return REF_SIZE;
+		RefI31, RefU64 => return offsets.Array_pair_elem_size;
+	}
+}
