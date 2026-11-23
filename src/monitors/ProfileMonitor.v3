@@ -8,6 +8,7 @@ def monitor_ = MonitorRegistry.add(
 def depthOpt = monitor_.options.newIntOption("depth", -1, "limit the maximum call tree depth");
 def dotGraphOpt = monitor_.options.newFlag("dot", null, "print the call graph (.dot) instead");
 def filterOpt = monitor_.options.newDeclFilterOption("calls", "apply profiling to selected functions");
+def clockOpt = monitor_.options.newStringOption("clock", "us", "clock for measuring time: \"us\" (microseconds) or \"count\" (deterministic, one tick per read, for testing)");
 
 // variables & functions for dot graph functionality
 var callStack: Vector<(string, int)> = Vector<(string, int)>.new(); // (name, ID)
@@ -18,18 +19,25 @@ class ProfileMonitor extends Monitor {
 	var maxDepth: int = -1;
 	var filter: DeclFilter;
 
-	// format: --monitors=profile{depth=2,calls=*}
+	var clock: void -> int;
+
+	// format: --monitors=profile{depth=2,calls=*,clock=us}
 	def configure(args: string) -> string {
 		maxDepth = depthOpt.val;
 		filter = filterOpt.val;
+		var c = clockOpt.val;
+		if (Strings.equal(c, "us")) clock = System.ticksUs;
+		else if (Strings.equal(c, "count")) clock = CountingClock.new().tick;
+		else return Strings.format1("unknown clock \"%s\" (expected \"us\" or \"count\")", c);
 		return null;
 	}
 	def onParse(module: Module, err: ErrorGen) {
 		var mm = ModuleInstrumenter.new(module);
-		tree = ProfileTree.new();
+		tree = ProfileTree.new(if(clock != null, clock, System.ticksUs));
 		mm.forEachFuncFiltered(filter, ModuleInstrumenter.beforeFuncExecAndReturn(_, _, tree.enterFunc, tree.exitFunc));
 	}
 	def onFinish(i: Instance, r: Result) {
+		tree.finish(); // close out functions that never returned, e.g. due to a trap or exit
 		if (dotGraphOpt.val) 
 			tree.renderDot(out, maxDepth);
 		else
@@ -52,12 +60,12 @@ private class ProfileTreeNode(parent: ProfileTreeNode, func: WasmFunction) {
 		children = List.new(childNode, children);
 		return childNode;
 	}
-	def enter() {
-		curTime = System.ticksUs();
+	def enter(now: int) {
+		curTime = now;
 		count++;
 	}
-	def exit() {
-		totalTime += System.ticksUs() - curTime;
+	def exit(now: int) {
+		totalTime += now - curTime;
 	}
 
 	def render(out: TraceBuilder, depth: int, total: int, maxDepth: int) {
@@ -186,26 +194,54 @@ def getFuncName(f: WasmFunction) -> string {
 	}
 }
 
+// A deterministic clock that advances by one tick each time it is read, for testing.
+private class CountingClock {
+	var count: int;
+	def tick() -> int { return count++; }
+}
+
+// Tracks the calling context tree. Functions are only guaranteed to have an exit event if they
+// return normally, so the tree also records the frame of each function that is currently executing
+// (i.e. each node from {curNode} up to the root) and closes out those whose frames have been
+// unwound by other means, such as a trap, an exception, or a tail call.
 private class ProfileTree {
+	def clock: void -> int;
 	var rootNode: ProfileTreeNode;
 	var curNode: ProfileTreeNode;
+	def frames = Vector<FrameAccessor>.new(); // one per node from {curNode} up to the root
 
-	new() {
+	new(clock) {
 		rootNode = ProfileTreeNode.new(null, null);
 		curNode = rootNode;
 	}
 	def enterFunc(dynamicLoc: DynamicLoc) -> ProbeAction {
+		var now = clock();
+		popUnwound(now);
 		curNode = curNode.getOrCreateChild(dynamicLoc.func);
-		curNode.enter();
+		curNode.enter(now);
+		frames.put(dynamicLoc.frame.getFrameAccessor());
 		return ProbeAction.Continue;
 	}
 	def exitFunc(dynamicLoc: DynamicLoc) -> ProbeAction {
-		pop();
+		var now = clock();
+		popUnwound(now);
+		if (frames.length > 0) pop(now); // the returning function itself
 		return ProbeAction.Continue;
 	}
-	def pop() {
-		curNode.exit();
+	// Closes out all functions that are still executing, e.g. at the end of the program.
+	def finish() {
+		var now = clock();
+		while (frames.length > 0) pop(now);
+	}
+	// Closes out functions whose frames were unwound without an exit event. Their time is counted
+	// up to {now}, the first event after they were unwound.
+	private def popUnwound(now: int) {
+		while (frames.length > 0 && frames[frames.length - 1].isUnwound()) pop(now);
+	}
+	private def pop(now: int) {
+		curNode.exit(now);
 		curNode = curNode.parent;
+		frames.resize(frames.length - 1);
 	}
 	def renderDot(out: TraceBuilder, maxDepth: int) {
 		callStack.clear();

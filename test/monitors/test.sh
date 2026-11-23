@@ -33,7 +33,8 @@ else
         "profile_bytecode{switch_size=7,abstract_interpreter=true}"
         "alloc"
         "opcodes"
-        "ssevent")
+        "ssevent"
+        "profile{clock=count}")
 fi
 
 TESTS=$(ls *.wasm)
