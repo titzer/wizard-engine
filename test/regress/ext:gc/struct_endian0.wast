@@ -1,0 +1,98 @@
+;; Struct fields have no visible byte order, so every path that reads or writes a field (constant
+;; expressions, the runtime, and inline JIT code) must agree. Uses values with distinct bytes so
+;; that any byte-order mismatch between paths changes the value read.
+(module
+  (type $s (struct (field (mut i8)) (field (mut i16)) (field (mut i32)) (field (mut i64))
+                   (field (mut f32)) (field (mut f64)) (field (mut v128))))
+
+  ;; Initialized by a constant expression, with f32 bits 0x84838281 and f64 bits 0x84838281ded9d8db.
+  (global $g (ref $s) (struct.new $s
+    (i32.const 0x81) (i32.const 0x8281) (i32.const 0x84838281) (i64.const 0x84838281ded9d8db)
+    (f32.const -0x1.070502p-118) (f64.const -0x1.38281ded9d8dbp-951)
+    (v128.const i8x16 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f 0x10)))
+
+  (func (export "get_i8_u") (result i32) (struct.get_u $s 0 (global.get $g)))
+  (func (export "get_i8_s") (result i32) (struct.get_s $s 0 (global.get $g)))
+  (func (export "get_i16_u") (result i32) (struct.get_u $s 1 (global.get $g)))
+  (func (export "get_i16_s") (result i32) (struct.get_s $s 1 (global.get $g)))
+  (func (export "get_i32") (result i32) (struct.get $s 2 (global.get $g)))
+  (func (export "get_i64") (result i64) (struct.get $s 3 (global.get $g)))
+  (func (export "get_f32_bits") (result i32) (i32.reinterpret_f32 (struct.get $s 4 (global.get $g))))
+  (func (export "get_f64_bits") (result i64) (i64.reinterpret_f64 (struct.get $s 5 (global.get $g))))
+  (func (export "get_v128") (result v128) (struct.get $s 6 (global.get $g)))
+  (func (export "get_v128_lanes") (result i64 i64)
+    (i64x2.extract_lane 0 (struct.get $s 6 (global.get $g)))
+    (i64x2.extract_lane 1 (struct.get $s 6 (global.get $g))))
+  (func (export "get_v128_byte") (param i32) (result i32)
+    ;; Selects byte {i} by shuffling it into lane 0.
+    (i8x16.extract_lane_u 0 (i8x16.swizzle (struct.get $s 6 (global.get $g)) (i8x16.splat (local.get 0)))))
+
+  (func (export "set_i8") (param i32) (struct.set $s 0 (global.get $g) (local.get 0)))
+  (func (export "set_i16") (param i32) (struct.set $s 1 (global.get $g) (local.get 0)))
+  (func (export "set_i32") (param i32) (struct.set $s 2 (global.get $g) (local.get 0)))
+  (func (export "set_i64") (param i64) (struct.set $s 3 (global.get $g) (local.get 0)))
+  (func (export "set_f32_bits") (param i32) (struct.set $s 4 (global.get $g) (f32.reinterpret_i32 (local.get 0))))
+  (func (export "set_f64_bits") (param i64) (struct.set $s 5 (global.get $g) (f64.reinterpret_i64 (local.get 0))))
+  (func (export "set_v128") (param v128) (struct.set $s 6 (global.get $g) (local.get 0)))
+
+  ;; Allocates a struct in code from the given values and reads all of them back.
+  (func (export "fresh") (param i32 i64 v128) (result i32 i32 i32 i32 i32 i64 i32 i64 i64 i64)
+    (local $o (ref $s))
+    (local.set $o (struct.new $s (local.get 0) (local.get 0) (local.get 0) (local.get 1)
+      (f32.reinterpret_i32 (local.get 0)) (f64.reinterpret_i64 (local.get 1)) (local.get 2)))
+    (struct.get_u $s 0 (local.get $o))
+    (struct.get_s $s 0 (local.get $o))
+    (struct.get_u $s 1 (local.get $o))
+    (struct.get_s $s 1 (local.get $o))
+    (struct.get $s 2 (local.get $o))
+    (struct.get $s 3 (local.get $o))
+    (i32.reinterpret_f32 (struct.get $s 4 (local.get $o)))
+    (i64.reinterpret_f64 (struct.get $s 5 (local.get $o)))
+    (i64x2.extract_lane 0 (struct.get $s 6 (local.get $o)))
+    (i64x2.extract_lane 1 (struct.get $s 6 (local.get $o))))
+)
+
+;; Values written by the constant expression.
+(assert_return (invoke "get_i8_u") (i32.const 0x81))
+(assert_return (invoke "get_i8_s") (i32.const -0x7f))
+(assert_return (invoke "get_i16_u") (i32.const 0x8281))
+(assert_return (invoke "get_i16_s") (i32.const -0x7d7f))
+(assert_return (invoke "get_i32") (i32.const 0x84838281))
+(assert_return (invoke "get_i64") (i64.const 0x84838281ded9d8db))
+(assert_return (invoke "get_f32_bits") (i32.const 0x84838281))
+(assert_return (invoke "get_f64_bits") (i64.const 0x84838281ded9d8db))
+(assert_return (invoke "get_v128") (v128.const i8x16 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f 0x10))
+(assert_return (invoke "get_v128_lanes") (i64.const 0x0807060504030201) (i64.const 0x100f0e0d0c0b0a09))
+(assert_return (invoke "get_v128_byte" (i32.const 0)) (i32.const 0x01))
+(assert_return (invoke "get_v128_byte" (i32.const 7)) (i32.const 0x08))
+(assert_return (invoke "get_v128_byte" (i32.const 8)) (i32.const 0x09))
+(assert_return (invoke "get_v128_byte" (i32.const 15)) (i32.const 0x10))
+
+;; Values written by code.
+(invoke "set_i8" (i32.const 0xfedcba7f))
+(invoke "set_i16" (i32.const 0xfedc7f01))
+(invoke "set_i32" (i32.const 0x01020304))
+(invoke "set_i64" (i64.const 0x0102030405060708))
+(invoke "set_f32_bits" (i32.const 0x3f010203))
+(invoke "set_f64_bits" (i64.const 0x3ff1020304050607))
+(invoke "set_v128" (v128.const i8x16 0xf0 0xe1 0xd2 0xc3 0xb4 0xa5 0x96 0x87 0x78 0x69 0x5a 0x4b 0x3c 0x2d 0x1e 0x0f))
+(assert_return (invoke "get_i8_u") (i32.const 0x7f))
+(assert_return (invoke "get_i8_s") (i32.const 0x7f))
+(assert_return (invoke "get_i16_u") (i32.const 0x7f01))
+(assert_return (invoke "get_i16_s") (i32.const 0x7f01))
+(assert_return (invoke "get_i32") (i32.const 0x01020304))
+(assert_return (invoke "get_i64") (i64.const 0x0102030405060708))
+(assert_return (invoke "get_f32_bits") (i32.const 0x3f010203))
+(assert_return (invoke "get_f64_bits") (i64.const 0x3ff1020304050607))
+(assert_return (invoke "get_v128") (v128.const i8x16 0xf0 0xe1 0xd2 0xc3 0xb4 0xa5 0x96 0x87 0x78 0x69 0x5a 0x4b 0x3c 0x2d 0x1e 0x0f))
+(assert_return (invoke "get_v128_lanes") (i64.const 0x8796a5b4c3d2e1f0) (i64.const 0x0f1e2d3c4b5a6978))
+(assert_return (invoke "get_v128_byte" (i32.const 0)) (i32.const 0xf0))
+(assert_return (invoke "get_v128_byte" (i32.const 9)) (i32.const 0x69))
+(assert_return (invoke "get_v128_byte" (i32.const 15)) (i32.const 0x0f))
+
+;; Values written by struct.new in code.
+(assert_return (invoke "fresh" (i32.const 0x84838281) (i64.const 0x0102030405060708)
+    (v128.const i64x2 0x1112131415161718 0x2122232425262728))
+  (i32.const 0x81) (i32.const -0x7f) (i32.const 0x8281) (i32.const -0x7d7f) (i32.const 0x84838281)
+  (i64.const 0x0102030405060708) (i32.const 0x84838281) (i64.const 0x0102030405060708)
+  (i64.const 0x1112131415161718) (i64.const 0x2122232425262728))
