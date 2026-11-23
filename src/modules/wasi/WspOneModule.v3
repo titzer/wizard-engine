@@ -70,7 +70,7 @@ var x_ = void(
 	map["sched_yield"] =			v_i(		fun i => i.sched_yield),
 	map["proc_exit"] =			i_r(		fun i => i.proc_exit),
 	map["proc_raise"] =			i_i(		fun i => i.proc_raise),
-	map["poll_oneoff"] =			iiii_i(		fun i => i.poll_oneoff),
+	map["poll_oneoff"] =			iiii_r(		fun i => i.poll_oneoff),
 	map["random_get"] =			ii_r(		fun i => i.random_get),
 	map["sock_recv"] =			iiiiii_i(	fun i => i.sock_recv),
 	map["sock_send"] =			iiiii_i(	fun i => i.sock_send),
@@ -318,7 +318,88 @@ class WasiInstance extends HostInstance {
 		return HostResult.Throw(Exit.new(u32.view(code)));
 	}
 	def proc_raise(sig: int) => UNIMPLEMENTED;
-	def poll_oneoff(in_: int, out_: int, nsubscriptions: int, nevents: int) => UNIMPLEMENTED;
+	// Waits until at least one of the {nsubscriptions} subscriptions at {in_} is ready, writes an
+	// event for each ready subscription to {out_}, and their count to {nevents}. Clock subscriptions
+	// become ready at their timeout. Subscriptions to file descriptors are always ready immediately,
+	// since readiness is not tracked.
+	def poll_oneoff(in_: int, out_: int, nsubscriptions: int, nevents: int) -> HostResult {
+		if (!hasClocks()) return i(UNIMPLEMENTED);
+		if (memory == null) return FAULT_HR;
+		if (nsubscriptions <= 0) return INVAL_HR;
+		var n = nsubscriptions;
+		var in_r = getRegion(in_, n * SUBSCRIPTION_SIZE);
+		if (!in_r.ok()) return in_r.toHostResultThrow();
+		var out_r = getRegion(out_, n * EVENT_SIZE);
+		if (!out_r.ok()) return out_r.toHostResultThrow();
+		var nevents_r = getRegion(nevents, 4);
+		if (!nevents_r.ok()) return nevents_r.toHostResultThrow();
+		var subs = in_r.result, events = out_r.result;
+
+		// Check the subscriptions, compute the deadlines of clock subscriptions, and note which
+		// subscriptions are ready (or failed) immediately.
+		var deadlines = Array<long>.new(n), clocks = Array<int>.new(n), immediate = Array<u16>.new(n);
+		var any_immediate = false;
+		for (j < n) {
+			var sub = subs[(j * SUBSCRIPTION_SIZE) ...];
+			clocks[j] = -1;
+			match (sub[8]) {
+				EVENTTYPE_CLOCK => {
+					var id = int.view(DataReaders.read_range_u32(sub[16 ...]));
+					var timeout = long.view(DataReaders.read_range_u64(sub[24 ...]));
+					var flags = DataReaders.read_range_u16(sub[40 ...]);
+					var now = clock_now(id);
+					if (now < 0) {
+						immediate[j] = INVAL;
+						any_immediate = true;
+					} else {
+						clocks[j] = id;
+						deadlines[j] = if((flags & SUBCLOCKFLAGS_ABSTIME) != 0, timeout, now + timeout);
+					}
+				}
+				EVENTTYPE_FD_READ, EVENTTYPE_FD_WRITE => {
+					var fd = int.view(DataReaders.read_range_u32(sub[16 ...]));
+					immediate[j] = if(fdmap.get(fd) == null, BADF, SUCCESS);
+					any_immediate = true;
+				}
+				_ => return INVAL_HR;
+			}
+		}
+		// Unless some subscription is ready already, wait for the earliest clock deadline. Waking
+		// early (e.g. due to a signal) just waits again.
+		if (!any_immediate) {
+			while (true) {
+				var wait = long.max;
+				for (j < n) {
+					if (clocks[j] < 0) continue;
+					var remaining = deadlines[j] - clock_now(clocks[j]);
+					if (remaining < wait) wait = remaining;
+				}
+				if (wait <= 0) break;
+				sleep_ns(wait);
+			}
+		}
+		// Report the subscriptions that are ready: failed or file descriptor subscriptions, and
+		// clock subscriptions whose deadline has passed.
+		var count = 0;
+		for (j < n) {
+			var sub = subs[(j * SUBSCRIPTION_SIZE) ...];
+			var ready = if(clocks[j] < 0, true, clock_now(clocks[j]) >= deadlines[j]);
+			if (!ready) continue;
+			var event = events[(count * EVENT_SIZE) ..+ EVENT_SIZE];
+			for (k < event.length) event[k] = 0;
+			for (k < 8) event[k] = sub[k]; // userdata
+			DataWriters.write_range_u16(event[8 ...], immediate[j]); // error
+			event[10] = sub[8]; // type
+			count++;
+		}
+		DataWriters.write_range_u32(nevents_r.result, u32.view(count));
+		return SUCCESS_HR;
+	}
+	// Platform hooks for {poll_oneoff}: whether clocks are supported, the current time of the WASI
+	// clock {clock_id} in nanoseconds (or -1 if invalid), and sleeping for {ns} nanoseconds.
+	def hasClocks() -> bool { return false; }
+	def clock_now(clock_id: int) -> long { return -1; }
+	def sleep_ns(ns: long) { }
 	def random_get(ptr: int, len: int) -> HostResult {
 		var range = getRegion(ptr, len);
 		if (range.reason != TrapReason.NONE) return HostResult.Throw(Trap.new(range.reason, null, null));
@@ -370,3 +451,12 @@ def BADF = WspOneErrno.BADF.code;
 def BADF_HR = HostResult.Value1(Value.I32(BADF));
 def INVAL = WspOneErrno.INVAL.code;
 def INVAL_HR = HostResult.Value1(Value.I32(INVAL));
+def FAULT_HR = HostResult.Value1(Value.I32(WspOneErrno.FAULT.code));
+
+// Layout of {subscription} and {event} records for {poll_oneoff}.
+def SUBSCRIPTION_SIZE = 48;
+def EVENT_SIZE = 32;
+def EVENTTYPE_CLOCK: byte = 0;
+def EVENTTYPE_FD_READ: byte = 1;
+def EVENTTYPE_FD_WRITE: byte = 2;
+def SUBCLOCKFLAGS_ABSTIME: u16 = 1;
