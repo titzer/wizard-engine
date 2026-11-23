@@ -1267,31 +1267,70 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			return;
 		}
 		var kind = ValueTypes.kind(global.valtype);
-		if (SpcTuning.inlineGlobalAccess && kind != ValueKind.REF && kind != ValueKind.REF_U64) {
-			var tmp = allocTmp(ValueKind.REF);
-			emit_load_instance(tmp);
-			masm.emit_v3_Instance_globals_r_r(tmp, tmp);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp, tmp, int.!(index));
-			var result = allocRegTos(kind);
-			masm.emit_mov_r_m(kind, result, MasmAddr(tmp, masm.getOffsets().Global_low)); // TODO: unboxed value read
-			state.push(SpcConsts.kindToFlags(kind) | IN_REG, result, 0);
-		} else {
-			emit_call_runtime_op1n(Opcode.GLOBAL_GET, index, 0, [global.valtype], false);
+		if (!canInlineGlobal(kind)) return emit_call_runtime_op1n(Opcode.GLOBAL_GET, index, 0, [global.valtype], false);
+		var offsets = masm.getOffsets();
+		var tmp = emit_load_global(index);
+		var result = allocRegTos(kind);
+		match (kind) {
+			REF => {
+				// See {Global}: the reference word is {ref | low}, where {low} is nonzero only for an i31.
+				masm.emit_mov_r_m(kind, result, MasmAddr(tmp, offsets.Global_ref));
+				if (mayHoldI31(global.valtype)) masm.emit_binop_r_m(Opcode.I64_OR, result, MasmAddr(tmp, offsets.Global_low));
+			}
+			REF_U64 => masm.emit_mov_r_m(kind, result, MasmAddr(tmp, offsets.Global_ref)); // {ref, low} pair
+			_ => masm.emit_mov_r_m(kind, result, MasmAddr(tmp, offsets.Global_low));
 		}
+		state.push(SpcConsts.kindToFlags(kind) | IN_REG, result, 0);
 	}
 	def visit_GLOBAL_SET(index: u31) {
 		var global = module.globals[index];
 		var kind = ValueTypes.kind(global.valtype);
-		if (SpcTuning.inlineGlobalAccess && kind != ValueKind.REF && kind != ValueKind.REF_U64) {
-			var tmp = allocTmp(ValueKind.REF);
-			emit_load_instance(tmp);
-			masm.emit_v3_Instance_globals_r_r(tmp, tmp);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp, tmp, int.!(index));
-			var reg = popReg().reg; // XXX: improve global.set for constants
-			masm.emit_mov_m_r(kind, MasmAddr(tmp, masm.getOffsets().Global_low), reg); // TODO: unboxed value write
-		} else {
-			emit_call_runtime_op1n(Opcode.GLOBAL_SET, index, 1, ValueTypes.NONE, false);
+		if (!canInlineGlobal(kind)) return emit_call_runtime_op1n(Opcode.GLOBAL_SET, index, 1, ValueTypes.NONE, false);
+		var offsets = masm.getOffsets();
+		var tmp = emit_load_global(index);
+		var reg = popReg().reg; // XXX: improve global.set for constants
+		match (kind) {
+			REF => {
+				if (mayHoldI31(global.valtype)) {
+					// See {Global}: split the reference word {w} into {ref} (the pointer, if not an i31)
+					// and {low} (the tagged i31 bits, if an i31) without branching.
+					var t = allocTmp(ValueKind.I64);
+					masm.emit_mov_r_r(ValueKind.I64, t, reg);
+					masm.emit_binop_r_i(Opcode.I64_AND, t, 1);
+					masm.emit_binop_r_i(Opcode.I64_SUB, t, 1);	// 0 if an i31, else all ones
+					masm.emit_binop_r_r(Opcode.I64_AND, t, reg);	// the pointer, or 0 if an i31
+					masm.emit_mov_m_r(ValueKind.REF, MasmAddr(tmp, offsets.Global_ref), t);
+					masm.emit_binop_r_r(Opcode.I64_XOR, t, reg);	// the i31 bits, or 0 if a pointer
+					masm.emit_mov_m_r(ValueKind.I64, MasmAddr(tmp, offsets.Global_low), t);
+				} else {
+					masm.emit_mov_m_r(kind, MasmAddr(tmp, offsets.Global_ref), reg); // {low} is always 0
+				}
+			}
+			REF_U64 => masm.emit_mov_m_r(kind, MasmAddr(tmp, offsets.Global_ref), reg); // {ref, low} pair
+			_ => masm.emit_mov_m_r(kind, MasmAddr(tmp, offsets.Global_low), reg);
 		}
+	}
+	// Returns {true} if accesses to a global of {kind} can be inlined.
+	private def canInlineGlobal(kind: ValueKind) -> bool {
+		if (!SpcTuning.inlineGlobalAccess) return false;
+		if (kind == ValueKind.REF_U64) {
+			// The {ref, low} pair is accessed with one 16-byte move.
+			var offsets = masm.getOffsets();
+			return offsets.Global_low == offsets.Global_ref + offsets.REF_SIZE;
+		}
+		return true;
+	}
+	// Loads the {Global} object for global {index} into a new temporary register.
+	private def emit_load_global(index: u31) -> Reg {
+		var tmp = allocTmp(ValueKind.REF);
+		emit_load_instance(tmp);
+		masm.emit_v3_Instance_globals_r_r(tmp, tmp);
+		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp, tmp, int.!(index));
+		return tmp;
+	}
+	// Returns {true} if a value of type {vt} may be an i31, in which case it is stored differently.
+	private def mayHoldI31(vt: ValueType) -> bool {
+		return FieldStorage.getKind(StorageType(vt, Packedness.UNPACKED, true)) == FieldStorageKind.RefI31;
 	}
 	def visit_TABLE_GET(index: u31) {
 		var table = module.tables[index];
