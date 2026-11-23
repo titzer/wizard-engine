@@ -39,6 +39,12 @@ fi
 
 TESTS=$(ls *.wasm)
 
+# SPC inlining (e.g. --inline-max-depth=1 in WIZENG_OPTS) has its own expected failures.
+INLINING=0
+if [[ "$WIZENG_OPTS" =~ --inline-max-depth=[1-9] ]]; then
+    INLINING=1
+fi
+
 RAW=${RAW:=0}
 
 function run_test {
@@ -77,6 +83,10 @@ function run_test {
                 fi
                 if [ -f failures.$target.$TEST_MODE ] && grep -q "$test *$monitor" failures.$target.$TEST_MODE; then
                     echo "##-ok" # expected failure (mode-specific)
+                    continue
+                fi
+                if [ "$INLINING" = 1 ] && [ -f failures.$target.inline ] && grep -q "$test *$monitor" failures.$target.inline; then
+                    echo "##-ok" # expected failure (SPC inlining enabled)
                     continue
                 fi
                 echo "##-fail: $P.out.diff"
